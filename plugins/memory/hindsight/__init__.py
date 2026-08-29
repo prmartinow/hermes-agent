@@ -413,6 +413,34 @@ REFLECT_SCHEMA = {
     },
 }
 
+RETHINK_SCHEMA = {
+    "name": "rethink_memory",
+    "description": (
+        "Create, update, or delete standing repository procedural rules, coding "
+        "standards, formatting conventions, or architectural policies in procedural memory "
+        "with Git version tracking and automatic directive synchronization."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "rule_name": {
+                "type": "string",
+                "description": "Name/identifier of the procedural rule (without .md).",
+            },
+            "content": {
+                "type": "string",
+                "description": "Markdown content or text of the procedural rule.",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["update", "insert", "delete"],
+                "description": "Action to perform: 'update', 'insert', or 'delete'. Defaults to 'update'.",
+            },
+        },
+        "required": ["rule_name", "content"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -2219,7 +2247,7 @@ class HindsightMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
             return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, RETHINK_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if tool_name == "hindsight_retain":
@@ -2240,7 +2268,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
                              self._bank_id, len(content), context)
                 self._run_hindsight_operation(
-                    lambda client: client.aretain_batch(bank_id=self._bank_id, items=[item])
+                    lambda client: client.aretain_batch(
+                        bank_id=self._bank_id, items=[item], retain_async=self._retain_async
+                    )
                 )
                 logger.debug("Tool hindsight_retain: success")
                 return json.dumps({"result": "Memory stored successfully."})
@@ -2292,6 +2322,37 @@ class HindsightMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.warning("hindsight_reflect failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to reflect: {e}")
+
+        elif tool_name == "rethink_memory":
+            rule_name = args.get("rule_name", "")
+            if not rule_name:
+                return tool_error("Missing required parameter: rule_name")
+            content = args.get("content", "")
+            action = args.get("action", "update")
+            session_id = self._session_id or kwargs.get("session_id") or "hindsight-rethink"
+            try:
+                from hermes_constants import get_hermes_home
+                _agent_db_path = os.getenv("AGENT_MEMORY_DB_PATH", str(get_hermes_home() / "agent-memory" / "db"))
+                if _agent_db_path not in sys.path and os.path.isdir(_agent_db_path):
+                    sys.path.insert(0, _agent_db_path)
+                from rule_mutator import mutate_rule  # type: ignore[import-not-found] # pyright: ignore[reportMissingImports]
+
+                logger.debug(
+                    "Tool rethink_memory: rule_name=%s, action=%s, session=%s",
+                    rule_name, action, session_id,
+                )
+                res = mutate_rule(
+                    rule_name=rule_name,
+                    content=content,
+                    action=action,
+                    session_id=session_id,
+                    tool_caller="hindsight_plugin",
+                )
+                logger.debug("Tool rethink_memory: success: %s", res)
+                return json.dumps({"result": res})
+            except Exception as e:
+                logger.warning("rethink_memory failed: %s", e, exc_info=True)
+                return tool_error(f"Failed to rethink memory: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
 

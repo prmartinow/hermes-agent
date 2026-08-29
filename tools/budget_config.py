@@ -12,6 +12,13 @@ PINNED_THRESHOLDS: Dict[str, float] = {
     "read_file": float("inf"),
 }
 
+# Default per-tool threshold overrides for heavy/verbose execution tools (5 KB offload threshold).
+DEFAULT_TOOL_THRESHOLDS: Dict[str, int] = {
+    "terminal": 5_120,
+    "execute_code": 5_120,
+    "code_execution": 5_120,
+}
+
 # Defaults matching the current hardcoded values in tool_result_storage.py.
 # Kept here as the single source of truth; tool_result_storage.py imports these.
 DEFAULT_RESULT_SIZE_CHARS: int = 100_000
@@ -77,7 +84,7 @@ class BudgetConfig:
     turn_budget: int = DEFAULT_TURN_BUDGET_CHARS
     preview_size: int = DEFAULT_PREVIEW_SIZE_CHARS
     mcp_result_size: int = DEFAULT_MCP_RESULT_SIZE_CHARS
-    tool_overrides: Dict[str, int] = field(default_factory=dict)
+    tool_overrides: Dict[str, int] = field(default_factory=lambda: dict(DEFAULT_TOOL_THRESHOLDS))
 
     def resolve_threshold(self, tool_name: str) -> int | float:
         """Resolve the persistence threshold for a tool.

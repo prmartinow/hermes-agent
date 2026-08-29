@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from tools.budget_config import (
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_PREVIEW_SIZE_CHARS,
+    DEFAULT_BUDGET,
     BudgetConfig,
 )
 from tools.tool_result_storage import (
@@ -171,6 +172,12 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
+    @pytest.fixture(autouse=True)
+    def _disable_context_db(self, monkeypatch):
+        import tools.tool_result_storage as trs
+        monkeypatch.setattr(trs, "_archive_to_context_db", lambda *a, **kw: None)
+        yield
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(
@@ -267,6 +274,12 @@ class TestMaybePersistToolResult:
 # ── enforce_turn_budget ───────────────────────────────────────────────
 
 class TestEnforceTurnBudget:
+    @pytest.fixture(autouse=True)
+    def _disable_context_db(self, monkeypatch):
+        import tools.tool_result_storage as trs
+        monkeypatch.setattr(trs, "_archive_to_context_db", lambda *a, **kw: None)
+        yield
+
     def test_under_budget_no_changes(self):
         msgs = [
             {"role": "tool", "tool_call_id": "t1", "content": "small"},
@@ -341,6 +354,7 @@ class TestSpillover:
         # Reset the once-per-process prune flag so each test is independent.
         import tools.tool_result_storage as trs
         monkeypatch.setattr(trs, "_spillover_pruned_once", False)
+        monkeypatch.setattr(trs, "_archive_to_context_db", lambda *a, **kw: None)
         yield
 
     def test_env_none_persists_to_spillover(self):
@@ -499,3 +513,101 @@ class TestRecoveryHint:
         assert msg.startswith(PERSISTED_OUTPUT_TAG)
         assert msg.endswith(PERSISTED_OUTPUT_CLOSING_TAG)
         assert "read_file" in msg
+
+
+# ── Context Offloading & Retrieval (Gap 2) ─────────────────────────────
+
+class TestContextOffloading:
+    def test_offload_above_threshold_archives_and_returns_brief(self):
+        content = "Line 1: starting build\n" + "Line ...\n" * 800 + "Line 802: build finished"
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_term_1",
+            env=None,
+            threshold=5_120,
+        )
+        assert "[ARCHIVE_ID:" in result
+        assert "⚡ [OFFLOADED VERBOSE TOOL OUTPUT: terminal]" in result
+        assert "context_retrieve" in result
+
+    def test_default_threshold_triggers_at_5kb_for_terminal(self):
+        # ~6000 chars of terminal output should offload under DEFAULT_BUDGET (5120 char threshold)
+        content = "hello world\n" * 500
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_term_2",
+            env=None,
+            config=DEFAULT_BUDGET,
+        )
+        assert "[ARCHIVE_ID:" in result
+        assert "⚡ [OFFLOADED VERBOSE TOOL OUTPUT: terminal]" in result
+
+    def test_default_threshold_does_not_trigger_below_5kb(self):
+        content = "small output\n" * 100  # ~1300 chars
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_term_3",
+            env=None,
+            config=DEFAULT_BUDGET,
+        )
+        assert result == content
+
+    def test_read_file_unconstrained(self):
+        # read_file should never be offloaded even with large content
+        content = "a" * 50_000
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="read_file",
+            tool_use_id="tc_read_1",
+            env=None,
+            config=DEFAULT_BUDGET,
+        )
+        assert result == content
+
+    def test_context_retrieve_tool_full_and_sliced(self):
+        from tools.context_retrieve_tool import context_retrieve
+        sample_text = "\n".join([f"line_{i}" for i in range(1, 21)])
+        # Offload
+        result = maybe_persist_tool_result(
+            content=sample_text,
+            tool_name="terminal",
+            tool_use_id="tc_retrieve_test",
+            env=None,
+            threshold=10,
+        )
+        assert "[ARCHIVE_ID: " in result
+        import re
+        m = re.search(r"\[ARCHIVE_ID: ([a-f0-9\-]+)\]", result)
+        assert m is not None
+        archive_id = m.group(1)
+
+        # 1. Full retrieval
+        full = context_retrieve(archive_id=archive_id)
+        assert full == sample_text
+
+        # 2. Sliced retrieval (offset=5, limit=3)
+        sliced = context_retrieve(archive_id=archive_id, offset=5, limit=3)
+        assert "Lines 5 to 7 of 20 total lines" in sliced
+        assert "line_5\nline_6\nline_7" in sliced
+
+    def test_context_retrieve_not_found(self):
+        from tools.context_retrieve_tool import context_retrieve
+        res = context_retrieve(archive_id="non-existent-uuid-12345")
+        assert "not found" in res.lower() or "error" in res.lower()
+
+    def test_fallback_when_archiver_fails(self, monkeypatch):
+        import tools.tool_result_storage as trs
+        monkeypatch.setattr(trs, "_get_archiver_modules", lambda: (None, None))
+        content = "x" * 60_000
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_fallback_1",
+            env=None,
+            threshold=30_000,
+        )
+        assert PERSISTED_OUTPUT_TAG in result
+        assert "Full output saved to:" in result
