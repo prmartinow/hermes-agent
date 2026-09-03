@@ -1,8 +1,0 @@
-name: web-gemini-grounding
-version: 1.0.0
-description: "First-party Google Search Grounding via Gemini Cloud Code PA OAuth — zero external API keys required."
-author: NousResearch
-kind: backend
-provides_web_providers:
-  - gemini-grounding
-  - google-grounding

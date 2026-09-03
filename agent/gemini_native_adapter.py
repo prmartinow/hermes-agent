@@ -20,22 +20,16 @@ import asyncio
 import base64
 import json
 import logging
-import mimetypes
-import os
 import re
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, Iterator, List, Optional, Set
-from urllib.parse import unquote
+from typing import Any, Dict, Iterator, List, Optional
 
 import httpx
 
 from agent.bounded_response import read_streaming_error_body
-from agent.gemini_schema import (
-    build_gemini_tools,
-    sanitize_gemini_tool_parameters,
-)
+from agent.gemini_schema import sanitize_gemini_tool_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -53,18 +47,14 @@ DEFAULT_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # passes max_tokens=None, because Gemini's native API otherwise applies a low
 # internal default and truncates output (unlike OpenAI-compat endpoints where
 # an omitted limit means full budget).
-GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = 65536
+GEMINI_DEFAULT_MAX_OUTPUT_TOKENS = 65535
 
 
 def bare_gemini_model_id(model: str) -> str:
     """Strip Gemini's own provider prefix from an aggregator-style model id."""
     name = (model or "").strip()
     lowered = name.lower()
-    for prefix in (
-        "google/", "gemini/", "gemini-oauth/", "gemini_oauth/",
-        "gemini-1/", "gemini-2/", "gemini-3/", "gemini-4/", "gemini-5/",
-        "gemini-oauth-1/", "gemini-oauth-2/", "gemini-oauth-3/", "gemini-oauth-4/", "gemini-oauth-5/",
-    ):
+    for prefix in ("google/", "gemini/"):
         if lowered.startswith(prefix):
             return name[len(prefix):].strip() or name
     return name
@@ -109,7 +99,7 @@ def probe_gemini_tier(
     api_key: str,
     base_url: str = DEFAULT_GEMINI_BASE_URL,
     *,
-    model: str = "gemini-3.6-flash",
+    model: str = "gemini-3.7-flash",
     timeout: float = 10.0,
 ) -> str:
     """Probe a Google AI Studio API key and return its tier.
@@ -200,7 +190,7 @@ _FREE_TIER_GUIDANCE = (
 
 
 def is_standard_key_auth_error(
-    status: int, error_message: str, reason: str = "", url: str = ""
+    status: int, error_message: str, reason: str = ""
 ) -> bool:
     """Return True when a Gemini 401 indicates Google rejected the key TYPE.
 
@@ -213,12 +203,9 @@ def is_standard_key_auth_error(
     ``google.rpc.ErrorInfo`` reason ``ACCESS_TOKEN_TYPE_UNSUPPORTED``.
 
     Scoped narrowly so a plain bad key (reason ``API_KEY_INVALID``,
-    "API key not valid") keeps its existing message, and OAuth endpoints
-    (Cloud Code PA) do not trigger API key advice.
+    "API key not valid") keeps its existing message.
     """
     if status != 401:
-        return False
-    if "cloudcode-pa.googleapis.com" in str(url):
         return False
     if reason == "ACCESS_TOKEN_TYPE_UNSUPPORTED":
         return True
@@ -257,7 +244,6 @@ class GeminiAPIError(Exception):
         self.response = response
         self.retry_after = retry_after
         self.details = details or {}
-        self.challenge_url: Optional[str] = (self.details.get("challenge_url") or None)
 
 
 def _coerce_content_to_text(content: Any) -> str:
@@ -278,162 +264,7 @@ def _coerce_content_to_text(content: Any) -> str:
     return str(content)
 
 
-_EXTENSION_TO_MIME = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".webp": "image/webp",
-    ".gif": "image/gif",
-    ".bmp": "image/bmp",
-    ".svg": "image/svg+xml",
-    ".tiff": "image/tiff",
-    ".tif": "image/tiff",
-    ".heic": "image/heic",
-    ".heif": "image/heif",
-    ".pdf": "application/pdf",
-    ".mp3": "audio/mp3",
-    ".wav": "audio/wav",
-    ".ogg": "audio/ogg",
-    ".m4a": "audio/m4a",
-    ".aac": "audio/aac",
-    ".flac": "audio/flac",
-    ".mp4": "video/mp4",
-    ".webm": "video/webm",
-    ".mov": "video/quicktime",
-    ".avi": "video/x-msvideo",
-    ".txt": "text/plain",
-    ".csv": "text/csv",
-    ".json": "application/json",
-    ".html": "text/html",
-}
-
-
-def _detect_mime_type(path_or_url: str, data: Optional[bytes] = None) -> str:
-    """Detect MIME type using magic bytes, extension map, or mimetypes module."""
-    if data:
-        if data.startswith(b"%PDF"):
-            return "application/pdf"
-        if data.startswith(b"\x89PNG\r\n\x1a\n"):
-            return "image/png"
-        if data.startswith(b"\xff\xd8\xff"):
-            return "image/jpeg"
-        if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
-            return "image/gif"
-        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            return "image/webp"
-        if data.startswith(b"BM"):
-            return "image/bmp"
-
-    clean = str(path_or_url or "").split("?")[0].split("#")[0].lower()
-    for ext, mime in _EXTENSION_TO_MIME.items():
-        if clean.endswith(ext):
-            return mime
-
-    guessed, _ = mimetypes.guess_type(clean)
-    if guessed:
-        return guessed
-
-    return "application/octet-stream"
-
-
-def _resolve_media_to_inline_data(
-    media_ref: str, mime_type: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
-    """Convert local file path, file:// URI, remote URL, or data URI to base64 inlineData."""
-    if not isinstance(media_ref, str) or not media_ref.strip():
-        return None
-    ref = media_ref.strip()
-
-    # 1. Data URI (e.g. data:image/png;base64,iVBORw0KGgo...)
-    if ref.startswith("data:"):
-        try:
-            header, encoded = ref.split(",", 1)
-            parsed_mime = header.split(":", 1)[1].split(";", 1)[0].strip()
-            clean_b64 = re.sub(r"\s+", "", encoded)
-            base64.b64decode(clean_b64)
-            return {
-                "inlineData": {
-                    "mimeType": mime_type or parsed_mime or "image/png",
-                    "data": clean_b64,
-                }
-            }
-        except Exception as exc:
-            logger.debug("_resolve_media_to_inline_data: failed to parse data URI: %s", exc)
-            return None
-
-    # 2. Local file path or file:// URI
-    file_path = ref
-    if file_path.startswith("file://"):
-        file_path = unquote(file_path[7:])
-    expanded_path = os.path.expanduser(file_path)
-
-    if os.path.isfile(expanded_path):
-        try:
-            with open(expanded_path, "rb") as f:
-                raw_bytes = f.read()
-            detected_mime = mime_type or _detect_mime_type(expanded_path, raw_bytes)
-            if detected_mime == "application/octet-stream" and not mime_type:
-                detected_mime = "image/png"
-            return {
-                "inlineData": {
-                    "mimeType": detected_mime,
-                    "data": base64.b64encode(raw_bytes).decode("ascii"),
-                }
-            }
-        except Exception as exc:
-            logger.warning("_resolve_media_to_inline_data: failed to read file %s: %s", expanded_path, exc)
-            return None
-
-    # 3. Remote HTTP/HTTPS URL
-    if ref.startswith(("http://", "https://")):
-        try:
-            resp = httpx.get(
-                ref,
-                timeout=15.0,
-                follow_redirects=True,
-                headers={"User-Agent": f"hermes-agent/{_HERMES_VERSION}"},
-            )
-            if resp.status_code == 200:
-                raw_bytes = resp.content
-                content_type = resp.headers.get("content-type", "").split(";")[0].strip()
-                detected_mime = (
-                    mime_type
-                    or (content_type if content_type and "/" in content_type else None)
-                    or _detect_mime_type(ref, raw_bytes)
-                )
-                if detected_mime == "application/octet-stream" and not mime_type:
-                    detected_mime = "image/png"
-                return {
-                    "inlineData": {
-                        "mimeType": detected_mime,
-                        "data": base64.b64encode(raw_bytes).decode("ascii"),
-                    }
-                }
-            else:
-                logger.warning(
-                    "_resolve_media_to_inline_data: HTTP %d downloading media from %s",
-                    resp.status_code,
-                    ref,
-                )
-        except Exception as exc:
-            logger.warning(
-                "_resolve_media_to_inline_data: failed to download remote media from %s: %s",
-                ref,
-                exc,
-            )
-            return None
-
-    return None
-
-
 def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
-    """Extract multimodal parts (text and base64 inlineData) from message content."""
-    if content is None:
-        return []
-    if isinstance(content, str):
-        return [{"text": content}] if content else []
-    if isinstance(content, dict):
-        content = [content]
     if not isinstance(content, list):
         text = _coerce_content_to_text(content)
         return [{"text": text}] if text else []
@@ -441,168 +272,46 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
     parts: List[Dict[str, Any]] = []
     for item in content:
         if isinstance(item, str):
-            if item:
-                parts.append({"text": item})
+            parts.append({"text": item})
             continue
         if not isinstance(item, dict):
             continue
-
-        media_res = (
-            item.get("mediaResolution")
-            or item.get("media_resolution")
-            or (item.get("image_url", {}).get("mediaResolution") if isinstance(item.get("image_url"), dict) else None)
-            or (item.get("image_url", {}).get("media_resolution") if isinstance(item.get("image_url"), dict) else None)
-            or (item.get("image_url", {}).get("detail") if isinstance(item.get("image_url"), dict) else None)
-            or item.get("detail")
-        )
-        res_str = None
-        if isinstance(media_res, str):
-            res_clean = media_res.strip().upper()
-            if res_clean in ("LOW", "MEDIA_RESOLUTION_LOW"):
-                res_str = "MEDIA_RESOLUTION_LOW"
-            elif res_clean in ("MEDIUM", "MEDIA_RESOLUTION_MEDIUM"):
-                res_str = "MEDIA_RESOLUTION_MEDIUM"
-            elif res_clean in ("HIGH", "MEDIA_RESOLUTION_HIGH"):
-                res_str = "MEDIA_RESOLUTION_HIGH"
-
-        def _attach_res(part_dict: Dict[str, Any]) -> Dict[str, Any]:
-            if res_str and isinstance(part_dict, dict) and "inlineData" in part_dict and isinstance(part_dict["inlineData"], dict):
-                part_dict["inlineData"]["mediaResolution"] = res_str
-            return part_dict
-
-        # Direct inlineData / inline_data objects
-        if "inlineData" in item and isinstance(item["inlineData"], dict):
-            parts.append(_attach_res({"inlineData": dict(item["inlineData"])}))
-            continue
-        if "inline_data" in item and isinstance(item["inline_data"], dict):
-            idat = item["inline_data"]
-            mime = idat.get("mime_type") or idat.get("mimeType") or "image/png"
-            data = idat.get("data")
-            if data:
-                parts.append(_attach_res({"inlineData": {"mimeType": mime, "data": data}}))
-                continue
-
-        ptype = str(item.get("type") or "").lower()
-
+        ptype = item.get("type")
         if ptype == "text":
             text = item.get("text")
             if isinstance(text, str) and text:
                 parts.append({"text": text})
-            continue
-
-        if ptype in ("image_url", "input_image"):
-            image_url_obj = item.get("image_url")
-            url_str = (
-                image_url_obj.get("url")
-                if isinstance(image_url_obj, dict)
-                else (image_url_obj if isinstance(image_url_obj, str) else "")
-            )
-            inline_part = _resolve_media_to_inline_data(url_str)
-            if inline_part:
-                parts.append(_attach_res(inline_part))
-            continue
-
-        if ptype in ("image", "document", "file", "input_file", "pdf", "audio", "video"):
-            source = item.get("source")
-            if isinstance(source, dict):
-                stype = str(source.get("type") or "").lower()
-                if stype == "base64":
-                    mime = source.get("media_type") or source.get("mime_type") or "image/png"
-                    data = source.get("data")
-                    if isinstance(data, str) and data:
-                        parts.append(_attach_res({"inlineData": {"mimeType": mime, "data": data.strip()}}))
-                        continue
-                elif stype == "url":
-                    url = source.get("url")
-                    inline_part = _resolve_media_to_inline_data(str(url or ""))
-                    if inline_part:
-                        parts.append(_attach_res(inline_part))
-                        continue
-
-            media_ref = (
-                item.get("path")
-                or item.get("file_path")
-                or item.get("url")
-                or item.get("image_url")
-            )
-            mime = item.get("mime_type") or item.get("mimeType") or item.get("media_type")
-            data = item.get("data") or item.get("base64")
-            if isinstance(data, str) and data.strip():
-                parts.append(_attach_res({"inlineData": {"mimeType": mime or "image/png", "data": data.strip()}}))
+        elif ptype == "image_url":
+            url = ((item.get("image_url") or {}).get("url") or "")
+            if not isinstance(url, str) or not url.startswith("data:"):
                 continue
-            if media_ref:
-                inline_part = _resolve_media_to_inline_data(str(media_ref), mime_type=mime)
-                if inline_part:
-                    parts.append(_attach_res(inline_part))
-                    continue
-
-        if ptype in ("inline_data", "inlinedata"):
-            idat = item.get("inline_data") or item.get("inlineData") or item
-            if isinstance(idat, dict):
-                mime = idat.get("mime_type") or idat.get("mimeType") or "image/png"
-                data = idat.get("data")
-                if data:
-                    parts.append(_attach_res({"inlineData": {"mimeType": mime, "data": data}}))
-                    continue
-
+            try:
+                header, encoded = url.split(",", 1)
+                mime = header.split(":", 1)[1].split(";", 1)[0]
+                raw = base64.b64decode(encoded)
+            except Exception:
+                continue
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }
+            )
     return parts
 
 
-def is_gemini_model(model: str) -> bool:
-    """Return True if model is a native Google Gemini model (not a 3P/partner model).
-
-    Gemini models require thought signatures for tool call validation on Gemini 3.
-    Non-Gemini partner models (e.g. claude-sonnet-4-6, claude-opus-4-6-thinking,
-    gpt-oss-120b-medium) reject thoughtSignature with HTTP 400.
-    """
-    name = bare_gemini_model_id(model or "").lower().strip()
-    if not name:
-        return True
-    if name in (
-        "claude-sonnet-4-6",
-        "claude-opus-4-6-thinking",
-        "gpt-oss-120b-medium",
-    ):
-        return False
-    if any(p in name for p in ("claude", "gpt-oss", "anthropic", "openai", "llama", "mistral", "qwen", "deepseek")):
-        return False
-    return True
-
-
 def _tool_call_extra_signature(tool_call: Dict[str, Any]) -> Optional[str]:
-    """Extract cryptographic thought signature from a tool call dictionary."""
-    if not isinstance(tool_call, dict):
+    extra = tool_call.get("extra_content") or {}
+    if not isinstance(extra, dict):
         return None
-
-    # 1. Direct fields on tool_call
-    for key in ("thought_signature", "thoughtSignature", "thought_sig"):
-        val = tool_call.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-
-    # 2. extra_content dictionary
-    extra = tool_call.get("extra_content")
-    if isinstance(extra, dict):
-        for key in ("thought_signature", "thoughtSignature", "signature", "thought_sig"):
-            val = extra.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-        google = extra.get("google")
-        if isinstance(google, dict):
-            sig = google.get("thought_signature") or google.get("thoughtSignature") or google.get("signature")
-            if isinstance(sig, str) and sig.strip():
-                return sig.strip()
-        elif isinstance(google, str) and google.strip():
-            return google.strip()
-
-    # 3. Inside function dict if present
-    fn = tool_call.get("function")
-    if isinstance(fn, dict):
-        for key in ("thought_signature", "thoughtSignature"):
-            val = fn.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-
+    google = extra.get("google") or extra.get("thought_signature")
+    if isinstance(google, dict):
+        sig = google.get("thought_signature") or google.get("thoughtSignature")
+        return str(sig) if isinstance(sig, str) and sig else None
+    if isinstance(google, str) and google:
+        return google
     return None
 
 
@@ -619,12 +328,11 @@ _INTERRUPTED_RESPONSE_PLACEHOLDER = (
 def _translate_tool_call_to_gemini(
     tool_call: Dict[str, Any],
     include_ids: bool = False,
-    model: str = "",
 ) -> Dict[str, Any]:
     fn = tool_call.get("function") or {}
-    args_raw = fn.get("arguments") or {}
+    args_raw = fn.get("arguments", "")
     try:
-        args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+        args = json.loads(args_raw) if isinstance(args_raw, str) and args_raw else {}
     except json.JSONDecodeError:
         args = {"_raw": args_raw}
     if not isinstance(args, dict):
@@ -642,64 +350,104 @@ def _translate_tool_call_to_gemini(
         tool_call_id = str(tool_call.get("id") or tool_call.get("call_id") or "")
         if tool_call_id:
             part["functionCall"]["id"] = tool_call_id
-
-    # Cryptographic thought signature handling:
-    # 1. Non-Gemini partner models (claude-sonnet-4-6, claude-opus-4-6-thinking, gpt-oss-120b-medium):
-    #    Strictly STRIP thoughtSignature to prevent HTTP 400 rejection by Google's Cloud Code PA proxy.
-    # 2. Gemini models:
-    #    Attach thoughtSignature if present in extra_content/tool_call; if missing or compacted,
-    #    attach fallback "skip_thought_signature_validator".
-    if is_gemini_model(model):
-        thought_signature = _tool_call_extra_signature(tool_call) or "skip_thought_signature_validator"
-        part["thoughtSignature"] = thought_signature
-
+    thought_signature = _tool_call_extra_signature(tool_call)
+    # Fallback sentinel for cross-provider tool_calls (e.g. fallback from
+    # xAI/Anthropic to Gemini, where the original tool_call carries no
+    # Gemini thoughtSignature). Mirrors gemini_cloudcode_adapter.py:106.
+    # Without this, Gemini 3 thinking models reject replayed history with
+    # 400 INVALID_ARGUMENT on the missing thoughtSignature.
+    part["thoughtSignature"] = thought_signature or "skip_thought_signature_validator"
     return part
+
+
+def _looks_like_json_schema(node: Any) -> bool:
+    """True if a parsed value contains a JSON-Schema-style ``$ref`` pointer.
+
+    Gemini 3 resolves ``$ref``/``$defs`` references inside a
+    functionResponse.response payload and rejects unknown pointers with
+    HTTP 400 INVALID_ARGUMENT. A tool result that is itself a JSON Schema
+    (e.g. the output of ``tool_describe`` for an MCP tool) must therefore be
+    forwarded as opaque text rather than as a structured response.
+
+    Detection is deliberately structural, not semantic: any ``$ref`` value
+    shaped like a JSON pointer (``#/...``) demotes the whole result. Non-schema
+    data that happens to carry such a pointer is a false positive, but the raw
+    content is preserved verbatim either way, so the cost is fidelity-free.
+    The recursive walk is O(n) over the parsed value; tool-result payloads are
+    small, so this is negligible per turn.
+    """
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "$ref" and isinstance(value, str) and value.startswith("#/"):
+                return True
+            if _looks_like_json_schema(value):
+                return True
+    elif isinstance(node, list):
+        return any(_looks_like_json_schema(item) for item in node)
+    return False
 
 
 def _translate_tool_result_to_gemini(
     message: Dict[str, Any],
     tool_name_by_call_id: Optional[Dict[str, str]] = None,
     include_ids: bool = False,
+    *,
+    is_gemini3: bool = False,
 ) -> Dict[str, Any]:
     tool_name_by_call_id = tool_name_by_call_id or {}
     tool_call_id = str(message.get("tool_call_id") or "")
     # A tool result can carry the unwrapped internal tool name (for example,
     # an MCP tool invoked through the `tool_call` bridge). Gemini requires
-    # the functionResponse name to match the functionCall name it originally
-    # emitted, so prefer the declaration name mapped from the call ID.
-    resolved_name = tool_name_by_call_id.get(tool_call_id)
-    if not resolved_name:
-        resolved_name = str(message.get("tool_name") or message.get("name") or "")
-    name = resolved_name
-    content_raw = message.get("content")
+    # functionResponse.name to echo the matching functionCall.name, so the
+    # call-id mapping must take precedence over the internal result name.
+    name = str(
+        tool_name_by_call_id.get(tool_call_id)
+        or message.get("name")
+        or tool_call_id
+        or "tool"
+    )
+    raw_content = message.get("content")
+    content = _coerce_content_to_text(raw_content)
     try:
-        content_val = (
-            json.loads(content_raw)
-            if isinstance(content_raw, str)
-            else content_raw
-        )
+        parsed = json.loads(content) if content.strip().startswith(("{", "[")) else None
     except json.JSONDecodeError:
-        content_val = content_raw
-    response_payload: Dict[str, Any]
-    if isinstance(content_val, dict):
-        response_payload = content_val
-    else:
-        response_payload = {"output": content_val}
-    part: Dict[str, Any] = {
-        "functionResponse": {
-            "name": name,
-            "response": response_payload,
-        }
+        parsed = None
+    # Gemini 3 resolves JSON-Schema ``$ref`` pointers inside a
+    # functionResponse.response payload and rejects unknown references with
+    # HTTP 400 INVALID_ARGUMENT ("referenced name '#/$defs/...' does not match
+    # a display_name"; see vercel/ai#14369). A tool result that is itself a
+    # JSON Schema (e.g. tool_describe output for an MCP tool) must therefore
+    # be forwarded as opaque text, not as a structured response.
+    if isinstance(parsed, dict) and _looks_like_json_schema(parsed):
+        parsed = None
+    response = parsed if isinstance(parsed, dict) else {"output": content}
+    function_response: Dict[str, Any] = {
+        "name": name,
+        "response": response,
     }
     if include_ids and tool_call_id:
-        part["functionResponse"]["id"] = tool_call_id
-    return part
+        function_response["id"] = tool_call_id
+    # Gemini 3.x supports embedding images directly inside
+    # functionResponse.parts (Google's recommended shape for multimodal tool
+    # results — see "Multimodal function responses" in the Gemini docs).
+    # Gemini 2.x rejects the field, so only attach inlineData when the target
+    # model supports it — otherwise the vision tool result is silently
+    # downgraded to text-only.
+    if is_gemini3:
+        image_parts = [
+            p for p in _extract_multimodal_parts(raw_content)
+            if "inlineData" in p
+        ]
+        if image_parts:
+            function_response["parts"] = image_parts
+    return {"functionResponse": function_response}
 
 
 def _build_gemini_contents(
     messages: List[Dict[str, Any]],
     include_tool_call_ids: bool = False,
-    model: str = "",
+    *,
+    is_gemini3: bool = False,
 ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     system_text_parts: List[str] = []
     contents: List[Dict[str, Any]] = []
@@ -723,6 +471,7 @@ def _build_gemini_contents(
                             msg,
                             tool_name_by_call_id=tool_name_by_call_id,
                             include_ids=include_tool_call_ids,
+                            is_gemini3=is_gemini3,
                         )
                     ],
                 }
@@ -745,7 +494,7 @@ def _build_gemini_contents(
                         tool_name_by_call_id[tool_call_id] = tool_name
                     parts.append(
                         _translate_tool_call_to_gemini(
-                            tool_call, include_ids=include_tool_call_ids, model=model
+                            tool_call, include_ids=include_tool_call_ids
                         )
                     )
 
@@ -800,17 +549,6 @@ def _build_gemini_contents(
             merged_contents.append(content)
     contents = merged_contents
 
-    # 5) Gemini multi-turn validation requires that `contents` begins with a
-    #    `user` turn. If history compaction/slicing or an initial assistant turn
-    #    leaves `contents[0]` as a `model` turn (especially with functionCall
-    #    parts), prepend a synthetic user turn ("Continue") so that functionCall
-    #    turns always immediately follow a user turn and multi-turn alternation
-    #    invariants are satisfied.
-    if contents and contents[0].get("role") == "model":
-        contents.insert(0, {"role": "user", "parts": [{"text": "Continue"}]})
-    elif not contents:
-        contents = [{"role": "user", "parts": [{"text": "Continue"}]}]
-
     system_instruction = None
     joined_system = "\n".join(part for part in system_text_parts if part).strip()
     if joined_system:
@@ -819,7 +557,27 @@ def _build_gemini_contents(
 
 
 def _translate_tools_to_gemini(tools: Any) -> List[Dict[str, Any]]:
-    return build_gemini_tools(tools)
+    if not isinstance(tools, list):
+        return []
+    declarations: List[Dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") or {}
+        if not isinstance(fn, dict):
+            continue
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        decl: Dict[str, Any] = {"name": name}
+        description = fn.get("description")
+        if isinstance(description, str) and description:
+            decl["description"] = description
+        parameters = fn.get("parameters")
+        if isinstance(parameters, dict):
+            decl["parameters"] = sanitize_gemini_tool_parameters(parameters)
+        declarations.append(decl)
+    return [{"functionDeclarations": declarations}] if declarations else []
 
 
 def _translate_tool_choice_to_gemini(tool_choice: Any) -> Optional[Dict[str, Any]]:
@@ -877,60 +635,26 @@ def _thinking_requests_output_headroom(thinking_config: Any) -> bool:
 
 
 def _effective_gemini_max_output_tokens(
-    max_tokens: Optional[int],
-    thinking_config: Any,
-    model: str = "",
+    max_tokens: Optional[int], thinking_config: Any
 ) -> int:
     """Resolve native ``maxOutputTokens``.
 
     Gemini's generateContent API does not treat an omitted cap as
     unlimited — it applies a low internal default and truncates. When
     thinking is enabled, also raise a too-small explicit cap to the
-    published ceiling (or thinkingBudget + 8192 headroom) so thought tokens
-    do not starve the answer.
+    published 65,535 ceiling so thought tokens do not starve the answer.
     """
-    bare = bare_gemini_model_id(model).lower() if model else ""
-    default_ceiling = GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
-    if "gpt-oss" in bare:
-        default_ceiling = 8192
-    elif "claude" in bare:
-        default_ceiling = 64000
-
     if max_tokens is None:
-        requested = default_ceiling
-    else:
-        try:
-            requested = int(max_tokens)
-        except (TypeError, ValueError):
-            requested = default_ceiling
+        return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
+    try:
+        requested = int(max_tokens)
+    except (TypeError, ValueError):
+        return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
     if requested <= 0:
-        requested = default_ceiling
-
-    normalized = _normalize_thinking_config(thinking_config)
+        return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
     if _thinking_requests_output_headroom(thinking_config):
-        budget = normalized.get("thinkingBudget", 0) if normalized else 0
-        if isinstance(budget, (int, float)) and budget > 0:
-            return max(requested, int(budget) + 8192, default_ceiling)
-        return max(requested, default_ceiling)
-    return min(requested, default_ceiling)
-
-
-def _normalize_media_resolution(media_resolution: Any) -> Optional[str]:
-    """Normalize media resolution string to Gemini generationConfig format."""
-    if not media_resolution or not isinstance(media_resolution, str):
-        return None
-    val = media_resolution.strip().upper()
-    if val in ("LOW", "MEDIA_RESOLUTION_LOW"):
-        return "MEDIA_RESOLUTION_LOW"
-    if val in ("MEDIUM", "MEDIA_RESOLUTION_MEDIUM"):
-        return "MEDIA_RESOLUTION_MEDIUM"
-    if val in ("HIGH", "MEDIA_RESOLUTION_HIGH"):
-        return "MEDIA_RESOLUTION_HIGH"
-    if val in ("UNSPECIFIED", "MEDIA_RESOLUTION_UNSPECIFIED"):
-        return "MEDIA_RESOLUTION_UNSPECIFIED"
-    if val.startswith("MEDIA_RESOLUTION_"):
-        return val
-    return None
+        return max(requested, GEMINI_DEFAULT_MAX_OUTPUT_TOKENS)
+    return requested
 
 
 def build_gemini_request(
@@ -943,13 +667,14 @@ def build_gemini_request(
     top_p: Optional[float] = None,
     stop: Any = None,
     thinking_config: Any = None,
-    media_resolution: Optional[str] = None,
     model: str = "",
 ) -> Dict[str, Any]:
+    version = _gemini_major_version(model)
+    is_gemini3 = version is not None and version >= 3
     contents, system_instruction = _build_gemini_contents(
         messages,
         include_tool_call_ids=gemini_requires_tool_call_ids(model),
-        model=model,
+        is_gemini3=is_gemini3,
     )
     request: Dict[str, Any] = {"contents": contents}
     if system_instruction:
@@ -967,7 +692,7 @@ def build_gemini_request(
     if temperature is not None:
         generation_config["temperature"] = temperature
     generation_config["maxOutputTokens"] = _effective_gemini_max_output_tokens(
-        max_tokens, thinking_config, model=model
+        max_tokens, thinking_config
     )
     if top_p is not None:
         generation_config["topP"] = top_p
@@ -976,9 +701,6 @@ def build_gemini_request(
     normalized_thinking = _normalize_thinking_config(thinking_config)
     if normalized_thinking:
         generation_config["thinkingConfig"] = normalized_thinking
-    normalized_resolution = _normalize_media_resolution(media_resolution)
-    if normalized_resolution:
-        generation_config["mediaResolution"] = normalized_resolution
     if generation_config:
         request["generationConfig"] = generation_config
 
@@ -997,12 +719,9 @@ def _map_gemini_finish_reason(reason: str) -> str:
 
 
 def _tool_call_extra_from_part(part: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    sig = part.get("thoughtSignature") or part.get("thought_signature")
-    if isinstance(sig, str) and sig.strip():
-        return {
-            "google": {"thought_signature": sig.strip()},
-            "thought_signature": sig.strip(),
-        }
+    sig = part.get("thoughtSignature")
+    if isinstance(sig, str) and sig:
+        return {"google": {"thought_signature": sig}}
     return None
 
 
@@ -1187,7 +906,6 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
     cand = candidates[0] if isinstance(candidates[0], dict) else {}
     parts = ((cand.get("content") or {}).get("parts") or []) if isinstance(cand, dict) else []
     chunks: List[_GeminiStreamChunk] = []
-    seen_slots_in_event: Set[int] = set()
 
     for part_index, part in enumerate(parts):
         if not isinstance(part, dict):
@@ -1204,42 +922,27 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
                 args_str = json.dumps(fc.get("args") or {}, ensure_ascii=False, sort_keys=True)
             except (TypeError, ValueError):
                 args_str = "{}"
-            fc_id = str(fc.get("id") or "").strip()
-
-            slot = None
-            if fc_id:
-                call_key = f"id:{fc_id}"
-                slot = tool_call_indices.get(call_key)
-                if slot is None:
-                    slot = {
-                        "index": len(tool_call_indices),
-                        "id": fc_id,
-                        "name": name,
-                        "last_arguments": "",
-                    }
-                    tool_call_indices[call_key] = slot
-            else:
-                # Find matching slot by name and argument continuity, excluding slots already matched in this event
-                for k, s in tool_call_indices.items():
-                    if s.get("index") in seen_slots_in_event:
-                        continue
-                    if s.get("name") == name:
-                        last_args = str(s.get("last_arguments") or "")
-                        if last_args == args_str or (last_args and args_str.startswith(last_args)):
-                            slot = s
-                            break
-                if slot is None:
-                    slot_key = f"auto_{len(tool_call_indices)}"
-                    slot = {
-                        "index": len(tool_call_indices),
-                        "id": f"call_{uuid.uuid4().hex[:12]}",
-                        "name": name,
-                        "last_arguments": "",
-                    }
-                    tool_call_indices[slot_key] = slot
-
-            seen_slots_in_event.add(slot["index"])
-
+            thought_signature = part.get("thoughtSignature") if isinstance(part.get("thoughtSignature"), str) else ""
+            call_key = json.dumps(
+                {
+                    "part_index": part_index,
+                    "name": name,
+                    "thought_signature": thought_signature,
+                },
+                sort_keys=True,
+            )
+            slot = tool_call_indices.get(call_key)
+            if slot is None:
+                slot = {
+                    "index": len(tool_call_indices),
+                    "id": (
+                        str(fc["id"])
+                        if isinstance(fc.get("id"), str) and fc.get("id")
+                        else f"call_{uuid.uuid4().hex[:12]}"
+                    ),
+                    "last_arguments": "",
+                }
+                tool_call_indices[call_key] = slot
             emitted_arguments = args_str
             last_arguments = str(slot.get("last_arguments") or "")
             if last_arguments:
@@ -1312,8 +1015,6 @@ def gemini_http_error(
     reason = ""
     retry_after: Optional[float] = None
     metadata: Dict[str, Any] = {}
-    violations: List[Dict[str, Any]] = []
-    help_links: List[Dict[str, Any]] = []
     for detail in details_list:
         if not isinstance(detail, dict):
             continue
@@ -1325,62 +1026,22 @@ def gemini_http_error(
             md = detail.get("metadata")
             if isinstance(md, dict):
                 metadata = md
-        elif type_url.endswith("/google.rpc.Help"):
-            links = detail.get("links")
-            if isinstance(links, list):
-                help_links.extend([lnk for lnk in links if isinstance(lnk, dict)])
-        elif type_url.endswith("/google.rpc.RetryInfo"):
-            retry_delay_str = str(detail.get("retryDelay") or "").strip()
-            if retry_delay_str.endswith("s"):
-                try:
-                    retry_after = float(retry_delay_str[:-1])
-                except ValueError:
-                    pass
-            elif retry_delay_str:
-                try:
-                    retry_after = float(retry_delay_str)
-                except ValueError:
-                    pass
-        elif type_url.endswith("/google.rpc.QuotaFailure"):
-            v_list = detail.get("violations")
-            if isinstance(v_list, list):
-                violations.extend([v for v in v_list if isinstance(v, dict)])
-
-    challenge_url: Optional[str] = None
-    for link in help_links:
-        u = link.get("url")
-        if isinstance(u, str) and u.strip():
-            challenge_url = u.strip()
-            break
-    if not challenge_url and metadata:
-        for k in ("challenge_url", "validation_url", "url", "verification_url"):
-            val = metadata.get(k)
-            if isinstance(val, str) and val.strip():
-                challenge_url = val.strip()
-                break
-
     header_retry = response.headers.get("Retry-After") or response.headers.get("retry-after")
-    if header_retry and retry_after is None:
+    if header_retry:
         try:
             retry_after = float(header_retry)
         except (TypeError, ValueError):
             retry_after = None
 
-    reset_at = (time.time() + retry_after) if retry_after is not None else None
-
     code = f"gemini_http_{status}"
     if status == 401:
         code = "gemini_unauthorized"
-    elif status == 403 and (reason == "VALIDATION_REQUIRED" or challenge_url is not None):
-        code = "gemini_validation_required"
     elif status == 429:
         code = "gemini_rate_limited"
     elif status == 404:
         code = "gemini_model_not_found"
 
-    if reason == "VALIDATION_REQUIRED" and challenge_url:
-        message = f"Gemini HTTP 403 (VALIDATION_REQUIRED): Google verification required. Verify at: {challenge_url}"
-    elif err_message:
+    if err_message:
         message = f"Gemini HTTP {status} ({err_status or 'error'}): {err_message}"
     else:
         message = f"Gemini returned HTTP {status}: {body_text[:500]}"
@@ -1394,8 +1055,7 @@ def gemini_http_error(
     # Legacy "Standard" Google Cloud key rejection (June 19, 2026 onward) ->
     # Google's raw 401 misleadingly tells the user to use OAuth. Append the
     # actual fix (mint a new Gemini API key in AI Studio).
-    req_url = str(getattr(response, "url", "") or "")
-    if is_standard_key_auth_error(status, err_message or body_text, reason, url=req_url):
+    if is_standard_key_auth_error(status, err_message or body_text, reason):
         message = message + _STANDARD_KEY_GUIDANCE
 
     return GeminiAPIError(
@@ -1409,11 +1069,6 @@ def gemini_http_error(
             "reason": reason,
             "metadata": metadata,
             "message": err_message,
-            "retry_after": retry_after,
-            "reset_at": reset_at,
-            "violations": violations,
-            "challenge_url": challenge_url,
-            "help_links": help_links,
         },
     )
 
@@ -1435,25 +1090,13 @@ class _AsyncGeminiChatCompletions:
 
 
 class _GeminiChatNamespace:
-    def __init__(self, client: Any):
+    def __init__(self, client: "GeminiNativeClient"):
         self.completions = _GeminiChatCompletions(client)
-        self._client = client
-
-    def count_tokens(self, **kwargs: Any) -> int:
-        if hasattr(self._client, "count_tokens"):
-            return self._client.count_tokens(**kwargs)
-        raise NotImplementedError("count_tokens is not supported on this client")
 
 
 class _AsyncGeminiChatNamespace:
-    def __init__(self, client: Any):
+    def __init__(self, client: "AsyncGeminiNativeClient"):
         self.completions = _AsyncGeminiChatCompletions(client)
-        self._client = client
-
-    async def count_tokens(self, **kwargs: Any) -> int:
-        if hasattr(self._client, "count_tokens"):
-            return await self._client.count_tokens(**kwargs)
-        raise NotImplementedError("count_tokens is not supported on this client")
 
 
 class GeminiNativeClient:
@@ -1530,7 +1173,7 @@ class GeminiNativeClient:
     def _create_chat_completion(
         self,
         *,
-        model: str = "gemini-3.6-flash",
+        model: str = "gemini-3.7-flash",
         messages: Optional[List[Dict[str, Any]]] = None,
         stream: bool = False,
         tools: Any = None,
@@ -1541,15 +1184,11 @@ class GeminiNativeClient:
         stop: Any = None,
         extra_body: Optional[Dict[str, Any]] = None,
         timeout: Any = None,
-        **kwargs: Any,
+        **_: Any,
     ) -> Any:
         thinking_config = None
-        media_resolution = None
         if isinstance(extra_body, dict):
             thinking_config = extra_body.get("thinking_config") or extra_body.get("thinkingConfig")
-            media_resolution = extra_body.get("media_resolution") or extra_body.get("mediaResolution")
-        if not media_resolution:
-            media_resolution = kwargs.get("media_resolution") or kwargs.get("mediaResolution")
 
         request = build_gemini_request(
             messages=messages or [],
@@ -1560,15 +1199,14 @@ class GeminiNativeClient:
             top_p=top_p,
             stop=stop,
             thinking_config=thinking_config,
-            media_resolution=media_resolution,
             model=model,
         )
 
-        bare_model = bare_gemini_model_id(model)
+        model = bare_gemini_model_id(model)
         if stream:
-            return self._stream_completion(model=bare_model, request=request, timeout=timeout)
+            return self._stream_completion(model=model, request=request, timeout=timeout)
 
-        url = f"{self.base_url}/models/{bare_model}:generateContent"
+        url = f"{self.base_url}/models/{model}:generateContent"
         response = self._http.post(url, json=request, headers=self._headers(), timeout=timeout)
         if response.status_code != 200:
             raise gemini_http_error(response)
@@ -1581,84 +1219,7 @@ class GeminiNativeClient:
                 status_code=response.status_code,
                 response=response,
             ) from exc
-        return translate_gemini_response(payload, model=bare_model)
-
-    def count_tokens(
-        self,
-        contents: Any,
-        *,
-        model: str = "gemini-3.6-flash",
-        system_instruction: Any = None,
-        tools: Any = None,
-        timeout: Any = None,
-        **kwargs: Any,
-    ) -> int:
-        """Call Gemini REST :countTokens endpoint to get exact token count."""
-        bare_model = bare_gemini_model_id(model)
-        req_payload: Dict[str, Any] = {}
-
-        if isinstance(contents, str):
-            req_payload["contents"] = [{"role": "user", "parts": [{"text": contents}]}]
-        elif isinstance(contents, list):
-            if contents and isinstance(contents[0], dict) and ("role" in contents[0]) and ("parts" not in contents[0]):
-                c_list, sys_inst = _build_gemini_contents(
-                    contents,
-                    include_tool_call_ids=gemini_requires_tool_call_ids(bare_model),
-                    model=bare_model,
-                )
-                req_payload["contents"] = c_list
-                if sys_inst and not system_instruction:
-                    req_payload["systemInstruction"] = sys_inst
-            else:
-                req_payload["contents"] = contents
-        elif isinstance(contents, dict):
-            req_payload["contents"] = [contents]
-        else:
-            req_payload["contents"] = []
-
-        if system_instruction:
-            if isinstance(system_instruction, str):
-                req_payload["systemInstruction"] = {
-                    "role": "system",
-                    "parts": [{"text": system_instruction}],
-                }
-            elif isinstance(system_instruction, dict):
-                req_payload["systemInstruction"] = system_instruction
-            elif isinstance(system_instruction, list):
-                req_payload["systemInstruction"] = {
-                    "role": "system",
-                    "parts": [{"text": _coerce_content_to_text(system_instruction)}],
-                }
-
-        if tools:
-            if isinstance(tools, list) and tools and isinstance(tools[0], dict) and "functionDeclarations" in tools[0]:
-                req_payload["tools"] = tools
-            else:
-                gemini_tools = _translate_tools_to_gemini(tools)
-                if gemini_tools:
-                    req_payload["tools"] = gemini_tools
-
-        url = f"{self.base_url}/models/{bare_model}:countTokens"
-        response = self._http.post(
-            url,
-            params={"key": self.api_key},
-            json=req_payload,
-            headers=self._headers(),
-            timeout=timeout,
-        )
-        if response.status_code != 200:
-            raise gemini_http_error(response)
-
-        try:
-            payload = response.json()
-            return int(payload.get("totalTokens", 0))
-        except (ValueError, TypeError) as exc:
-            raise GeminiAPIError(
-                f"Invalid JSON from Gemini countTokens API: {exc}",
-                code="gemini_invalid_json",
-                status_code=response.status_code,
-                response=response,
-            ) from exc
+        return translate_gemini_response(payload, model=model)
 
     def _stream_completion(self, *, model: str, request: Dict[str, Any], timeout: Any = None) -> Iterator[_GeminiStreamChunk]:
         url = f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse"
@@ -1713,27 +1274,6 @@ class AsyncGeminiNativeClient:
                 yield chunk
 
         return _async_stream()
-
-    async def count_tokens(
-        self,
-        contents: Any,
-        *,
-        model: str = "gemini-3.6-flash",
-        system_instruction: Any = None,
-        tools: Any = None,
-        timeout: Any = None,
-        **kwargs: Any,
-    ) -> int:
-        """Async wrapper over GeminiNativeClient.count_tokens."""
-        return await asyncio.to_thread(
-            self._sync.count_tokens,
-            contents,
-            model=model,
-            system_instruction=system_instruction,
-            tools=tools,
-            timeout=timeout,
-            **kwargs,
-        )
 
     async def close(self) -> None:
         await asyncio.to_thread(self._sync.close)
