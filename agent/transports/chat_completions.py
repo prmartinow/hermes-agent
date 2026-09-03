@@ -200,18 +200,13 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
     normalized_model = (model or "").strip().lower()
     if normalized_model.startswith("google/"):
         normalized_model = normalized_model.split("/", 1)[1]
-    for prefix in (
-        "gemini/", "gemini-oauth/", "gemini_oauth/",
-        "gemini-1/", "gemini-2/", "gemini-3/", "gemini-4/", "gemini-5/",
-        "gemini-oauth-1/", "gemini-oauth-2/", "gemini-oauth-3/", "gemini-oauth-4/", "gemini-oauth-5/",
-    ):
-        if normalized_model.startswith(prefix):
-            normalized_model = normalized_model[len(prefix):].strip()
-            break
 
-    # ``thinking_config`` is a Gemini-only / Gemini-OAuth partner parameter.
-    # Gemma and other non-Gemini/Claude models reject the field with HTTP 400.
-    if not (normalized_model.startswith("gemini") or "claude" in normalized_model):
+    # ``thinking_config`` is a Gemini-only request parameter. The same
+    # ``gemini`` provider also serves Gemma (and historically PaLM/Bard);
+    # those reject the field with HTTP 400 "Unknown name 'thinking_config':
+    # Cannot find field" — including the polite ``{"includeThoughts": False}``
+    # form. Omit the field entirely on non-Gemini models. (#17426)
+    if not normalized_model.startswith("gemini"):
         return None
 
     if reasoning_config.get("enabled") is False:
@@ -223,15 +218,7 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
     if effort == "none":
         return {"includeThoughts": False}
 
-    if "lite" in normalized_model and "gemini" in normalized_model:
-        return None
-
     thinking_config: Dict[str, Any] = {"includeThoughts": True}
-
-    if "claude" in normalized_model:
-        budget_map = {"minimal": 1024, "low": 1024, "medium": 4096, "high": 16384, "max": 24576, "ultra": 32768}
-        thinking_config["thinkingBudget"] = budget_map.get(effort, 4096)
-        return thinking_config
 
     # Gemini 2.5 accepts thinkingBudget; don't guess a budget from Hermes'
     # coarse effort levels. ``includeThoughts`` alone is enough to surface
@@ -242,19 +229,21 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
     if effort not in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
         effort = "medium"
 
-    # Gemini 3.x Flash supports dynamic low/medium/high thinking levels on the tiered wire endpoint.
-    # Fixed-tier models (gemini-3.6-flash-*, gemini-3.1-pro-*) have their effort built into the model slug.
-    if (
-        normalized_model.startswith("gemini-3")
-        or normalized_model in ("gemini-3.7", "gemini-3.7-thinking")
-        or "thinking" in normalized_model
-    ):
-        if effort in {"minimal", "low"}:
-            thinking_config["thinkingLevel"] = "low"
-        elif effort in {"high", "xhigh", "max", "ultra"}:
-            thinking_config["thinkingLevel"] = "high"
-        else:
-            thinking_config["thinkingLevel"] = "medium"
+    # Gemini 3 Flash documents low/medium/high thinking levels; Gemini 3 Pro
+    # is stricter (low/high). Clamp Hermes' wider effort set to what each
+    # family accepts so we never forward an undocumented level verbatim.
+    if normalized_model.startswith(("gemini-3", "gemini-3.1")):
+        if "flash" in normalized_model:
+            if effort in {"minimal", "low"}:
+                thinking_config["thinkingLevel"] = "low"
+            elif effort in {"high", "xhigh", "max", "ultra"}:
+                thinking_config["thinkingLevel"] = "high"
+            else:
+                thinking_config["thinkingLevel"] = "medium"
+        elif "pro" in normalized_model:
+            thinking_config["thinkingLevel"] = (
+                "high" if effort in {"high", "xhigh", "max", "ultra"} else "low"
+            )
 
     return thinking_config
 
@@ -291,7 +280,7 @@ def _raise_gemini_thinking_max_tokens(
         return requested
     from agent.gemini_native_adapter import _effective_gemini_max_output_tokens
 
-    return _effective_gemini_max_output_tokens(requested, thinking_config, model=model)
+    return _effective_gemini_max_output_tokens(requested, thinking_config)
 
 
 def _is_gemini_openai_compat_base_url(base_url: Any) -> bool:
@@ -791,7 +780,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 else:
                     extra_body["reasoning"] = {"enabled": False, "effort": "none"}
 
-        if provider_name.startswith("gemini"):
+        if provider_name == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
             if _is_gemini_openai_compat_base_url(base_url):
                 thinking_config = _snake_case_gemini_thinking_config(raw_thinking_config)

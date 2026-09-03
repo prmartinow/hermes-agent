@@ -1,21 +1,12 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { Link } from "react-router";
 import {
   ShieldCheck,
   ShieldOff,
   ExternalLink,
   RefreshCw,
   Terminal,
-  Clock,
-  Activity,
 } from "lucide-react";
-import {
-  api,
-  type OAuthProvider,
-  type DociRanking,
-  type GeminiAccountStatus,
-  type GeminiAccountQuota,
-} from "@/lib/api";
+import { api, type OAuthProvider } from "@/lib/api";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { CopyButton } from "@nous-research/ui/ui/components/command-block";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -34,16 +25,6 @@ import { useI18n } from "@/i18n";
 interface Props {
   onError?: (msg: string) => void;
   onSuccess?: (msg: string) => void;
-}
-
-interface DisconnectTarget {
-  id: string;
-  name: string;
-}
-
-interface LoginTarget {
-  provider: OAuthProvider;
-  accountId?: number;
 }
 
 function formatExpiresAt(
@@ -72,63 +53,33 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
   const [providers, setProviders] = useState<OAuthProvider[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [loginFor, setLoginFor] = useState<LoginTarget | null>(null);
+  const [loginFor, setLoginFor] = useState<OAuthProvider | null>(null);
   const [disconnectTarget, setDisconnectTarget] =
-    useState<DisconnectTarget | null>(null);
+    useState<OAuthProvider | null>(null);
   const { t } = useI18n();
 
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
 
-  const isMountedRef = useRef(true);
-
-  const refresh = useCallback((showSpinner = true) => {
-    if (showSpinner) setLoading(true);
+  const refresh = useCallback(() => {
+    setLoading(true);
     api
       .getOAuthProviders()
-      .then((resp) => {
-        if (isMountedRef.current) setProviders(resp.providers);
-      })
-      .catch((e) => {
-        if (isMountedRef.current && showSpinner) onErrorRef.current?.(`Failed to load providers: ${e}`);
-      })
-      .finally(() => {
-        if (isMountedRef.current && showSpinner) setLoading(false);
-      });
+      .then((resp) => setProviders(resp.providers))
+      .catch((e) => onErrorRef.current?.(`Failed to load providers: ${e}`))
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
-    isMountedRef.current = true;
-    refresh(true);
-
-    // Continuous active polling (every 15s) regardless of window focus
-    const interval = setInterval(() => {
-      refresh(false);
-    }, 15000);
-
-    // Instant refresh when user focuses or returns to the tab
-    const handleFocus = () => {
-      if (document.visibilityState === "visible") {
-        refresh(false);
-      }
-    };
-    window.addEventListener("focus", handleFocus);
-    document.addEventListener("visibilitychange", handleFocus);
-
-    return () => {
-      isMountedRef.current = false;
-      clearInterval(interval);
-      window.removeEventListener("focus", handleFocus);
-      document.removeEventListener("visibilitychange", handleFocus);
-    };
+    refresh();
   }, [refresh]);
 
-  const handleDisconnect = async (target: DisconnectTarget) => {
-    setBusyId(target.id);
+  const handleDisconnect = async (provider: OAuthProvider) => {
+    setBusyId(provider.id);
     setDisconnectTarget(null);
     try {
-      await api.disconnectOAuthProvider(target.id);
-      onSuccess?.(`${target.name} disconnected`);
+      await api.disconnectOAuthProvider(provider.id);
+      onSuccess?.(`${provider.name} ${t.oauth.disconnect.toLowerCase()}ed`);
       refresh();
     } catch (e) {
       onError?.(`${t.oauth.disconnect} failed: ${e}`);
@@ -155,7 +106,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
             ghost
             size="icon"
             className="text-muted-foreground hover:text-foreground"
-            onClick={() => refresh(true)}
+            onClick={refresh}
             disabled={loading}
             aria-label={t.common.refresh}
           >
@@ -181,283 +132,11 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
         )}
         <div className="flex flex-col divide-y divide-border">
           {providers?.map((p) => {
-            const isGemini =
-              p.id === "gemini-oauth" ||
-              p.id === "gemini_oauth" ||
-              p.id.startsWith("gemini");
             const expiresLabel = formatExpiresAt(
               p.status.expires_at,
               t.oauth.expiresIn,
             );
             const isBusy = busyId === p.id;
-
-            if (isGemini) {
-              const accounts: GeminiAccountStatus[] =
-                p.status.accounts && p.status.accounts.length > 0
-                  ? p.status.accounts
-                  : Array.from({ length: 5 }, (_, i) => ({
-                      account_id: i + 1,
-                      logged_in: false,
-                      email: null,
-                      name: null,
-                      source: `gemini_account_${i + 1}`,
-                      source_label: `Google Gemini Account ${i + 1}`,
-                      token_preview: null,
-                      expires_at: null,
-                      has_refresh_token: false,
-                      quota: {} as GeminiAccountQuota,
-                    }));
-
-              const loggedCount = accounts.filter((a) => a.logged_in).length;
-              const dociMap = new Map<number, DociRanking>();
-              p.status.doci_rankings?.forEach((dr) => {
-                dociMap.set(dr.account_id, dr);
-              });
-
-              return (
-                <div key={p.id} className="flex flex-col gap-3 py-4">
-                  {/* Master Slot Header */}
-                  <div className="flex items-center justify-between gap-4">
-                    <div className="flex items-start gap-3 min-w-0 flex-1">
-                      {p.status.logged_in ? (
-                        <ShieldCheck className="h-5 w-5 text-success shrink-0 mt-0.5" />
-                      ) : (
-                        <ShieldOff className="h-5 w-5 text-muted-foreground shrink-0 mt-0.5" />
-                      )}
-                      <div className="flex flex-col min-w-0 gap-1">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="font-medium text-sm">{p.name}</span>
-                          <Badge tone="outline" className="text-xs tracking-wide">
-                            {t.oauth.flowLabels[p.flow]}
-                          </Badge>
-                          {loggedCount > 0 ? (
-                            <Badge tone="success" className="text-xs">
-                              {loggedCount}/5 Accounts Active
-                            </Badge>
-                          ) : (
-                            <Badge tone="outline" className="text-xs">
-                              {t.oauth.notConnected.split("{command}")[0].trim()}
-                            </Badge>
-                          )}
-                          <Badge tone="outline" className="text-xs text-text-tertiary">
-                            DOCI Dynamic Rotation
-                          </Badge>
-                        </div>
-                        <span className="text-xs text-text-secondary">
-                          Single unified pool for all 5 accounts. Automatically rotates for maximum rate limit utilization and KV cache stickiness.
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2 shrink-0">
-                      <Link
-                        to="/gemini/history"
-                        className="inline-flex items-center gap-1 text-xs font-mono font-semibold text-midground hover:text-foreground bg-midground/10 hover:bg-midground/20 border border-midground/30 rounded px-2.5 py-1 transition-colors"
-                      >
-                        <Clock className="w-3.5 h-3.5" />
-                        Account History
-                      </Link>
-                      <Link
-                        to="/gemini/quota-timeline"
-                        className="inline-flex items-center gap-1 text-xs font-mono font-semibold text-midground hover:text-foreground bg-midground/10 hover:bg-midground/20 border border-midground/30 rounded px-2.5 py-1 transition-colors"
-                      >
-                        <Activity className="w-3.5 h-3.5" />
-                        Quota Timeline
-                      </Link>
-                      {p.docs_url && (
-                        <a
-                          href={p.docs_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex"
-                          title={`Open ${p.name} docs`}
-                        >
-                          <Button ghost size="icon">
-                            <ExternalLink />
-                          </Button>
-                        </a>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* 5 Accounts Detailed Breakdown */}
-                  <div className="grid grid-cols-1 gap-2.5 mt-1 pl-8">
-                    {accounts.map((acc) => {
-                      const doci = dociMap.get(acc.account_id);
-                      const accBusy =
-                        busyId === `gemini-oauth-${acc.account_id}` ||
-                        busyId === `gemini-${acc.account_id}` ||
-                        busyId === p.id;
-                      const accExpires = formatExpiresAt(
-                        acc.expires_at,
-                        t.oauth.expiresIn,
-                      );
-
-                      return (
-                        <div
-                          key={acc.account_id}
-                          className="border border-border/70 rounded-md p-3 bg-secondary/15 flex flex-col gap-2 transition-colors hover:border-border"
-                        >
-                          <div className="flex items-center justify-between gap-3">
-                            <div className="flex items-center gap-2 flex-wrap min-w-0">
-                              <span className="font-medium text-xs text-foreground flex items-center gap-1.5">
-                                <span className={`inline-block w-2 h-2 rounded-full ${acc.logged_in ? "bg-success" : "bg-muted-foreground"}`} />
-                                Account #{acc.account_id}
-                              </span>
-
-                              {acc.logged_in ? (
-                                <>
-                                  {acc.email && (
-                                    <span
-                                      className="text-xs font-mono-ui text-text-secondary cursor-help underline decoration-dotted decoration-border underline-offset-2"
-                                      title={acc.email}
-                                    >
-                                      {acc.alias || acc.email}
-                                    </span>
-                                  )}
-                                  <Badge tone="success" className="text-[10px] py-0 px-1.5">
-                                    Connected
-                                  </Badge>
-                                  {doci && (
-                                    <Badge
-                                      tone={doci.rank === 1 ? "success" : "outline"}
-                                      className="text-[10px] py-0 px-1.5"
-                                      title={`DOCI Score: ${doci.doci_score ?? doci.score}`}
-                                    >
-                                      Rank #{doci.rank}
-                                      {doci.status_note ? ` · ${doci.status_note}` : ""}
-                                    </Badge>
-                                  )}
-                                  {accExpires && accExpires !== "expired" && (
-                                    <Badge tone="outline" className="text-[10px] py-0 px-1.5">
-                                      {accExpires}
-                                    </Badge>
-                                  )}
-                                </>
-                              ) : (
-                                <Badge tone="outline" className="text-[10px] py-0 px-1.5 text-text-tertiary">
-                                  Not Connected
-                                </Badge>
-                              )}
-                            </div>
-
-                            <div className="flex items-center gap-1.5 shrink-0">
-                              {acc.logged_in ? (
-                                <Button
-                                  size="sm"
-                                  outlined
-                                  className="uppercase text-[11px] h-7 px-2.5"
-                                  onClick={() =>
-                                    setDisconnectTarget({
-                                      id: `gemini-oauth-${acc.account_id}`,
-                                      name: `Google Gemini Account #${acc.account_id} (${acc.alias || "Active"})`,
-                                    })
-                                  }
-                                  disabled={accBusy}
-                                  prefix={accBusy ? <Spinner /> : undefined}
-                                >
-                                  {t.oauth.disconnect}
-                                </Button>
-                              ) : (
-                                <Button
-                                  size="sm"
-                                  className="uppercase text-[11px] h-7 px-2.5"
-                                  onClick={() =>
-                                    setLoginFor({
-                                      provider: p,
-                                      accountId: acc.account_id,
-                                    })
-                                  }
-                                >
-                                  Connect #{acc.account_id}
-                                </Button>
-                              )}
-                            </div>
-                          </div>
-
-                          {/* Quota Telemetry Matrix */}
-                          {acc.logged_in && acc.quota && (
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs font-mono-ui bg-background/60 rounded p-2 border border-border/40">
-                              {/* Gemini Models */}
-                              <div className="flex flex-col gap-0.5 min-w-0">
-                                <span className="text-text-tertiary text-[11px] font-sans font-medium">
-                                  Gemini Models (Flash / Pro)
-                                </span>
-                                <div className="text-text-secondary">
-                                  <span className="text-text-tertiary">5h: </span>
-                                  <span className="text-foreground font-medium">
-                                    {typeof acc.quota.gemini_5h_percent === "number"
-                                      ? `${acc.quota.gemini_5h_percent}%`
-                                      : "—"}
-                                  </span>
-                                  {acc.quota.gemini_5h_countdown && (
-                                    <span className="text-text-tertiary text-[11px]">
-                                      {" "}
-                                      (resets in {acc.quota.gemini_5h_countdown})
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="text-text-secondary">
-                                  <span className="text-text-tertiary">Weekly: </span>
-                                  <span className="text-foreground font-medium">
-                                    {typeof acc.quota.gemini_weekly_percent === "number"
-                                      ? `${acc.quota.gemini_weekly_percent}%`
-                                      : "—"}
-                                  </span>
-                                  {acc.quota.gemini_weekly_countdown && (
-                                    <span className="text-text-tertiary text-[11px]">
-                                      {" "}
-                                      (resets in {acc.quota.gemini_weekly_countdown})
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-
-                              {/* Claude & GPT Models */}
-                              <div className="flex flex-col gap-0.5 min-w-0">
-                                <span className="text-text-tertiary text-[11px] font-sans font-medium">
-                                  Claude & GPT Models (Opus / Sonnet / GPT-OSS)
-                                </span>
-                                <div className="text-text-secondary">
-                                  <span className="text-text-tertiary">5h: </span>
-                                  <span className="text-foreground font-medium">
-                                    {typeof acc.quota.claude_5h_percent === "number"
-                                      ? `${acc.quota.claude_5h_percent}%`
-                                      : "—"}
-                                  </span>
-                                  {acc.quota.claude_5h_countdown && (
-                                    <span className="text-text-tertiary text-[11px]">
-                                      {" "}
-                                      (resets in {acc.quota.claude_5h_countdown})
-                                    </span>
-                                  )}
-                                </div>
-                                <div className="text-text-secondary">
-                                  <span className="text-text-tertiary">Weekly: </span>
-                                  <span className="text-foreground font-medium">
-                                    {typeof acc.quota.claude_weekly_percent === "number"
-                                      ? `${acc.quota.claude_weekly_percent}%`
-                                      : "—"}
-                                  </span>
-                                  {acc.quota.claude_weekly_countdown && (
-                                    <span className="text-text-tertiary text-[11px]">
-                                      {" "}
-                                      (resets in {acc.quota.claude_weekly_countdown})
-                                    </span>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              );
-            }
-
-            // Standard rendering for other providers
             return (
               <div
                 key={p.id}
@@ -472,7 +151,10 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                   <div className="flex flex-col min-w-0 gap-0.5">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-medium text-sm">{p.name}</span>
-                      <Badge tone="outline" className="text-xs tracking-wide">
+                      <Badge
+                        tone="outline"
+                        className="text-xs tracking-wide"
+                      >
                         {t.oauth.flowLabels[p.flow]}
                       </Badge>
                       {p.status.logged_in && (
@@ -549,7 +231,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                     <Button
                       size="sm"
                       className="uppercase"
-                      onClick={() => setLoginFor({ provider: p })}
+                      onClick={() => setLoginFor(p)}
                     >
                       {t.oauth.login}
                     </Button>
@@ -559,12 +241,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                       size="sm"
                       outlined
                       className="uppercase"
-                      onClick={() =>
-                        setDisconnectTarget({
-                          id: p.id,
-                          name: p.name,
-                        })
-                      }
+                      onClick={() => setDisconnectTarget(p)}
                       disabled={isBusy}
                       prefix={isBusy ? <Spinner /> : undefined}
                     >
@@ -585,8 +262,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
       </CardContent>
       {loginFor && (
         <OAuthLoginModal
-          provider={loginFor.provider}
-          accountId={loginFor.accountId}
+          provider={loginFor}
           onClose={() => {
             setLoginFor(null);
             refresh();
@@ -602,7 +278,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
           if (disconnectTarget) void handleDisconnect(disconnectTarget);
         }}
         title={`${t.oauth.disconnect} ${disconnectTarget?.name ?? ""}?`}
-        description={`This will remove stored OAuth credentials for ${disconnectTarget?.name ?? "this account/provider"}. You will need to re-authenticate to use it again.`}
+        description={`This will remove the stored OAuth tokens for ${disconnectTarget?.name ?? "this provider"}. You will need to re-authenticate to use it again.`}
         destructive
         confirmLabel={t.oauth.disconnect}
       />

@@ -2737,8 +2737,6 @@ def check_compression_model_feasibility(agent: Any) -> None:
                     main_ctx,
                     _CC._effective_threshold_percent(main_ctx, safe_pct / 100),
                     getattr(agent.context_compressor, "max_tokens", None),
-                    model=getattr(agent, "model", "") or "",
-                    provider=getattr(agent, "provider", "") or "",
                 )
             threshold_suggestion_viable = (
                 recomputed_threshold is None or recomputed_threshold <= aux_context

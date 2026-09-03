@@ -735,16 +735,6 @@ class AIAgent:
             # unrecoverable by find_latest_gateway_session_for_peer (regression:
             # Telegram rows with chat_id=NULL/session_key=NULL under multiplexed
             # profile routes).
-            if self.provider in {"gemini-oauth", "gemini_oauth"}:
-                try:
-                    pool = getattr(self, "_credential_pool", None)
-                    if pool:
-                        curr = pool.current()
-                        if curr:
-                            _init_model_config = dict(_init_model_config or {})
-                            _init_model_config["gemini_account"] = curr.label or curr.id
-                except Exception:
-                    pass
             self._session_db.create_session(
                 session_id=self.session_id,
                 source=source,
@@ -2585,42 +2575,6 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                _msg_disp_meta = msg.get("display_metadata")
-                if role == "assistant" and getattr(self, "provider", None) in {"gemini-oauth", "gemini_oauth"}:
-                    if not isinstance(_msg_disp_meta, dict) or not _msg_disp_meta.get("gemini_account"):
-                        try:
-                            from hermes_cli.auth import get_account_alias
-                            pool = getattr(self, "_credential_pool", None)
-                            entry_id = getattr(self, "_credential_pool_entry_id", None)
-                            curr = None
-                            if entry_id and pool:
-                                _all_entries = pool.entries() if hasattr(pool, "entries") else getattr(pool, "_entries", [])
-                                curr = next((e for e in _all_entries if getattr(e, "id", None) == entry_id), None)
-                            if curr is None and pool:
-                                curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
-                            raw_lbl = (curr.label or curr.id) if curr else entry_id
-                            if raw_lbl:
-                                _acc_alias = get_account_alias(raw_lbl)
-                                if _acc_alias:
-                                    if isinstance(_msg_disp_meta, dict):
-                                        _msg_disp_meta = dict(_msg_disp_meta)
-                                        _msg_disp_meta["gemini_account"] = _acc_alias
-                                    elif isinstance(_msg_disp_meta, str):
-                                        try:
-                                            _parsed_meta = json.loads(_msg_disp_meta)
-                                            if isinstance(_parsed_meta, dict):
-                                                _parsed_meta["gemini_account"] = _acc_alias
-                                                _msg_disp_meta = _parsed_meta
-                                            else:
-                                                _msg_disp_meta = {"gemini_account": _acc_alias}
-                                        except Exception:
-                                            _msg_disp_meta = {"gemini_account": _acc_alias}
-                                    else:
-                                        _msg_disp_meta = {"gemini_account": _acc_alias}
-                                    msg["display_metadata"] = _msg_disp_meta
-                        except Exception:
-                            pass
-
                 _row = {
                     "role": role,
                     "content": content,
@@ -7034,7 +6988,6 @@ class AIAgent:
             self._client_kwargs["default_headers"] = merged
 
     def _swap_credential(self, entry) -> None:
-        old_entry_id = getattr(self, "_credential_pool_entry_id", None)
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         self._credential_pool_entry_id = getattr(entry, "id", None)
@@ -7043,45 +6996,6 @@ class AIAgent:
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(
             runtime_base
         )
-
-        if self.provider in {"gemini-oauth", "gemini_oauth"}:
-            try:
-                from hermes_cli.auth import get_account_alias
-                import json
-                raw_label = getattr(entry, "label", None) or getattr(entry, "id", "")
-                alias = get_account_alias(raw_label)
-                if old_entry_id != self._credential_pool_entry_id:
-                    switch_msg = f"🔄 [Gemini Pool] Active account switched: {alias}"
-                    logger.info("gemini pool: switched active account to %s (%s)", alias, raw_label)
-                    if hasattr(self, "_on_commentary") and callable(self._on_commentary):
-                        try:
-                            self._on_commentary(switch_msg)
-                        except Exception:
-                            pass
-                    elif not getattr(self, "quiet_mode", False):
-                        print(f"\n{switch_msg}")
-                if self._session_db and hasattr(self._session_db, "update_session_meta") and self.session_id:
-                    try:
-                        sess = self._session_db.get_session(self.session_id)
-                        if sess:
-                            cfg = sess.get("model_config") or {}
-                            if isinstance(cfg, str):
-                                cfg = json.loads(cfg)
-                            if not isinstance(cfg, dict):
-                                cfg = {}
-                            cfg["gemini_account"] = raw_label
-                            self._session_db.update_session_meta(self.session_id, json.dumps(cfg), model=self.model)
-                    except Exception:
-                        pass
-                if hasattr(self, "_on_commentary") and callable(self._on_commentary):
-                    try:
-                        self._on_commentary(switch_msg)
-                    except Exception:
-                        pass
-                elif not getattr(self, "quiet_mode", False):
-                    print(f"\n{switch_msg}")
-            except Exception:
-                pass
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
@@ -7105,8 +7019,6 @@ class AIAgent:
         self.api_key = runtime_key
         self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
         self._client_kwargs["api_key"] = self.api_key
-        if "access_token" in self._client_kwargs:
-            self._client_kwargs["access_token"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
         self._replace_primary_openai_client(reason="credential_rotation")
@@ -7658,12 +7570,6 @@ class AIAgent:
                 delivered = True
             except Exception:
                 pass
-        live_writer = getattr(self, "_live_stream_writer", None)
-        if live_writer is not None:
-            try:
-                live_writer.message_delta(text)
-            except Exception:
-                pass
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -7691,12 +7597,6 @@ class AIAgent:
                 cb(text)
             except Exception:
                 pass
-        live_writer = getattr(self, "_live_stream_writer", None)
-        if live_writer is not None:
-            try:
-                live_writer.reasoning_delta(text)
-            except Exception:
-                pass
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook, stream_reasoning_deltas_enabled
 
@@ -7722,12 +7622,6 @@ class AIAgent:
         if cb is not None:
             try:
                 cb(tool_name)
-            except Exception:
-                pass
-        live_writer = getattr(self, "_live_stream_writer", None)
-        if live_writer is not None:
-            try:
-                live_writer.tool_generating(tool_name)
             except Exception:
                 pass
 

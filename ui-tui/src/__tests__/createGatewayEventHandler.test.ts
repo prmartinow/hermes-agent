@@ -396,19 +396,20 @@ describe('createGatewayEventHandler', () => {
     expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
-  it('routes thinking.delta to status ticker without polluting reasoning state', () => {
+  it('streams legacy thinking.delta into visible reasoning state', () => {
     vi.useFakeTimers()
     const appended: Msg[] = []
-    const statusText = '(｡•̀ᴗ-)✧ pondering...'
+    const streamed = 'short streamed reasoning'
     const onEvent = createGatewayEventHandler(buildCtx(appended))
 
     try {
       onEvent({ payload: {}, type: 'message.start' } as any)
-      onEvent({ payload: { text: statusText }, type: 'thinking.delta' } as any)
+      onEvent({ payload: { text: streamed }, type: 'thinking.delta' } as any)
       vi.runOnlyPendingTimers()
 
-      expect(getUiState().status).toBe(statusText)
-      expect(getTurnState().reasoning).toBe('')
+      expect(getTurnState().reasoning).toBe(streamed)
+      expect(getTurnState().reasoningActive).toBe(true)
+      expect(getTurnState().reasoningTokens).toBe(estimateTokensRough(streamed))
     } finally {
       vi.useRealTimers()
     }

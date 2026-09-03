@@ -11,7 +11,6 @@ import { cn, themedBody } from "@/lib/utils";
 
 interface Props {
   provider: OAuthProvider;
-  accountId?: number;
   onClose: () => void;
   onSuccess: (msg: string) => void;
   onError: (msg: string) => void;
@@ -26,7 +25,7 @@ type Phase =
   | "approved"
   | "error";
 
-export function OAuthLoginModal({ provider, accountId, onClose, onSuccess }: Props) {
+export function OAuthLoginModal({ provider, onClose, onSuccess }: Props) {
   const [phase, setPhase] = useState<Phase>("starting");
   const [start, setStart] = useState<OAuthStartResponse | null>(null);
   const [pkceCode, setPkceCode] = useState("");
@@ -44,7 +43,7 @@ export function OAuthLoginModal({ provider, accountId, onClose, onSuccess }: Pro
   useEffect(() => {
     isMounted.current = true;
     api
-      .startOAuthLogin(provider.id, accountId)
+      .startOAuthLogin(provider.id)
       .then((resp) => {
         if (!isMounted.current) return;
         setStart(resp);
@@ -68,7 +67,7 @@ export function OAuthLoginModal({ provider, accountId, onClose, onSuccess }: Pro
         window.clearTimeout(copyResetTimer.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accountId]);
+  }, []);
 
   // When the sign-in window lapses locally, the backend poller usually has
   // the real story (e.g. "Portal sign-in is required before the device code
@@ -365,104 +364,62 @@ export function OAuthLoginModal({ provider, accountId, onClose, onSuccess }: Pro
             </div>
           )}
 
-          {phase === "error" && (() => {
-            const challengeUrl = errorMsg?.match(/https?:\/\/[^\s"'<>]+/)?.[0] ?? null;
-            const isChallenge = Boolean(
-              challengeUrl &&
-                (errorMsg?.includes("VALIDATION_REQUIRED") ||
-                  errorMsg?.toLowerCase().includes("verification") ||
-                  errorMsg?.toLowerCase().includes("challenge") ||
-                  errorMsg?.toLowerCase().includes("google")),
-            );
-
-            return (
-              <>
-                {isChallenge && challengeUrl ? (
-                  <div className="border border-warning/40 bg-warning/10 p-4 text-sm flex flex-col gap-2.5 rounded">
-                    <div className="font-semibold text-warning flex items-center gap-1.5 text-xs tracking-wide uppercase">
-                      Account Verification Challenge Required
-                    </div>
-                    <p className="text-xs text-muted-foreground">
-                      Google requires interactive one-time verification for this account before requests can proceed.
-                    </p>
-                    <div className="flex items-center gap-2 pt-1">
-                      <a
-                        href={challengeUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1.5 text-xs font-semibold text-primary hover:underline"
-                      >
-                        <ExternalLink className="h-3.5 w-3.5" />
-                        Open Verification Link
-                      </a>
-                      <Button
-                        size="sm"
-                        outlined
-                        onClick={() => void copyTextToClipboard(challengeUrl)}
-                        className="text-xs"
-                      >
-                        <Copy className="h-3 w-3 mr-1" />
-                        Copy Link
-                      </Button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
-                    {errorMsg || t.oauth.loginFailed}
-                  </div>
-                )}
-                <div className="flex justify-end gap-2">
-                  <Button outlined onClick={handleClose}>
-                    {t.common.close}
-                  </Button>
-                  <Button
-                    onClick={() => {
-                      if (start?.session_id) {
-                        api.cancelOAuthSession(start.session_id).catch(() => {});
-                      }
-                      setErrorMsg(null);
-                      setStart(null);
-                      setPkceCode("");
-                      setSecondsLeft(null);
-                      setPhase("starting");
-                      api
-                        .startOAuthLogin(provider.id, accountId)
-                        .then((resp) => {
-                          if (!isMounted.current) return;
-                          setStart(resp);
-                          setSecondsLeft(resp.expires_in);
-                          setPhase(
-                            resp.flow === "device_code"
-                              ? "polling"
-                              : "awaiting_user",
+          {phase === "error" && (
+            <>
+              <div className="border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                {errorMsg || t.oauth.loginFailed}
+              </div>
+              <div className="flex justify-end gap-2">
+                <Button outlined onClick={handleClose}>
+                  {t.common.close}
+                </Button>
+                <Button
+                  onClick={() => {
+                    if (start?.session_id) {
+                      api.cancelOAuthSession(start.session_id).catch(() => {});
+                    }
+                    setErrorMsg(null);
+                    setStart(null);
+                    setPkceCode("");
+                    setSecondsLeft(null);
+                    setPhase("starting");
+                    api
+                      .startOAuthLogin(provider.id)
+                      .then((resp) => {
+                        if (!isMounted.current) return;
+                        setStart(resp);
+                        setSecondsLeft(resp.expires_in);
+                        setPhase(
+                          resp.flow === "device_code"
+                            ? "polling"
+                            : "awaiting_user",
+                        );
+                        if (resp.flow === "pkce") {
+                          window.open(
+                            resp.auth_url,
+                            "_blank",
+                            "noopener,noreferrer",
                           );
-                          if (resp.flow === "pkce") {
-                            window.open(
-                              resp.auth_url,
-                              "_blank",
-                              "noopener,noreferrer",
-                            );
-                          } else {
-                            window.open(
-                              resp.verification_url,
-                              "_blank",
-                              "noopener,noreferrer",
-                            );
-                          }
-                        })
-                        .catch((e) => {
-                          if (!isMounted.current) return;
-                          setPhase("error");
-                          setErrorMsg(`${t.common.retry} failed: ${e}`);
-                        });
-                    }}
-                  >
-                    {t.common.retry}
-                  </Button>
-                </div>
-              </>
-            );
-          })()}
+                        } else {
+                          window.open(
+                            resp.verification_url,
+                            "_blank",
+                            "noopener,noreferrer",
+                          );
+                        }
+                      })
+                      .catch((e) => {
+                        if (!isMounted.current) return;
+                        setPhase("error");
+                        setErrorMsg(`${t.common.retry} failed: ${e}`);
+                      });
+                  }}
+                >
+                  {t.common.retry}
+                </Button>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>

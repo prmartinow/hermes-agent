@@ -6,7 +6,7 @@ import {
   useCallback,
   useRef,
 } from "react";
-import { useNavigate, Link } from "react-router";
+import { useNavigate } from "react-router";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -528,12 +528,6 @@ function SessionRow({
         {session.source ? sourceLabel(session.source) : "local"}
       </Badge>
 
-      {session.account_alias && (
-        <Badge tone="secondary" className="text-xs font-mono-ui">
-          {session.account_alias}
-        </Badge>
-      )}
-
       {resumeInChatEnabled && (
         <Button
           ghost
@@ -1015,23 +1009,14 @@ export default function SessionsPage() {
 
   useEffect(() => {
     setEnd(
-      <div className="flex items-center gap-2">
-        <Link
-          to="/gemini/history"
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono font-bold bg-midground/10 hover:bg-midground/20 text-foreground border border-midground/30 rounded transition-colors"
-        >
-          <Clock className="w-3.5 h-3.5 text-midground" />
-          Account History
-        </Link>
-        <Button
-          outlined
-          size="sm"
-          onClick={() => setPruneOpen(true)}
-          prefix={<Archive />}
-        >
-          Prune old sessions
-        </Button>
-      </div>,
+      <Button
+        outlined
+        size="sm"
+        onClick={() => setPruneOpen(true)}
+        prefix={<Archive />}
+      >
+        Prune old sessions
+      </Button>,
     );
     return () => {
       setEnd(null);
@@ -2196,15 +2181,6 @@ export default function SessionsPage() {
                       <Database className="mr-1 h-3 w-3" />
                       {s.source ? sourceLabel(s.source) : "local"}
                     </Badge>
-
-                    {s.account_alias && (
-                      <Badge
-                        tone="secondary"
-                        className="shrink-0 self-start text-xs font-mono-ui sm:self-center"
-                      >
-                        {s.account_alias}
-                      </Badge>
-                    )}
                   </div>
                 ))}
               </CardContent>

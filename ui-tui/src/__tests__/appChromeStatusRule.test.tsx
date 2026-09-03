@@ -100,7 +100,7 @@ const baseProps = {
   statusColor: DEFAULT_THEME.color.ok,
   t: DEFAULT_THEME,
   turnStartedAt: null,
-  usage: { calls: 0, input: 0, output: 0, total: 50_000, context_max: 200_000, context_percent: 25, context_used: 50_000 },
+  usage: { context_max: 200_000, context_percent: 25, context_used: 50_000, total: 50_000 },
   voiceLabel: ''
 }
 
@@ -547,27 +547,3 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     expect(textContent(element)).not.toContain('weekly-digest')
   })
 })
-describe('StatusRule model account display', () => {
-  it('renders gemini account next to model name when modelAccount is provided', () => {
-    const element = StatusRule({
-      ...baseProps,
-      model: 'gemini-3.7-flash-high',
-      modelAccount: 'dev@example.com'
-    })
-
-    const text = textContent(element)
-    expect(text).toContain('gemini 3.7 flash high · dev@example.com')
-  })
-
-  it('renders plain model name without account when modelAccount is omitted', () => {
-    const element = StatusRule({
-      ...baseProps,
-      model: 'gemini-3.7-flash-high'
-    })
-
-    const text = textContent(element)
-    expect(text).toContain('gemini 3.7 flash high')
-    expect(text).not.toContain('· dev@example.com')
-  })
-})
-

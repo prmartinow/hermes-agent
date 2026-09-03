@@ -606,19 +606,6 @@ def _(rid, params: dict) -> dict:
     except Exception:
         pass
 
-    if name == "gs":
-        try:
-            from hermes_cli.auth import handle_gs_command
-            output = handle_gs_command(
-                session_id=params.get("session_id", ""),
-                arg=arg,
-                db=_get_db(),
-                agent=(session or {}).get("agent"),
-            )
-            return _ok(rid, {"type": "exec", "output": output})
-        except Exception as exc:
-            return _err(rid, 4018, f"gs failed: {exc}")
-
     # ── Commands that queue messages onto _pending_input in the CLI ───
     # In the TUI the slash worker subprocess has no reader for that queue,
     # so we handle them here and return a structured payload.

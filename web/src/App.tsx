@@ -96,8 +96,6 @@ const ChannelsPage = lazy(() => import("@/pages/ChannelsPage"));
 const WebhooksPage = lazy(() => import("@/pages/WebhooksPage"));
 const SystemPage = lazy(() => import("@/pages/SystemPage"));
 const ChatPage = lazy(() => import("@/pages/ChatPage"));
-const GeminiHistoryPage = lazy(() => import("@/pages/GeminiHistoryPage"));
-const GeminiQuotaTimelinePage = lazy(() => import("@/pages/GeminiQuotaTimelinePage"));
 import { LanguageSwitcher } from "@/components/LanguageSwitcher";
 import { ThemeSwitcher } from "@/components/ThemeSwitcher";
 import { useI18n } from "@/i18n";
@@ -174,10 +172,6 @@ const BUILTIN_ROUTES_CORE: Record<string, ComponentType> = {
   "/profiles/new": ProfileBuilderPage,
   "/config": ConfigPage,
   "/env": EnvPage,
-  "/gemini/history": GeminiHistoryPage,
-  "/sessions/history": GeminiHistoryPage,
-  "/gemini/quota-timeline": GeminiQuotaTimelinePage,
-  "/gemini/timeline": GeminiQuotaTimelinePage,
   "/docs": DocsPage,
 };
 
@@ -220,8 +214,6 @@ const BUILTIN_NAV_REST: NavItem[] = [
   { path: "/profiles", labelKey: "profiles", label: "Profiles", icon: Users },
   { path: "/config", labelKey: "config", label: "Config", icon: Settings },
   { path: "/env", labelKey: "keys", label: "Keys", icon: KeyRound },
-  { path: "/gemini/history", label: "Account History", icon: Clock },
-  { path: "/gemini/quota-timeline", label: "Quota Timeline", icon: Activity },
   { path: "/system", label: "System", icon: Wrench },
   {
     path: "/docs",

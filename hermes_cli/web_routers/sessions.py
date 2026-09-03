@@ -190,10 +190,6 @@ def get_sessions(
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
-                from hermes_cli.auth import resolve_session_last_used_account, get_account_alias
-                raw_acc = resolve_session_last_used_account(s.get("id"), db)
-                if raw_acc:
-                    s["account_alias"] = get_account_alias(raw_acc)
             if not full:
                 _strip_session_list_rows(sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
