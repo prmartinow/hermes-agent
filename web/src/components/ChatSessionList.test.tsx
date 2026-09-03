@@ -193,3 +193,36 @@ describe("ChatSessionList Subline & Account Alias Invariants", () => {
     expect(msgSpan?.textContent).toBe("20 msgs");
   });
 });
+
+  it("reactively updates active session account alias when activeAccountAlias prop changes", async () => {
+    // Initial render with activeSessionId="session-1" (default prm)
+    await render(<ChatSessionList activeSessionId="session-1" />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await new Promise((r) => setTimeout(r, 20));
+    });
+
+    const getSession1 = () => {
+      const items = container.querySelectorAll("button");
+      return Array.from(items).find((btn) => btn.textContent?.includes("Research Paper Review"));
+    };
+
+    expect(getSession1()?.textContent).toContain("prm");
+
+    // Re-render with new live activeAccountAlias="tkm" (simulating live /gs switch)
+    await act(async () => {
+      root.render(
+        <MemoryRouter>
+          <I18nProvider>
+            <ChatSessionList activeSessionId="session-1" activeAccountAlias="tkm" />
+          </I18nProvider>
+        </MemoryRouter>,
+      );
+    });
+
+    // Row should immediately reflect 'tkm' without refetching from server
+    const updatedRow = getSession1();
+    expect(updatedRow?.textContent).toContain("tkm");
+    expect(updatedRow?.textContent).not.toContain("prm");
+  });

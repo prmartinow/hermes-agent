@@ -33,6 +33,8 @@ const SESSION_LIMIT = 30;
 interface ChatSessionListProps {
   /** Active resume target (the session currently shown in the terminal). */
   activeSessionId: string | null;
+  /** Live active account alias from gateway session.info for instantaneous badge synchronization. */
+  activeAccountAlias?: string | null;
   /** Management profile from the dashboard switcher — scopes the listing. */
   profile?: string;
   className?: string;
@@ -57,6 +59,7 @@ function rowLabel(session: SessionInfo, untitled: string): string {
 
 export function ChatSessionList({
   activeSessionId,
+  activeAccountAlias,
   profile,
   className,
   onPicked,
@@ -121,6 +124,21 @@ export function ChatSessionList({
       window.removeEventListener("focus", onFocus);
     };
   }, [load]);
+
+  // Instantaneous reactive binding: immediately update active session's
+  // account alias badge whenever gateway session.info broadcasts a live /gs switch.
+  useEffect(() => {
+    if (!activeAccountAlias || !activeSessionId) return;
+    setSessions((prev) =>
+      prev
+        ? prev.map((s) =>
+            s.id === activeSessionId && s.account_alias !== activeAccountAlias
+              ? { ...s, account_alias: activeAccountAlias }
+              : s,
+          )
+        : prev,
+    );
+  }, [activeAccountAlias, activeSessionId]);
 
   const reload = useCallback(() => setReloadNonce((n) => n + 1), []);
 

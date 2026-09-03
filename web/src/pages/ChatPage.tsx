@@ -306,6 +306,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // /chat re-runs the effect (derived flips back to true) and re-locks.
   // Keying on the raw state would leak the body.overflow="hidden" across
   // tabs because the dep wouldn't change on tab switch.
+  const [activeAccountAlias, setActiveAccountAlias] = useState<string | null>(null);
   const [mobilePanelOpenRaw, setMobilePanelOpenRaw] = useState(false);
   const mobilePanelOpen = isActive && mobilePanelOpenRaw;
 
@@ -1855,10 +1856,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
+                onAccountAliasChange={setActiveAccountAlias}
               />
             </div>
             <ChatSessionList
               activeSessionId={resumeParam}
+              activeAccountAlias={activeAccountAlias}
               profile={scopedProfile}
               onPicked={closeMobilePanel}
               onNewChat={startFreshDashboardChat}
@@ -2024,6 +2027,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 profile={scopedProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
+                onAccountAliasChange={setActiveAccountAlias}
               />
             </div>
 
@@ -2031,6 +2035,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             <div className="min-h-0 flex-1 overflow-hidden">
               <ChatSessionList
                 activeSessionId={resumeParam}
+                activeAccountAlias={activeAccountAlias}
                 profile={scopedProfile}
                 onNewChat={startFreshDashboardChat}
               />
