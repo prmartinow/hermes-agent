@@ -313,6 +313,8 @@ export interface SessionUsageResponse {
     gemini_weekly_percent?: number | null
     gemini_weekly_reset?: string | null
   }
+  quota_rows?: any[]
+  quota_title?: string
   reasoning?: number
   total?: number
   // Shared dollar usage model (two-bar view) so /usage renders the same bars
