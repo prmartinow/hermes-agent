@@ -1,5 +1,5 @@
 import { LONG_MSG } from '../config/limits.js'
-import { buildToolTrailLine, estimateTokensRough } from '../lib/text.js'
+import { buildToolTrailLine } from '../lib/text.js'
 import type { Msg, SessionInfo } from '../types.js'
 
 export const introMsg = (info: SessionInfo): Msg => ({ info, kind: 'intro', role: 'system', text: '' })
@@ -30,11 +30,6 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
     }
 
     const { context, display_kind, name, role, text, timestamp } = row as TranscriptRow
-    const rawReasoning =
-      (row as TranscriptRow).reasoning ??
-      (row as TranscriptRow).reasoning_content ??
-      (row as TranscriptRow).thinking
-    const thinking = typeof rawReasoning === 'string' && rawReasoning.trim() ? rawReasoning.trim() : undefined
 
     const createdAt =
       typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 ? timestamp : undefined
@@ -45,8 +40,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       continue
     }
 
-    const hasText = typeof text === 'string' && text.trim().length > 0
-    if (!hasText && !thinking && !pending.length) {
+    if (typeof text !== 'string' || !text.trim()) {
       continue
     }
 
@@ -93,35 +87,12 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
     }
 
     if (role === 'assistant') {
-      const assistantText = typeof text === 'string' ? text : ''
-      const msg: Msg = {
-        role,
-        text: assistantText,
-        ...(createdAt !== undefined && { createdAt }),
-        ...(pending.length && { tools: pending }),
-        ...(thinking && {
-          thinking,
-          thinkingTokens: estimateTokensRough(thinking)
-        })
-      }
-      if (!assistantText.trim() && (thinking || pending.length)) {
-        msg.kind = 'trail'
-      }
-      out.push(msg)
+      out.push({ role, text, ...(createdAt !== undefined && { createdAt }), ...(pending.length && { tools: pending }) })
       pending = []
     } else if (role === 'user' || role === 'system') {
-      if (pending.length) {
-        out.push({ kind: 'trail', role: 'assistant', text: '', tools: pending })
-        pending = []
-      }
-      if (hasText) {
-        out.push({ role, text: text!, ...(createdAt !== undefined && { createdAt }) })
-      }
+      out.push({ role, text, ...(createdAt !== undefined && { createdAt }) })
+      pending = []
     }
-  }
-
-  if (pending.length) {
-    out.push({ kind: 'trail', role: 'assistant', text: '', tools: pending })
   }
 
   return out
@@ -141,10 +112,7 @@ interface TranscriptRow {
   display_kind?: string
   display_metadata?: { task_count?: number; [key: string]: unknown }
   name?: string
-  reasoning?: string
-  reasoning_content?: string
   role?: string
   text?: string
-  thinking?: string
   timestamp?: number
 }
