@@ -2210,8 +2210,11 @@ def _build_child_agent(
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
     # ``list_sessions_rich`` child-exclusion clause.
     parent_sid = getattr(parent_agent, "session_id", None)
-    if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
-        child._session_init_model_config["_delegate_from"] = parent_sid
+    if getattr(child, "_session_init_model_config", None) is not None:
+        # Subagents must never inherit parent's G-Switch account PIN — always unpinned dynamic CD-DOCI mode
+        child._session_init_model_config.pop("gemini_account", None)
+        if parent_sid:
+            child._session_init_model_config["_delegate_from"] = parent_sid
 
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
@@ -2673,7 +2676,13 @@ def _run_single_child(
         leased_cred_id = child_pool.acquire_lease()
         if leased_cred_id is not None:
             try:
-                leased_entry = child_pool.current()
+                if hasattr(child_pool, "get_entry") and callable(child_pool.get_entry):
+                    leased_entry = child_pool.get_entry(leased_cred_id)
+                elif hasattr(child_pool, "current") and callable(child_pool.current):
+                    leased_entry = child_pool.current()
+                else:
+                    leased_entry = None
+
                 if leased_entry is not None and hasattr(child, "_swap_credential"):
                     child._swap_credential(leased_entry)
             except Exception as exc:
@@ -4703,7 +4712,8 @@ def _resolve_child_credential_pool(
 
     Rules:
     1. Same provider as the parent -> share the parent's pool so cooldown state
-       and rotation stay synchronized.
+       and rotation stay synchronized (cloned so child subagents operate with
+       their own isolated cursor and never mutate the parent's active account pointer).
     2. Different provider -> try to load that provider's own pool.
     3. No pool available -> return None and let the child keep the inherited
        fixed credential behavior.
@@ -4718,7 +4728,10 @@ def _resolve_child_credential_pool(
     parent's pool when both resolve to the *same* custom endpoint.
     """
     if not effective_provider:
-        return getattr(parent_agent, "_credential_pool", None)
+        pool = getattr(parent_agent, "_credential_pool", None)
+        if pool is not None and hasattr(pool, "clone"):
+            return pool.clone()
+        return pool
 
     parent_provider = getattr(parent_agent, "provider", None) or ""
     parent_pool = getattr(parent_agent, "_credential_pool", None)
@@ -4748,7 +4761,7 @@ def _resolve_child_credential_pool(
                 and parent_key is not None
                 and parent_key == child_key
             ):
-                return parent_pool
+                return parent_pool.clone() if hasattr(parent_pool, "clone") else parent_pool
 
             pool = load_pool(child_key)
             if pool is not None and pool.has_credentials():
@@ -4762,7 +4775,7 @@ def _resolve_child_credential_pool(
         return None
 
     if parent_pool is not None and effective_provider == parent_provider:
-        return parent_pool
+        return parent_pool.clone() if hasattr(parent_pool, "clone") else parent_pool
 
     try:
         from agent.credential_pool import load_pool

@@ -44,7 +44,6 @@ from agent.memory_manager import build_memory_context_block
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
-    anchored_context_tokens,
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
@@ -624,6 +623,42 @@ def build_turn_context(
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
 
+    # Enforce strict session KV-cache stickiness for pooled Gemini OAuth accounts
+    if getattr(agent, "provider", "") in {"gemini-oauth", "gemini_oauth"}:
+        try:
+            pool = getattr(agent, "_credential_pool", None)
+            if pool is not None and pool.has_available():
+                pinned_acc = None
+                # Child subagents must NEVER inherit parent's G-Switch account PIN — always unpinned dynamic CD-DOCI mode
+                is_subagent = (
+                    getattr(agent, "platform", None) == "subagent"
+                    or (isinstance(getattr(agent, "_subagent_id", None), str) and bool(agent._subagent_id))
+                    or (isinstance(getattr(agent, "_delegate_role", None), str) and bool(agent._delegate_role))
+                    or (isinstance(getattr(agent, "parent_session_id", None), str) and bool(agent.parent_session_id))
+                )
+                if not is_subagent:
+                    db = getattr(agent, "_session_db", None)
+                    sid = getattr(agent, "session_id", None)
+                    if db and sid and hasattr(db, "get_session"):
+                        sess_row = db.get_session(sid)
+                        if sess_row:
+                            cfg_raw = sess_row.get("model_config")
+                            if isinstance(cfg_raw, str):
+                                import json
+                                cfg_raw = json.loads(cfg_raw)
+                            if isinstance(cfg_raw, dict):
+                                pinned_acc = cfg_raw.get("gemini_account")
+                    if not pinned_acc:
+                        pinned_acc = getattr(agent, "_credential_pool_entry_id", None)
+                if pinned_acc and not is_subagent:
+                    entry = pool.select(preferred_account=pinned_acc)
+                else:
+                    entry = pool.select()
+                if entry is not None and getattr(entry, "id", None) != getattr(agent, "_credential_pool_entry_id", None):
+                    agent._swap_credential(entry)
+        except Exception:
+            pass
+
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.
     try:
@@ -868,11 +903,13 @@ def build_turn_context(
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    _raw_nudge = getattr(agent, "_memory_nudge_interval", 0)
+    _nudge_int = _raw_nudge if isinstance(_raw_nudge, int) else 0
+    if (_nudge_int > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
-        if agent._turns_since_memory >= agent._memory_nudge_interval:
+        if agent._turns_since_memory >= _nudge_int:
             should_review_memory = True
             agent._turns_since_memory = 0
 
@@ -1065,10 +1102,10 @@ def build_turn_context(
             agent.context_compressor.threshold_tokens,
         )
     ):
-        _preflight_tokens = _preflight_request_tokens(
-            agent,
+        _preflight_tokens = estimate_request_tokens_rough(
             messages,
-            active_system_prompt or "",
+            system_prompt=active_system_prompt or "",
+            tools=agent.tools or None,
         )
         _compressor = agent.context_compressor
         # getattr guard: minimal compressor doubles (SimpleNamespace in the
@@ -1265,10 +1302,10 @@ def build_turn_context(
                 # lower token count — e.g. summarising tool outputs) is
                 # recognised as progress instead of being misread as
                 # "Cannot compress further". Fixes #39548.
-                _preflight_tokens = _preflight_request_tokens(
-                    agent,
+                _preflight_tokens = estimate_request_tokens_rough(
                     messages,
-                    active_system_prompt or "",
+                    system_prompt=active_system_prompt or "",
+                    tools=agent.tools or None,
                 )
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens

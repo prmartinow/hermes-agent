@@ -157,6 +157,7 @@ def _read_config_key(*path: str) -> Optional[str]:
 # a free tier on upgrade). Filtered by ``is_available()`` at walk time so
 # we don't surface a provider the user has no credentials for.
 _LEGACY_PREFERENCE = (
+    "gemini-grounding",
     "firecrawl",
     "parallel",
     "tavily",
@@ -175,6 +176,7 @@ _LEGACY_PREFERENCE = (
 # entirely, and rate-limited requests fail over to the next ring vendor).
 # Disable the tier with ``web.keyless_fallback: false``.
 _KEYLESS_PREFERENCE = (
+    "gemini-grounding",
     "exa",
     "parallel",
     "firecrawl",
@@ -367,8 +369,8 @@ def _disabled_web_plugin_for(configured: Optional[str] = None, *, capability: Op
     try:
         from hermes_cli.plugins import get_plugin_manager
 
-        pm = get_plugin_manager()
-        for key, loaded in pm._plugins.items():
+        alias2 = get_plugin_manager()
+        for key, loaded in alias2._plugins.items():
             if not isinstance(key, str) or not key.startswith("web/"):
                 continue
             if loaded.enabled:

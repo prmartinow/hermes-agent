@@ -190,6 +190,7 @@ export interface ProjectInfo {
 export interface SessionInfo {
   cwd?: string
   fast?: boolean
+  gemini_account?: string
   install_warning?: string
   lazy?: boolean
   mcp_servers?: McpServerStatus[]

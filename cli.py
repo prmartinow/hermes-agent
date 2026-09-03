@@ -12360,6 +12360,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if result.success and result.requires_new_session:
             _cprint("    Tip: `/reset` starts a new session immediately.")
 
+    def _handle_gs(self, cmd_original: str) -> None:
+        """Handle /gs command — switch Gemini account for this chat by label."""
+        from hermes_cli.auth import handle_gs_command
+        parts = cmd_original.split(None, 1)
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+        out = handle_gs_command(
+            session_id=getattr(self, "session_id", None),
+            arg=raw_args,
+            db=getattr(self, "_session_db", None),
+            agent=getattr(self, "agent", None),
+        )
+        if out:
+            _cprint(f"  {out}")
+
     def _should_handle_model_command_inline(self, text: str, has_images: bool = False) -> bool:
         """Return True when /model should be handled immediately on the UI thread."""
         if not text or has_images or not _looks_like_slash_command(text):
@@ -12799,6 +12813,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_sessions_command(cmd_original)
         elif canonical == "model":
             self._handle_model_switch(cmd_original)
+        elif canonical == "gs":
+            self._handle_gs(cmd_original)
         elif canonical == "codex-runtime":
             self._handle_codex_runtime(cmd_original)
 
@@ -14394,15 +14410,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         provider = getattr(agent, "provider", None) or getattr(self, "provider", None)
         base_url = getattr(agent, "base_url", None) or getattr(self, "base_url", None)
         api_key = getattr(agent, "api_key", None) or getattr(self, "api_key", None)
+
+        pinned_acc = None
+        if str(provider or "").strip().lower() in {"gemini-oauth", "gemini_oauth", "gemini"} or (provider and str(provider).startswith("gemini-")):
+            try:
+                entry_id = getattr(agent, "_credential_pool_entry_id", None)
+                pool = getattr(agent, "_credential_pool", None)
+                if entry_id and pool:
+                    entries = pool.entries() if hasattr(pool, "entries") else []
+                    curr = next((e for e in entries if getattr(e, "id", None) == entry_id), None)
+                    if curr:
+                        pinned_acc = curr.label or curr.id
+                if not pinned_acc and pool:
+                    curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
+                    if curr:
+                        pinned_acc = curr.label or curr.id
+            except Exception:
+                pass
+
         # Lazy import — pulls the OpenAI SDK chain, only needed here.
         from agent.account_usage import fetch_account_usage, render_account_usage_lines
         account_snapshot = None
         if provider:
+            fetch_kwargs = {}
+            if base_url:
+                fetch_kwargs["base_url"] = base_url
+            if api_key:
+                fetch_kwargs["api_key"] = api_key
+            if str(provider or "").strip().lower() in {"gemini-oauth", "gemini_oauth", "gemini"} or (provider and str(provider).startswith("gemini-")):
+                if pinned_acc:
+                    fetch_kwargs["account"] = pinned_acc
+                if getattr(self, "session_id", None):
+                    fetch_kwargs["session_id"] = getattr(self, "session_id", None)
+                if getattr(agent, "model", None) or getattr(self, "model", None):
+                    fetch_kwargs["model"] = getattr(agent, "model", None) or getattr(self, "model", None)
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
                 try:
                     account_snapshot = _pool.submit(
                         fetch_account_usage, provider,
-                        base_url=base_url, api_key=api_key,
+                        **fetch_kwargs,
                     ).result(timeout=10.0)
                 except (concurrent.futures.TimeoutError, Exception):
                     account_snapshot = None

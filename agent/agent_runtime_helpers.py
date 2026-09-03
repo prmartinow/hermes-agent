@@ -1309,6 +1309,9 @@ def recover_with_credential_pool(
                 or "gousagelimit" in context_reason
                 or "usage limit reached" in context_message
                 or "usage limit has been reached" in context_message
+                or "resource_exhausted" in context_reason
+                or "resource has been exhausted" in context_message
+                or "rate_limited" in context_reason
             )
         if not has_retried_429 and not usage_limit_reached:
             return False, True
@@ -1893,7 +1896,29 @@ def restore_primary_runtime(agent) -> bool:
         agent._credential_pool_entry_id = None
         pool = getattr(agent, "_credential_pool", None)
         if pool is not None and pool.has_available():
-            entry = pool.select()
+            sess_pinned_acc = None
+            is_subagent = (
+                getattr(agent, "platform", None) == "subagent"
+                or (isinstance(getattr(agent, "_subagent_id", None), str) and bool(agent._subagent_id))
+                or (isinstance(getattr(agent, "_delegate_role", None), str) and bool(agent._delegate_role))
+                or (isinstance(getattr(agent, "parent_session_id", None), str) and bool(agent.parent_session_id))
+            )
+            if not is_subagent:
+                try:
+                    db = getattr(agent, "_session_db", None)
+                    sid = getattr(agent, "session_id", None)
+                    if db and sid and hasattr(db, "get_session"):
+                        sess_row = db.get_session(sid)
+                        if sess_row:
+                            cfg_raw = sess_row.get("model_config")
+                            if isinstance(cfg_raw, str):
+                                import json
+                                cfg_raw = json.loads(cfg_raw)
+                            if isinstance(cfg_raw, dict):
+                                sess_pinned_acc = cfg_raw.get("gemini_account")
+                except Exception:
+                    pass
+            entry = pool.select(preferred_account=sess_pinned_acc if not is_subagent else None)
             if entry is not None:
                 entry_provider = str(getattr(entry, "provider", "") or "").strip().lower()
                 entry_matches_primary = credential_pool_matches_provider(
@@ -2834,6 +2859,33 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return provider_client
+
+    from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient, is_cloudcode_pa_base_url
+
+    if (
+        agent.provider in {"gemini-oauth", "gemini_oauth"}
+        or (agent.provider and re.match(r"^gemini(?:-oauth)?-[1-5]$", str(agent.provider)))
+        or is_cloudcode_pa_base_url(client_kwargs.get("base_url", ""))
+    ):
+        base_url = str(client_kwargs.get("base_url", "") or "")
+        safe_kwargs = {
+            k: v for k, v in client_kwargs.items()
+            if k in {"api_key", "access_token", "base_url", "default_headers", "timeout", "http_client", "project_id"}
+        }
+        if "http_client" not in safe_kwargs:
+            keepalive_http = agent._build_keepalive_http_client(
+                base_url, verify=httpx_verify,
+            )
+            if keepalive_http is not None:
+                safe_kwargs["http_client"] = keepalive_http
+        client = GeminiCloudCodeClient(**safe_kwargs)
+        _ra().logger.info(
+            "Gemini Cloud Code PA client created (%s, shared=%s) %s",
+            reason,
+            shared,
+            agent._client_log_context(),
+        )
+        return client
     if agent.provider == "gemini":
         from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
@@ -5179,6 +5231,25 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
         ratelimit_reset = headers.get("x-ratelimit-reset")
         if ratelimit_reset and "reset_at" not in context:
             context["reset_at"] = ratelimit_reset
+
+    details = getattr(error, "details", None)
+    if isinstance(details, dict):
+        if "reset_at" in details and details["reset_at"] is not None and "reset_at" not in context:
+            context["reset_at"] = details["reset_at"]
+        elif "retry_after" in details and details["retry_after"] is not None and "reset_at" not in context:
+            try:
+                context["reset_at"] = time.time() + float(details["retry_after"])
+            except (TypeError, ValueError):
+                pass
+        if "reason" in details and details["reason"] and "reason" not in context:
+            context["reason"] = details["reason"]
+
+    err_retry_after = getattr(error, "retry_after", None)
+    if err_retry_after is not None and "reset_at" not in context:
+        try:
+            context["reset_at"] = time.time() + float(err_retry_after)
+        except (TypeError, ValueError):
+            pass
 
     if "message" not in context:
         raw_message = str(error).strip()

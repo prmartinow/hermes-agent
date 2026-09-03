@@ -41,6 +41,22 @@ class TestGetToolset:
         assert "xurl" in description
         assert "authenticated" in description
 
+    def test_google_search_toolset_and_helpers(self):
+        from toolsets import is_google_search_grounding_toolset, is_google_grounding_enabled
+        ts = get_toolset("google_search")
+        assert ts is not None
+        assert ts["tools"] == ["google_search"]
+        assert "Google Search Grounding" in ts["description"]
+
+        assert is_google_search_grounding_toolset("google_search") is True
+        assert is_google_search_grounding_toolset("google_grounding") is True
+        assert is_google_search_grounding_toolset("google-search") is True
+        assert is_google_search_grounding_toolset("web") is False
+
+        assert is_google_grounding_enabled(["google_search", "terminal"]) is True
+        assert is_google_grounding_enabled(["web", "terminal"]) is False
+        assert is_google_grounding_enabled(None) is False
+
     def test_merges_registry_tools_into_builtin_toolset(self, monkeypatch):
         reg = ToolRegistry()
         reg.register(

@@ -400,6 +400,59 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
     assert first[-1].choices[0].finish_reason == "tool_calls"
 
 
+def test_stream_event_translation_parallel_tool_calls_multi_event():
+    from agent.gemini_native_adapter import translate_stream_event
+
+    tool_call_indices = {}
+    event1 = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "skill_view", "args": {"name": "rpc-environment"}}}
+                    ]
+                }
+            }
+        ]
+    }
+    event2 = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "skill_view", "args": {"name": "github-ops"}}}
+                    ]
+                }
+            }
+        ]
+    }
+    event3_finish = {
+        "candidates": [
+            {
+                "finishReason": "STOP",
+            }
+        ]
+    }
+
+    c1 = translate_stream_event(event1, model="gemini-3.7-flash-high", tool_call_indices=tool_call_indices)
+    c2 = translate_stream_event(event2, model="gemini-3.7-flash-high", tool_call_indices=tool_call_indices)
+    c3 = translate_stream_event(event3_finish, model="gemini-3.7-flash-high", tool_call_indices=tool_call_indices)
+
+    assert len(c1) == 1
+    assert c1[0].choices[0].delta.tool_calls[0].index == 0
+    assert c1[0].choices[0].delta.tool_calls[0].function.name == "skill_view"
+    assert c1[0].choices[0].delta.tool_calls[0].function.arguments == '{"name": "rpc-environment"}'
+
+    assert len(c2) == 1
+    assert c2[0].choices[0].delta.tool_calls[0].index == 1
+    assert c2[0].choices[0].delta.tool_calls[0].function.name == "skill_view"
+    assert c2[0].choices[0].delta.tool_calls[0].function.arguments == '{"name": "github-ops"}'
+    assert c2[0].choices[0].delta.tool_calls[0].id != c1[0].choices[0].delta.tool_calls[0].id
+
+    assert len(c3) == 1
+    assert c3[0].choices[0].finish_reason == "tool_calls"
+
+
 def test_build_gemini_request_preserves_explicit_max_tokens_without_thinking():
     from agent.gemini_native_adapter import build_gemini_request
 

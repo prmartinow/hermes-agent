@@ -705,6 +705,11 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
     # PARALLEL_TOOL_CALL_GUIDANCE block (injected for all models), so it is no
     # longer duplicated here — keeping it would send Gemini/Gemma the same
     # instruction twice.
+    "- **Iterative tool execution:** Execute tools iteratively in focused, "
+    "step-by-step calls rather than generating massive multi-step monolithic "
+    "scripts in a single breath.\n"
+    "- **Output headroom safety:** Keep tool calls modular so thinking tokens "
+    "leave ample output headroom.\n"
     "- **Non-interactive commands:** Use flags like -y, --yes, --non-interactive "
     "to prevent CLI tools from hanging on prompts.\n"
     "- **Keep going:** Work autonomously until the task is fully resolved. "
