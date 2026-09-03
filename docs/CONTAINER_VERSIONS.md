@@ -14,7 +14,6 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Version | Image ID | Git Commit | Build Date (UTC) | Core Changes & Fixes | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`v0.17`** | `69287f8bcaf3` | `869610dbbe` | 2026-09-03 11:41 | Candidate release v0.17: single container workflow baseline, clean image layer | Built (Available) |
 | **`v0.16`** | `a6bc3a522f48` | `869610dbbe` | 2026-09-03 07:15 | Single container architecture baseline, agy v1.1.24, main-wrapper background spawn guard | **Active (Serving :9119)** |
 | **`v0.15`** (Pruned) | `2fd7a9a2d368` | `491b688d0c` | 2026-09-02 20:14 | Rebuilt candidate v0.15: latest fixes, single container workflow, main-wrapper background guard | Pruned |
 | **`v0.14`** (Pruned) | `011297896f15` | `7add2d2c88` | 2026-09-02 18:05 | Candidate release v0.14: single container architecture baseline, agy v1.1.24, parity script updates | Pruned |
