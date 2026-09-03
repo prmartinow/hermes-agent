@@ -5747,17 +5747,25 @@ def handle_gs_command(
         return f"✗ Account '{label}' is not logged in"
 
     # Swap live runtime credential on agent and set cursor for next turn
+    target_acc_id = None
     if agent is not None:
         try:
             pool = getattr(agent, "_credential_pool", None)
             if pool is not None:
                 entry = pool.select(preferred_account=label) or pool.select(preferred_account=acc_idx)
-                if entry is not None and hasattr(agent, "_swap_credential"):
-                    agent._swap_credential(entry)
+                if entry is not None:
+                    target_acc_id = str(entry.id or entry.label or label).strip()
+                    if hasattr(agent, "_swap_credential"):
+                        agent._swap_credential(entry)
                     pool._current_id = entry.id
                     setattr(agent, "_credential_pool_entry_id", entry.id)
         except Exception as exc:
             logger.debug("Failed live credential swap during /gs: %s", exc)
+
+    if session_id:
+        target_account = str(target_acc_id or label).strip()
+        with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+            _RESOLVED_SESSION_ACCOUNTS[str(session_id).strip()] = target_account
 
     return f"✓ Switched to {label}"
 

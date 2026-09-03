@@ -6,6 +6,7 @@ Covers:
 3. Numerical arguments (/gs 2) are rejected with label instructions.
 4. Unknown labels (/gs xyz) are rejected with available label list.
 5. Bare /gs displays usage syntax.
+6. /gs immediately updates in-memory fast cache (_RESOLVED_SESSION_ACCOUNTS).
 """
 
 import unittest
@@ -92,6 +93,25 @@ class TestGSCommand(unittest.TestCase):
         with patch("hermes_cli.auth.get_gemini_account_label_map", return_value={"alias1": 1}):
             output = handle_gs_command("sess-123", "")
             self.assertIn("Usage: /gs <label>", output)
+
+    def test_gs_updates_in_memory_fast_cache(self):
+        """/gs immediately updates _RESOLVED_SESSION_ACCOUNTS for the session."""
+        from hermes_cli.auth import _RESOLVED_SESSION_ACCOUNTS, resolve_session_last_used_account
+        agent = MagicMock()
+        mock_pool = MagicMock()
+        mock_entry = MagicMock(id="gemini-2", label="alias2")
+        mock_pool.select.return_value = mock_entry
+        agent._credential_pool = mock_pool
+
+        def mock_status(idx):
+            return {"logged_in": True, "email": "user2@example.com"}
+
+        with patch("hermes_cli.auth.get_gemini_account_label_map", return_value={"alias2": 2, "alias1": 1}), \
+             patch("hermes_cli.auth.get_gemini_oauth_auth_status", side_effect=mock_status):
+            output = handle_gs_command(session_id="sess-fast-cache", arg="alias2", agent=agent)
+            self.assertEqual(output, "✓ Switched to alias2")
+            self.assertEqual(_RESOLVED_SESSION_ACCOUNTS.get("sess-fast-cache"), "gemini-2")
+            self.assertEqual(resolve_session_last_used_account("sess-fast-cache"), "gemini-2")
 
 
 if __name__ == "__main__":

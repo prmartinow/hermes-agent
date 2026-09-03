@@ -16393,12 +16393,16 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
     if name == "gs":
         try:
             from hermes_cli.auth import handle_gs_command
-            return handle_gs_command(
+            output = handle_gs_command(
                 session_id=sid,
                 arg=arg,
                 db=_session_db,
                 agent=(session or {}).get("agent"),
             )
+            if not str(output).startswith("✗"):
+                agent_obj = (session or {}).get("agent")
+                _emit("session.info", sid, _session_info(agent_obj, session))
+            return output
         except Exception as exc:
             return f"✗ Failed to switch account: {exc}"
     if name == "compress":
