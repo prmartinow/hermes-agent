@@ -588,6 +588,92 @@ def test_fetch_gemini_available_models_and_caching():
 # 10. Dynamic Opportunity-Cost Index (DOCI) & Optimal Rotation Tests
 # ---------------------------------------------------------------------------
 
+
+def test_fetch_gemini_38_flash_tiered_dynamic_expansion():
+    """Verify gemini-3.8-flash-tiered with supportsThinking=True is dynamically expanded into 3 virtual tiers."""
+    from hermes_cli.auth import (
+        fetch_gemini_available_models,
+        get_gemini_model_display_names,
+        _GEMINI_MODELS_CACHE,
+    )
+
+    mock_resp = {
+        "agentModelSorts": [
+            {
+                "groups": [
+                    {
+                        "modelIds": [
+                            "gemini-3.8-flash-tiered",
+                            "gemini-3.7-flash-tiered",
+                            "claude-opus-4-6-thinking",
+                        ]
+                    }
+                ]
+            }
+        ],
+        "models": {
+            "gemini-3.8-flash-tiered": {
+                "displayName": None,
+                "supportsThinking": True,
+                "thinkingBudget": -1,
+                "maxOutputTokens": 65536,
+            },
+            "gemini-3.7-flash-tiered": {
+                "displayName": None,
+                "supportsThinking": True,
+                "thinkingBudget": -1,
+                "maxOutputTokens": 65536,
+            },
+            "claude-opus-4-6-thinking": {
+                "displayName": "Claude Opus 4.6 (Thinking)",
+                "supportsThinking": True,
+                "thinkingBudget": 4096,
+            },
+            "chat_internal": {"displayName": None},
+        },
+    }
+
+    with patch("hermes_cli.auth.resolve_gemini_oauth_runtime_credentials") as mock_creds, \
+         patch("httpx.post") as mock_post:
+        mock_creds.return_value = {"access_token": "ya29.test"}
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: mock_resp)
+
+        _GEMINI_MODELS_CACHE.clear()
+        models = fetch_gemini_available_models(account=1, force=True)
+
+        # Assert 3.8 virtual tiers are generated
+        assert "gemini-3.8-flash-high" in models
+        assert "gemini-3.8-flash-medium" in models
+        assert "gemini-3.8-flash-low" in models
+
+        # Assert 3.7 virtual tiers are generated
+        assert "gemini-3.7-flash-high" in models
+        assert "gemini-3.7-flash-medium" in models
+        assert "gemini-3.7-flash-low" in models
+
+        assert "claude-opus-4-6-thinking" in models
+        assert "chat_internal" not in models
+
+        # Check display names
+        dnames = get_gemini_model_display_names(account=1)
+        assert dnames["gemini-3.8-flash-high"] == "Gemini 3.8 Flash (High)"
+        assert dnames["gemini-3.8-flash-medium"] == "Gemini 3.8 Flash (Medium)"
+        assert dnames["gemini-3.8-flash-low"] == "Gemini 3.8 Flash (Low)"
+        assert dnames["gemini-3.7-flash-high"] == "Gemini 3.7 Flash (High)"
+        assert dnames["claude-opus-4-6-thinking"] == "Claude Opus 4.6 (Thinking)"
+
+
+def test_resolve_cloudcode_model_and_effort_gemini_38():
+    """Verify resolve_cloudcode_model_and_effort translates 3.8 tiers to wire slug."""
+    from agent.gemini_cloudcode_adapter import resolve_cloudcode_model_and_effort
+
+    assert resolve_cloudcode_model_and_effort("gemini-3.8-flash-high") == "gemini-3.8-flash-tiered"
+    assert resolve_cloudcode_model_and_effort("gemini-3.8-flash-medium") == "gemini-3.8-flash-tiered"
+    assert resolve_cloudcode_model_and_effort("gemini-3.8-flash-low") == "gemini-3.8-flash-tiered"
+    assert resolve_cloudcode_model_and_effort("gemini-3.8-flash", effort="high") == "gemini-3.8-flash-tiered"
+    assert resolve_cloudcode_model_and_effort("gemini-3.7-flash-high") == "gemini-3.7-flash-tiered"
+    assert resolve_cloudcode_model_and_effort("gemini-3.6-flash", effort="low") == "gemini-3.6-flash-low"
+
 def test_calculate_gemini_doci_score_math():
     from hermes_cli.auth import calculate_gemini_doci_score
 

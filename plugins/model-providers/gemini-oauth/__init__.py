@@ -38,6 +38,12 @@ gemini_oauth = GeminiOAuthProfile(
     default_max_tokens=65536,
     default_aux_model="gemini-3.6-flash-low",
     fallback_models=(
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        "gemini-3.7-flash-high",
+        "gemini-3.7-flash-medium",
+        "gemini-3.7-flash-low",
         "gemini-3.6-flash-high",
         "gemini-3.6-flash-medium",
         "gemini-3.6-flash-low",

@@ -3953,10 +3953,10 @@ def format_gemini_user_facing_slug(model_id: str, raw_display_name: str = "") ->
     """Format model ID into agy-style human display name (matching backend.UserFacingSlug in agy).
 
     Priority:
-      1. Raw API displayName from Google if non-empty (e.g. "Claude Sonnet 4.6 (Thinking)").
+      1. Raw API displayName from Google if non-empty and not identical to slug.
       2. Algorithmic dynamic slug formatter for future-proof resolution.
     """
-    if raw_display_name and raw_display_name.strip():
+    if raw_display_name and raw_display_name.strip() and raw_display_name.strip() != model_id:
         return raw_display_name.strip()
     mid = str(model_id or "").strip()
     if not mid:
@@ -3981,13 +3981,31 @@ def format_gemini_user_facing_slug(model_id: str, raw_display_name: str = "") ->
         tier_str = f" ({tier_name})"
         clean = clean[:tier_match.start()]
 
-    # 3. Format hyphenated version numbers (e.g. 4-6 -> 4.6)
+    # 3. Format hyphenated version numbers (e.g. 4-6 -> 4.6, 3-8 -> 3.8)
     clean = re.sub(r"(\d+)-(\d+)", r"\1.\2", clean)
 
     # 4. Title case words and preserve version numbers
     words = clean.split("-")
     cap_words = [w if re.match(r"^\d+(\.\d+)*$", w) else w.capitalize() for w in words]
     return (" ".join(cap_words) + tier_str).strip()
+
+
+def _expand_model_tier_slugs(mid_str: str, minfo: dict) -> list[tuple[str, str]]:
+    """Return list of (slug, display_name) for a model entry, expanding tiered models matching FetchTieredModels in agy."""
+    supports_thinking = bool(minfo.get("supportsThinking", False))
+    budget = minfo.get("thinkingBudget", 0)
+    dname = minfo.get("displayName") or ""
+
+    if supports_thinking and budget == -1 and mid_str.endswith("-tiered"):
+        base_slug = mid_str[:-7]
+        results = []
+        for eff in ("high", "medium", "low"):
+            v_slug = f"{base_slug}-{eff}"
+            v_dname = format_gemini_user_facing_slug(v_slug)
+            results.append((v_slug, v_dname))
+        return results
+
+    return [(mid_str, dname or format_gemini_user_facing_slug(mid_str, dname))]
 
 
 def fetch_gemini_available_models(
@@ -4032,37 +4050,28 @@ def fetch_gemini_available_models(
                 seen_ids: set[str] = set()
                 display_names: Dict[str, str] = {}
 
-                # 1. Include Gemini 3.7 Flash if returned in models_dict
-                if "gemini-3.7-flash-tiered" in models_dict and "gemini-3.7-flash-tiered" not in seen_ids:
-                    mid_str = "gemini-3.7-flash-tiered"
-                    ordered_ids.append(mid_str)
-                    seen_ids.add(mid_str)
-                    display_names[mid_str] = models_dict[mid_str].get("displayName") or "Gemini 3.7 Flash"
+                def _add_model_entry(mid_raw: str, minfo: dict) -> None:
+                    mid_clean = str(mid_raw).strip()
+                    if not mid_clean or mid_clean.startswith(("tab_", "chat_", "models/")) or "image" in mid_clean:
+                        return
+                    for slug, dname in _expand_model_tier_slugs(mid_clean, minfo):
+                        if slug not in seen_ids:
+                            ordered_ids.append(slug)
+                            seen_ids.add(slug)
+                            display_names[slug] = dname
 
-                # 2. Prioritize recommended/agent sort models in order directly from Google API
+                # 1. Prioritize recommended/agent sort models in order directly from Google API
                 for sort_group in sorts:
                     for group in sort_group.get("groups", []):
                         for mid in group.get("modelIds", []):
                             mid_str = str(mid).strip()
-                            if mid_str and mid_str not in seen_ids and mid_str in models_dict:
-                                ordered_ids.append(mid_str)
-                                seen_ids.add(mid_str)
-                                raw_dname = models_dict.get(mid_str, {}).get("displayName", "")
-                                display_names[mid_str] = raw_dname or format_gemini_user_facing_slug(mid_str, raw_dname)
+                            if mid_str and mid_str in models_dict:
+                                _add_model_entry(mid_str, models_dict.get(mid_str, {}))
 
-                # 3. Format any remaining valid user-facing models from Google API
+                # 2. Format any remaining valid user-facing models from Google API
                 for mid, minfo in models_dict.items():
-                    mid_str = str(mid).strip()
-                    if not isinstance(minfo, dict):
-                        continue
-                    dname = minfo.get("displayName")
-                    # Skip internal helper models (tab_*, chat_*, proactive-observer, image helpers)
-                    if mid_str.startswith(("tab_", "chat_", "models/")) or "image" in mid_str or not dname:
-                        continue
-                    if mid_str not in seen_ids:
-                        ordered_ids.append(mid_str)
-                        seen_ids.add(mid_str)
-                        display_names[mid_str] = dname or format_gemini_user_facing_slug(mid_str, dname)
+                    if isinstance(minfo, dict):
+                        _add_model_entry(str(mid).strip(), minfo)
 
                 if ordered_ids:
                     with _GEMINI_MODELS_CACHE_LOCK:

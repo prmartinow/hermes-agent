@@ -89,8 +89,18 @@ def resolve_cloudcode_model_and_effort(model: str, effort: Optional[str] = None)
     if not bare:
         return "gemini-3.7-flash-tiered"
 
-    if bare.startswith("gemini-3.7-flash") or bare in ("gemini-3.7", "gemini-3.7-thinking"):
+    import re
+    # Dynamic tiered models (Gemini 3.7, 3.8, and future >= 3.7) route to -tiered on the wire
+    m_dynamic = re.match(r"^gemini-(?:3\.(?:[7-9]|\d{2,})|[4-9]\.\d+)-flash(?:-(high|medium|low|tiered))?$", bare)
+    if m_dynamic:
+        v_match = re.search(r"gemini-(\d+\.\d+)-flash", bare)
+        v = v_match.group(1) if v_match else "3.7"
+        return f"gemini-{v}-flash-tiered"
+
+    if bare in ("gemini-3.7", "gemini-3.7-thinking"):
         return "gemini-3.7-flash-tiered"
+    if bare in ("gemini-3.8", "gemini-3.8-thinking"):
+        return "gemini-3.8-flash-tiered"
 
     # If the slug already has an explicit effort tier or specific model ID, preserve as-is
     if any(bare.endswith(f"-{eff}") for eff in ("high", "medium", "low", "extra-low", "tiered")):
@@ -228,7 +238,12 @@ class GeminiCloudCodeClient:
                     break
 
         if not thinking_config:
-            if bare.startswith("gemini-3.7-flash") or bare in ("gemini-3.7", "gemini-3.7-thinking"):
+            import re
+            is_dynamic_gemini = (
+                bool(re.match(r"^gemini-(?:3\.(?:[7-9]|\d{2,})|[4-9]\.\d+)-flash", bare))
+                or bare in ("gemini-3.7", "gemini-3.7-thinking", "gemini-3.8", "gemini-3.8-thinking")
+            )
+            if is_dynamic_gemini:
                 eff_val = (effort or "high").strip().lower()
                 if eff_val == "none":
                     thinking_config = {"includeThoughts": False}
