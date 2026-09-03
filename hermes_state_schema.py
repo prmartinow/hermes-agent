@@ -574,6 +574,22 @@ class SessionSchemaMixin:
                 exc,
             )
             return None
+        except sqlite3.OperationalError as exc:
+            if self._is_fts5_unavailable_error(exc):
+                # Only disable FTS entirely when the whole module is missing.
+                # A missing trigram tokenizer only affects trigram searches.
+                if self._is_trigram_unavailable_error(exc):
+                    self._warn_trigram_unavailable(exc)
+                else:
+                    self._warn_fts5_unavailable(exc)
+                return None
+            if "no such table" in str(exc).lower():
+                return False
+            logger.debug("FTS table probe failed for %s (%s); disabling FTS capability", table_name, exc)
+            return False
+        except Exception as exc:
+            logger.debug("FTS table probe encountered unexpected error for %s (%s); disabling FTS capability", table_name, exc)
+            return False
 
     def _recover_stale_fts(
         self, cursor: sqlite3.Cursor, *, legacy: bool, timeout_seconds=None

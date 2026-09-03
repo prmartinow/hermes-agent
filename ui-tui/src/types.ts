@@ -141,6 +141,7 @@ export interface Msg {
   // [HH:MM] label when `display.timestamps` is on (#41531).
   createdAt?: number
   thinking?: string
+  thinkingTitle?: string
   // MoA reference-model output stored in `thinking` (see turnController's
   // recordMoaReference): unlike ordinary model reasoning, this is the
   // user-facing mixture-of-agents process the user opted into, so it stays
@@ -190,6 +191,7 @@ export interface ProjectInfo {
 export interface SessionInfo {
   cwd?: string
   fast?: boolean
+  gemini_account?: string
   install_warning?: string
   lazy?: boolean
   mcp_servers?: McpServerStatus[]

@@ -332,12 +332,13 @@ describe('createGatewayEventHandler', () => {
       type: 'message.complete'
     } as any)
 
-    expect(appended).toHaveLength(2)
+    expect(appended).toHaveLength(3)
     expect(appended[0]).toMatchObject({ kind: 'trail', role: 'system', text: '', thinking: 'mapped the page' })
-    expect(appended[0]?.tools).toHaveLength(1)
-    expect(appended[0]?.tools?.[0]).toContain('hero cards')
-    expect(appended[0]?.toolTokens).toBeGreaterThan(0)
-    expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
+    expect(appended[1]).toMatchObject({ kind: 'trail', role: 'system', text: '' })
+    expect(appended[1]?.tools).toHaveLength(1)
+    expect(appended[1]?.tools?.[0]).toContain('hero cards')
+    expect(appended[1]?.toolTokens).toBeGreaterThan(0)
+    expect(appended[2]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
   it('groups sequential completed tools into one trail when the turn completes', () => {
@@ -390,26 +391,26 @@ describe('createGatewayEventHandler', () => {
       type: 'message.complete'
     } as any)
 
-    expect(appended).toHaveLength(2)
-    expect(appended[0]?.tools).toHaveLength(1)
-    expect(appended[0]?.toolTokens).toBeGreaterThan(0)
-    expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
+    expect(appended).toHaveLength(3)
+    expect(appended[0]).toMatchObject({ kind: 'trail', role: 'system', text: '', thinking: 'mapped the page' })
+    expect(appended[1]?.tools).toHaveLength(1)
+    expect(appended[1]?.toolTokens).toBeGreaterThan(0)
+    expect(appended[2]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
-  it('streams legacy thinking.delta into visible reasoning state', () => {
+  it('routes thinking.delta to status ticker without polluting reasoning state', () => {
     vi.useFakeTimers()
     const appended: Msg[] = []
-    const streamed = 'short streamed reasoning'
+    const statusText = '(｡•̀ᴗ-)✧ pondering...'
     const onEvent = createGatewayEventHandler(buildCtx(appended))
 
     try {
       onEvent({ payload: {}, type: 'message.start' } as any)
-      onEvent({ payload: { text: streamed }, type: 'thinking.delta' } as any)
+      onEvent({ payload: { text: statusText }, type: 'thinking.delta' } as any)
       vi.runOnlyPendingTimers()
 
-      expect(getTurnState().reasoning).toBe(streamed)
-      expect(getTurnState().reasoningActive).toBe(true)
-      expect(getTurnState().reasoningTokens).toBe(estimateTokensRough(streamed))
+      expect(getUiState().status).toBe(statusText)
+      expect(getTurnState().reasoning).toBe('')
     } finally {
       vi.useRealTimers()
     }

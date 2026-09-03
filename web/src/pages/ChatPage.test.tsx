@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, type ReactNode } from "react";
+import { act, useEffect, useState, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -61,6 +61,10 @@ class FakeTerminal {
     return { dispose() {} };
   }
 
+  onSelectionChange() {
+    return { dispose() {} };
+  }
+
   get buffer() {
     // Minimal active-buffer surface for the resume follow-scroll pin
     // (isViewportPinnedToBottom reads viewportY/baseY).
@@ -68,6 +72,8 @@ class FakeTerminal {
   }
 
   scrollToBottom() {}
+
+  scrollToLine(_line?: number) {}
 
   open() {}
 
@@ -80,7 +86,15 @@ class FakeTerminal {
 
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
 const apiMocks = vi.hoisted(() => ({
-  buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
+  buildWsUrl: vi.fn(async (path: string, params?: Record<string, string>) => {
+    const qs = params ? new URLSearchParams(params).toString() : "channel=chat-1";
+    return `ws://localhost${path}?${qs}`;
+  }),
+  buildWsUrlSync: vi.fn(() => null),
+  getSessions: vi.fn(async () => ({ sessions: [] as import("@/lib/api").SessionInfo[], total: 0, limit: 20, offset: 0 })),
+  getSessionDetail: vi.fn(async (id: string) => ({ title: `Session ${id}` })),
+  getSessionLatestDescendant: vi.fn(async (id: string) => ({ session_id: id })),
+  getSessionMessages: vi.fn(async () => ({ messages: [] })),
 }));
 
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: FakeFitAddon }));
@@ -98,8 +112,25 @@ vi.mock("@/components/Backdrop", () => ({ Backdrop: () => null }));
 vi.mock("@/plugins", () => ({
   PluginSlot: () => null,
 }));
+const headerSlot = vi.hoisted(() => {
+  const listeners = new Set<(node: React.ReactNode) => void>();
+  return {
+    setEnd: (node: React.ReactNode) => {
+      for (const listener of listeners) listener(node);
+    },
+    subscribe: (listener: (node: React.ReactNode) => void) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+});
 vi.mock("@/contexts/usePageHeader", () => ({
-  usePageHeader: () => ({ setEnd: vi.fn(), setTitle: vi.fn() }),
+  usePageHeader: () => ({
+    setEnd: (node: React.ReactNode) => headerSlot.setEnd(node),
+    setTitle: vi.fn(),
+  }),
 }));
 vi.mock("@/contexts/useProfileScope", () => ({
   useProfileScope: () => ({ profile: "" }),
@@ -326,11 +357,19 @@ describe("ChatPage", () => {
 describe("ChatPage side panel collapse", () => {
   async function renderChat() {
     const { default: ChatPage } = await import("./ChatPage");
-    await render(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatPage isActive />
-      </MemoryRouter>,
-    );
+    function TestWrapper() {
+      const [endNode, setEndNode] = useState<React.ReactNode>(null);
+      useEffect(() => {
+        return headerSlot.subscribe(setEndNode);
+      }, []);
+      return (
+        <MemoryRouter initialEntries={["/chat"]}>
+          <div>{endNode}</div>
+          <ChatPage isActive />
+        </MemoryRouter>
+      );
+    }
+    await render(<TestWrapper />);
   }
 
   it("collapses the desktop side panel and persists the choice", async () => {

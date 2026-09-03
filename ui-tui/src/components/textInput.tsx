@@ -5,7 +5,7 @@ import { type MutableRefObject, useEffect, useMemo, useRef, useState } from 'rea
 import { setInputSelection } from '../app/inputSelectionStore.js'
 import { highlightMask, highlightsStable } from '../domain/composerHighlights.js'
 import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
-import { cursorLayout, offsetFromPosition } from '../lib/inputMetrics.js'
+import { cursorLayout, inputVisualHeight, offsetFromPosition } from '../lib/inputMetrics.js'
 import {
   DEFAULT_VOICE_RECORD_KEY,
   isActionMod,
@@ -375,8 +375,23 @@ export function deleteWordForward(value: string, cursor: number): TextInsertResu
  * is already on the first line (up) or last line (down) — callers use that
  * signal to fall through to history cycling instead of eating the arrow key.
  */
-export function lineNav(s: string, p: number, dir: -1 | 1): null | number {
+export function lineNav(s: string, p: number, dir: -1 | 1, cols?: number): null | number {
   const pos = snapPos(s, p)
+
+  if (cols && cols > 0) {
+    const layout = cursorLayout(s, pos, cols)
+    const totalLines = inputVisualHeight(s, cols)
+    const targetLine = layout.line + dir
+
+    if (targetLine < 0 || targetLine >= totalLines) {
+      return null
+    }
+
+    const nextPos = offsetFromPosition(s, targetLine, layout.column, cols)
+
+    return snapPos(s, nextPos)
+  }
+
   const curStart = s.lastIndexOf('\n', pos - 1) + 1
   const col = pos - curStart
 
@@ -1396,7 +1411,7 @@ export function TextInput({
       if (k.upArrow || k.downArrow) {
         flushKeyBurst()
 
-        const next = lineNav(vRef.current, curRef.current, k.upArrow ? -1 : 1)
+        const next = lineNav(vRef.current, curRef.current, k.upArrow ? -1 : 1, columns)
 
         if (next !== null) {
           moveCursor(next, k.shift)
@@ -1575,6 +1590,11 @@ export function TextInput({
           ;({ cursor: c, value: v } = killToLineEnd(v, c))
         }
       } else if (event.keypress.isPasted || inp.length > 0) {
+        // Discard unhandled ANSI escape sequences (e.g. mouse reports, cursor reports, focus reports)
+        if (!event.keypress.isPasted && eventRaw && (eventRaw.startsWith('\x1b') || eventRaw.includes('\x1b['))) {
+          return
+        }
+
         const bracketed = event.keypress.isPasted || inp.includes('[200~')
         const text = inp.replace(BRACKET_PASTE, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
 

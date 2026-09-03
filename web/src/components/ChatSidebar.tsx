@@ -57,6 +57,7 @@ interface SessionInfo {
   cwd?: string;
   model?: string;
   provider?: string;
+  gemini_account?: string;
   credential_warning?: string;
   title?: string;
 }

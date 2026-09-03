@@ -13,8 +13,10 @@ import {
   buildToolTrailLine,
   buildVerboseToolTrailLine,
   estimateTokensRough,
+  extractThoughtTitle,
   isTransientTrailLine,
   sameToolTrailGroup,
+  THINKING_BOUNDARY_RE,
   toolTrailLabel
 } from '../lib/text.js'
 import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '../types.js'
@@ -378,11 +380,14 @@ class TurnController {
       return
     }
 
+    const { title } = extractThoughtTitle(thinking)
+
     const msg: Msg = {
       kind: 'trail',
       role: 'system',
       text: '',
       thinking,
+      thinkingTitle: title || undefined,
       thinkingTokens: estimateTokensRough(thinking),
       toolTokens: this.toolTokenAcc || undefined,
       ...(live ? { isLiveReasoning: true } : {})
@@ -399,7 +404,10 @@ class TurnController {
   }
 
   private closeReasoningSegment() {
-    this.syncReasoningSegment(false)
+    if (this.activeReasoningText.trim()) {
+      this.syncReasoningSegment(false)
+    }
+
     this.activeReasoningText = ''
     this.reasoningSegmentIndex = null
   }
@@ -475,10 +483,6 @@ class TurnController {
       text: '',
       tools: this.pendingSegmentTools
     })
-
-    if (next.length === this.segmentMessages.length + 1) {
-      return false
-    }
 
     this.segmentMessages = next
     this.pendingSegmentTools = []
@@ -625,22 +629,41 @@ class TurnController {
       this.reasoningSegmentIndex !== null || segments.some(msg => Boolean(msg.thinking?.trim()))
 
     const finalThinking = hasReasoningSegment ? '' : savedReasoning.trim()
+    const thinkingMsg: Msg | null = finalThinking
+      ? {
+          kind: 'trail',
+          role: 'system',
+          text: '',
+          thinking: finalThinking,
+          thinkingTokens: estimateTokensRough(finalThinking)
+        }
+      : null
+
+    // If we have tool tokens and there is a tool-carrying segment, attach toolTokens to it
+    let finalSegments = segments
+    if (savedToolTokens) {
+      const lastToolIdx = finalSegments.findLastIndex(msg => Boolean(msg.kind === 'trail' && msg.tools?.length))
+      if (lastToolIdx >= 0) {
+        finalSegments = finalSegments.map((msg, i) =>
+          i === lastToolIdx ? { ...msg, toolTokens: savedToolTokens } : msg
+        )
+      }
+    }
 
     const finalDetails: Msg = {
       kind: 'trail',
       role: 'system',
       text: '',
-      thinking: finalThinking || undefined,
-      thinkingTokens: finalThinking ? estimateTokensRough(finalThinking) : undefined,
-      toolTokens: savedToolTokens || undefined,
-      ...(tools.length && { tools })
+      ...(tools.length && { tools }),
+      ...(savedToolTokens && !finalSegments.some(m => Boolean(m.toolTokens)) ? { toolTokens: savedToolTokens } : {})
     }
 
     // Archive prepended so the trail msg anchors under the user prompt,
     // not between thinking/tools and final assistant text.
     const finalMessages: Msg[] = [
       ...archiveDoneTodos(),
-      ...segments,
+      ...(thinkingMsg ? [thinkingMsg] : []),
+      ...finalSegments,
       ...(hasDetails(finalDetails) ? [finalDetails] : [])
     ]
 
@@ -788,12 +811,30 @@ class TurnController {
     this.reasoningText += text
     this.activeReasoningText += text
 
+    // Check for thinking paragraph / title boundary to decouple discrete thinking steps
+    if (this.activeReasoningText.length > 60) {
+      const match = THINKING_BOUNDARY_RE.exec(this.activeReasoningText)
+
+      if (match && match.index > 30) {
+        const completed = this.activeReasoningText.slice(0, match.index).trim()
+        const remainder = this.activeReasoningText.slice(match.index).trimStart()
+
+        if (completed) {
+          this.activeReasoningText = completed
+          this.syncReasoningSegment(false)
+          this.activeReasoningText = remainder
+          this.reasoningSegmentIndex = null
+          this.syncReasoningSegment(true)
+        }
+      }
+    }
+
     if (this.reasoningText.length > 80_000) {
       this.reasoningText = this.reasoningText.slice(-60_000)
     }
 
     this.scheduleReasoning()
-    this.syncReasoningSegment()
+    this.syncReasoningSegment(true)
     this.pulseReasoningStreaming()
   }
 
@@ -808,6 +849,10 @@ class TurnController {
   ) {
     if (this.interrupted) {
       return
+    }
+
+    if (this.reasoningSegmentIndex !== null) {
+      this.closeReasoningSegment()
     }
 
     this.recordTodos(todos)

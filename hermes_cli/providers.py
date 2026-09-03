@@ -82,6 +82,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://portal.qwen.ai/v1",
         base_url_env_var="HERMES_QWEN_BASE_URL",
     ),
+    "gemini-oauth": HermesOverlay(
+        transport="openai_chat",
+        auth_type="oauth_external",
+        base_url_override="https://daily-cloudcode-pa.googleapis.com/v1internal",
+        base_url_env_var="HERMES_GEMINI_OAUTH_BASE_URL",
+    ),
     "lmstudio": HermesOverlay(
         transport="openai_chat",
         auth_type="api_key",
@@ -359,6 +365,20 @@ ALIASES: Dict[str, str] = {
     "kilo-code": "kilo",
     "kilo-gateway": "kilo",
 
+    # gemini
+    "gemini-oauth": "gemini-oauth",
+    "gemini_oauth": "gemini-oauth",
+    "gemini-1": "gemini-oauth",
+    "gemini-2": "gemini-oauth",
+    "gemini-3": "gemini-oauth",
+    "gemini-4": "gemini-oauth",
+    "gemini-5": "gemini-oauth",
+    "gemini-oauth-1": "gemini-oauth",
+    "gemini-oauth-2": "gemini-oauth",
+    "gemini-oauth-3": "gemini-oauth",
+    "gemini-oauth-4": "gemini-oauth",
+    "gemini-oauth-5": "gemini-oauth",
+
     # deepseek
     "deep-seek": "deepseek",
 
@@ -459,6 +479,12 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "vertex": "Google Vertex AI",
     "ollama-cloud": "Ollama Cloud",
     "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)",
+    "gemini-oauth": "Google Gemini (OAuth)",
+    "gemini-1": "Google Gemini (OAuth)",
+    "gemini-2": "Google Gemini (OAuth)",
+    "gemini-3": "Google Gemini (OAuth)",
+    "gemini-4": "Google Gemini (OAuth)",
+    "gemini-5": "Google Gemini (OAuth)",
     "opencode-free": "OpenCode Free",
 }
 

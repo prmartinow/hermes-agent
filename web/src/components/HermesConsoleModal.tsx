@@ -346,7 +346,8 @@ export function HermesConsoleModal({ open, onClose }: HermesConsoleModalProps) {
     let resizeFrame = 0;
     const term = new XtermTerminal({
       allowProposedApi: true,
-      cursorBlink: true,
+      cursorStyle: "underline",
+      cursorBlink: false,
       fontFamily:
         "'JetBrains Mono', 'Cascadia Mono', 'Fira Code', 'MesloLGS NF', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
       fontSize: 13,

@@ -3219,6 +3219,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             if model is None:
                 continue  # skip provider if we don't know a valid aux model
             logger.debug("Auxiliary text client: %s (%s) via pool", pconfig.name, model)
+            if provider_id in {"gemini-oauth", "gemini_oauth"} or re.match(r"^gemini(?:-oauth)?-[1-5]$", provider_id):
+                from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+                return GeminiCloudCodeClient(access_token=api_key, base_url=raw_base_url), model
             if provider_id == "gemini":
                 from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
@@ -3259,6 +3262,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         if model is None:
             continue  # skip provider if we don't know a valid aux model
         logger.debug("Auxiliary text client: %s (%s)", pconfig.name, model)
+        if provider_id in {"gemini-oauth", "gemini_oauth"} or re.match(r"^gemini(?:-oauth)?-[1-5]$", provider_id):
+            from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+            return GeminiCloudCodeClient(access_token=api_key, base_url=raw_base_url), model
         if provider_id == "gemini":
             from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
 
@@ -6717,6 +6723,13 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     if isinstance(sync_client, BedrockAuxiliaryClient):
         return AsyncBedrockAuxiliaryClient(sync_client), model
     try:
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient, AsyncGeminiCloudCodeClient
+
+        if isinstance(sync_client, GeminiCloudCodeClient):
+            return AsyncGeminiCloudCodeClient(sync_client), model
+    except ImportError:
+        pass
+    try:
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
 
         if isinstance(sync_client, GeminiNativeClient):
@@ -7093,6 +7106,33 @@ def resolve_provider_client(
         final_model = _normalize_resolved_model(model or default, provider)
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
+
+    # ── Google Gemini OAuth (Antigravity / Cloud Code PA) ─────────────
+    if provider in {"gemini-oauth", "gemini_oauth"} or (provider and re.match(r"^gemini(?:-oauth)?-[1-5]$", str(provider))):
+        try:
+            from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials, _normalize_gemini_account_id
+            from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+            from agent.gemini_native_adapter import bare_gemini_model_id
+
+            acc_idx = _normalize_gemini_account_id(provider)
+            creds = resolve_gemini_oauth_runtime_credentials(account=acc_idx, refresh_if_expiring=True)
+            access_token = creds.get("api_key") or creds.get("access_token")
+            base_url = creds.get("base_url") or "https://cloudcode-pa.googleapis.com/v1internal"
+            if not access_token:
+                logger.warning(
+                    "resolve_provider_client: %s requested but no Google OAuth token found (run: hermes auth add %s)",
+                    provider, provider
+                )
+                return None, None
+            client = GeminiCloudCodeClient(access_token=access_token, base_url=base_url)
+            default = "gemini-3.6-flash-low"
+            raw_model = model or default
+            final_model = bare_gemini_model_id(raw_model)
+            return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
+                    else (client, final_model))
+        except Exception as exc:
+            logger.warning("resolve_provider_client: %s credential resolution failed: %s", provider, exc)
+            return None, None
 
     # ── Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY) ───────────
     if provider == "custom":

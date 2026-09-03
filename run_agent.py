@@ -148,6 +148,25 @@ def _gateway_origin_json(agent: "AIAgent") -> Optional[str]:
         return None
 
 
+_PENDING_LEASE_CLEANUP: set[tuple[str, str]] = set()
+_PENDING_LEASE_CLEANUP_LOCK = threading.Lock()
+
+
+def _drain_pending_lease_cleanups(db: Any) -> None:
+    """Best-effort reclaim of turn leases stranded by transient DB lock contention."""
+    if not _PENDING_LEASE_CLEANUP or not callable(getattr(db, "release_session_turn_lease", None)):
+        return
+    with _PENDING_LEASE_CLEANUP_LOCK:
+        items = list(_PENDING_LEASE_CLEANUP)
+    for sid, h in items:
+        try:
+            db.release_session_turn_lease(sid, h)
+            with _PENDING_LEASE_CLEANUP_LOCK:
+                _PENDING_LEASE_CLEANUP.discard((sid, h))
+        except Exception:
+            pass
+
+
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
 # The other `# noqa: F401` re-exports below cover names accessed via
@@ -735,6 +754,16 @@ class AIAgent:
             # unrecoverable by find_latest_gateway_session_for_peer (regression:
             # Telegram rows with chat_id=NULL/session_key=NULL under multiplexed
             # profile routes).
+            if self.provider in {"gemini-oauth", "gemini_oauth"}:
+                try:
+                    pool = getattr(self, "_credential_pool", None)
+                    if pool:
+                        curr = pool.current()
+                        if curr:
+                            _init_model_config = dict(_init_model_config or {})
+                            _init_model_config["gemini_account"] = curr.label or curr.id
+                except Exception:
+                    pass
             self._session_db.create_session(
                 session_id=self.session_id,
                 source=source,
@@ -2575,6 +2604,42 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                _msg_disp_meta = msg.get("display_metadata")
+                if role == "assistant" and getattr(self, "provider", None) in {"gemini-oauth", "gemini_oauth"}:
+                    if not isinstance(_msg_disp_meta, dict) or not _msg_disp_meta.get("gemini_account"):
+                        try:
+                            from hermes_cli.auth import get_account_alias
+                            pool = getattr(self, "_credential_pool", None)
+                            entry_id = getattr(self, "_credential_pool_entry_id", None)
+                            curr = None
+                            if entry_id and pool:
+                                _all_entries = pool.entries() if hasattr(pool, "entries") else getattr(pool, "_entries", [])
+                                curr = next((e for e in _all_entries if getattr(e, "id", None) == entry_id), None)
+                            if curr is None and pool:
+                                curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
+                            raw_lbl = (curr.label or curr.id) if curr else entry_id
+                            if raw_lbl:
+                                _acc_alias = get_account_alias(raw_lbl)
+                                if _acc_alias:
+                                    if isinstance(_msg_disp_meta, dict):
+                                        _msg_disp_meta = dict(_msg_disp_meta)
+                                        _msg_disp_meta["gemini_account"] = _acc_alias
+                                    elif isinstance(_msg_disp_meta, str):
+                                        try:
+                                            _parsed_meta = json.loads(_msg_disp_meta)
+                                            if isinstance(_parsed_meta, dict):
+                                                _parsed_meta["gemini_account"] = _acc_alias
+                                                _msg_disp_meta = _parsed_meta
+                                            else:
+                                                _msg_disp_meta = {"gemini_account": _acc_alias}
+                                        except Exception:
+                                            _msg_disp_meta = {"gemini_account": _acc_alias}
+                                    else:
+                                        _msg_disp_meta = {"gemini_account": _acc_alias}
+                                    msg["display_metadata"] = _msg_disp_meta
+                        except Exception:
+                            pass
+
                 _row = {
                     "role": role,
                     "content": content,
@@ -2644,9 +2709,9 @@ class AIAgent:
                         self, "_active_session_turn_lease_holder", None
                     ),
                     turn_lease_ttl_seconds=getattr(
-                        self, "_active_session_turn_lease_ttl_seconds", 300.0
+                        self, "_active_session_turn_lease_ttl_seconds", 45.0
                     )
-                    or 300.0,
+                    or 45.0,
                 )
                 from agent.transcript_repair import sync_flushed_message_markers
 
@@ -6988,6 +7053,7 @@ class AIAgent:
             self._client_kwargs["default_headers"] = merged
 
     def _swap_credential(self, entry) -> None:
+        old_entry_id = getattr(self, "_credential_pool_entry_id", None)
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         self._credential_pool_entry_id = getattr(entry, "id", None)
@@ -6996,6 +7062,45 @@ class AIAgent:
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(
             runtime_base
         )
+
+        if self.provider in {"gemini-oauth", "gemini_oauth"}:
+            try:
+                from hermes_cli.auth import get_account_alias
+                import json
+                raw_label = getattr(entry, "label", None) or getattr(entry, "id", "")
+                alias = get_account_alias(raw_label)
+                if old_entry_id != self._credential_pool_entry_id:
+                    switch_msg = f"🔄 [Gemini Pool] Active account switched: {alias}"
+                    logger.info("gemini pool: switched active account to %s (%s)", alias, raw_label)
+                    if hasattr(self, "_on_commentary") and callable(self._on_commentary):
+                        try:
+                            self._on_commentary(switch_msg)
+                        except Exception:
+                            pass
+                    elif not getattr(self, "quiet_mode", False):
+                        print(f"\n{switch_msg}")
+                if self._session_db and hasattr(self._session_db, "update_session_meta") and self.session_id:
+                    try:
+                        sess = self._session_db.get_session(self.session_id)
+                        if sess:
+                            cfg = sess.get("model_config") or {}
+                            if isinstance(cfg, str):
+                                cfg = json.loads(cfg)
+                            if not isinstance(cfg, dict):
+                                cfg = {}
+                            cfg["gemini_account"] = raw_label
+                            self._session_db.update_session_meta(self.session_id, json.dumps(cfg), model=self.model)
+                    except Exception:
+                        pass
+                if hasattr(self, "_on_commentary") and callable(self._on_commentary):
+                    try:
+                        self._on_commentary(switch_msg)
+                    except Exception:
+                        pass
+                elif not getattr(self, "quiet_mode", False):
+                    print(f"\n{switch_msg}")
+            except Exception:
+                pass
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
@@ -7019,6 +7124,8 @@ class AIAgent:
         self.api_key = runtime_key
         self.base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
         self._client_kwargs["api_key"] = self.api_key
+        if "access_token" in self._client_kwargs:
+            self._client_kwargs["access_token"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
         self._replace_primary_openai_client(reason="credential_rotation")
@@ -7570,6 +7677,12 @@ class AIAgent:
                 delivered = True
             except Exception:
                 pass
+        live_writer = getattr(self, "_live_stream_writer", None)
+        if live_writer is not None:
+            try:
+                live_writer.message_delta(text)
+            except Exception:
+                pass
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -7595,6 +7708,12 @@ class AIAgent:
         if cb is not None:
             try:
                 cb(text)
+            except Exception:
+                pass
+        live_writer = getattr(self, "_live_stream_writer", None)
+        if live_writer is not None:
+            try:
+                live_writer.reasoning_delta(text)
             except Exception:
                 pass
         try:
@@ -7624,6 +7743,12 @@ class AIAgent:
                 cb(tool_name)
             except Exception:
                 pass
+        live_writer = getattr(self, "_live_stream_writer", None)
+        if live_writer is not None:
+            try:
+                live_writer.tool_generating(tool_name)
+            except Exception:
+                pass
 
     def _has_stream_consumers(self) -> bool:
         """Return True if any streaming consumer is registered."""
@@ -7637,6 +7762,10 @@ class AIAgent:
         return (
             self.stream_delta_callback is not None
             or getattr(self, "_stream_callback", None) is not None
+            or (
+                getattr(self, "_live_stream_writer", None) is not None
+                and not getattr(getattr(self, "_live_stream_writer", None), "_disabled", True)
+            )
         )
 
     def _interruptible_streaming_api_call(
@@ -9418,11 +9547,14 @@ class AIAgent:
                 # prologue. We just proved this row exists, so suppress the
                 # redundant create attempt after acquiring it.
                 self._session_db_created = True
+                _drain_pending_lease_cleanups(_turn_db)
                 _durable_holder = (
                     f"pid={os.getpid()}:turn={relay_turn_id}:platform="
                     f"{task_context['platform'] or 'unknown'}"
                 )
-                _lease_ttl = 300.0
+                _lease_ttl = float(
+                    getattr(self, "_session_turn_lease_ttl_seconds", 45.0)
+                )
                 _lease_waited = False
 
                 def _on_session_turn_lease_wait(elapsed: float) -> None:
@@ -9543,7 +9675,7 @@ class AIAgent:
                 # late refresher/release from a successor lease.
                 durable_turn_lease_stop = threading.Event()
                 _lease_refresh_interval = float(
-                    getattr(self, "_session_turn_lease_refresh_interval", 60.0)
+                    getattr(self, "_session_turn_lease_refresh_interval", 15.0)
                 )
 
                 # ── Turn liveness watchdog (#95548) ─────────────────────
@@ -9901,6 +10033,10 @@ class AIAgent:
                                 session_id,
                                 exc_info=True,
                             )
+                            with _PENDING_LEASE_CLEANUP_LOCK:
+                                _PENDING_LEASE_CLEANUP.add(
+                                    (session_id, durable_turn_lease)
+                                )
                         if (
                             getattr(self, "_active_session_turn_lease_holder", None)
                             == durable_turn_lease

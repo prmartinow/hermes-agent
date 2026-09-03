@@ -2,7 +2,7 @@ import { forceRedraw, useInput } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
-import { DASHBOARD_TUI_MODE } from '../config/env.js'
+import { DASHBOARD_TUI_MODE, TERMUX_TUI_MODE } from '../config/env.js'
 import { DOUBLE_ESC_MS, TYPING_IDLE_MS } from '../config/timing.js'
 import { applyCompletion } from '../domain/slash.js'
 import type {
@@ -12,6 +12,7 @@ import type {
   SudoRespondResponse,
   VoiceRecordResponse
 } from '../gatewayTypes.js'
+import { composerPromptWidth, cursorLayout, inputVisualHeight, stableComposerColumns } from '../lib/inputMetrics.js'
 import { isAction, isCopyShortcut, isMac, isVoiceToggleKey } from '../lib/platform.js'
 import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
@@ -569,13 +570,21 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (key.upArrow && !cState.inputBuf.length) {
+      if (!cState.input) {
+        cycleQueue(1) || cycleHistory(-1)
+
+        return
+      }
+
       const inputSel = getInputSelection()
       const cursor = inputSel && inputSel.start === inputSel.end ? inputSel.start : null
+      const totalCols = terminal.stdout?.columns ?? 80
+      const promptWidth = composerPromptWidth('›')
+      const inputCols = stableComposerColumns(totalCols, promptWidth, TERMUX_TUI_MODE)
 
-      const noLineAbove =
-        !cState.input || (cursor !== null && cState.input.lastIndexOf('\n', Math.max(0, cursor - 1)) < 0)
+      const hasLineAbove = cursor !== null && cursorLayout(cState.input, cursor, inputCols).line > 0
 
-      if (noLineAbove) {
+      if (!hasLineAbove) {
         cycleQueue(1) || cycleHistory(-1)
 
         return
@@ -583,11 +592,23 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (key.downArrow && !cState.inputBuf.length) {
+      if (!cState.input) {
+        cycleQueue(-1) || cycleHistory(1)
+
+        return
+      }
+
       const inputSel = getInputSelection()
       const cursor = inputSel && inputSel.start === inputSel.end ? inputSel.start : null
-      const noLineBelow = !cState.input || (cursor !== null && cState.input.indexOf('\n', cursor) < 0)
+      const totalCols = terminal.stdout?.columns ?? 80
+      const promptWidth = composerPromptWidth('›')
+      const inputCols = stableComposerColumns(totalCols, promptWidth, TERMUX_TUI_MODE)
 
-      if (noLineBelow || cState.historyIdx !== null) {
+      const hasLineBelow =
+        cursor !== null &&
+        cursorLayout(cState.input, cursor, inputCols).line < inputVisualHeight(cState.input, inputCols) - 1
+
+      if (!hasLineBelow || cState.historyIdx !== null) {
         cycleQueue(-1) || cycleHistory(1)
 
         return

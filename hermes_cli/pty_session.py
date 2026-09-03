@@ -69,7 +69,7 @@ class PtySession:
                         pass
                 return
             if not chunk:                            # idle tick
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
                 continue
             self.buffer.append(chunk)
             ws = self._ws
@@ -136,7 +136,7 @@ class RegistryFull(Exception):
     pass
 
 
-async def run_reaper(registry: "PtySessionRegistry", *, interval: float = 60.0) -> None:
+async def run_reaper(registry: "PtySessionRegistry", *, interval: float = 30.0) -> None:
     """Periodically reap idle/dead keep-alive sessions. Cancelled on shutdown."""
     while True:
         await asyncio.sleep(interval)
@@ -154,9 +154,35 @@ class PtySessionRegistry:
         self._buffer_cap = buffer_cap
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
+        self._standby_session: Optional[PtySession] = None
+        self._standby_lock = asyncio.Lock()
+        self._standby_spawn_fn: Optional[Callable[[], object]] = None
 
-    async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object]
-                              ) -> Tuple[PtySession, bool]:
+    def configure_standby_spawn(self, spawn_fn: Callable[[], object]) -> None:
+        self._standby_spawn_fn = spawn_fn
+
+    async def ensure_standby(self) -> None:
+        """Pre-spawn one warm standby PTY worker if none exists."""
+        if self._standby_session is not None and self._standby_session.alive:
+            return
+        if self._standby_spawn_fn is None:
+            return
+        async with self._standby_lock:
+            if self._standby_session is not None and self._standby_session.alive:
+                return
+            try:
+                bridge = await asyncio.to_thread(self._standby_spawn_fn)
+                session = PtySession("__standby__", bridge,
+                                     buffer_cap=self._buffer_cap,
+                                     read_timeout=self._read_timeout)
+                await session.start()
+                self._standby_session = session
+            except Exception:
+                # Standby failure should not crash dashboard; fallback to on-demand spawn
+                self._standby_session = None
+
+    async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object],
+                              allow_standby: bool = True) -> Tuple[PtySession, bool]:
         await self.reap_idle()
         existing = self._sessions.get(key)
         if existing is not None and existing.alive:
@@ -166,6 +192,20 @@ class PtySessionRegistry:
             self._sessions.pop(key, None)
         if len(self._sessions) >= self._max:
             self._reap_one_idle_or_raise()
+
+        # Claim standby worker if available and eligible
+        if allow_standby and self._standby_session is not None and self._standby_session.alive:
+            async with self._standby_lock:
+                if self._standby_session is not None and self._standby_session.alive:
+                    session = self._standby_session
+                    self._standby_session = None
+                    session.key = key
+                    self._sessions[key] = session
+                    # Replenish pool in background
+                    if self._standby_spawn_fn is not None:
+                        asyncio.create_task(self.ensure_standby())
+                    return session, True
+
         # PTY spawn does blocking fork/exec work — keep it off the event
         # loop (#53227).
         bridge = await asyncio.to_thread(spawn)
@@ -173,6 +213,9 @@ class PtySessionRegistry:
                              read_timeout=self._read_timeout)
         await session.start()
         self._sessions[key] = session
+        # Ensure standby worker is stocked
+        if allow_standby and self._standby_spawn_fn is not None:
+            asyncio.create_task(self.ensure_standby())
         return session, True
 
     def detach(self, key: str, ws) -> None:
@@ -182,6 +225,16 @@ class PtySessionRegistry:
 
     async def reap_idle(self, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
+        if self._standby_session is not None and not self._standby_session.alive:
+            standby = self._standby_session
+            self._standby_session = None
+            try:
+                await standby.close()
+            except Exception:
+                pass
+            if self._standby_spawn_fn is not None:
+                asyncio.create_task(self.ensure_standby())
+
         doomed = [
             key for key, s in self._sessions.items()
             if (not s.alive)
@@ -201,5 +254,12 @@ class PtySessionRegistry:
         asyncio.create_task(oldest.close())
 
     async def close_all(self) -> None:
+        if self._standby_session is not None:
+            standby = self._standby_session
+            self._standby_session = None
+            try:
+                await standby.close()
+            except Exception:
+                pass
         for key in list(self._sessions):
             await self._sessions.pop(key).close()

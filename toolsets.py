@@ -126,6 +126,16 @@ TOOLSETS = {
         "tools": ["x_search"],
         "includes": []
     },
+
+    "google_search": {
+        "description": (
+            "Native Google Search Grounding for Gemini models. Direct "
+            "server-side web search returning citations and grounding "
+            "metadata without consuming client iteration budget."
+        ),
+        "tools": ["google_search"],
+        "includes": []
+    },
     
     "vision": {
         "description": "Image analysis and vision tools",
@@ -1021,6 +1031,18 @@ def get_toolset_info(name: str) -> Dict[str, Any]:
     }
 
 
+def is_google_search_grounding_toolset(name: str) -> bool:
+    """Return True if the toolset name represents native Google Search Grounding."""
+    return (name or "").strip().lower() in {
+        "google_search", "google_grounding", "google-search", "google-grounding"
+    }
+
+
+def is_google_grounding_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
+    """Return True if Google Search Grounding is enabled in the active toolset list."""
+    if not enabled_toolsets:
+        return False
+    return any(is_google_search_grounding_toolset(ts) for ts in enabled_toolsets)
 
 
 if __name__ == "__main__":

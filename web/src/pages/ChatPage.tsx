@@ -25,8 +25,8 @@ import "@xterm/xterm/css/xterm.css";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Typography } from "@nous-research/ui/ui/components/typography/index";
 import { cn } from "@/lib/utils";
-import { Copy, PanelRight, RotateCcw, X } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Check, Copy, PanelRight, RotateCcw, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
 
@@ -36,7 +36,8 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
-import { copyTextToClipboard } from "@/lib/clipboard";
+import { copyTextSync, copyTextToClipboard } from "@/lib/clipboard";
+import { withPreservedTerminalContext } from "@/lib/terminal-state";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { createPtyCompositionForwarder } from "@/lib/pty-composition";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
@@ -219,6 +220,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   );
   const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastAssistantTurnRef = useRef<string | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
   const forceFreshPtyRef = useRef(false);
@@ -319,7 +321,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       return next;
     });
   }, []);
-  const { setEnd, setTitle } = usePageHeader();
+  const { setTitle } = usePageHeader();
   const [sessionTitleState, setSessionTitleState] = useState<{
     scope: string;
     title: string | null;
@@ -456,54 +458,68 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => mql.removeEventListener("change", onChange);
   }, []);
 
-  useLayoutEffect(() => {
-    // When hidden (non-chat tab) another page owns the header's end slot.
-    // Don't touch it AT ALL — the persistent chat host mounts (plugin
-    // manifests resolving) and updates AFTER the routed page's layout
-    // effect has already filled the slot, so even a "defensive"
-    // setEnd(null) here wipes that page's header buttons (Cron "Create",
-    // Profiles "Build", …). Ownership rule: only write to the slot while
-    // /chat is the active route AND the narrow layout needs the button;
-    // the effect cleanup handles removal on every transition out.
-    if (!isActive || !narrow) return;
-    setEnd(
-      <Button
-        ghost
-        onClick={() => setMobilePanelOpenRaw(true)}
-        aria-expanded={mobilePanelOpen}
-        aria-controls="chat-side-panel"
-        className={cn(
-          "shrink-0 rounded border border-current/20",
-          "px-2 py-1 text-xs font-medium tracking-wide",
-          "text-text-secondary hover:text-midground hover:bg-midground/5",
-        )}
-      >
-        <span className="inline-flex items-center gap-1.5">
-          <PanelRight className="h-3 w-3 shrink-0" />
-          {modelToolsLabel}
-        </span>
-      </Button>,
-    );
-    return () => setEnd(null);
-  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
+  useEffect(() => {
+    lastAssistantTurnRef.current = null;
+    if (!resumeParam) return;
+    let cancelled = false;
+    api
+      .getSessionMessages(resumeParam, scopedProfile)
+      .then((resp) => {
+        if (cancelled) return;
+        const msgs = resp.messages || [];
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const content = msgs[i].content;
+          if (msgs[i].role === "assistant" && content) {
+            lastAssistantTurnRef.current = content;
+            break;
+          }
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [resumeParam, scopedProfile]);
 
-  const handleCopyLast = () => {
-    const ws = wsRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    // Send the slash as a burst, wait long enough for Ink's tokenizer to
-    // emit a keypress event for each character (not coalesce them into a
-    // paste), then send Return as its own event.  The timing here is
-    // empirical — 100ms is safely past Node's default stdin coalescing
-    // window and well inside UI responsiveness.
-    ws.send("/copy");
-    setTimeout(() => {
-      const s = wsRef.current;
-      if (s && s.readyState === WebSocket.OPEN) s.send("\r");
-    }, 100);
-    setCopyState("copied");
-    if (copyResetRef.current) clearTimeout(copyResetRef.current);
-    copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
-    termRef.current?.focus();
+  const handleCopyLast = async () => {
+    await withPreservedTerminalContext(termRef.current, async () => {
+      if (lastAssistantTurnRef.current) {
+        await copyTextToClipboard(lastAssistantTurnRef.current);
+        setCopyState("copied");
+        if (copyResetRef.current) clearTimeout(copyResetRef.current);
+        copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
+        return;
+      }
+
+      const targetSessionId = resumeParam;
+      if (targetSessionId) {
+        try {
+          const resp = await api.getSessionMessages(targetSessionId, scopedProfile);
+          const msgs = resp.messages || [];
+          for (let i = msgs.length - 1; i >= 0; i--) {
+            const content = msgs[i].content;
+            if (msgs[i].role === "assistant" && content) {
+              lastAssistantTurnRef.current = content;
+              await copyTextToClipboard(content);
+              setCopyState("copied");
+              if (copyResetRef.current) clearTimeout(copyResetRef.current);
+              copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
+              return;
+            }
+          }
+        } catch (err) {
+          console.warn("[dashboard clipboard] failed to fetch last assistant message:", err);
+        }
+      }
+
+      const terminalSelection = termRef.current?.getSelection();
+      if (terminalSelection) {
+        await copyTextToClipboard(terminalSelection);
+        setCopyState("copied");
+        if (copyResetRef.current) clearTimeout(copyResetRef.current);
+        copyResetRef.current = setTimeout(() => setCopyState("idle"), 1500);
+      }
+    });
   };
 
   useEffect(() => {
@@ -531,7 +547,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const tierW0 = terminalTierWidthPx(host);
     const term = new Terminal({
       allowProposedApi: true,
-      cursorBlink: true,
+      cursorStyle: "underline",
+      cursorBlink: false,
       fontFamily:
         "'JetBrains Mono', 'Cascadia Mono', 'Fira Code', 'MesloLGS NF', 'Source Code Pro', Menlo, Consolas, 'DejaVu Sans Mono', monospace",
       fontSize: terminalFontSizeForWidth(tierW0),
@@ -553,7 +570,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       rightClickSelectsWord: true,
       // Browser-embedded chat runs the TUI in inline mode. Keep transcript
       // history in xterm.js so the browser wheel can scroll it directly.
-      scrollback: 5000,
+      scrollback: 50000,
       theme: terminalTheme,
     });
     termRef.current = term;
@@ -597,11 +614,9 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         const binary = atob(payload);
         const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
         const text = new TextDecoder("utf-8").decode(bytes);
-        // copyTextToClipboard falls back to a selection-based copy when the
-        // Clipboard API is unavailable (plain-HTTP deployments) or when the
-        // write is rejected — e.g. the OSC 52 response arriving outside the
-        // original keydown event's activation ("user gesture" requirement).
-        void copyTextToClipboard(text).then((copied) => {
+        void withPreservedTerminalContext(term, async () => {
+          copyTextSync(text);
+          const copied = await copyTextToClipboard(text);
           if (!copied) {
             console.warn("[dashboard clipboard] OSC 52 write failed");
           }
@@ -631,18 +646,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const driveImageAttach = async (paths: string[]) => {
       for (const path of paths) {
         if (imageUploadDisposed) return;
-        const ws = wsRef.current;
-        if (!ws || ws.readyState !== WebSocket.OPEN) {
-          setBanner(
-            "Image uploaded, but chat is not connected — try again.",
-          );
-          return;
-        }
-        ws.send(`/image ${path}`);
-        await new Promise<void>((resolve) => window.setTimeout(resolve, 100));
-        const s = wsRef.current;
-        if (!s || s.readyState !== WebSocket.OPEN) return;
-        s.send("\r");
+        term.paste(path);
         await pasteDelay();
       }
       term.focus();
@@ -661,10 +665,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
     const handleBrowserPaste = (ev: ClipboardEvent) => {
       const files = imageFilesFromTransfer(ev.clipboardData);
-      if (!files.length) return;
-      ev.preventDefault();
-      ev.stopPropagation();
-      uploadAndAttachImages(files);
+      if (files.length) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        uploadAndAttachImages(files);
+        return;
+      }
+      const text = ev.clipboardData?.getData("text/plain");
+      if (text) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        term.paste(text);
+        return;
+      }
     };
     const handleBrowserDragOver = (ev: DragEvent) => {
       if (!transferMayContainImage(ev.dataTransfer)) return;
@@ -688,14 +701,16 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // Copy: Cmd+C on macOS, Ctrl+C or Ctrl+Shift+C elsewhere. Copy only
       // when xterm has a selection; without one Ctrl+C still reaches the TUI
       // as SIGINT.
-      // Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
-      const copyModifier = isMac ? ev.metaKey : ev.ctrlKey;
-      // Paste on BARE Ctrl+V too (not only Ctrl+Shift+V). Bare Ctrl+V otherwise
-      // falls through to the TUI, whose server-side clipboard read can't see the
-      // browser/OS clipboard → "No image found in clipboard". Routing Ctrl+V
-      // through the same navigator.clipboard path below makes it paste
-      // image-or-text correctly, like Ctrl+Shift+V.
-      const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey;
+      // Paste: Cmd+V / Cmd+Shift+V on macOS, Ctrl+V / Ctrl+Shift+V on others.
+      const isCopy =
+        ((isMac ? ev.metaKey : ev.ctrlKey) ||
+          (ev.shiftKey && (ev.metaKey || ev.ctrlKey))) &&
+        !ev.altKey &&
+        ev.key.toLowerCase() === "c";
+      const isPaste =
+        (ev.metaKey || ev.ctrlKey) &&
+        !ev.altKey &&
+        ev.key.toLowerCase() === "v";
 
       const terminalSelection = term.getSelection();
       const shortcut = resolvePtyKeyboardShortcut(
@@ -704,23 +719,26 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         Boolean(terminalSelection),
       );
 
-      if (
-        (shortcut === "copy" ||
-          (copyModifier && ev.shiftKey && ev.key.toLowerCase() === "c")) &&
-        terminalSelection
-      ) {
-        // Direct copy inside the keydown handler preserves the user
-        // gesture — async round-trips through OSC 52 can lose activation
-        // and fail with "Document is not focused". copyTextToClipboard
-        // additionally covers insecure (plain-HTTP) contexts where the
-        // Clipboard API is unavailable.
-        void copyTextToClipboard(terminalSelection).then((copied) => {
-          if (!copied) {
-            console.warn("[dashboard clipboard] direct copy failed");
-          }
-        });
-        // Clear xterm.js's highlight after copy (matches gnome-terminal).
-        term.clearSelection();
+      if (shortcut === "copy" || isCopy) {
+        if (terminalSelection) {
+          void withPreservedTerminalContext(term, async () => {
+            copyTextSync(terminalSelection);
+            await copyTextToClipboard(terminalSelection);
+            term.clearSelection();
+            if (typeof window !== "undefined") {
+              window.getSelection()?.removeAllRanges();
+            }
+          });
+          ev.preventDefault();
+          return false;
+        }
+
+        // If xterm DOM selection is empty, forward Ctrl+C (\x03) across the PTY WebSocket
+        // so Ink executes copySelection() on its virtual selection and emits OSC 52!
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send("\x03");
+        }
         ev.preventDefault();
         return false;
       }
@@ -745,44 +763,50 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         return false;
       }
 
-      if (pasteModifier && ev.key.toLowerCase() === "v") {
-        // preventDefault suppresses the DOM paste event, so image paste must
-        // be handled here via clipboard.read() — readText() alone misses
-        // image-only clipboards (the Discord / #24860 failure mode).
-        ev.preventDefault();
-        void (async () => {
-          try {
-            const read = navigator.clipboard?.read;
-            if (typeof read === "function") {
-              const items = await read.call(navigator.clipboard);
-              const files: File[] = [];
-              for (const item of items) {
-                const type = item.types.find((t) => t.startsWith("image/"));
-                if (!type) continue;
-                const blob = await item.getType(type);
-                const ext = type.split("/")[1]?.split("+")[0] || "png";
-                files.push(
-                  new File([blob], `clipboard.${ext}`, { type }),
-                );
+      if (isPaste) {
+        if (isMac && ev.metaKey) {
+          // On macOS, Cmd+V natively dispatches the DOM 'paste' event to handleBrowserPaste above.
+          // Returning true lets the browser fire the event with ev.clipboardData on all protocols.
+          return true;
+        }
+
+        // For non-Mac Ctrl+V, read from navigator.clipboard if available
+        if (typeof navigator !== "undefined" && navigator.clipboard) {
+          void (async () => {
+            try {
+              const read = navigator.clipboard.read;
+              if (typeof read === "function") {
+                const items = await read.call(navigator.clipboard);
+                const files: File[] = [];
+                for (const item of items) {
+                  const type = item.types.find((t) => t.startsWith("image/"));
+                  if (!type) continue;
+                  const blob = await item.getType(type);
+                  const ext = type.split("/")[1]?.split("+")[0] || "png";
+                  files.push(
+                    new File([blob], `clipboard.${ext}`, { type }),
+                  );
+                }
+                if (files.length) {
+                  uploadAndAttachImages(files);
+                  return;
+                }
               }
-              if (files.length) {
-                uploadAndAttachImages(files);
-                return;
-              }
+            } catch {
+              /* fall through to text paste */
             }
-          } catch {
-            /* fall through to text paste */
-          }
-          try {
-            const text = await navigator.clipboard.readText();
-            if (text) term.paste(text);
-          } catch (err) {
-            const message =
-              err instanceof Error ? err.message : String(err);
-            console.warn("[dashboard clipboard] paste failed:", message);
-          }
-        })();
-        return false;
+            try {
+              const text = await navigator.clipboard.readText();
+              if (text) term.paste(text);
+            } catch {
+              /* non-secure context or denied */
+            }
+          })();
+          ev.preventDefault();
+          return false;
+        }
+
+        return true;
       }
 
       return true;
@@ -791,22 +815,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const fit = new FitAddon();
     fitRef.current = fit;
     term.loadAddon(fit);
-
-    // Dashboard chat should scroll the browser-side transcript, not send
-    // mouse-wheel protocol bytes through the PTY.
-    term.attachCustomWheelEventHandler((ev) => {
-      const delta = ev.deltaY;
-      if (!delta) {
-        return false;
-      }
-
-      const step = Math.max(1, Math.round(Math.abs(delta) / 50));
-      term.scrollLines(delta > 0 ? step : -step);
-
-      ev.preventDefault();
-      ev.stopPropagation();
-      return false;
-    });
 
     const unicode11 = new Unicode11Addon();
     term.loadAddon(unicode11);
@@ -822,6 +830,18 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       sendComposedText(data);
     });
     term.open(host);
+
+    // Synchronous initial fit to eliminate the 80x24 -> actual dims resize jump on frame 2
+    if (host.clientWidth > 0 && host.clientHeight > 0) {
+      const initialW = terminalTierWidthPx(host);
+      term.options.fontSize = terminalFontSizeForWidth(initialW);
+      term.options.lineHeight = terminalLineHeightForWidth(initialW);
+      try {
+        fit.fit();
+      } catch {
+        /* ignore */
+      }
+    }
 
     // IME composition guard (fixes #52111).
     //
@@ -945,10 +965,23 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         term.options.fontSize = nextSize;
         term.options.lineHeight = nextLh;
       }
+      const wasPinned = isViewportPinnedToBottom(term.buffer.active);
+      const prevCols = term.cols;
+      const prevRows = term.rows;
       try {
         fit.fit();
       } catch {
         return;
+      }
+      const dimsChanged = term.cols !== prevCols || term.rows !== prevRows;
+      if (dimsChanged || fontChanged) {
+        if (wasPinned || stickToBottomRef.current) {
+          try {
+            term.scrollToBottom();
+          } catch {
+            /* ignore */
+          }
+        }
       }
       if (fontChanged && term.rows > 0) {
         try {
@@ -958,7 +991,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         }
       }
       if (
-        fontChanged &&
+        (fontChanged || dimsChanged) &&
         wsRef.current &&
         wsRef.current.readyState === WebSocket.OPEN
       ) {
@@ -1087,10 +1120,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         resumeMaxTimer = null;
       }
     };
+    let isReplayActive = Boolean(resumeParam);
     const finishResumeHydration = () => {
       clearResumeLoadingTimers();
+      isReplayActive = false;
       if (!unmounting) {
         setResumeHydrating(false);
+      }
+      if (stickToBottomRef.current) {
+        try {
+          term.scrollToBottom();
+        } catch {
+          /* ignore */
+        }
       }
     };
     const noteResumePtyChunk = (chunkText: string) => {
@@ -1173,25 +1215,30 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
 
-      ticketTimer = setTimeout(() => {
-        ticketTimer = null;
-        if (unmounting || ticketSuperseded) {
+      let url: string;
+      const syncUrl = api.buildWsUrlSync("/api/pty", params);
+      if (syncUrl) {
+        url = syncUrl;
+      } else {
+        ticketTimer = setTimeout(() => {
+          ticketTimer = null;
+          if (unmounting || ticketSuperseded) {
+            return;
+          }
+          failTicketAttempt();
+        }, PTY_TICKET_TIMEOUT_MS);
+
+        try {
+          url = await api.buildWsUrl("/api/pty", params);
+        } catch (err) {
+          if (unmounting || ticketSuperseded) return;
+          console.warn(`[chat] PTY ticket request failed: ${err}`);
+          failTicketAttempt();
           return;
         }
-        failTicketAttempt();
-      }, PTY_TICKET_TIMEOUT_MS);
-
-      let url: string;
-      try {
-        url = await api.buildWsUrl("/api/pty", params);
-      } catch (err) {
         if (unmounting || ticketSuperseded) return;
-        console.warn(`[chat] PTY ticket request failed: ${err}`);
-        failTicketAttempt();
-        return;
+        clearTicketTimer();
       }
-      if (unmounting || ticketSuperseded) return;
-      clearTicketTimer();
 
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
@@ -1221,6 +1268,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       setLastCloseCode(null);
       setPtyState("open");
       blockedInputNoticeRef.current = false;
+      term.reset();
       // Connected — cancel any pending reconnect from a prior transient drop.
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
@@ -1263,6 +1311,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const decoder = new TextDecoder();
     const sanitizer = new PtyResumeSanitizer();
     const beginResumeReplay = () => {
+      isReplayActive = true;
       stickToBottomRef.current = true;
       if (!eraseSuppressionTimer) {
         eraseSuppressionTimer = setTimeout(() => {
@@ -1282,15 +1331,29 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       beginResumeReplay();
     }
 
+    let pendingWriteChunks: string[] = [];
+    let rafWriteHandle: number | null = null;
+
+    const flushWrites = () => {
+      if (pendingWriteChunks.length === 0) return;
+      const batch = pendingWriteChunks.join("");
+      pendingWriteChunks = [];
+      rafWriteHandle = null;
+
+      const followScroll = shouldFollowPtyOutput(
+        effectiveResume,
+        stickToBottomRef.current,
+        isReplayActive,
+      )
+        ? () => termRef.current?.scrollToBottom()
+        : undefined;
+
+      term.write(batch, followScroll);
+      noteResumePtyChunk(batch);
+    };
+
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
-        // The active-session fallback (no `?resume=` on the URL) tells us
-        // via a one-off JSON control frame that a replay is starting (#93518,
-        // see `pty_ws` in web_server.py). Real PTY output always arrives as
-        // binary frames, so any text frame is a candidate; anything that
-        // isn't this control shape (e.g. the ANSI "Chat unavailable" banners
-        // pty_ws sends as text on failure) falls through to the write path
-        // below unchanged.
         const resumeId = parseResumeControlMessage(ev.data);
         if (resumeId) {
           effectiveResume = resumeId;
@@ -1304,26 +1367,27 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           : decoder.decode(new Uint8Array(ev.data as ArrayBuffer), {
               stream: true,
             });
-      // Gate hydration on the payload actually written to xterm. The
-      // sanitizer can turn a nonempty erase-only / all-newline / partial-CSI
-      // resume frame into "" (pty-resume-sanitizer.ts); keying off raw `text`
-      // would hide the wait notice while the terminal is still blank.
       const rendered = effectiveResume ? sanitizer.next(text) : text;
-      // Resume replay lands over many write chunks; pin the viewport to the
-      // bottom as each chunk COMMITS (xterm write callback) instead of
-      // guessing with a fixed delay, and release the pin the moment the user
-      // scrolls up to read the backlog (#59591).
-      const followScroll = shouldFollowPtyOutput(
-        effectiveResume,
-        stickToBottomRef.current,
-      )
-        ? () => termRef.current?.scrollToBottom()
-        : undefined;
-      term.write(rendered, followScroll);
-      noteResumePtyChunk(rendered);
+      if (!rendered) return;
+
+      pendingWriteChunks.push(rendered);
+      if (pendingWriteChunks.length > 30 || rendered.length > 8192) {
+        if (rafWriteHandle !== null) {
+          cancelAnimationFrame(rafWriteHandle);
+          rafWriteHandle = null;
+        }
+        flushWrites();
+      } else if (rafWriteHandle === null) {
+        rafWriteHandle = requestAnimationFrame(flushWrites);
+      }
     };
 
     ws.onclose = (ev) => {
+      if (rafWriteHandle !== null) {
+        cancelAnimationFrame(rafWriteHandle);
+        rafWriteHandle = null;
+      }
+      flushWrites();
       // Drain buffered sanitizer state. A buffered partial escape is dropped
       // (writing an unterminated CSI would wedge xterm's parser); a buffered
       // newline run is emitted collapsed.
@@ -1439,22 +1503,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
       const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
       const forwardPtyData = (data: string, useMobileReplacement = true) => {
-        // Mouse reports (scroll wheel etc.) are not typed input — swallow
-        // them before the blocked-input check so scrolling a disconnected
-        // terminal doesn't trip the "reconnecting" notice.
-        if (SGR_MOUSE_RE.test(data)) {
-          return;
-        }
-
         if (
           ws.readyState !== WebSocket.OPEN ||
           shouldBlockPtyInput(ptyStateRef.current)
         ) {
-          if (!blockedInputNoticeRef.current) {
+          if (!SGR_MOUSE_RE.test(data) && !blockedInputNoticeRef.current) {
             blockedInputNoticeRef.current = true;
             term.write(
               `\r\n\x1b[33m[${PTY_RECONNECT_INPUT_MESSAGE}]\x1b[0m\r\n`,
             );
+          }
+          return;
+        }
+
+        if (SGR_MOUSE_RE.test(data)) {
+          try {
+            ws.send(data);
+          } catch {
+            /* socket closed */
           }
           return;
         }
@@ -1828,8 +1894,56 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         >
           <div
             ref={hostRef}
-            className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
+            className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1 [&_.xterm-viewport]:scrollbar-none [&_.xterm-viewport]:[scrollbar-width:none] [&_.xterm-viewport::-webkit-scrollbar]:hidden"
           />
+
+          {/* Floating Icon-Only Copy Last Response Button (Bottom-Right) */}
+          <Button
+            ghost
+            onClick={handleCopyLast}
+            title={
+              copyState === "copied"
+                ? "Copied to clipboard!"
+                : "Copy last assistant response as raw markdown"
+            }
+            aria-label="Copy last assistant response"
+            className={cn(
+              "absolute z-10",
+              "rounded border border-current/30",
+              "bg-black/30 backdrop-blur-sm",
+              "opacity-70 hover:opacity-100 hover:border-current/60",
+              "transition-opacity duration-150",
+              "bottom-2 right-2 p-1.5 sm:bottom-3 sm:right-3 lg:bottom-4 lg:right-4",
+            )}
+            style={{ color: terminalFg }}
+          >
+            {copyState === "copied" ? (
+              <Check className="h-3.5 w-3.5 shrink-0 text-success" />
+            ) : (
+              <Copy className="h-3.5 w-3.5 shrink-0" />
+            )}
+          </Button>
+
+          {/* Floating Icon-Only Panel Button (Top-Right) */}
+          {(narrow || chatPanelCollapsed) && (
+            <Button
+              ghost
+              onClick={narrow ? () => setMobilePanelOpenRaw(true) : toggleChatPanel}
+              title="Show side panel (model + sessions)"
+              aria-label="Show chat side panel"
+              className={cn(
+                "absolute z-10",
+                "rounded border border-current/30",
+                "bg-black/30 backdrop-blur-sm",
+                "opacity-70 hover:opacity-100 hover:border-current/60",
+                "transition-opacity duration-150",
+                "top-2 right-2 p-1.5 sm:top-3 sm:right-3",
+              )}
+              style={{ color: terminalFg }}
+            >
+              <PanelRight className="h-3.5 w-3.5 shrink-0" />
+            </Button>
+          )}
 
           {showReconnectOverlay && (
             <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">
@@ -1881,57 +1995,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
                 Start new session
               </Button>
             </div>
-          )}
-
-          <Button
-            ghost
-            onClick={handleCopyLast}
-            title="Copy last assistant response as raw markdown"
-            aria-label="Copy last assistant response"
-            className={cn(
-              "absolute z-10",
-              "normal-case tracking-normal font-normal",
-              "rounded border border-current/30",
-              "bg-black/20",
-              "opacity-70 hover:opacity-100 hover:border-current/60",
-              "transition-opacity duration-150",
-              "bottom-2 right-2 px-2 py-1 text-xs sm:bottom-3 sm:right-3 sm:px-2.5 sm:py-1.5",
-              "lg:bottom-4 lg:right-4",
-            )}
-            style={{ color: terminalFg }}
-          >
-            <span className="inline-flex items-center gap-1.5">
-              <Copy className="h-3 w-3 shrink-0" />
-              <span className="hidden min-[400px]:inline tracking-wide">
-                {copyState === "copied" ? "copied" : "copy last response"}
-              </span>
-            </span>
-          </Button>
-
-          {chatPanelCollapsed && (
-            <Button
-              ghost
-              onClick={toggleChatPanel}
-              title="Show side panel (model + sessions)"
-              aria-label="Show chat side panel"
-              className={cn(
-                "absolute z-10",
-                "normal-case tracking-normal font-normal",
-                "rounded border border-current/30",
-                "bg-black/20",
-                "opacity-70 hover:opacity-100 hover:border-current/60",
-                "transition-opacity duration-150",
-                "top-2 right-2 px-2 py-1 text-xs sm:top-3 sm:right-3",
-              )}
-              style={{ color: terminalFg }}
-            >
-              <span className="inline-flex items-center gap-1">
-                <PanelRight className="h-3 w-3 shrink-0" />
-                <span className="hidden min-[400px]:inline tracking-wide">
-                  panel
-                </span>
-              </span>
-            </Button>
           )}
         </div>
 

@@ -32,7 +32,6 @@ import {
 import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { SendDiagnosticsHost } from '@/components/send-diagnostics-dialog'
-import { TipHost } from '@/components/tips'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getLatestSessionMessages } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
@@ -46,7 +45,7 @@ import { requestVoiceConversationStart } from '@/store/composer'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronReviewRequest, setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
-import { notifyError } from '@/store/notifications'
+import { notify } from '@/store/notifications'
 import { $previewTarget } from '@/store/preview'
 import {
   $activeGatewayProfile,
@@ -74,6 +73,7 @@ import {
   $sessions,
   forgetSessionOwnerHintsForSession,
   requestSessionResume,
+  rememberedSessionProfile,
   sessionMatchesStoredId,
   sessionOwnerRouteFromRow,
   sessionPinId,
@@ -81,9 +81,11 @@ import {
   setBusy,
   setMessages
 } from '@/store/session'
+import { requestForSessionProfile } from '@/store/session-request-router'
+import { $focusedStoredSessionId, sessionTileOwnerRoute } from '@/store/session-states'
 import { clearSessionTodos, setSessionTodos, todosForHydration } from '@/store/todos'
 import { armWakeWord, stopClientCapture } from '@/store/wake-word'
-import { isAuxiliaryWindow, isBrowserWindow, isHudWindow } from '@/store/windows'
+import { isAuxiliaryWindow, isHudWindow } from '@/store/windows'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
 import { closeWorkspaceTab } from '../chat/close-tab'
@@ -152,7 +154,6 @@ import { useQuickEntryBridge } from './hooks/use-quick-entry-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
 import { McpInstallDeepLinkDialog } from './mcp-install-deeplink-dialog'
 import { $restartPreviewServer, useTitlebarToolContributions } from './panes'
-import { createSessionRpcDispatcher } from './session-rpc-dispatcher'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
 
@@ -279,7 +280,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeSessionIdRef,
     ensureSessionState,
     getRuntimeIdForStoredSession,
-    holdSessionTranscriptView,
     resetViewSync,
     runtimeIdByStoredSessionIdRef,
     selectedStoredSessionIdRef,
@@ -299,18 +299,29 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   // When chrome stays on the launch backend (Bot Mode / all-profiles
   // navigation), session-owned RPCs still have to hit the session's backend.
-  // The routing itself lives in createSessionRpcDispatcher (routed by the
-  // session the RPC targets, owner ladder in resolveSessionRpcOwner) so the
-  // exact production dispatcher is what the integration tests drive.
-  const requestGateway = useMemo(
-    () =>
-      createSessionRpcDispatcher({
-        ambientRequest: ambientRequestGateway,
-        runtimeIdByStoredSessionIdRef,
-        selectedStoredSessionIdRef,
-        sessionStateByRuntimeIdRef
-      }),
-    [ambientRequestGateway, runtimeIdByStoredSessionIdRef, selectedStoredSessionIdRef, sessionStateByRuntimeIdRef]
+  //
+  // A bot chat is a persisted TILE that already records the EXACT owning route
+  // (connectionId + profile) it was opened with — the same authoritative owner
+  // Sessions mode reads off the session row. Prefer it, keyed on the FOCUSED
+  // stored id: a tile is never $selectedStoredSessionId (that stays the primary
+  // pane), so routing off `selected` would send the bot's RPC to the primary's
+  // profile. The canonical Bot Chat is also hidden, so it never appears in
+  // $sessions and rememberedSessionProfile's row lookup misses and falls back to
+  // the ACTIVE profile — the Bot Mode "session not found" / hang. The tile route
+  // is per-session, survives relaunch, and needs no list membership, so it fixes
+  // an already-open chat too. Fall back to the list-derived profile (keyed on
+  // the same focused id) only when no tile route exists.
+  const requestGateway = useCallback(
+    <T,>(method: string, params?: Record<string, unknown>, timeoutMs?: number, signal?: AbortSignal) => {
+      const routingSessionId = $focusedStoredSessionId.get() ?? selectedStoredSessionIdRef.current
+
+      const owner =
+        (routingSessionId ? sessionTileOwnerRoute(routingSessionId) : undefined) ??
+        rememberedSessionProfile($sessions.get(), routingSessionId, $activeGatewayProfile.get())
+
+      return requestForSessionProfile<T>(owner, ambientRequestGateway, method, params ?? {}, timeoutMs, signal)
+    },
+    [ambientRequestGateway]
   )
 
   const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
@@ -500,7 +511,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     ensureSessionState,
     getRouteToken,
     getRoutedStoredSessionId,
-    holdSessionTranscriptView,
     navigate,
     onFreshDraftRouteIntent: clearRoutedSessionIntent,
     requestGateway,
@@ -767,10 +777,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           if (payload?.start_new_session !== false) {
             newSessionInProfile(targetProfile)
           } else {
-            void ensureGatewayProfile(normalizeProfileKey(targetProfile)).catch((error: unknown) => {
-              // #81094: the voice-path switch must surface its failure too.
-              notifyError(error, `Failed to switch to profile "${normalizeProfileKey(targetProfile)}"`)
-            })
+            void ensureGatewayProfile(normalizeProfileKey(targetProfile))
           }
         } else if (payload?.start_new_session !== false) {
           startFreshSessionDraft()
@@ -834,8 +841,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     refreshHermesConfig,
     refreshMessagingSessions,
     refreshSessions,
-    requestGateway,
-    updateSessionState
+    requestGateway
   })
 
   // Electron-main / OS / cross-window integrations: update polling, ⌘W close,
@@ -892,17 +898,24 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // the sidebar until its first message persists a turn and a refresh surfaces
   // it — Cursor-style. Every click opens a fresh "New session" tab (multiple
   // empty tabs are fine since none touch the session list).
-  //
-  // Bot Mode aims the "+" at the selected bot's own profile. Anything short of
-  // an exact route — a group chat's `blocked` target, an orphaned roster row —
-  // falls THROUGH to the ordinary session rather than refusing: the main strip
-  // carries plain session tabs alongside bot chats, so a "+" there must never
-  // be dead just because the sidebar's current selection has nowhere to route.
   const openNewSessionTab = useCallback(() => {
+    const workspaceMode = $workspaceMode.get()
     const workspaceOwnerKey = $workspaceOwnerKey.get()
     const workspaceNewSessionTarget = $workspaceNewSessionTarget.get()
 
-    if ($workspaceMode.get() === 'bots' && workspaceNewSessionTarget?.kind === 'route' && workspaceOwnerKey) {
+    if (workspaceMode === 'bots') {
+      if (workspaceNewSessionTarget?.kind !== 'route' || !workspaceOwnerKey) {
+        notify({
+          kind: 'info',
+          message:
+            workspaceNewSessionTarget?.kind === 'blocked'
+              ? workspaceNewSessionTarget.message
+              : 'Select a Bot or group first.'
+        })
+
+        return
+      }
+
       void openNewSessionTile('center', {
         listed: false,
         route: workspaceNewSessionTarget.route,
@@ -1023,6 +1036,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       openSession(sessionId, navigate)
     },
+    onResumeSession: sessionId => openSession(sessionId, navigate),
     onRetryResume: sessionId => void resumeSession(sessionId, true),
     onSteer: steerPrompt,
     onSubmit: submitText,
@@ -1140,10 +1154,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           } as CSSProperties
         }
       >
-        {/* HUD and the popped-out Browser have no titlebar to hang these off —
-            the clusters are `fixed`, so without this they'd float over the
-            surface as orphaned buttons. */}
-        {!isHudWindow() && !isBrowserWindow() && (
+        {/* HUD mode has no titlebar to hang these off — the clusters are
+            `fixed`, so without this they'd float over the chat as orphaned
+            buttons. Exits are the ⌘⇧H toggle and ⌘W. */}
+        {!isHudWindow() && (
           <TitlebarControls
             leftTools={leftTitlebarTools}
             onOpenSettings={() => navigate(SETTINGS_ROUTE)}
@@ -1270,18 +1284,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
       {/* Petdex floating mascot — renders nothing unless installed + enabled.
           Never in the HUD: that window is the chat bar and nothing else. */}
-      {!isHudWindow() && !isBrowserWindow() && <FloatingPet />}
-
-      {/* In-app tips. Renders nothing until the app is quiet and has something
-          to point at, and nothing at all once they're off or all retired. The
-          HUD and browser windows have none of the surfaces a tip talks about. */}
-      {!isHudWindow() && !isBrowserWindow() && <TipHost />}
+      {!isHudWindow() && <FloatingPet />}
 
       {/* Single persistent xterm host chasing the terminal pane's slot rect.
           The HUD has no terminal pane, so it has nothing to chase. */}
-      {!isHudWindow() && !isBrowserWindow() && (
-        <PersistentTerminal onAddSelectionToChat={composer.addTerminalSelectionAttachment} />
-      )}
+      {!isHudWindow() && <PersistentTerminal onAddSelectionToChat={composer.addTerminalSelectionAttachment} />}
     </ContribWiringContext.Provider>
   )
 }

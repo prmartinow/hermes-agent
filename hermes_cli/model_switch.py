@@ -50,10 +50,11 @@ from agent.models_dev import (
 )
 from utils import base_url_host_matches, base_url_hostname, base_url_origin
 
-# Providers whose picker model list should NOT be capped by max_models.
-# OpenCode Zen / Go are aggregators whose full catalogs (70+ models each) must
-# be visible so users can pick any model they have access to.
-_UNCAPPED_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "opencode-go"})
+_UNCAPPED_PICKER_PROVIDERS: frozenset[str] = frozenset({
+    "opencode-zen",
+    "opencode-go",
+    "gemini-oauth",
+})
 
 logger = logging.getLogger(__name__)
 
@@ -2901,6 +2902,10 @@ def _collect_authed_provider_slugs(
                 providers_store = store.get("providers", {}) if store else {}
                 if pid in providers_store or hermes_slug in providers_store:
                     has_creds = True
+                elif hermes_slug in {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"} or pid in {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"}:
+                    from hermes_cli.auth import has_gemini_oauth_credentials
+                    if has_gemini_oauth_credentials(account=hermes_slug or pid):
+                        has_creds = True
             except Exception:
                 pass
         if not has_creds:
@@ -3388,6 +3393,10 @@ def list_authenticated_providers(
                 providers_store = store.get("providers", {})
                 if store and (pid in providers_store or hermes_slug in providers_store):
                     has_creds = True
+                elif hermes_slug in {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"} or pid in {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"}:
+                    from hermes_cli.auth import has_gemini_oauth_credentials
+                    if has_gemini_oauth_credentials(account=hermes_slug or pid):
+                        has_creds = True
             except Exception as exc:
                 logger.debug("Auth store check failed for %s: %s", pid, exc)
         # Fallback: check the credential pool with full auto-seeding.
@@ -3519,7 +3528,7 @@ def list_authenticated_providers(
         else:
             top = model_ids[:max_models] if max_models is not None else model_ids
 
-        results.append({
+        _row_dict = {
             "slug": hermes_slug,
             "name": get_label(hermes_slug),
             "is_current": hermes_slug == current_provider or pid == current_provider,
@@ -3527,7 +3536,26 @@ def list_authenticated_providers(
             "models": top,
             "total_models": total,
             "source": "hermes",
-        })
+        }
+        if hermes_slug in {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"}:
+            try:
+                from hermes_cli.auth import (
+                    resolve_gemini_oauth_runtime_credentials,
+                    fetch_gemini_quota_summary,
+                    get_gemini_model_display_names,
+                    get_quota_for_gemini_model,
+                )
+                creds = resolve_gemini_oauth_runtime_credentials(hermes_slug, refresh_if_expiring=True)
+                token = creds.get("api_key") or creds.get("access_token")
+                quota_raw = fetch_gemini_quota_summary(token)
+                _row_dict["model_display_names"] = get_gemini_model_display_names(hermes_slug)
+                _row_dict["model_quotas"] = {
+                    mid: get_quota_for_gemini_model(mid, quota_raw) for mid in top
+                }
+            except Exception as _gerr:
+                logger.debug("Failed to populate Gemini model quotas for %s: %s", hermes_slug, _gerr)
+
+        results.append(_row_dict)
         seen_slugs.add(pid.lower())
         seen_slugs.add(hermes_slug.lower())
         _record_builtin_endpoint(hermes_slug)
@@ -3573,6 +3601,10 @@ def list_authenticated_providers(
                 _cp_providers_store = _cp_store.get("providers", {})
                 if _cp_store and _cp.slug in _cp_providers_store:
                     _cp_has_creds = True
+                elif _cp.slug in {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"}:
+                    from hermes_cli.auth import has_gemini_oauth_credentials
+                    if has_gemini_oauth_credentials(account=_cp.slug):
+                        _cp_has_creds = True
             except Exception:
                 pass
         if not _cp_has_creds:
@@ -3605,9 +3637,12 @@ def list_authenticated_providers(
             if not _cp_model_ids:
                 _cp_model_ids = curated.get(_cp.slug, [])
         _cp_total = len(_cp_model_ids)
-        _cp_top = _cp_model_ids[:max_models] if max_models is not None else _cp_model_ids
+        if _cp.slug in _UNCAPPED_PICKER_PROVIDERS:
+            _cp_top = _cp_model_ids
+        else:
+            _cp_top = _cp_model_ids[:max_models] if max_models is not None else _cp_model_ids
 
-        results.append({
+        _cp_row_dict = {
             "slug": _cp.slug,
             "name": _cp.label,
             "is_current": _cp.slug == current_provider,
@@ -3615,7 +3650,26 @@ def list_authenticated_providers(
             "models": _cp_top,
             "total_models": _cp_total,
             "source": "canonical",
-        })
+        }
+        if _cp.slug in {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"}:
+            try:
+                from hermes_cli.auth import (
+                    resolve_gemini_oauth_runtime_credentials,
+                    fetch_gemini_quota_summary,
+                    get_gemini_model_display_names,
+                    get_quota_for_gemini_model,
+                )
+                creds = resolve_gemini_oauth_runtime_credentials(_cp.slug, refresh_if_expiring=True)
+                token = creds.get("api_key") or creds.get("access_token")
+                quota_raw = fetch_gemini_quota_summary(token)
+                _cp_row_dict["model_display_names"] = get_gemini_model_display_names(_cp.slug)
+                _cp_row_dict["model_quotas"] = {
+                    mid: get_quota_for_gemini_model(mid, quota_raw) for mid in _cp_top
+                }
+            except Exception as _gerr:
+                logger.debug("Failed to populate Gemini model quotas for %s: %s", _cp.slug, _gerr)
+
+        results.append(_cp_row_dict)
         seen_slugs.add(_cp.slug.lower())
         _record_builtin_endpoint(_cp.slug)
 

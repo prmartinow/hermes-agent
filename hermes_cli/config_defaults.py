@@ -1435,6 +1435,9 @@ DEFAULT_CONFIG = {
     },
     
     "display": {
+        # Mapping from account emails or identifiers to custom user-facing display aliases.
+        # Configured in user's config.yaml (e.g. user@example.com: my-alias).
+        "account_aliases": {},
         "compact": False,
         "personality": "",
         "resume_display": "full",

@@ -466,6 +466,11 @@ def _(rid, params: dict) -> dict:
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
     defer_history = is_truthy_value(params.get("defer_history", False))
+    try:
+        viewport_limit = int(params.get("viewport_limit", 20))
+    except (TypeError, ValueError):
+        viewport_limit = 20
+    windowed = is_truthy_value(params.get("windowed", False))
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
     # the caller explicitly requests it; other clients keep upstream behavior.
@@ -729,9 +734,18 @@ def _(rid, params: dict) -> dict:
             # A lazy watch session never owns a run loop, so its payload's running
             # flag is always False — overlay the child-run registry so a reconnecting
             # watch window keeps its busy indicator while the child is still mid-run.
-            if session.get("agent") is None and _child_run_active(target):
-                payload["running"] = True
-                payload["status"] = "streaming"
+            if session.get("agent") is None:
+                is_ext_active = False
+                try:
+                    from agent.live_session_stream import is_live_session_active
+                    is_ext_active = is_live_session_active(target, profile_home=session.get("profile_home"))
+                except Exception:
+                    pass
+                if _child_run_active(target) or is_ext_active:
+                    payload["running"] = True
+                    payload["status"] = "streaming"
+                    if is_ext_active:
+                        _start_external_stream_tailer(target, sid, profile_home=session.get("profile_home"))
             return payload
 
         def _reuse_live_response(sid: str, session: dict) -> dict:
@@ -813,7 +827,7 @@ def _(rid, params: dict) -> dict:
             # feeds live replay. Fall back to it if the display read fails.
             try:
                 display_history = db.get_messages_as_conversation(
-                    target, repair_alternation=False, include_row_ids=True
+                    target, include_compacted=True, repair_alternation=False, include_row_ids=True
                 )
             except Exception:
                 logger.debug("child-watch display projection read failed", exc_info=True)
@@ -907,6 +921,93 @@ def _(rid, params: dict) -> dict:
                     },
                     record,
                 ),
+            )
+
+        # Viewport-First / Windowed resume: return total count and the trailing
+        # viewport slice immediately for sub-30ms first frame painting.
+        # Background worker asynchronously hydrates full working conversation
+        # history and warms the agent off the interactive critical path.
+        if windowed and not is_truthy_value(params.get("eager_build", False)):
+            sid = uuid.uuid4().hex[:8]
+            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+            lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
+            _enable_gateway_prompts()
+            try:
+                db.reopen_session(target)
+                if hasattr(db, "get_resume_viewport_conversations"):
+                    total_count, display_viewport = db.get_resume_viewport_conversations(
+                        target, viewport_limit=viewport_limit
+                    )
+                else:
+                    _raw, display_all = db.get_resume_conversations(target)
+                    total_count = len(display_all)
+                    display_viewport = display_all[-viewport_limit:] if viewport_limit > 0 else display_all
+            except Exception as e:
+                if lease is not None:
+                    lease.release()
+                return _err(rid, 5000, f"resume failed: {e}")
+
+            overrides = _stored_session_runtime_overrides(found) or {}
+            model_override = overrides.get("model_override") or {}
+            cwd = profile_resume_cwd or _default_session_cwd()
+            record = _deferred_session_record(
+                target,
+                cols=cols,
+                cwd=cwd,
+                history=[],
+                lease=lease,
+                source=source,
+                close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
+                profile_home=profile_home,
+                model_override=overrides.get("model_override"),
+                resume_runtime_overrides=overrides or None,
+            )
+            record["resume_history_ready"] = threading.Event()
+            record["resume_hydrating"] = True
+            record["resume_message_count"] = total_count
+            if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
+                return _ok(rid, _reuse_live_payload(*live))
+
+            _schedule_resume_hydration(sid, target, db, close_db=owns_db)
+            if owns_db:
+                owns_db = False
+            _schedule_session_cap_enforcement()
+
+            from hermes_cli.auth import resolve_session_last_used_account, get_account_alias
+            raw_acc = resolve_session_last_used_account(target, db)
+            pinned_gemini_acc = get_account_alias(raw_acc) if raw_acc else ""
+
+            messages = [] if omit_messages else _history_to_messages(display_viewport)
+            start_idx = max(0, total_count - len(messages))
+
+            return _ok(
+                rid,
+                {
+                    "session_id": sid,
+                    "resumed": target,
+                    "message_count": total_count,
+                    "viewport": {
+                        "start_index": start_idx,
+                        "end_index": total_count,
+                        "total": total_count,
+                        "has_more_before": start_idx > 0,
+                    },
+                    "messages": messages,
+                    "messages_omitted": omit_messages,
+                    "hydrating": False,
+                    "info": _lazy_resume_info(
+                        cwd,
+                        model=model_override.get("model") or "",
+                        provider=overrides.get("provider_override") or "",
+                        gemini_account=pinned_gemini_acc,
+                        profile=profile,
+                    ),
+                    "inflight": None,
+                    "running": False,
+                    "session_key": target,
+                    "started_at": record["created_at"],
+                    "status": "idle",
+                },
             )
 
         # Cold resume default: register the live session and read its stored
@@ -1834,6 +1935,71 @@ def _(rid, params: dict) -> dict:
     usage: dict = _session_usage_snapshot(session)
     if agent is None and not usage:
         usage = {"calls": 0, "input": 0, "output": 0, "total": 0}
+
+    # Attach account info, Gemini quota, and provider limits
+    try:
+        from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+        info = _session_info(agent, session) if session else {}
+        provider = (
+            info.get("provider")
+            or _metadata_mirror(session).get("provider", getattr(agent, "provider", ""))
+            or ""
+        )
+        gemini_acc = info.get("gemini_account", "")
+        session_key = str(
+            (session or {}).get("session_key")
+            or getattr(agent, "session_id", "")
+            or params.get("session_id", "")
+            or ""
+        )
+        model = (
+            info.get("model")
+            or _metadata_mirror(session).get("model", getattr(agent, "model", ""))
+            or ""
+        )
+
+        snapshot = fetch_account_usage(
+            provider,
+            account=gemini_acc,
+            session_id=session_key,
+            model=model,
+        )
+        if snapshot:
+            lines = render_account_usage_lines(snapshot)
+            if lines:
+                usage["account_lines"] = lines
+            if "gemini" in str(provider).lower():
+                from hermes_cli.auth import get_gemini_oauth_auth_status, get_account_alias
+
+                acc_idx = 1
+                if gemini_acc:
+                    for idx in range(1, 6):
+                        try:
+                            st = get_gemini_oauth_auth_status(idx)
+                            if st.get("logged_in"):
+                                alias = st.get("alias") or get_account_alias(st.get("email", ""))
+                                if str(gemini_acc).strip().lower() in (
+                                    str(idx),
+                                    (st.get("email") or "").lower(),
+                                    alias.lower(),
+                                ):
+                                    acc_idx = idx
+                                    break
+                        except Exception:
+                            pass
+                st = get_gemini_oauth_auth_status(acc_idx)
+                if st.get("logged_in"):
+                    usage["gemini_account"] = (
+                        st.get("alias")
+                        or get_account_alias(st.get("email", ""))
+                        or f"Account {acc_idx}"
+                    )
+                    if st.get("quota"):
+                        usage["quota"] = st["quota"]
+    except Exception:
+        pass
+
     # Nous credits block — agent-independent (a portal fetch), so it shows even
     # with zero API calls or on a resumed session. The TUI /usage panel renders
     # these lines regardless of `calls`. Fail-open: [] when not logged into Nous
@@ -2925,31 +3091,89 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    history = list(session.get("history", []))
-    if session.get("session_key"):
-        with _session_db(session) as db:
-            if db is not None:
-                try:
-                    # include_row_ids: the durable row id is how clients address
-                    # a specific persisted turn (reactions, and the Desktop's
-                    # content-based truncation-target resolution — #87059). The
-                    # projection in _history_to_messages only forwards row_id
-                    # when the row carries a stamp, so an unstamped read here
-                    # silently strips the one durable address clients can use.
-                    history = db.get_messages_as_conversation(
-                        session["session_key"],
-                        include_ancestors=True,
-                        include_row_ids=True,
-                    )
-                except Exception:
-                    pass
-    return _ok(
-        rid,
-        {
-            "count": len(history),
-            "messages": _history_to_messages(history),
-        },
-    )
+
+    before_index = params.get("before_index")
+    limit_param = params.get("limit")
+
+    if before_index is None and limit_param is None:
+        history = list(session.get("history", []))
+        if session.get("session_key"):
+            with _session_db(session) as db:
+                if db is not None:
+                    try:
+                        # include_row_ids: the durable row id is how clients address
+                        # a specific persisted turn (reactions, and the Desktop's
+                        # content-based truncation-target resolution — #87059). The
+                        # projection in _history_to_messages only forwards row_id
+                        # when the row carries a stamp, so an unstamped read here
+                        # silently strips the one durable address clients can use.
+                        history = db.get_messages_as_conversation(
+                            session["session_key"],
+                            include_ancestors=True,
+                            include_compacted=True,
+                            include_row_ids=True,
+                        )
+                    except Exception:
+                        pass
+        return _ok(
+            rid,
+            {
+                "count": len(history),
+                "messages": _history_to_messages(history),
+            },
+        )
+
+    stored_id = str(session.get("session_key") or params.get("session_id") or "")
+    try:
+        before_index_val = int(before_index or 0)
+    except (TypeError, ValueError):
+        before_index_val = 0
+    try:
+        limit_val = min(max(int(limit_param or 50), 1), 100)
+    except (TypeError, ValueError):
+        limit_val = 50
+
+    with _session_db(session) as db:
+        if db is None:
+            return _err(rid, 5000, "database unavailable")
+
+        session_ids = (
+            [stored_id]
+            if db._is_explicit_branch_session(stored_id)
+            else db._session_lineage_root_to_tip(stored_id)
+        )
+        placeholders = ",".join("?" for _ in session_ids)
+        offset = max(0, before_index_val - limit_val)
+        fetch_count = before_index_val - offset
+
+        with db._read_ctx() as conn:
+            rows = conn.execute(
+                f"SELECT session_id, active, compacted, {db._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1) "
+                f"ORDER BY id ASC LIMIT ? OFFSET ?",
+                tuple(session_ids) + (fetch_count, offset),
+            ).fetchall()
+
+        display_history = db._rows_to_conversation(
+            rows,
+            session_id=stored_id,
+            include_ancestors=True,
+            repair_alternation=False,
+            include_row_ids=True,
+        )
+        messages = _history_to_messages(display_history)
+
+        return _ok(
+            rid,
+            {
+                "session_id": str(params.get("session_id") or ""),
+                "messages": messages,
+                "start_index": offset,
+                "end_index": before_index_val,
+                "has_more_before": offset > 0,
+                "count": len(messages),
+            },
+        )
 
 
 @method("session.undo")

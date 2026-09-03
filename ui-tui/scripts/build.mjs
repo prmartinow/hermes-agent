@@ -35,6 +35,10 @@ await build({
   outfile: out,
   jsx: 'automatic',
   jsxImportSource: 'react',
+  minifyWhitespace: true,
+  minifySyntax: true,
+  treeShaking: true,
+  legalComments: 'none',
   // Skip the prebuilt @hermes/ink bundle and inline the source instead:
   // (1) esbuild's `__esm` helper does not await nested async init, so the
   //     prebuilt bundle's lazy `render` would never resolve when nested in

@@ -609,10 +609,19 @@ export default class Ink {
     }, 160)
   }
 
+  private pendingTerminalFocusIn = false
+
   private handleTerminalFocusChange(isFocused: boolean): void {
-    if (!isFocused || !this.options.stdout.isTTY) {
+    if (!this.options.stdout.isTTY) {
       return
     }
+
+    if (!isFocused) {
+      this.pendingTerminalFocusIn = false
+      return
+    }
+
+    this.pendingTerminalFocusIn = true
 
     // Focus-in means the terminal emulator has just made this tab/pane
     // visible again. Some emulators throttle or coalesce hidden-tab output;
@@ -635,9 +644,11 @@ export default class Ink {
     // non-destructive form — extended keys + mouse preset, no alt-screen
     // re-entry, no erase — so it costs a few idempotent bytes and no flicker.
     queueMicrotask(() => {
-      if (this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
+      if (!this.pendingTerminalFocusIn || this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
         return
       }
+
+      this.pendingTerminalFocusIn = false
 
       this.reassertTerminalModes(false)
 

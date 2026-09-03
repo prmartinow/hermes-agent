@@ -1537,7 +1537,7 @@ def _make_run_env(env: dict) -> dict:
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     merged = dict(os.environ | env)
-    run_env = {}
+    run_env = {"HERMES_ACTIVE_TURN": "1"}
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
@@ -1955,6 +1955,33 @@ def _prepend_shell_init(cmd_string: str, files: list[str]) -> str:
     return prelude + cmd_string
 
 
+def _is_already_in_host_namespace() -> bool:
+    """Return True if the current process is already in the host (PID 1) mount namespace.
+
+    When Hermes runs inside a container with HERMES_USE_NSENTER=1, it enters
+    PID 1's namespaces via nsenter. If a child process is spawned on the host
+    (or if Hermes is already running on the host), it should not attempt to
+    re-run nsenter (which will fail with 'Operation not permitted' for unprivileged users).
+    """
+    if _IS_WINDOWS:
+        return False
+    try:
+        if os.path.exists("/proc/self/ns/mnt") and os.path.exists("/proc/1/ns/mnt"):
+            return os.stat("/proc/self/ns/mnt").st_ino == os.stat("/proc/1/ns/mnt").st_ino
+    except Exception:
+        pass
+    try:
+        # Fallback check: if /proc/1/comm is systemd/init and not running in a container
+        if os.path.exists("/proc/1/comm"):
+            with open("/proc/1/comm", "r", encoding="utf-8", errors="replace") as f:
+                comm = f.read().strip().lower()
+            if comm in ("systemd", "init") and not os.path.exists("/.dockerenv") and not os.path.exists("/run/.containerenv"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host machine.
 
@@ -2061,6 +2088,15 @@ class LocalEnvironment(BaseEnvironment):
         if configured and configured.startswith("/") and os.path.isdir(configured):
             return configured.rstrip("/") or "/"
 
+        if os.getenv("HERMES_USE_NSENTER", "").lower() in ("1", "true", "yes") and not _is_already_in_host_namespace():
+            temp_dir = Path("/tmp/hermes_terminal")
+            try:
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(temp_dir, 0o777)
+                return str(temp_dir)
+            except Exception:
+                return "/tmp"
+
         for env_var in ("TMPDIR", "TMP", "TEMP"):
             candidate = self.env.get(env_var) or os.environ.get(env_var)
             if candidate and candidate.startswith("/"):
@@ -2102,34 +2138,22 @@ class LocalEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
+        use_nsenter = os.getenv("HERMES_USE_NSENTER", "").lower() in ("1", "true", "yes")
+        if use_nsenter and _is_already_in_host_namespace():
+            use_nsenter = False
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
         # custom init files so tools registered outside bash_profile
         # (nvm, asdf, pyenv, …) end up on PATH in the captured snapshot.
         # Non-login invocations are already sourcing the snapshot and
         # don't need this.
-        if login:
+        if login and not use_nsenter:
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
-        run_env = _make_run_env(self.env)
 
-        # Recover when the cwd has been deleted out from under us — usually by
-        # a previous tool call that ran ``rm -rf`` on its own working dir
-        # (issue #17558).  Popen would otherwise raise FileNotFoundError on
-        # the cwd before bash starts, wedging every subsequent call until the
-        # gateway restarts.
-        #
-        # On Windows, ``_resolve_safe_cwd`` also normalises Git Bash-style
-        # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
-        # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
-        # and spammed as a warning on every command.
         safe_cwd = _resolve_safe_cwd(self.cwd)
         if safe_cwd != self.cwd:
-            # MSYS → Windows translation alone shouldn't surface as a warning
-            # (it's a benign normalization, not a recovery). Only warn when
-            # the directory really doesn't exist on disk.
             normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
             if safe_cwd != normalized:
                 logger.warning(
@@ -2140,7 +2164,32 @@ class LocalEnvironment(BaseEnvironment):
                 )
             self.cwd = safe_cwd
 
-        _popen_cwd = self.cwd
+        if use_nsenter and not _IS_WINDOWS:
+            import shlex
+            host_user = os.getenv("HERMES_HOST_USER", "").strip()
+            host_uid = os.getenv("HERMES_UID", "1000")
+            host_gid = os.getenv("HERMES_GID", "1000")
+            home_dir = f"/home/{host_user}" if host_user else "/root"
+            hermes_home = f"{home_dir}/.hermes"
+            env_prefix = f"export HERMES_ACTIVE_TURN=1 HERMES_USE_NSENTER=0 HERMES_HOME={hermes_home} HOME={home_dir} USER={host_user or 'root'} LOGNAME={host_user or 'root'} XDG_RUNTIME_DIR=/run/user/{host_uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{host_uid}/bus; "
+            if safe_cwd:
+                wrapped_cmd = f"{env_prefix}cd {shlex.quote(safe_cwd)} && {cmd_string}"
+            else:
+                wrapped_cmd = f"{env_prefix}{cmd_string}"
+            if host_user:
+                args = [
+                    "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
+                    "--", "setpriv", "--reuid", host_uid, "--regid", host_gid, "--init-groups",
+                    "/bin/bash", "-lc", wrapped_cmd
+                ]
+            else:
+                args = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "/bin/bash", "-lc", wrapped_cmd]
+            _popen_cwd = None
+        else:
+            args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+            _popen_cwd = self.cwd
+
+        run_env = _make_run_env(self.env)
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 

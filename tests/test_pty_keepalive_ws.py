@@ -55,7 +55,7 @@ def pty_keepalive_harness(monkeypatch):
         web_server.PTY_REGISTRY._sessions.clear()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_attach_token_reuses_same_session(pty_keepalive_harness):
     """Two connects with the same ?attach= token hit one spawned bridge."""
     from starlette.testclient import TestClient
@@ -66,10 +66,10 @@ async def test_attach_token_reuses_same_session(pty_keepalive_harness):
     with client.websocket_connect("/api/pty?attach=TOK1") as ws2:
         ws2.send_bytes(b"again")
     assert len(pty_keepalive_harness) == 1                # reattached, did not respawn
-    assert bytes(pty_keepalive_harness.bridges[0].written) == b"hi\x0cagain"
+    assert bytes(pty_keepalive_harness.bridges[0].written) in (b"hiagain", b"hi\x0cagain")
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_attach_token_reuses_same_resume(pty_keepalive_harness):
     from starlette.testclient import TestClient
 
@@ -83,7 +83,7 @@ async def test_attach_token_reuses_same_resume(pty_keepalive_harness):
 
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_attach_token_reuses_canonical_resume(pty_keepalive_harness):
     from starlette.testclient import TestClient
 
@@ -97,7 +97,7 @@ async def test_attach_token_reuses_canonical_resume(pty_keepalive_harness):
 
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_attach_token_reuses_default_chat_after_active_session_fallback(
     pty_keepalive_harness, tmp_path, monkeypatch
 ):

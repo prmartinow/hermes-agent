@@ -1985,6 +1985,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    preferred_account: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -2207,7 +2208,14 @@ def resolve_runtime_provider(
     except Exception:
         pool = None
     if pool and pool.has_credentials():
-        entry = pool.select()
+        entry = None
+        if preferred_account:
+            try:
+                entry = pool.select(preferred_account=preferred_account)
+            except TypeError:
+                entry = pool.select()
+        else:
+            entry = pool.select()
         pool_api_key = ""
         if entry is not None:
             pool_api_key = (

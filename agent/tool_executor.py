@@ -1071,6 +1071,19 @@ def _begin_tool_execution(
         except Exception as callback_error:
             logging.debug("Tool start callback error: %s", callback_error)
 
+    if getattr(agent, "_live_stream_writer", None) is not None:
+        try:
+            display_args = (
+                _redact_tool_args_for_display(function_name, function_args)
+                or function_args
+            )
+            preview = _build_tool_preview(function_name, display_args)
+            agent._live_stream_writer.tool_start(
+                tool_call_id, function_name, display_args, preview=preview
+            )
+        except Exception:
+            pass
+
     if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
         try:
             _ensure_file_checkpoint(
@@ -1898,6 +1911,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug("Tool complete callback error: %s", cb_err)
+
+        if not blocked and getattr(agent, "_live_stream_writer", None) is not None:
+            try:
+                display_args = _redact_tool_args_for_display(name, args) or args
+                _preview_str = _multimodal_text_summary(display_function_result)
+                agent._live_stream_writer.tool_complete(
+                    tc.id, name, display_args, display_function_result, summary=_preview_str, duration_s=tool_duration
+                )
+            except Exception:
+                pass
 
         if (
             risk_metadata is not None

@@ -1712,6 +1712,14 @@ def init_agent(
         if not delegated_child:
             os.environ["HERMES_SESSION_ID"] = agent.session_id
 
+    # Initialize live session stream writer for real-time cross-process streaming
+    agent._live_stream_writer = None
+    try:
+        from agent.live_session_stream import LiveSessionStreamWriter
+        agent._live_stream_writer = LiveSessionStreamWriter(agent.session_id)
+    except Exception:
+        pass
+
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"

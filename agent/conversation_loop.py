@@ -2185,6 +2185,12 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    if getattr(agent, "_live_stream_writer", None) is not None:
+        try:
+            agent._live_stream_writer.turn_start(user_message)
+        except Exception:
+            pass
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -3307,6 +3313,11 @@ def run_conversation(
             # Animated thinking spinner in quiet mode
             face = random.choice(KawaiiSpinner.get_thinking_faces())
             verb = random.choice(KawaiiSpinner.get_thinking_verbs())
+            if getattr(agent, "_live_stream_writer", None) is not None:
+                try:
+                    agent._live_stream_writer.thinking_delta(f"{face} {verb}...")
+                except Exception:
+                    pass
             if agent.thinking_callback:
                 # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                 # (works in both streaming and non-streaming modes)
@@ -4536,12 +4547,12 @@ def run_conversation(
                                 # network stall doesn't need a bigger budget, but
                                 # a genuine output-cap truncation does, and the
                                 # boost is harmless for the stall case.
-                                _tc_boost_base = agent.max_tokens if agent.max_tokens else 4096
+                                _tc_boost_base = agent.max_tokens if agent.max_tokens else 8192
                                 _tc_boost = _tc_boost_base * (2 ** truncated_tool_call_retries)
                                 _tc_requested_cap = agent._requested_output_cap_from_api_kwargs(api_kwargs)
                                 if _tc_requested_cap is not None:
                                     _tc_boost = max(_tc_boost, _tc_requested_cap)
-                                _tc_boost_cap = max(32768, _tc_requested_cap or 0)
+                                _tc_boost_cap = max(65535, _tc_requested_cap or 0)
                                 agent._ephemeral_max_output_tokens = min(_tc_boost, _tc_boost_cap)
                                 # Don't append the broken response to messages;
                                 # just re-run the same API call from the current
@@ -4808,9 +4819,23 @@ def run_conversation(
                     _cache_pct = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
                         _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+
+                    _acc_info = ""
+                    try:
+                        if agent.provider in {"gemini-oauth", "gemini_oauth"}:
+                            from hermes_cli.auth import get_account_alias
+                            pool = getattr(agent, "_credential_pool", None)
+                            curr = pool.current() or pool.peek() if pool else None
+                            raw_lbl = (curr.label or curr.id) if curr else getattr(agent, "_credential_pool_entry_id", None)
+                            if raw_lbl:
+                                _acc_info = f" account={get_account_alias(raw_lbl)}"
+                    except Exception:
+                        pass
+
                     logger.info(
-                        "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
+                        "API call #%d: model=%s provider=%s%s in=%d out=%d total=%d latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
+                        _acc_info,
                         prompt_tokens, completion_tokens, total_tokens,
                         api_duration, _cache_pct,
                     )

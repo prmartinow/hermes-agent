@@ -381,6 +381,19 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemini-3.6-flash",
         "gemini-3.1-flash-lite-preview",
     ],
+    "gemini-oauth": [
+        "gemini-3.7-flash-high",
+        "gemini-3.7-flash-medium",
+        "gemini-3.7-flash-low",
+        "gemini-3.6-flash-high",
+        "gemini-3.6-flash-medium",
+        "gemini-3.6-flash-low",
+        "gemini-3.1-flash-lite",
+        "gemini-pro-agent",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6-thinking",
+        "gpt-oss-120b-medium",
+    ],
     "zai": [
         "glm-5.3",
         "glm-5.3-flash",
@@ -1380,6 +1393,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("azure-foundry",  "Azure Foundry",            "Azure Foundry (OpenAI-style or Anthropic-style endpoint, your Azure AI deployment)"),
     ProviderEntry("ai-gateway",     "Vercel AI Gateway",        "Vercel AI Gateway (Multi-model aggregator)"),
     ProviderEntry("qwen-oauth",     "Qwen OAuth (Portal)",      "Qwen OAuth (Reuses local Qwen CLI login)"),
+    ProviderEntry("gemini-oauth",   "Google Gemini (OAuth)",    "Google Gemini OAuth multi-account pool (Antigravity)"),
 ]
 
 # Auto-extend CANONICAL_PROVIDERS with any provider registered in providers/
@@ -1403,6 +1417,9 @@ except Exception:
 
 # Derived dicts — used throughout the codebase
 _PROVIDER_LABELS = {p.slug: p.label for p in CANONICAL_PROVIDERS}
+_PROVIDER_LABELS["gemini-oauth"] = "Google Gemini (OAuth)"
+for _gi in range(1, 6):
+    _PROVIDER_LABELS[f"gemini-{_gi}"] = "Google Gemini (OAuth)"
 _PROVIDER_LABELS["custom"] = "Custom endpoint"  # special case: not a named provider
 
 
@@ -1432,7 +1449,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "kimi":     ("Kimi / Moonshot", "Coding Plan, Moonshot global & China endpoints", ["kimi-coding", "kimi-coding-cn"]),
     "minimax":  ("MiniMax",         "Global, OAuth Coding Plan & China endpoints",     ["minimax", "minimax-oauth", "minimax-cn"]),
     "xai":      ("xAI Grok",        "Direct API or SuperGrok / Premium+ OAuth",        ["xai", "xai-oauth"]),
-    "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
+    "google":   ("Google Gemini",   "Google AI Studio (API key) or Gemini OAuth Pool", ["gemini", "gemini-oauth"]),
     "openai":   ("OpenAI",          "ChatGPT/Codex subscription or direct OpenAI API", ["openai-codex", "openai-api"]),
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan, Token Plan & Qwen CLI OAuth", ["alibaba", "alibaba-cn", "alibaba-coding-plan", "alibaba-coding-plan-cn", "alibaba-token-plan", "alibaba-token-plan-cn", "qwen-oauth"]),
     "opencode": ("OpenCode",        "Zen pay-as-you-go, Go subscription, or free tier", ["opencode-zen", "opencode-go", "opencode-free"]),
@@ -4512,6 +4529,12 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         except Exception:
             access_token = None
         return get_codex_model_ids(access_token=access_token)
+    if normalized in {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"}:
+        try:
+            from hermes_cli.auth import fetch_gemini_available_models
+            return fetch_gemini_available_models(account=normalized, force=force_refresh)
+        except Exception:
+            return []
     if normalized in {"copilot", "copilot-acp"}:
         try:
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())

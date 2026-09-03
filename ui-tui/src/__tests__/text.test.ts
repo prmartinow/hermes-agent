@@ -4,9 +4,11 @@ import {
   boundedLiveRenderText,
   buildToolTrailLine,
   buildVerboseToolTrailLine,
+  cleanThinkingText,
   edgePreview,
   estimateRows,
   estimateTokensRough,
+  extractThoughtTitle,
   fmtK,
   hasAnsi,
   isToolTrailResultLine,
@@ -17,6 +19,7 @@ import {
   sanitizeAnsiForRender,
   splitToolDuration,
   stripAnsi,
+  THINKING_BOUNDARY_RE,
   thinkingPreview
 } from '../lib/text.js'
 
@@ -263,5 +266,68 @@ describe('estimateRows', () => {
     const plain = 'look at test case with underscores now'
 
     expect(estimateRows(snake, w)).toBe(estimateRows(plain, w))
+  })
+})
+
+describe('cleanThinkingText edge-case safety', () => {
+  it('does not strip common English verbs from prose or list numbers', () => {
+    expect(cleanThinkingText('1. Analyzing the code')).toBe('1. Analyzing the code')
+    expect(cleanThinkingText('We are analyzing data.')).toBe('We are analyzing data.')
+    expect(cleanThinkingText('- Computing the bounds')).toBe('- Computing the bounds')
+  })
+
+  it('filters kaomoji and standalone status tickers cleanly', () => {
+    expect(cleanThinkingText('(¬_¬) synthesizing...')).toBe('')
+    expect(cleanThinkingText('( ͡° ͜ʖ ͡°) analyzing')).toBe('')
+    expect(cleanThinkingText('synthesizing...')).toBe('')
+  })
+
+  it('does not break mid-sentence bold text into multiple paragraphs', () => {
+    expect(cleanThinkingText('I think this is **important** for our design.')).toBe(
+      'I think this is **important** for our design.'
+    )
+  })
+})
+
+describe('extractThoughtTitle', () => {
+  it('extracts bold markdown titles', () => {
+    const text = '**Step 1: Diagnostic Profiling**\nFirst, we analyze execution plans.'
+    expect(extractThoughtTitle(text)).toEqual({
+      title: 'Step 1: Diagnostic Profiling',
+      body: 'First, we analyze execution plans.'
+    })
+  })
+
+  it('extracts markdown headings', () => {
+    const text = '### Trade-off Analysis\nExamining write vs read amplification.'
+    expect(extractThoughtTitle(text)).toEqual({
+      title: 'Trade-off Analysis',
+      body: 'Examining write vs read amplification.'
+    })
+  })
+
+  it('extracts numbered step headers', () => {
+    const text = '1. Identify Invariants\nCheck schema constraints and indexes.'
+    expect(extractThoughtTitle(text)).toEqual({
+      title: '1. Identify Invariants',
+      body: 'Check schema constraints and indexes.'
+    })
+  })
+
+  it('returns empty title when no heading is present', () => {
+    const text = 'Just regular thought text without a title.'
+    expect(extractThoughtTitle(text)).toEqual({
+      title: '',
+      body: 'Just regular thought text without a title.'
+    })
+  })
+})
+
+describe('THINKING_BOUNDARY_RE', () => {
+  it('matches boundary before bold step titles and headings', () => {
+    const text = 'Analyzing paragraph 1.\n\n**Step 2: Next Step**\nContinuing paragraph 2.'
+    const match = THINKING_BOUNDARY_RE.exec(text)
+    expect(match).not.toBeNull()
+    expect(match?.index).toBe(22)
   })
 })

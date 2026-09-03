@@ -1608,11 +1608,13 @@ def apply_wal_with_fallback(
                     _enforce_macos_synchronous_full(conn)
                     return "wal"
                 break
-        # Don't downgrade if another process already set WAL on disk, or if
-        # the mode cannot be verified at all (probe blocked by a concurrent
-        # opener's locks) — ownership is not provably exclusive either way.
         existing = _on_disk_journal_mode(conn)
-        if existing == "wal" or existing is None:
+        if existing == "wal":
+            _apply_wal_size_limit(conn)
+            _apply_macos_checkpoint_barrier(conn)
+            _enforce_macos_synchronous_full(conn)
+            return "wal"
+        if existing is None:
             raise
         if require_wal:
             # Caller mandates WAL — fail loudly instead of degrading to DELETE.
@@ -2042,6 +2044,7 @@ def apply_database_pragmas(
         "temp_store",
         "wal_autocheckpoint",
         "journal_size_limit",
+        "busy_timeout",
     ):
         raw_value = cfg_get(cfg, "database", pragma_name, default=None)
         if raw_value is None:
@@ -2058,6 +2061,14 @@ def apply_database_pragmas(
             continue
         try:
             conn.execute(f"PRAGMA {pragma_name}={value}")
+        except sqlite3.OperationalError:
+            pass
+
+    # Default busy_timeout to 15000ms (15s) if not explicitly set in config
+    # to absorb multi-process / multi-container write bursts safely.
+    if cfg_get(cfg, "database", "busy_timeout", default=None) is None:
+        try:
+            conn.execute("PRAGMA busy_timeout=15000")
         except sqlite3.OperationalError:
             pass
 
@@ -2173,6 +2184,27 @@ def is_malformed_schema_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.DatabaseError):
         return False
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
+
+
+# Backwards-compatibility alias
+is_malformed_schema_error = is_malformed_db_error
+
+
+def _is_not_a_database_error(exc: BaseException) -> bool:
+    """True if *exc* is SQLite's connection/file corruption error.
+
+    Raised when a connection's backing file or pages encounter corruption
+    (e.g., 'file is not a database', 'disk I/O error', or 'database disk
+    image is malformed'). The fix is a clean reconnect and pool drain.
+    """
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return (
+        "file is not a database" in msg
+        or "disk i/o error" in msg
+        or "database disk image is malformed" in msg
+    )
 
 
 # Markers that mean the host filesystem cannot accept another write. Kept as
@@ -12360,11 +12392,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 else {}
             )
 
+            # Batch fetch total cumulative message counts across all compression chains
+            all_lineage_ids = [sid for chain in chain_by_root.values() for sid in chain]
+            lineage_counts: Dict[str, int] = {}
+            if all_lineage_ids:
+                placeholders = ",".join("?" * len(all_lineage_ids))
+                with self._read_ctx() as conn:
+                    cursor = conn.execute(
+                        f"SELECT session_id, COUNT(*) FROM messages WHERE session_id IN ({placeholders}) GROUP BY session_id",
+                        all_lineage_ids,
+                    )
+                    counts_by_sid = dict(cursor.fetchall())
+                for root_id, chain in chain_by_root.items():
+                    lineage_counts[root_id] = sum(counts_by_sid.get(sid, 0) for sid in chain)
+
             projected = []
             for s in sessions:
                 tip_id = tip_ids_by_root.get(s["id"])
                 tip_row = tip_rows.get(tip_id) if tip_id else None
                 if not tip_row:
+                    s["total_message_count"] = s.get("message_count", 0)
                     projected.append(s)
                     continue
                 # Preserve the root's started_at for stable sort order, but
@@ -12378,13 +12425,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     if key in tip_row:
                         merged[key] = tip_row[key]
                 merged["_lineage_root_id"] = s["id"]
-                # Every id on the chain, intermediates included. Root and tip
-                # alone are not enough client-side: a persisted tile or route
-                # can hold a MIDDLE segment's id (it was the tip when opened,
-                # then rotated again), and with only the root/tip pair such a
-                # surface can no longer prove it names this conversation —
-                # which is how one chat ends up open twice after compaction.
                 merged["_lineage_ids"] = chain_by_root.get(s["id"]) or None
+                merged["total_message_count"] = lineage_counts.get(s["id"], merged.get("message_count", 0))
                 projected.append(merged)
             sessions = projected
 
@@ -13711,6 +13753,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         offset: int = 0,
         latest: bool = False,
         after_id: Optional[int] = None,
+        include_ancestors: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -13747,6 +13790,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError("after_id is incompatible with latest/offset paging")
         if after_id is not None and include_compacted:
             raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        session_ids = [session_id]
+        if include_ancestors and not self._is_explicit_branch_session(session_id):
+            session_ids = self._session_lineage_root_to_tip(session_id)
+
         if include_inactive:
             # Audit / debug reads: every row, including soft-deleted.
             active_clause = ""
@@ -13757,12 +13804,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             active_clause = " AND (active = 1 OR compacted = 1)"
         else:
             active_clause = " AND active = 1"
+        placeholders = ",".join("?" for _ in session_ids)
         keyset_clause = " AND id > ?" if after_id is not None else ""
         sql = (
-            "SELECT * FROM messages WHERE session_id = ?"
+            f"SELECT * FROM messages WHERE session_id IN ({placeholders})"
             f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
         )
-        params: list = [session_id]
+        params: list = list(session_ids)
         if after_id is not None:
             params.append(after_id)
         if include_compacted:
@@ -13771,9 +13819,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # generations, then apply paging.
             with self._read_ctx() as conn:
                 cursor = conn.execute(
-                    "SELECT * FROM messages WHERE session_id = ?" + active_clause
+                    f"SELECT * FROM messages WHERE session_id IN ({placeholders})" + active_clause
                     + " ORDER BY id ASC",
-                    [session_id],
+                    tuple(session_ids),
                 )
                 all_rows = cursor.fetchall()
             rows = self._dedupe_display_generations(all_rows)
@@ -14016,9 +14064,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         include_ancestors: bool = False,
         include_inactive: bool = False,
+        include_compacted: bool = False,
         repair_alternation: bool = False,
         include_row_ids: bool = False,
-        include_compacted: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -14026,7 +14074,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         By default only active messages are returned. Pass
         ``include_inactive=True`` to load soft-deleted (rewound) rows
-        as well. See :meth:`rewind_to_message`.
+        as well. See :meth:`rewind_to_message`. Pass ``include_compacted=True``
+        to include in-place compacted turns (active=0, compacted=1) for
+        complete display history while excluding soft-deleted undo rows.
 
         ``include_compacted=True`` additionally loads rows preserved by
         in-place compaction (``active=0, compacted=1``), deduped by
@@ -14370,6 +14420,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if self._is_explicit_branch_session(session_id):
             return [session_id]
         return self._session_lineage_root_to_tip(session_id)
+
+    def get_resume_viewport_conversations(
+        self, session_id: str, viewport_limit: int = 20
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        """Return (total_count, viewport_display_history) in efficient queries.
+
+        Fetches total count and the trailing `viewport_limit` rows for instant UI painting.
+        """
+        session_ids = (
+            [session_id]
+            if self._is_explicit_branch_session(session_id)
+            else self._session_lineage_root_to_tip(session_id)
+        )
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._read_ctx() as conn:
+            # 1. Fast indexed count
+            total_count = conn.execute(
+                f"SELECT COUNT(*) FROM messages WHERE session_id IN ({placeholders}) "
+                f"AND (active = 1 OR compacted = 1)",
+                tuple(session_ids),
+            ).fetchone()[0]
+
+            # 2. Viewport slice: last N rows in chronological order
+            viewport_rows = conn.execute(
+                f"SELECT * FROM ("
+                f"  SELECT session_id, active, compacted, {self._CONVERSATION_ROW_COLUMNS} "
+                f"  FROM messages WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1) "
+                f"  ORDER BY id DESC LIMIT ?"
+                f") ORDER BY id ASC",
+                tuple(session_ids) + (viewport_limit,),
+            ).fetchall()
+
+        display_history = self._rows_to_conversation(
+            viewport_rows,
+            session_id=session_id,
+            include_ancestors=True,
+            repair_alternation=False,
+            include_row_ids=True,
+        )
+        return total_count, display_history
 
     def get_resume_message_count(
         self, session_id: str, *, tip_only: bool = False

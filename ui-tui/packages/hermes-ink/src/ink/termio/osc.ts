@@ -257,10 +257,13 @@ export type ClipboardResult = {
   success: boolean
 }
 
+export const MAX_OSC52_BYTES = 256 * 1024
+
 export async function setClipboard(text: string): Promise<ClipboardResult> {
-  const b64 = Buffer.from(text, 'utf8').toString('base64')
-  const raw = osc(OSC.CLIPBOARD, 'c', b64)
-  const emitSequence = shouldEmitClipboardSequence(process.env)
+  const byteLength = Buffer.byteLength(text, 'utf8')
+  const emitSequence = shouldEmitClipboardSequence(process.env) && byteLength <= MAX_OSC52_BYTES
+  const b64 = emitSequence ? Buffer.from(text, 'utf8').toString('base64') : ''
+  const raw = emitSequence ? osc(OSC.CLIPBOARD, 'c', b64) : ''
 
   // Native safety net — fire FIRST, before the tmux await, so a quick
   // focus-switch after selecting doesn't race pbcopy. Previously this ran

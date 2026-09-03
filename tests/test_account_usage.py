@@ -95,6 +95,51 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert "Credits balance: $12.50" in snapshot.details
 
 
+def test_fetch_account_usage_gemini_oauth(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_gemini_oauth_auth_status",
+        lambda acc=1: {
+            "logged_in": True,
+            "account_id": 1,
+            "provider": "gemini-1",
+            "email": "user@example.com",
+            "alias": "alias1",
+            "quota": {
+                "gemini_5h_percent": 88.5,
+                "gemini_5h_reset": "2026-08-24T18:00:00Z",
+                "gemini_5h_countdown": "3h 18m",
+                "gemini_weekly_percent": 94.2,
+                "gemini_weekly_reset": "2026-08-30T12:00:00Z",
+                "gemini_weekly_countdown": "5d 14h",
+                "claude_5h_percent": 100.0,
+                "claude_5h_reset": None,
+                "claude_5h_countdown": None,
+                "claude_weekly_percent": 100.0,
+                "claude_weekly_reset": "2026-08-31T00:00:00Z",
+                "claude_weekly_countdown": "6d 22h",
+            },
+        },
+    )
+
+    snapshot = fetch_account_usage("gemini-oauth", account="alias1")
+
+    assert snapshot is not None
+    assert snapshot.provider == "Google Gemini (OAuth)"
+    assert snapshot.plan == "Alias: alias1"
+    assert len(snapshot.windows) == 4
+    assert snapshot.windows[0].label == "Gemini 5h Limit"
+    assert snapshot.windows[0].used_percent == 11.5
+    assert snapshot.windows[0].detail == "resets in 3h 18m"
+    assert snapshot.windows[1].label == "Gemini Weekly Limit"
+    assert snapshot.windows[1].used_percent == 5.8
+    assert snapshot.windows[1].detail == "resets in 5d 14h"
+    assert "Active Account: alias1" in snapshot.details
+
+    lines = render_account_usage_lines(snapshot)
+    assert any("Gemini 5h Limit: 88% remaining (12% used) • resets" in l for l in lines)
+    assert any("Gemini Weekly Limit: 94% remaining (6% used) • resets" in l for l in lines)
+
+
 def test_render_account_usage_lines_includes_reset_and_provider():
     snapshot = AccountUsageSnapshot(
         provider="openai-codex",

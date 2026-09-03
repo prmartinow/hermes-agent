@@ -859,4 +859,10 @@ def finalize_turn(
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
 
+    if getattr(agent, "_live_stream_writer", None) is not None:
+        try:
+            agent._live_stream_writer.message_complete(final_response or "")
+        except Exception:
+            pass
+
     return result

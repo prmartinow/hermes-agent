@@ -273,6 +273,37 @@ def _remove_minimax_oauth(provider: str, removed) -> RemovalResult:
     return result
 
 
+def _remove_antigravity_cli(provider: str, removed) -> RemovalResult:
+    """Antigravity OAuth tokens live in ~/.gemini/antigravity-cli/antigravity-oauth-token-[1..5]."""
+    result = RemovalResult()
+    acc_idx = None
+    if removed:
+        acc_idx = getattr(removed, "extra", {}).get("account_id")
+        if not acc_idx and hasattr(removed, "source"):
+            from hermes_cli.auth import _normalize_gemini_account_id
+            acc_idx = _normalize_gemini_account_id(removed.source)
+    if acc_idx is None:
+        import re
+        m = re.match(r"^gemini(?:-oauth)?-([1-5])$", provider)
+        acc_idx = int(m.group(1)) if m else 1
+
+    try:
+        from hermes_cli.auth import _antigravity_token_path
+        auth_file = _antigravity_token_path(acc_idx)
+        if auth_file.exists():
+            auth_file.unlink()
+            result.cleaned.append(f"Deleted {auth_file.name}")
+    except Exception:
+        pass
+
+    if _clear_auth_store_provider(provider):
+        result.cleaned.append(f"Cleared {provider} state from auth store")
+    result.hints.append(
+        f"Run `hermes auth add gemini-{acc_idx}` to re-authenticate."
+    )
+    return result
+
+
 def _remove_xai_oauth_device_code(provider: str, removed) -> RemovalResult:
     """xAI OAuth tokens live in auth.json providers.xai-oauth — clear them.
 
@@ -434,6 +465,11 @@ def _register_all_sources() -> None:
         provider="qwen-oauth", source_id="qwen-cli",
         remove_fn=_remove_qwen_cli,
         description="~/.qwen/oauth_creds.json",
+    ))
+    register(RemovalStep(
+        provider="gemini-oauth", source_id="antigravity_cli",
+        remove_fn=_remove_antigravity_cli,
+        description="~/.gemini/antigravity-cli/antigravity-oauth-token",
     ))
     register(RemovalStep(
         provider="minimax-oauth", source_id="oauth",

@@ -5828,12 +5828,41 @@ class GatewaySlashCommandsMixin:
         account_lines: list[str] = []
         credits_lines: list[str] = []
         if provider:
+            pinned_acc = None
+            if str(provider or "").strip().lower() in {"gemini-oauth", "gemini_oauth", "gemini"} or (provider and str(provider).startswith("gemini-")):
+                try:
+                    entry_id = getattr(agent, "_credential_pool_entry_id", None)
+                    pool = getattr(agent, "_credential_pool", None)
+                    if entry_id and pool:
+                        entries = pool.entries() if hasattr(pool, "entries") else []
+                        curr = next((e for e in entries if getattr(e, "id", None) == entry_id), None)
+                        if curr:
+                            pinned_acc = curr.label or curr.id
+                    if not pinned_acc and pool:
+                        curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
+                        if curr:
+                            pinned_acc = curr.label or curr.id
+                except Exception:
+                    pass
+
+            fetch_kwargs = {}
+            if base_url:
+                fetch_kwargs["base_url"] = base_url
+            if api_key:
+                fetch_kwargs["api_key"] = api_key
+            if str(provider or "").strip().lower() in {"gemini-oauth", "gemini_oauth", "gemini"} or (provider and str(provider).startswith("gemini-")):
+                if pinned_acc:
+                    fetch_kwargs["account"] = pinned_acc
+                if session_key:
+                    fetch_kwargs["session_id"] = session_key
+                if getattr(agent, "model", None):
+                    fetch_kwargs["model"] = getattr(agent, "model", None)
+
             try:
                 account_snapshot = await asyncio.to_thread(
                     fetch_account_usage,
                     provider,
-                    base_url=base_url,
-                    api_key=api_key,
+                    **fetch_kwargs,
                 )
             except Exception:
                 account_snapshot = None

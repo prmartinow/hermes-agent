@@ -1737,6 +1737,41 @@ def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
     return None
 
 
+def get_model_max_output_tokens(
+    model: str = "",
+    provider: str = "",
+    config_max_tokens: Optional[int] = None,
+) -> int:
+    """Resolve authoritative max output tokens for a model.
+
+    If an explicit positive ``config_max_tokens`` is provided, it is honored.
+    Otherwise, returns the native model output ceiling for known large-output
+    models (65536 for Gemini, 64000 for Claude 3.7 / 4.6+), catalog values
+    when known, or 0 when unspecified.
+    """
+    if config_max_tokens is not None and int(config_max_tokens) > 0:
+        return int(config_max_tokens)
+
+    norm_provider = (provider or "").strip().lower()
+    norm_model = (model or "").strip().lower()
+
+    if norm_provider in ("gemini", "gemini-oauth", "google") or "gemini" in norm_model:
+        return 65536
+    if "claude" in norm_model:
+        if "opus-4-6" in norm_model or "sonnet-4-6" in norm_model or "claude-3-7" in norm_model:
+            return 64000
+
+    try:
+        from agent.models_dev import get_model_capabilities
+
+        caps = get_model_capabilities(provider, model, allow_network=False)
+        if caps and caps.max_output_tokens:
+            return caps.max_output_tokens
+    except Exception:
+        pass
+    return 0
+
+
 def _invalidate_cached_context_length(model: str, base_url: str) -> None:
     """Drop a stale cache entry so it gets re-resolved on the next lookup."""
     key = _context_cache_key(model, base_url)
@@ -1807,6 +1842,27 @@ def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
             # Sanity check: must be a reasonable context length
             if 1024 <= limit <= 10_000_000:
                 return limit
+    return None
+
+
+def get_model_max_output_tokens(
+    model: str = "",
+    provider: str = "",
+    config_max_tokens: Optional[int] = None,
+) -> Optional[int]:
+    """Return the authoritative native output token limit for a model, or None."""
+    if config_max_tokens is not None and config_max_tokens > 0:
+        return config_max_tokens
+    p_lower = (provider or "").strip().lower()
+    m_lower = (model or "").strip().lower()
+    if "gemini" in p_lower or "gemini" in m_lower:
+        return 65536
+    if "claude" in m_lower or "anthropic" in p_lower:
+        if "3-7" in m_lower or "3.7" in m_lower or "4-" in m_lower:
+            return 64000
+        return 8192
+    if "gpt-4o" in m_lower:
+        return 16384
     return None
 
 
