@@ -1229,6 +1229,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'todo.updated': {
+        if (ev.payload && 'todos' in ev.payload) {
+          turnController.recordTodos(ev.payload.todos)
+        }
+
+        return
+      }
+
       case 'clarify.request': {
         const batch = (ev.payload.questions ?? [])
           .filter(q => typeof q?.qid === 'string' && q.qid && typeof q?.question === 'string' && q.question.trim())

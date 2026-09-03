@@ -57,3 +57,37 @@ export function todoTree(todos: readonly TodoItem[]): [TodoItem, number][] {
 
   return out
 }
+
+export const isTodoStatus = (status: unknown): status is TodoItem['status'] =>
+  status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'cancelled'
+
+export const parseTodos = (value: unknown): null | TodoItem[] => {
+  if (!Array.isArray(value)) {
+    return null
+  }
+
+  return value
+    .map(item => {
+      if (!item || typeof item !== 'object') {
+        return null
+      }
+
+      const row = item as Record<string, unknown>
+      const status = row.status
+
+      if (!isTodoStatus(status)) {
+        return null
+      }
+
+      const id = String(row.id ?? '').trim()
+      const parent = String(row.parent ?? '').trim()
+
+      return {
+        content: String(row.content ?? '').trim(),
+        id,
+        status,
+        ...(parent && parent !== id ? { parent } : {})
+      }
+    })
+    .filter((item): item is TodoItem => Boolean(item?.id && item.content))
+}

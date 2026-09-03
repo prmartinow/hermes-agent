@@ -296,6 +296,20 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.system.sys).not.toHaveBeenCalled()
   })
 
+  it('updates the turnStore when receiving a dedicated todo.updated gateway event', () => {
+    const appended: Msg[] = []
+
+    const todos = [
+      { content: 'Inspect repo', id: '1', status: 'completed' },
+      { content: 'Fix bug', id: '2', status: 'in_progress' }
+    ]
+
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { revision: 2, todos }, type: 'todo.updated' } as any)
+    expect(getTurnState().todos).toEqual(todos)
+  })
+
   it('clears the visible todo list when the todo tool returns an empty list', () => {
     const appended: Msg[] = []
     const todos = [{ content: 'Boil water', id: 'boil', status: 'in_progress' }]

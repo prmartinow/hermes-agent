@@ -19,7 +19,8 @@ import {
   THINKING_BOUNDARY_RE,
   toolTrailLabel
 } from '../lib/text.js'
-import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '../types.js'
+import { parseTodos } from '../lib/todo.js'
+import type { ActiveTool, ActivityItem, Msg, SubagentProgress } from '../types.js'
 
 import type { Notice } from './interfaces.js'
 import { resetFlowOverlays } from './overlayStore.js'
@@ -47,39 +48,7 @@ const diffSegmentBody = (msg: Msg): null | string => {
 
 const hasDetails = (msg: Msg): boolean => Boolean(msg.thinking || msg.tools?.length || msg.toolTokens)
 
-const isTodoStatus = (status: unknown): status is TodoItem['status'] =>
-  status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'cancelled'
 
-const parseTodos = (value: unknown): null | TodoItem[] => {
-  if (!Array.isArray(value)) {
-    return null
-  }
-
-  return value
-    .map(item => {
-      if (!item || typeof item !== 'object') {
-        return null
-      }
-
-      const row = item as Record<string, unknown>
-      const status = row.status
-
-      if (!isTodoStatus(status)) {
-        return null
-      }
-
-      const id = String(row.id ?? '').trim()
-      const parent = String(row.parent ?? '').trim()
-
-      return {
-        content: String(row.content ?? '').trim(),
-        id,
-        status,
-        ...(parent && parent !== id ? { parent } : {})
-      }
-    })
-    .filter((item): item is TodoItem => Boolean(item?.id && item.content))
-}
 
 const textSegments = (segments: Msg[]) =>
   segments.filter(msg => msg.role === 'assistant' && msg.kind !== 'diff').map(msg => msg.text)
@@ -629,6 +598,7 @@ class TurnController {
       this.reasoningSegmentIndex !== null || segments.some(msg => Boolean(msg.thinking?.trim()))
 
     const finalThinking = hasReasoningSegment ? '' : savedReasoning.trim()
+
     const thinkingMsg: Msg | null = finalThinking
       ? {
           kind: 'trail',
@@ -641,8 +611,10 @@ class TurnController {
 
     // If we have tool tokens and there is a tool-carrying segment, attach toolTokens to it
     let finalSegments = segments
+
     if (savedToolTokens) {
       const lastToolIdx = finalSegments.findLastIndex(msg => Boolean(msg.kind === 'trail' && msg.tools?.length))
+
       if (lastToolIdx >= 0) {
         finalSegments = finalSegments.map((msg, i) =>
           i === lastToolIdx ? { ...msg, toolTokens: savedToolTokens } : msg

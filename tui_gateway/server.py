@@ -9620,6 +9620,16 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             # truncation was permanent.
             if args:
                 tool_msg["args"] = args
+            if name in ("todo_list", "todo"):
+                if content_text and '"todos"' in content_text:
+                    try:
+                        parsed = json.loads(content_text)
+                        if isinstance(parsed, dict) and "todos" in parsed and isinstance(parsed["todos"], list):
+                            tool_msg["todos"] = parsed["todos"]
+                    except Exception:
+                        pass
+                if "todos" not in tool_msg and isinstance(args.get("todos"), list):
+                    tool_msg["todos"] = args["todos"]
             messages.append(tool_msg)
             continue
         # An assistant turn may carry only reasoning/thinking content with no
