@@ -14,10 +14,10 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Version | Image ID | Git Commit | Build Date (UTC) | Core Changes & Fixes | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`v0.15`** | `2fd7a9a2d368` | `491b688d0c` | 2026-09-02 20:14 | Rebuilt candidate v0.15: latest fixes, single container workflow, main-wrapper background guard | Built (Available) |
-| **`v0.14`** | `011297896f15` | `7add2d2c88` | 2026-09-02 18:05 | Candidate release v0.14: single container architecture baseline, agy v1.1.24, parity script updates | Built (Available) |
+| **`v0.15`** (Pruned) | `2fd7a9a2d368` | `491b688d0c` | 2026-09-02 20:14 | Rebuilt candidate v0.15: latest fixes, single container workflow, main-wrapper background guard | Pruned |
+| **`v0.14`** (Pruned) | `011297896f15` | `7add2d2c88` | 2026-09-02 18:05 | Candidate release v0.14: single container architecture baseline, agy v1.1.24, parity script updates | Pruned |
 | **`v0.13`** (`stable`) | `ede551db54fe` | `fb6178e5f1` | 2026-09-02 05:56 | Baked `agy v1.1.24` into image, hermes-test project isolation, web server public hosts fix, unified 1:1 host mount architecture baseline | **Active (Serving :9119, `stable`)** |
-| **`v0.12`** | `1181d8414f9a` | `875e13e227` | 2026-09-01 01:43 | Unified 1:1 host mount architecture (`~/.hermes`), read-write memory mount (`~/.hermes/agent-memory:rw`), explicit compose project names | Available (Previous Stable) |
+| **`v0.12`** (Pruned) | `1181d8414f9a` | `875e13e227` | 2026-09-01 01:43 | Unified 1:1 host mount architecture (`~/.hermes`), read-write memory mount (`~/.hermes/agent-memory:rw`), explicit compose project names | Pruned |
 | **`v0.11`** (Pruned) | `2377019b0d6a` | `58a25bffbb` | 2026-08-31 13:51 | Staging candidate deployment, ledger synchronization, v0.9 pruning | Pruned |
 | **`v0.10`** (Pruned) | `3f9a62efeb7e` | `ad7e950eb6` | 2026-08-31 12:55 | Vite TS compilerPreset null-check hardening, container release ledger pruning, stability test suite, compose gitignore updates | Pruned |
 | **`v0.9`** (Pruned) | `deb795f589d6` | `9043b6c436` | 2026-08-31 08:50 | `HERMES_WRITE_SAFE_ROOT` workspace parity in compose files, tool safety synchronization | Pruned |
