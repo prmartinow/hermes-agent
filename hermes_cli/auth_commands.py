@@ -4,6 +4,7 @@ from __future__ import annotations
 from hermes_cli.cli_output import line_input
 
 import math
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -24,7 +25,10 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth"}
+_OAUTH_CAPABLE_PROVIDERS = {
+    "anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth",
+    "gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5",
+}
 
 
 def _get_custom_provider_entries() -> list[dict]:
@@ -356,6 +360,36 @@ def auth_add_command(args) -> None:
         _add_nous_oauth_credential(args, provider)
         return
 
+    if provider in {"gemini-oauth", "gemini_oauth"} or re.match(r"^gemini(?:-oauth)?-([1-5])$", provider):
+        m = re.match(r"^gemini(?:-oauth)?-([1-5])$", provider)
+        acc_idx = int(m.group(1)) if m else 1
+        try:
+            creds = auth_mod.resolve_gemini_oauth_runtime_credentials(account=acc_idx, refresh_if_expiring=False)
+        except Exception:
+            creds = auth_mod._gemini_oauth_pkce_login(account=acc_idx)
+        auth_mod._mark_gemini_oauth_active(creds, account=acc_idx)
+        label = (getattr(args, "label", None) or "").strip() or creds.get("email") or label_from_token(
+            creds["api_key"],
+            f"{provider}-oauth-{len(pool.entries()) + 1}",
+        )
+        entry = PooledCredential(
+            provider=provider,
+            id=uuid.uuid4().hex[:6],
+            label=label,
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=f"{SOURCE_MANUAL}:gemini_{acc_idx}",
+            access_token=creds["api_key"],
+            refresh_token=creds.get("refresh_token"),
+            base_url=creds.get("base_url"),
+        )
+        first_credential = not pool.entries()
+        pool.add_entry(entry)
+        if first_credential:
+            auth_mod.mark_provider_active_if_unset(provider)
+        print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
+        return
+
     spec = _OAUTH_ADD_SPECS.get(provider)
     if spec is None:
         raise SystemExit(f"`hermes auth add {provider}` is not implemented for auth type {requested_type} yet.")
@@ -460,10 +494,36 @@ def auth_status_command(args) -> None:
         print(f"{provider}: logged out" + (f" ({reason})" if reason else ""))
         return
     print(f"{provider}: logged in")
-    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url"):
+    if status.get("email"):
+        print(f"  Account: {status['email']}")
+    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url", "source", "auth_file"):
         value = status.get(key)
         if value:
             print(f"  {key}: {value}")
+
+    quota = status.get("quota")
+    if quota and isinstance(quota, dict):
+        print("  Rate Limits & Quota:")
+        if quota.get("gemini_5h_percent") is not None or quota.get("gemini_weekly_percent") is not None:
+            print("    Gemini Models (Flash, Pro):")
+            if quota.get("gemini_5h_percent") is not None:
+                countdown = quota.get("gemini_5h_countdown")
+                reset_txt = f" (resets in {countdown})" if countdown else ""
+                print(f"      5-Hour Limit:   {quota['gemini_5h_percent']}% remaining{reset_txt}")
+            if quota.get("gemini_weekly_percent") is not None:
+                countdown = quota.get("gemini_weekly_countdown")
+                reset_txt = f" (resets in {countdown})" if countdown else ""
+                print(f"      Weekly Limit:   {quota['gemini_weekly_percent']}% remaining{reset_txt}")
+        if quota.get("claude_5h_percent") is not None or quota.get("claude_weekly_percent") is not None:
+            print("    Claude & GPT Models (Opus, Sonnet):")
+            if quota.get("claude_5h_percent") is not None:
+                countdown = quota.get("claude_5h_countdown")
+                reset_txt = f" (resets in {countdown})" if countdown else ""
+                print(f"      5-Hour Limit:   {quota['claude_5h_percent']}% remaining{reset_txt}")
+            if quota.get("claude_weekly_percent") is not None:
+                countdown = quota.get("claude_weekly_countdown")
+                reset_txt = f" (resets in {countdown})" if countdown else ""
+                print(f"      Weekly Limit:   {quota['claude_weekly_percent']}% remaining{reset_txt}")
 
 
 def auth_logout_command(args) -> None:
@@ -652,7 +712,7 @@ def _interactive_strategy() -> None:
 _AUTH_ACTIONS = {
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
     "reset": auth_reset_command, "status": auth_status_command, "logout": auth_logout_command,
-    "spotify": auth_spotify_command}
+    "spotify": auth_spotify_command, "prime": lambda args: auth_prime_command(args)}
 
 
 def auth_command(args) -> None:
@@ -661,3 +721,55 @@ def auth_command(args) -> None:
         handler(args)
     else:
         _interactive_auth()  # no subcommand
+
+
+def auth_prime_command(args=None) -> None:
+    """Kick-start sleeping quota reset timers across all authorized Gemini OAuth accounts."""
+    from hermes_cli.auth import (
+        prime_sleeping_gemini_account_timer,
+        get_gemini_oauth_auth_status,
+    )
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    console.print("\n[bold cyan]⏳ Kick-starting sleeping quota reset timers across accounts...[/bold cyan]\n")
+
+    target_acc = getattr(args, "account", None)
+    target_group = getattr(args, "group", "all")
+    force = getattr(args, "force", False)
+
+    accounts = [target_acc] if target_acc else list(range(1, 6))
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Account", style="cyan", width=12)
+    table.add_column("Email", style="white", width=30)
+    table.add_column("Gemini 5h Status", style="green")
+    table.add_column("Claude/GPT 5h Status", style="yellow")
+
+    for acc in accounts:
+        status = get_gemini_oauth_auth_status(acc)
+        if not status.get("logged_in"):
+            table.add_row(f"Account {acc}", "[dim]Not logged in[/dim]", "[dim]-[/dim]", "[dim]-[/dim]")
+            continue
+
+        email = status.get("email", "")
+        r_gem = False
+        r_claude = False
+
+        if target_group in ("gemini", "all"):
+            r_gem = prime_sleeping_gemini_account_timer(acc, model_group="gemini", force=force)
+        if target_group in ("claude", "all"):
+            r_claude = prime_sleeping_gemini_account_timer(acc, model_group="claude/gpt", force=force)
+
+        st_after = get_gemini_oauth_auth_status(acc)
+        q = st_after.get("quota") or {}
+        g_cd = q.get("gemini_5h_countdown") or ("Active" if r_gem else "Idle")
+        c_cd = q.get("claude_5h_countdown") or ("Active" if r_claude else "Idle")
+
+        gem_status = f"[green]✅ Ticking ({g_cd})[/green]" if (r_gem or q.get("gemini_5h_countdown")) else "[dim]Idle[/dim]"
+        claude_status = f"[yellow]✅ Ticking ({c_cd})[/yellow]" if (r_claude or q.get("claude_5h_countdown")) else "[dim]Idle[/dim]"
+        table.add_row(f"Account {acc}", email, gem_status, claude_status)
+
+    console.print(table)
+    console.print("\n[bold green]✨ 5-hour rolling windows are now actively counting down![/bold green]\n")

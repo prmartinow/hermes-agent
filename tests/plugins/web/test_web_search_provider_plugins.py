@@ -48,6 +48,10 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "XAI_API_KEY",
     ):
         monkeypatch.delenv(k, raising=False)
+    try:
+        monkeypatch.setattr("hermes_cli.auth.has_gemini_oauth_credentials", lambda *a, **kw: False)
+    except Exception:
+        pass
 
 
 def _ensure_plugins_loaded() -> None:
@@ -81,6 +85,8 @@ class TestBundledPluginsRegister:
             "ddgs",
             "exa",
             "firecrawl",
+            "gemini-grounding",
+            "google-grounding",
             "keenable",
             "parallel",
             "perplexity",
@@ -101,6 +107,8 @@ class TestBundledPluginsRegister:
             ("tavily", True, True),
             ("perplexity", True, True),
             ("firecrawl", True, True),
+            ("gemini-grounding", True, False),
+            ("google-grounding", True, False),
             # xai: search-only via Grok's agentic web_search tool.
             ("xai", True, False),
         ],
@@ -121,7 +129,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "perplexity", "firecrawl", "keenable", "xai"],
+        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "perplexity", "firecrawl", "gemini-grounding", "google-grounding", "keenable", "xai"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()
@@ -250,6 +258,19 @@ class TestIsAvailable:
         assert p is not None
         # Truthy or falsy, just must not raise.
         _ = bool(p.is_available())
+
+    def test_gemini_grounding_availability_reflects_oauth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Gemini Grounding lights up when Gemini OAuth credentials exist."""
+        _ensure_plugins_loaded()
+        from agent.web_search_registry import get_provider
+
+        p = get_provider("gemini-grounding")
+        assert p is not None
+        assert p.is_available() is False
+
+        monkeypatch.setattr("hermes_cli.auth.has_gemini_oauth_credentials", lambda *a, **kw: True)
+        assert p.is_available() is True
+        assert p.is_keyless_available() is True
 
     def test_xai_requires_api_key_or_oauth(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """xAI needs XAI_API_KEY or OAuth tokens in auth.json."""

@@ -38,6 +38,9 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
                                base_url_override="https://api.x.ai/v1", base_url_env_var="XAI_BASE_URL"),
     "qwen-oauth": HermesOverlay(auth_type="oauth_external", base_url_override="https://portal.qwen.ai/v1",
                                 base_url_env_var="HERMES_QWEN_BASE_URL"),
+    "gemini-oauth": HermesOverlay(auth_type="oauth_external",
+                                  base_url_override="https://daily-cloudcode-pa.googleapis.com/v1internal",
+                                  base_url_env_var="HERMES_GEMINI_OAUTH_BASE_URL"),
     "lmstudio": HermesOverlay(extra_env_vars=("LM_API_KEY",), base_url_override="http://127.0.0.1:1234/v1",
                               base_url_env_var="LM_BASE_URL"),
     "copilot-acp": HermesOverlay(transport="codex_responses", auth_type="external_process",
@@ -124,6 +127,7 @@ _ALIAS_GROUPS: Dict[str, Tuple[str, ...]] = {
     "copilot-acp": ("github-copilot-acp",), "vercel": ("ai-gateway", "aigateway", "vercel-ai-gateway"),
     "opencode": ("opencode-zen", "zen"), "opencode-go": ("go", "opencode-go-sub"),
     "opencode-free": ("free", "opencode_free"), "kilo": ("kilocode", "kilo-code", "kilo-gateway"),
+    "gemini-oauth": ("gemini-oauth", "gemini_oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5", "gemini-oauth-1", "gemini-oauth-2", "gemini-oauth-3", "gemini-oauth-4", "gemini-oauth-5"),
     "deepseek": ("deep-seek",), "alibaba": ("dashscope", "aliyun", "qwen", "alibaba-cloud"),
     "alibaba-coding-plan": ("alibaba_coding", "alibaba-coding", "alibaba_coding_plan"),
     "huggingface": ("hf", "hugging-face", "huggingface-hub"), "novita": ("novita-ai", "novitaai"),
@@ -148,6 +152,9 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "nebius-token-factory": "Nebius Token Factory", "tencent-tokenplan": "Tencent TokenPlan", "lmstudio": "LM Studio",
     "local": "Local endpoint", "bedrock": "AWS Bedrock", "vertex": "Google Vertex AI", "ollama-cloud": "Ollama Cloud",
     "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)", "opencode-free": "OpenCode Free",
+    "gemini-oauth": "Google Gemini (OAuth)", "gemini-1": "Google Gemini (OAuth)",
+    "gemini-2": "Google Gemini (OAuth)", "gemini-3": "Google Gemini (OAuth)",
+    "gemini-4": "Google Gemini (OAuth)", "gemini-5": "Google Gemini (OAuth)",
 }
 
 

@@ -402,6 +402,41 @@ export function hiddenWindowsChildOptions(options = {}, isWindows = process.plat
 If the logic lives inline in a god-file and extraction feels disruptive, that is the signal to
 extract, not to regex around it.
 
+## Gemini OAuth & Cloud Code PA Architecture (Antigravity Parity)
+
+Hermes supports first-class Google Gemini OAuth authentication and routing directly through Google's internal Cloud Code PA inference gateway (`https://daily-cloudcode-pa.googleapis.com/v1internal`). This provides full parity with the Antigravity CLI (`agy`) and Antigravity IDE.
+
+### Wire Endpoints & Quota Telemetry
+- **Inference & Model Discovery Endpoint**: `https://daily-cloudcode-pa.googleapis.com/v1internal` (`DEFAULT_GEMINI_OAUTH_BASE_URL`). Avoid using `cloudcode-pa.googleapis.com` for chat inference as non-daily endpoints enforce strict burst rate limiting resulting in HTTP 429 (`RESOURCE_EXHAUSTED`).
+- **Quota Telemetry Endpoint**: `https://daily-cloudcode-pa.googleapis.com/v1internal` (`DEFAULT_GEMINI_QUOTA_BASE_URL`). Fetches 5h and weekly quota summary via `:retrieveUserQuotaSummary`.
+
+### Project Envelope & Header Rules
+- In the Cloud Code PA envelope, pass `project: "default-cli-project"` directly.
+- `_headers()` must explicitly strip `X-Goog-User-Project` to prevent Google's backend from rejecting `"default-cli-project"` with 403 errors.
+
+### Model & Effort Resolution Pipeline (matching Antigravity CLI)
+1. **Model Discovery (`fetch_gemini_available_models`)**:
+   - Queries `fetchAvailableModels` from Google Cloud Code PA.
+   - Formats user-facing model display names matching Antigravity: `Gemini 3.7 Flash (High)`, `Gemini 3.6 Flash (High)`, `Claude Sonnet 4.6 (Thinking)`, etc.
+2. **Model & Effort Resolution (`resolve_cloudcode_model_and_effort`)**:
+   - `gemini-3.7-flash` (or `gemini-3.7-flash-high`) routes directly to Google's active 3.7 Flash wire slug `gemini-3.7-flash-tiered` with full hybrid reasoning and cryptographic thought signatures (`thoughtsTokenCount`).
+   - `gemini-3.6-flash` (or `gemini-3.6-flash-high`) routes to `gemini-3.6-flash-high`.
+   - `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, and `gpt-oss-120b-medium` pass directly without synthetic prefix mutation.
+3. **SSE Response Unwrapping**:
+   - Synchronous and streaming completion handlers unwrap `event.get("response", event)` to properly extract candidates, thought signatures, tool calls, and token usage metadata.
+
+### 5-Step Verified Quota Ignition & 24/7 Watcher Daemon
+Google Cloud Code PA quotas run on rolling 5-hour replenishment windows. When an account is fresh (100% full with 0 tokens consumed in the window), the window is 'sleeping/floating'—Google returns a dynamic `resetTime = now + 5h` that does not start counting down until the first request in that window is made.
+
+To maximize throughput and ensure full capacity is replenished as early as possible, Hermes includes an automated 5-step verified quota ignition engine:
+1. **Detection (`is_sleeping_or_expired`)**: Detects when an account is floating (`remainingFraction >= 0.99999`) or when its previous window's `resetTime` has elapsed (`reset_dt <= now_utc`).
+2. **Structured Ignition Request**: Dispatches a lightweight request (`prompt: "Say: Ready"`, `max_tokens: 32`) on `gemini-3.7-flash-low` (for Gemini) or `gpt-oss-120b-medium` (for Claude/GPT) to ensure Google's billing engine records $>0$ tokens.
+3. **Metadata Capture**: Records latency in milliseconds, model reply, token usage (`prompt_tokens`, `completion_tokens`, `total_tokens`), and HTTP status.
+4. **Immediate Verification**: Re-queries `retrieveUserQuotaSummary` to verify that `remainingFraction < 0.99999` and that a fixed 5-hour countdown is actively ticking down.
+5. **Audit Logging & Daemon**: Emits structured verification logs to `agent.log`. The 24/7 background daemon (`start_gemini_quota_watcher_daemon()`) runs in the background, polling every 60 seconds to automatically ignite any reset or sleeping account across both model groups.
+
+---
+
 ## Routing Table — working in X → read X/AGENTS.md
 
 | Area | Read | Covers |

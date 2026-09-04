@@ -867,7 +867,7 @@ The ID token is what establishes identity — the access token is treated as opa
       "publicClient": true,
       "standardFlowEnabled": true,
       "protocol": "openid-connect",
-      "redirectUris": ["http://localhost:9119/auth/callback"],
+      "redirectUris": ["/envauth/callback"],
       "webOrigins": ["http://localhost:9119"],
       "attributes": { "pkce.code.challenge.method": "S256" }
     }
@@ -914,11 +914,11 @@ hermes dashboard --host 0.0.0.0 --port 9119 --no-open
 ```
 
 `HERMES_DASHBOARD_PUBLIC_URL` tells the dashboard its OAuth callback is
-`http://localhost:9119/auth/callback` — the redirect URI the realm registered
+`/envauth/callback` — the redirect URI the realm registered
 above. Binding to `0.0.0.0` (a non-loopback bind) is what
 engages the OAuth gate.
 
-**3. Log in.** Open `http://localhost:9119/`, you'll be bounced to `/login`. Click **Sign in with Self-Hosted OIDC** → authenticate at Keycloak as `testuser` / `testpassword` → land back on the authenticated dashboard. The sidebar shows `Logged in as Test User via self-hosted`, and `GET /api/auth/me` returns the verified session (`provider: self-hosted`, `email: testuser@example.com`).
+**3. Log in.** Open `/env`, you'll be bounced to `/login`. Click **Sign in with Self-Hosted OIDC** → authenticate at Keycloak as `testuser` / `testpassword` → land back on the authenticated dashboard. The sidebar shows `Logged in as Test User via self-hosted`, and `GET /api/auth/me` returns the verified session (`provider: self-hosted`, `email: testuser@example.com`).
 
 > If you bind or browse on a different host/port, add that origin's
 > `…/auth/callback` to the client's **Valid redirect URIs** in the Keycloak
