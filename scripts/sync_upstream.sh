@@ -19,7 +19,7 @@ LOG_FILE="${HOME}/.hermes/logs/upstream_sync.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
 
 # Topics defined by the 5-branch architecture in github-ops skill
-TOPIC_BRANCHES=("bug-fixes" "gemini" "memory" "mobile")
+TOPIC_BRANCHES=("dev")
 
 DRY_RUN=0
 SKIP_BUILD=0
@@ -179,7 +179,7 @@ fi
 # ------------------------------------------------------------------------------
 if [ -z "$SPECIFIC_TOPIC" ]; then
     log "======================================================================"
-    log "Rebuilding serving branch 'local' from pristine 'main' + 4 topic branches..."
+    log "Rebuilding serving branch 'local' from pristine 'main' + 'dev' topic branch..."
 
     git checkout -B local main >> "${LOG_FILE}" 2>&1
     log "✓ Reset 'local' to pristine main ($(git rev-parse --short main))"
