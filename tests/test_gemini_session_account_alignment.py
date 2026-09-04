@@ -460,6 +460,7 @@ def test_list_gemini_session_histories_verified_turn_metadata(tmp_path, monkeypa
     assert result["total"] >= 1
     session_data = next((s for s in result["sessions"] if s["session_id"] == sid), None)
     assert session_data is not None
+    assert session_data.get("model") == "gemini-3.7-flash" 
 
     turns = [e for e in session_data["events"] if e.get("event_type") == "turn"]
     assert len(turns) == 2

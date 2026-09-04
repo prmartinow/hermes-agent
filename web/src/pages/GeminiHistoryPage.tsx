@@ -16,6 +16,7 @@ import { api, type GeminiSessionAccountHistory } from "../lib/api";
 type SortField =
   | "title"
   | "is_subagent"
+  | "model"
   | "current_alias"
   | "turns_count"
   | "changes_count"
@@ -209,6 +210,12 @@ export default function GeminiHistoryPage() {
                   Type {renderSortIcon("is_subagent")}
                 </th>
                 <th
+                  onClick={() => handleSort("model")}
+                  className="py-2.5 px-3 font-semibold cursor-pointer hover:text-foreground transition-colors"
+                >
+                  Model {renderSortIcon("model")}
+                </th>
+                <th
                   onClick={() => handleSort("current_alias")}
                   className="py-2.5 px-3 font-semibold cursor-pointer hover:text-foreground transition-colors"
                 >
@@ -244,7 +251,7 @@ export default function GeminiHistoryPage() {
             <tbody className="divide-y divide-midground/10">
               {sortedSessions.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="py-12 text-center text-text-secondary">
+                  <td colSpan={10} className="py-12 text-center text-text-secondary">
                     {loading ? "Loading chat histories…" : "No Gemini chat sessions found."}
                   </td>
                 </tr>
@@ -294,9 +301,23 @@ export default function GeminiHistoryPage() {
                         </td>
 
                         <td className="py-3 px-3 whitespace-nowrap">
-                          <span className="px-2 py-0.5 bg-teal-500/20 text-teal-300 rounded font-bold border border-teal-500/40">
-                            {sess.current_alias}
-                          </span>
+                          {sess.model ? (
+                            <span className="px-2 py-0.5 bg-midground/10 text-foreground rounded font-mono text-[11px] border border-midground/20">
+                              {sess.model}
+                            </span>
+                          ) : (
+                            <span className="text-text-secondary/40 font-mono text-[11px]">—</span>
+                          )}
+                        </td>
+
+                        <td className="py-3 px-3 whitespace-nowrap">
+                          {sess.current_alias ? (
+                            <span className="px-2 py-0.5 bg-teal-500/20 text-teal-300 rounded font-bold border border-teal-500/40">
+                              {sess.current_alias}
+                            </span>
+                          ) : (
+                            <span className="text-text-secondary/40 font-mono text-[11px]">—</span>
+                          )}
                         </td>
 
                         <td className="py-3 px-3 whitespace-nowrap">
@@ -339,7 +360,7 @@ export default function GeminiHistoryPage() {
                       {/* Expanded Sub-Timeline for this specific chat */}
                       {isExpanded && (
                         <tr className="bg-black/60 border-y border-midground/20">
-                          <td colSpan={9} className="p-0">
+                          <td colSpan={10} className="p-0">
                             {eventsDesc.length === 0 ? (
                               <div className="py-4 pl-12 pr-4 text-xs text-text-secondary">
                                 No account events recorded for this session.

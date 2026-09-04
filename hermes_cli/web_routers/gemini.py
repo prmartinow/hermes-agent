@@ -10,7 +10,6 @@ router = APIRouter()
 
 
 @router.get("/api/gemini/account-history")
-@router.get("/api/gemini/session-histories")
 @router.get("/api/sessions/history")
 async def get_gemini_account_history(
     session_id: Optional[str] = Query(None),
@@ -20,6 +19,14 @@ async def get_gemini_account_history(
 ):
     from hermes_cli.auth import list_account_events
     return list_account_events(session_id=session_id, limit=limit, offset=offset, scope=scope)
+
+
+@router.get("/api/gemini/session-histories")
+async def get_gemini_session_histories(
+    limit: int = Query(100, ge=1, le=500),
+):
+    from hermes_cli.auth import list_gemini_session_histories
+    return list_gemini_session_histories(limit=limit)
 
 
 @router.get("/api/gemini/quota-timeline")

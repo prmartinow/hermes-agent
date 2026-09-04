@@ -2752,26 +2752,7 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT 
-                s.id,
-                s.title,
-                s.model,
-                s.model_config,
-                s.parent_session_id,
-                s.started_at,
-                s.last_activity_at,
-                s.message_count,
-                (SELECT COUNT(*) FROM messages WHERE session_id = s.id AND role = 'user') as user_turns,
-                (SELECT substr(content, 1, 60) FROM messages WHERE session_id = s.id AND role = 'user' LIMIT 1) as first_prompt
-            FROM sessions s
-            WHERE s.model LIKE '%gemini%'
-            ORDER BY s.started_at DESC
-            LIMIT ?
-        """, (limit,))
-        sessions_raw = cursor.fetchall()
-
-        # Load explicit account events
+        # Ensure explicit account events table exists
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS gemini_account_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2785,6 +2766,27 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
                 details TEXT
             )
         """)
+
+        cursor.execute("""
+            SELECT 
+                s.id,
+                s.title,
+                s.model,
+                s.model_config,
+                s.parent_session_id,
+                s.started_at,
+                s.last_activity_at,
+                s.message_count,
+                (SELECT COUNT(*) FROM messages WHERE session_id = s.id AND role = 'user') as user_turns,
+                (SELECT substr(content, 1, 60) FROM messages WHERE session_id = s.id AND role = 'user' LIMIT 1) as first_prompt
+            FROM sessions s
+            WHERE s.model LIKE '%gemini%' OR s.id IN (SELECT DISTINCT session_id FROM gemini_account_events WHERE session_id IS NOT NULL)
+            ORDER BY s.started_at DESC
+            LIMIT ?
+        """, (limit,))
+        sessions_raw = cursor.fetchall()
+
+        # Load explicit account events
         cursor.execute("SELECT * FROM gemini_account_events ORDER BY id ASC")
         events_raw = cursor.fetchall()
 
@@ -2976,10 +2978,15 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
                             rotation_count += 1
                         last_account = acc
 
+            if not current_alias and last_account:
+                current_alias = last_account
+                current_raw = last_account
+
             out.append({
                 "session_id": sid,
                 "title": title,
                 "is_subagent": is_subagent,
+                "model": s["model"] or "",
                 "current_account": current_raw,
                 "current_alias": current_alias,
                 "started_at": s["started_at"],

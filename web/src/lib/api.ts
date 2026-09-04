@@ -2022,6 +2022,7 @@ export interface GeminiSessionAccountHistory {
   session_id: string;
   title: string;
   is_subagent: boolean;
+  model?: string;
   current_account: string;
   current_alias: string;
   started_at: number;
