@@ -627,7 +627,7 @@ class SessionMessagesMixin:
 
     def get_messages(self, session_id: str, include_inactive: bool = False, include_compacted: bool = False,
                      limit: Optional[int] = None, offset: int = 0, latest: bool = False,
-                     after_id: Optional[int] = None) -> List[Dict[str, Any]]:
+                     after_id: Optional[int] = None, include_ancestors: bool = False) -> List[Dict[str, Any]]:
         """Load messages in insertion order (id, never timestamp: clocks regress). ``include_inactive``:
         rewind rows too; ``include_compacted``: compaction-archived display history (not rewind rows).
         ``latest`` pages back from the newest but returns chronological order; ``after_id``: keyset paging."""
@@ -635,16 +635,20 @@ class SessionMessagesMixin:
             raise ValueError("after_id is incompatible with latest/offset paging")
         if after_id is not None and include_compacted:
             raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        session_ids = [session_id]
+        if include_ancestors and not self._is_explicit_branch_session(session_id):
+            session_ids = self._session_lineage_root_to_tip(session_id)
+        placeholders = ",".join("?" for _ in session_ids)
         active_clause = self._active_clause(include_inactive, include_compacted)
         if include_compacted:
             # Full display set (the UI row cap lives in the endpoint), dedupe, then page ([:None] is a no-op).
             rows = self._dedupe_display_generations(self._read_all(
-                "SELECT * FROM messages WHERE session_id = ?" + active_clause + " ORDER BY id ASC", [session_id]))
+                f"SELECT * FROM messages WHERE session_id IN ({placeholders})" + active_clause + " ORDER BY id ASC", list(session_ids)))
             rows = rows[::-1][offset:][:limit][::-1] if latest else rows[offset:][:limit]
         else:
-            sql = (f"SELECT * FROM messages WHERE session_id = ?{active_clause}"
+            sql = (f"SELECT * FROM messages WHERE session_id IN ({placeholders}){active_clause}"
                 f"{' AND id > ?' if after_id is not None else ''} ORDER BY id {'DESC' if latest else 'ASC'}")
-            params: list = [session_id] if after_id is None else [session_id, after_id]
+            params: list = list(session_ids) if after_id is None else [*session_ids, after_id]
             if limit is not None or offset:
                 # SQLite's OFFSET requires LIMIT; -1 means "no limit".
                 sql += " LIMIT ? OFFSET ?"
@@ -874,6 +878,42 @@ class SessionMessagesMixin:
         return int(self._read_one(
             f"SELECT COUNT(*) FROM messages WHERE session_id IN ({_placeholders(session_ids)}) AND {active_clause}",
             tuple(session_ids))[0])
+
+    def get_resume_viewport_conversations(
+        self, session_id: str, viewport_limit: int = 20
+    ) -> Tuple[int, List[Dict[str, Any]]]:
+        """Return (total_count, viewport_display_history) in efficient queries.
+
+        Fetches total count and the trailing `viewport_limit` rows for instant UI painting.
+        """
+        session_ids = self._resume_lineage_ids(session_id)
+        placeholders = _placeholders(session_ids)
+        with self._read_ctx() as conn:
+            # 1. Fast indexed count
+            total_count = conn.execute(
+                f"SELECT COUNT(*) FROM messages WHERE session_id IN ({placeholders}) "
+                f"AND (active = 1 OR compacted = 1)",
+                tuple(session_ids),
+            ).fetchone()[0]
+
+            # 2. Viewport slice: last N rows in chronological order
+            viewport_rows = conn.execute(
+                f"SELECT * FROM ("
+                f"  SELECT session_id, active, compacted, {self._CONVERSATION_ROW_COLUMNS} "
+                f"  FROM messages WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1) "
+                f"  ORDER BY id DESC LIMIT ?"
+                f") ORDER BY id ASC",
+                tuple(session_ids) + (viewport_limit,),
+            ).fetchall()
+
+        display_history = self._rows_to_conversation(
+            viewport_rows,
+            session_id=session_id,
+            include_ancestors=True,
+            repair_alternation=False,
+            include_row_ids=True,
+        )
+        return total_count, display_history
 
     def assert_resume_safe(self, session_id: str, max_messages: Optional[int] = None, *, tip_only: bool = False) -> int:
         """Resume row count, or raise ``SessionResumeTooLargeError``. ``max_messages=None`` reads config; 0

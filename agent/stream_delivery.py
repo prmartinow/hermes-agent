@@ -311,6 +311,12 @@ class StreamDeliveryMixin:
         if not text:
             return
         delivered = self._deliver_to_stream_callbacks(text)
+        live_writer = getattr(self, "_live_stream_writer", None)
+        if live_writer is not None:
+            try:
+                live_writer.message_delta(text)
+            except Exception:
+                pass
         self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
         if delivered:
             self._record_streamed_assistant_text(text)
@@ -323,6 +329,12 @@ class StreamDeliveryMixin:
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
         self._call_quietly(self.reasoning_callback, text)
+        live_writer = getattr(self, "_live_stream_writer", None)
+        if live_writer is not None:
+            try:
+                live_writer.reasoning_delta(text)
+            except Exception:
+                pass
         try:
             from agent.plugin_stream_hooks import stream_reasoning_deltas_enabled
 
@@ -336,6 +348,12 @@ class StreamDeliveryMixin:
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify the display layer that the model is generating tool call arguments (spinner for large payloads)."""
         self._call_quietly(self.tool_gen_callback, tool_name)
+        live_writer = getattr(self, "_live_stream_writer", None)
+        if live_writer is not None:
+            try:
+                live_writer.tool_generating(tool_name)
+            except Exception:
+                pass
 
     def _has_stream_consumers(self) -> bool:
         """Return True if any streaming consumer is registered."""
@@ -346,4 +364,11 @@ class StreamDeliveryMixin:
                 return True
         except Exception:
             logger.debug("plugin stream hook consumer check failed", exc_info=True)
-        return self.stream_delta_callback is not None or getattr(self, "_stream_callback", None) is not None
+        return (
+            self.stream_delta_callback is not None
+            or getattr(self, "_stream_callback", None) is not None
+            or (
+                getattr(self, "_live_stream_writer", None) is not None
+                and not getattr(getattr(self, "_live_stream_writer", None), "_disabled", True)
+            )
+        )

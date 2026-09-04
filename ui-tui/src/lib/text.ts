@@ -106,16 +106,56 @@ export const pasteTokenLabel = (text: string, lineCount: number) => {
     : `[[ ${preview} [${fmtK(lineCount)} lines] ]]`
 }
 
-const THINKING_STATUS_RE = new RegExp(`^(?:${VERBS.join('|')})\\.{0,3}$`, 'i')
-const THINKING_STATUS_CHUNK_RE = new RegExp(`[^A-Za-z\n]+\\s*(?:${VERBS.join('|')})\\.{0,3}\\s*`, 'giu')
+export const THINKING_BOUNDARY_RE = /(?:\r?\n){2,}(?=\*\*[^*\n]{2,80}\*\*|###\s+|(?:\d+\.\s+[A-Z]))/
+
+const BOLD_TITLE_RE = /^\*\*([^*\n]{2,80})\*\*(?:\s*:?\s*)?(.*)$/s
+const HEADING_TITLE_RE = /^#{1,6}\s+([^\n]{2,80})\n*(.*)$/s
+const NUMBERED_TITLE_RE = /^(\d+\.\s+[A-Z][^\n.:]{2,60})(?:[:\n]|$)(.*)$/s
+
+export const extractThoughtTitle = (text: string): { body: string; title: string } => {
+  const t = text.trim()
+
+  if (!t) {
+    return { body: '', title: '' }
+  }
+
+  const boldMatch = t.match(BOLD_TITLE_RE)
+
+  if (boldMatch && boldMatch[1]) {
+    return { body: (boldMatch[2] ?? '').trim(), title: boldMatch[1].trim() }
+  }
+
+  const headMatch = t.match(HEADING_TITLE_RE)
+
+  if (headMatch && headMatch[1]) {
+    return { body: (headMatch[2] ?? '').trim(), title: headMatch[1].trim() }
+  }
+
+  const numMatch = t.match(NUMBERED_TITLE_RE)
+
+  if (numMatch && numMatch[1]) {
+    return { body: (numMatch[2] ?? '').trim(), title: numMatch[1].trim() }
+  }
+
+  return { body: t, title: '' }
+}
+
+const THINKING_STATUS_RE = new RegExp(
+  `^\\s*(?:\\([^)]+\\)|\\[[^\\]]+\\]|[*_~]+)?\\s*(?:${VERBS.join('|')})\\.{0,3}\\s*$`,
+  'i'
+)
+const THINKING_KAOMOJI_STATUS_RE = new RegExp(
+  `(?:\\([^A-Za-z0-9\\n)]+[^\\n)]*\\)|\\[[^A-Za-z0-9\\n\\]]+[^\\]]*\\]|٩[^\\n]+۶)\\s*(?:${VERBS.join('|')})\\.{0,3}\\s*`,
+  'giu'
+)
 
 export const cleanThinkingText = (reasoning: string) =>
   reasoning
     .split('\n')
-    .map(line => line.replace(THINKING_STATUS_CHUNK_RE, '').trim())
+    .map(line => line.replace(THINKING_KAOMOJI_STATUS_RE, '').trim())
     .filter(line => line && !THINKING_STATUS_RE.test(line.replace(/\.\.\.$/, '').trim()))
     .join('\n')
-    .replace(/([^\n])(?=\*\*[^*\n][^\n]*?\*\*)/g, '$1\n\n')
+    .replace(/(?<=[.!?\n])\s*(?=\*\*[A-Z][^*\n]{2,80}\*\*)/g, '\n\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 

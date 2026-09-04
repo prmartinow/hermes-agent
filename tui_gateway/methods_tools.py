@@ -804,11 +804,25 @@ def _cmd_compress(rid, params, session, name, arg):
         return _err(rid, 5009, f"compress failed: {exc}")
 
 
+def _cmd_gs(rid, params, session, name, arg):
+    try:
+        from hermes_cli.auth import handle_gs_command
+        output = handle_gs_command(
+            session_id=params.get("session_id", ""),
+            arg=arg,
+            db=_get_db(),
+            agent=(session or {}).get("agent"),
+        )
+        return _ok(rid, {"type": "exec", "output": output})
+    except Exception as exc:
+        return _err(rid, 4018, f"gs failed: {exc}")
+
+
 _SLASH_BUILTINS = {
     "queue": _cmd_queue, "q": _cmd_queue, "learn": _cmd_learn, "plan": _cmd_plan, "init": _cmd_init,
     "moa": _cmd_moa, "focus": _cmd_focus, "retry": _cmd_retry, "steer": _cmd_steer, "goal": _cmd_goal,
     "loop": _cmd_loop, "undo": _cmd_undo, "snapshot": _cmd_snapshot, "snap": _cmd_snapshot,
-    "compress": _cmd_compress, "compact": _cmd_compress}
+    "compress": _cmd_compress, "compact": _cmd_compress, "gs": _cmd_gs}
 
 
 @method("command.dispatch")

@@ -28,6 +28,11 @@ if [ -z "${HERMES_MAIN_WRAPPER_ENV_READY:-}" ] && \
 fi
 unset HERMES_MAIN_WRAPPER_ENV_READY
 
+# Ensure nsenter has setuid-root permissions for non-root host namespace switching
+if [ "$(id -u)" = 0 ] && [ -x /usr/bin/nsenter ]; then
+    chmod 4755 /usr/bin/nsenter 2>/dev/null || true
+fi
+
 drop() { [ "$(id -u)" = 0 ] && set -- s6-setuidgid hermes "$@"; exec "$@"; }
 
 # --- Reject the unsupported `docker run --user <uid>:<gid>` start ---
@@ -62,14 +67,16 @@ fi
 # to the hermes user's home before dropping privileges so libraries that
 # resolve paths via $HOME (e.g. discord lockfile under XDG_STATE_HOME)
 # don't try to write to /root.
-export HOME=/opt/data
+export HOME="${HOME:-${HERMES_HOME:-/opt/data}}"
+_hermes_state_dir="${HERMES_HOME:-/opt/data}"
 
 # Save the Docker -w (or default) working directory before init
 # scripts cd to /opt/data, so the container starts in the
 # directory the user requested.
 _hermes_orig_cwd="${HERMES_ORIG_CWD:-$PWD}"
 
-cd /opt/data
+mkdir -p "$_hermes_state_dir" 2>/dev/null || true
+cd "$_hermes_state_dir"
 # shellcheck disable=SC1091
 . /opt/hermes/.venv/bin/activate
 
@@ -77,6 +84,39 @@ cd /opt/data
 # the user's command so `hermes chat` starts in the Docker -w
 # directory, not /opt/data.
 cd "$_hermes_orig_cwd"
+
+# Spawn background dashboard/API services if requested, not running under s6, and not already the main CMD
+if [ "${1:-}" != "dashboard" ]; then
+    case "${HERMES_DASHBOARD:-}" in
+        1|true|TRUE|True|yes|YES|Yes)
+            dash_host="${HERMES_DASHBOARD_HOST:-0.0.0.0}"
+            dash_port="${HERMES_DASHBOARD_PORT:-9119}"
+            if ! pgrep -f "hermes dashboard" >/dev/null 2>&1; then
+                mkdir -p "$_hermes_state_dir/logs" 2>/dev/null || true
+                if [ "$(id -u)" = 0 ]; then
+                    s6-setuidgid hermes hermes dashboard --host "$dash_host" --port "$dash_port" --no-open >>"$_hermes_state_dir/logs/dashboard.log" 2>&1 &
+                else
+                    hermes dashboard --host "$dash_host" --port "$dash_port" --no-open >>"$_hermes_state_dir/logs/dashboard.log" 2>&1 &
+                fi
+            fi
+            ;;
+    esac
+fi
+
+case "${HERMES_API_SERVER:-}" in
+    1|true|TRUE|True|yes|YES|Yes)
+        api_host="${HERMES_API_HOST:-0.0.0.0}"
+        api_port="${HERMES_API_PORT:-8000}"
+        if ! pgrep -f "hermes api" >/dev/null 2>&1; then
+            mkdir -p "$_hermes_state_dir/logs" 2>/dev/null || true
+            if [ "$(id -u)" = 0 ]; then
+                s6-setuidgid hermes hermes api --host "$api_host" --port "$api_port" >>"$_hermes_state_dir/logs/api.log" 2>&1 &
+            else
+                hermes api --host "$api_host" --port "$api_port" >>"$_hermes_state_dir/logs/api.log" 2>&1 &
+            fi
+        fi
+        ;;
+esac
 
 if [ $# -eq 0 ]; then
     drop hermes

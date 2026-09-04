@@ -150,6 +150,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True, desktop="terminal"),
+    CommandDef("gs", "Switch Gemini account for this chat by label", "Configuration",
+               args_hint="<label>"),
     CommandDef("model", "Switch model (session-scoped; --global to persist)", "Configuration",
                args_hint="[model] [--provider name] [--global|--session] [--refresh]",
                busy_policy="reject", busy_handler="model", desktop="hidden"),

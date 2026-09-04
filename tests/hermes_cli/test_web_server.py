@@ -1217,6 +1217,30 @@ class TestWebServerEndpoints:
         assert resp.status_code == 200
         assert resp.json()["session_id"] == "cyc-b"
 
+    def test_latest_descendant_excludes_forked_branches(self):
+        """Explicit forks/branches (_branched_from) and delegates must not
+        hijack resume of the parent session."""
+        from hermes_state import SessionDB
+        import json
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="parent-orig", source="tui")
+            db.create_session(
+                session_id="child-fork",
+                source="tui",
+                parent_session_id="parent-orig",
+                model_config=json.dumps({"_branched_from": "parent-orig"}),
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/parent-orig/latest-descendant")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["session_id"] == "parent-orig"
+        assert data["changed"] is False
+
 
 
 

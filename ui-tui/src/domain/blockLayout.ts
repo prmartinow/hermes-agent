@@ -72,7 +72,10 @@ const PAINTS_TRAILING_GAP: ReadonlySet<BlockGroup> = new Set(['diff', 'event', '
  * assistant block therefore computes the same gap while it streams as the
  * settled segment does once it flushes, so the live area never jumps.
  */
-export const hasLeadGap = (prev: Pick<Msg, 'kind' | 'role'> | undefined, cur: Pick<Msg, 'kind' | 'role'>): boolean => {
+export const hasLeadGap = (
+  prev: Pick<Msg, 'kind' | 'role' | 'thinking' | 'tools'> | undefined,
+  cur: Pick<Msg, 'kind' | 'role' | 'thinking' | 'tools'>
+): boolean => {
   const group = messageGroup(cur)
 
   if (SELF_SPACED.has(group)) {
@@ -84,6 +87,24 @@ export const hasLeadGap = (prev: Pick<Msg, 'kind' | 'role'> | undefined, cur: Pi
   }
 
   const prevGroup = messageGroup(prev)
+
+  // Within the 'trail' working band, open a single blank line between
+  // distinct thinking step cards, and across thinking <-> tool boundaries,
+  // so chronological cards don't render flush against each other.
+  if (group === 'trail' && prevGroup === 'trail') {
+    const prevHasThinking = Boolean(prev.thinking?.trim())
+    const curHasThinking = Boolean(cur.thinking?.trim())
+    const prevHasTools = Boolean(prev.tools?.length)
+    const curHasTools = Boolean(cur.tools?.length)
+
+    if (
+      (prevHasThinking && curHasThinking) ||
+      (prevHasThinking && curHasTools) ||
+      (prevHasTools && curHasThinking)
+    ) {
+      return true
+    }
+  }
 
   return prevGroup !== group && !PAINTS_TRAILING_GAP.has(prevGroup)
 }

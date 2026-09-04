@@ -953,11 +953,26 @@ class SessionSessionsMixin:
                 {chain[-1] for chain in chain_by_root.values()}, compact_rows=compact_rows,
             ) if chain_by_root else {}
         )
+        # Batch fetch total cumulative message counts across all compression chains
+        all_lineage_ids = [sid for chain in chain_by_root.values() for sid in chain]
+        lineage_counts: Dict[str, int] = {}
+        if all_lineage_ids:
+            placeholders = ",".join("?" * len(all_lineage_ids))
+            with self._read_ctx() as conn:
+                cursor = conn.execute(
+                    f"SELECT session_id, COUNT(*) FROM messages WHERE session_id IN ({placeholders}) GROUP BY session_id",
+                    all_lineage_ids,
+                )
+                counts_by_sid = dict(cursor.fetchall())
+            for root_id, chain in chain_by_root.items():
+                lineage_counts[root_id] = sum(counts_by_sid.get(sid, 0) for sid in chain)
+
         projected = []
         for s in sessions:
             chain = chain_by_root.get(s["id"])
             tip_row = tip_rows.get(chain[-1]) if chain else None
             if not tip_row:
+                s["total_message_count"] = s.get("message_count", 0)
                 projected.append(s)
                 continue
             merged = dict(s)
@@ -969,6 +984,7 @@ class SessionSessionsMixin:
                     merged[key] = tip_row[key]
             merged["_lineage_root_id"] = s["id"]
             merged["_lineage_ids"] = chain
+            merged["total_message_count"] = lineage_counts.get(s["id"], merged.get("message_count", 0))
             projected.append(merged)
         return projected
 

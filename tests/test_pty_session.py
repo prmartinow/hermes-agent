@@ -65,7 +65,7 @@ class FakeWS:
         self.close_code = code
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_attach_replays_buffer_then_streams_live():
     from hermes_cli.pty_session import PtySession
     bridge = FakeBridge([b"hello ", b"world", None])
@@ -79,7 +79,7 @@ async def test_attach_replays_buffer_then_streams_live():
     await s.close()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_reattach_can_force_complete_tui_redraw_after_replay():
     """A fresh terminal cannot reconstruct a differential ANSI tail alone."""
     from hermes_cli.pty_session import PtySession
@@ -212,7 +212,7 @@ async def test_detach_keeps_draining_into_buffer():
     await s.close()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_eof_marks_dead_and_closes_socket_4410():
     from hermes_cli.pty_session import PtySession
     bridge = FakeBridge([b"bye", None])
@@ -234,7 +234,7 @@ def make_registry(ttl=1800.0, max_sessions=16):
                               buffer_cap=1024, read_timeout=0.01)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_same_key_reattaches_same_session():
     reg = make_registry()
     b1 = FakeBridge([b"", b"", b""])
@@ -248,7 +248,7 @@ async def test_same_key_reattaches_same_session():
 
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_new_key_at_capacity_raises_when_none_reapable():
     reg = make_registry(max_sessions=1)
     b = FakeBridge([b"", b""])
@@ -259,7 +259,7 @@ async def test_new_key_at_capacity_raises_when_none_reapable():
     await reg.close_all()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_reaper_loop_invokes_reap(monkeypatch):
     from hermes_cli.pty_session import run_reaper
     reg = make_registry()

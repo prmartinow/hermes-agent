@@ -911,6 +911,15 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
             _safe_callback(agent.tool_progress_callback, "Tool progress", "tool.started", function_name, preview, display_args)
     _safe_callback(agent.tool_start_callback, "Tool start", tool_call_id, function_name, display_args)
 
+    if getattr(agent, "_live_stream_writer", None) is not None:
+        try:
+            preview = _build_tool_preview(function_name, display_args)
+            agent._live_stream_writer.tool_start(
+                tool_call_id, function_name, display_args, preview=preview
+            )
+        except Exception:
+            pass
+
     if not agent._checkpoint_mgr.enabled:
         return
     with contextlib.suppress(Exception):
@@ -932,6 +941,15 @@ def _emit_tool_complete_and_risk(agent, ref: _ToolCallRef, result, risk_metadata
             logging.debug("Tool complete callback error: %s", cb_err)
         else:
             _safe_callback(agent.tool_complete_callback, "Tool complete", ref.call_id, ref.name, display_args, result)
+    if not blocked and getattr(agent, "_live_stream_writer", None) is not None:
+        try:
+            display_args = _redact_tool_args_for_display(ref.name, ref.args) or ref.args
+            _preview_str = _multimodal_text_summary(result)
+            agent._live_stream_writer.tool_complete(
+                ref.call_id, ref.name, display_args, result, summary=_preview_str,
+            )
+        except Exception:
+            pass
     if risk_metadata is not None and risk_metadata.get("risk") != "low":
         _safe_callback(
             agent.tool_progress_callback, "Tool output risk",

@@ -184,6 +184,19 @@ def _format_live_status_output(sid: str, session: dict, arg: str) -> str:
     return str(response.get("result", {}).get("output") or "")
 
 
+def _format_live_gs_output(sid: str, session: Optional[dict], arg: str) -> str:
+    try:
+        from hermes_cli.auth import handle_gs_command
+        return handle_gs_command(
+            session_id=sid,
+            arg=arg,
+            db=_session_db(session) if session else _get_db(),
+            agent=(session or {}).get("agent"),
+        )
+    except Exception as exc:
+        return f"✗ Failed to switch account: {exc}"
+
+
 # name → (reply when there is no session, formatter(sid, session, arg) or a fixed reply).
 # A None no-session reply means the formatter handles a missing session itself.
 _LIVE_SLASH_OUTPUT = {
@@ -200,7 +213,8 @@ _LIVE_SLASH_OUTPUT = {
     "clear": (None, "Screen clear is terminal-only; desktop/TUI chat left unchanged."),
     "models": (None, "Use /model to view or switch the current model; desktop users can also open the model picker."),
     "rename": (None, "Use /title <name> to rename this session."),
-    "effort": (None, "Use /reasoning <effort> to change reasoning effort.")}
+    "effort": (None, "Use /reasoning <effort> to change reasoning effort."),
+    "gs": (None, _format_live_gs_output)}
 
 
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:

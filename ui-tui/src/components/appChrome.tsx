@@ -455,8 +455,10 @@ const shortModelLabel = (model: string) =>
     .replace(/\b(\d+)\s+(\d+)\b/g, '$1.$2')
     .trim()
 
-const modelLabel = (model: string, effort?: string, fast?: boolean) =>
-  [shortModelLabel(model), effortLabel(effort), fast ? 'fast' : ''].filter(Boolean).join(' ')
+const modelLabel = (model: string, effort?: string, fast?: boolean, account?: string) =>
+  [shortModelLabel(model) + (account ? ` · ${account}` : ''), effortLabel(effort), fast ? 'fast' : '']
+    .filter(Boolean)
+    .join(' ')
 
 export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
   const [active, setActive] = useState(false)
@@ -494,6 +496,7 @@ export function StatusRule({
   statusBarFields = null,
   statusColor,
   model,
+  modelAccount,
   modelFast,
   modelReasoningEffort,
   indicatorStyle = 'kaomoji',
@@ -531,7 +534,7 @@ export function StatusRule({
       : ''
 
   const bar = !segs.compactCtx && usage.context_max && ok('context_pct') ? ctxBar(pct) : ''
-  const modelText = modelLabel(model, modelReasoningEffort, modelFast)
+  const modelText = modelLabel(model, modelReasoningEffort, modelFast, modelAccount)
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
   const showBattery = !!battery && battery.available && battery.percent != null && ok('battery')
@@ -854,7 +857,7 @@ export function FloatBox({ children, color }: { children: ReactNode; color: stri
 
 export function StickyPromptTracker({ messages, offsets, scrollRef, onChange }: StickyPromptTrackerProps) {
   const { atBottom, bottom, top } = useViewportSnapshot(scrollRef)
-  const text = stickyPromptFromViewport(messages, offsets, top, bottom, atBottom)
+  const text = atBottom ? '' : stickyPromptFromViewport(messages, offsets, top, bottom, atBottom)
 
   useEffect(() => onChange(text), [onChange, text])
 
@@ -889,6 +892,8 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
   return (
     <Box
       flexDirection="column"
+      flexGrow={0}
+      flexShrink={0}
       onMouseDown={(e: { localRow?: number }) => {
         const row = Math.max(0, Math.min(vp - 1, e.localRow ?? 0))
         const off = row >= thumbTop && row < thumbTop + thumb ? row - thumbTop : Math.floor(thumb / 2)
@@ -906,6 +911,7 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
         grabRef.current = null
         setGrab(null)
       }}
+      overflow="hidden"
       width={1}
     >
       {/* Nothing to scroll → draw nothing (the width={1} Box still reserves
@@ -914,14 +920,21 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
       {!scrollable ? null : (
         <>
           {thumbTop > 0 ? (
-            <Text color={trackColor}>{`${'│\n'.repeat(Math.max(0, thumbTop - 1))}${thumbTop > 0 ? '│' : ''}`}</Text>
+            <Text
+              color={trackColor}
+              wrap="truncate"
+            >{`${'│\n'.repeat(Math.max(0, thumbTop - 1))}${thumbTop > 0 ? '│' : ''}`}</Text>
           ) : null}
           {thumb > 0 ? (
-            <Text color={thumbColor}>{`${'┃\n'.repeat(Math.max(0, thumb - 1))}${thumb > 0 ? '┃' : ''}`}</Text>
+            <Text
+              color={thumbColor}
+              wrap="truncate"
+            >{`${'┃\n'.repeat(Math.max(0, thumb - 1))}${thumb > 0 ? '┃' : ''}`}</Text>
           ) : null}
           {vp - thumbTop - thumb > 0 ? (
             <Text
               color={trackColor}
+              wrap="truncate"
             >{`${'│\n'.repeat(Math.max(0, vp - thumbTop - thumb - 1))}${vp - thumbTop - thumb > 0 ? '│' : ''}`}</Text>
           ) : null}
         </>
@@ -943,6 +956,7 @@ interface StatusRuleProps {
   cols: number
   cwdLabel: string
   model: string
+  modelAccount?: string
   modelFast?: boolean
   modelReasoningEffort?: string
   indicatorStyle?: IndicatorStyle

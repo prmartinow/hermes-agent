@@ -52,4 +52,25 @@ describe('lineNav', () => {
   it('handles leading newline without crashing', () => {
     expect(lineNav('\nfoo', 2, -1)).toBe(0)
   })
+
+  it('navigates soft-wrapped visual lines when columns is provided', () => {
+    // 25 chars text wrapped at width 10:
+    // Line 0: "0123456789" (indices 0..9)
+    // Line 1: "abcdefghij" (indices 10..19)
+    // Line 2: "klmno"      (indices 20..24)
+    const text = '0123456789abcdefghijklmno'
+    const cols = 10
+
+    // Cursor at index 15 (Line 1, col 5 'f') -> Up moves to index 5 (Line 0, col 5 '5')
+    expect(lineNav(text, 15, -1, cols)).toBe(5)
+
+    // Cursor at index 5 (Line 0, col 5 '5') -> Down moves to index 15 (Line 1, col 5 'f')
+    expect(lineNav(text, 5, 1, cols)).toBe(15)
+
+    // Cursor at index 5 (Line 0) -> Up returns null (top line -> triggers history)
+    expect(lineNav(text, 5, -1, cols)).toBeNull()
+
+    // Cursor at index 22 (Line 2) -> Down returns null (bottom line -> triggers history)
+    expect(lineNav(text, 22, 1, cols)).toBeNull()
+  })
 })

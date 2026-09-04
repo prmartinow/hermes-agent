@@ -289,7 +289,7 @@ def maybe_persist_tool_result(
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
     def _persisted(path: str, host_suffix: str = "") -> str:
-        logger.info("Persisted large tool result: %s (%s, %d chars -> %s%s)",
+        logger.info("Persisted large tool result (fallback): %s (%s, %d chars -> %s%s)",
                     tool_name, tool_use_id, len(content), path, host_suffix)
         return _build_persisted_message(preview, has_more, len(content), path)
 

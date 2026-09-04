@@ -147,7 +147,8 @@ def test_background_review_installs_thread_local_whitelist():
     assert "skill_view" in deny
 
 
-def test_read_file_registers_background_review_read_mark(tmp_path):
+def test_read_file_registers_background_review_read_mark(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
     """read_file inside a review fork must satisfy the read-before-write guard.
 
     The whitelist now allows read_file; without this mark, the model would
@@ -187,7 +188,8 @@ def test_read_file_registers_background_review_read_mark(tmp_path):
         reset_current_write_origin(token)
 
 
-def test_read_file_outside_review_does_not_mark(tmp_path):
+def test_read_file_outside_review_does_not_mark(tmp_path, monkeypatch):
+    monkeypatch.setenv("TERMINAL_ENV", "local")
     """Foreground reads must not populate the review-fork read set."""
     from tools.file_tools import read_file_tool
     from tools.skill_manager_guards import (

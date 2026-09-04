@@ -70,4 +70,19 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         action="store_true",
         help="Force primer ping even if countdown is already active",
     )
+    auth_prime = auth_subparsers.add_parser(
+        "prime", help="Kick-start sleeping quota reset timers across all Gemini OAuth accounts"
+    )
+    auth_prime.add_argument("--account", type=int, help="Optional account index (1-5)")
+    auth_prime.add_argument(
+        "--group",
+        choices=["gemini", "claude", "all"],
+        default="all",
+        help="Quota group to prime (default: all)",
+    )
+    auth_prime.add_argument(
+        "--force",
+        action="store_true",
+        help="Force primer ping even if countdown is already active",
+    )
     auth_parser.set_defaults(func=cmd_auth)

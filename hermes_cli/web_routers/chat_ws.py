@@ -486,7 +486,9 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
     try:
-        session, _created = await PTY_REGISTRY.attach_or_spawn(attach_token, spawn=_spawn)
+        session, _created = await PTY_REGISTRY.attach_or_spawn(
+            attach_token, spawn=_spawn, allow_standby=bool(not resume and not profile)
+        )
     except (PtyUnavailableError, FileNotFoundError, OSError, RegistryFull) as exc:
         await _pty_fail(ws, f"Chat unavailable: {exc}")
         return

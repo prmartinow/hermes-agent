@@ -33,6 +33,8 @@ const SESSION_LIMIT = 30;
 interface ChatSessionListProps {
   /** Active resume target (the session currently shown in the terminal). */
   activeSessionId: string | null;
+  /** Live active account alias from gateway session.info for instantaneous badge synchronization. */
+  activeAccountAlias?: string | null;
   /** Management profile from the dashboard switcher — scopes the listing. */
   profile?: string;
   className?: string;
@@ -57,6 +59,7 @@ function rowLabel(session: SessionInfo, untitled: string): string {
 
 export function ChatSessionList({
   activeSessionId,
+  activeAccountAlias,
   profile,
   className,
   onPicked,
@@ -107,6 +110,35 @@ export function ChatSessionList({
     load();
     // `reloadNonce` is a manual refetch trigger (Refresh button / row pick).
   }, [load, reloadNonce]);
+
+  // Silent 15s interval + window focus poller to keep session metadata
+  // (message counts, time-ago, and active account alias) live in real time.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      load();
+    }, 15000);
+    const onFocus = () => load();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [load]);
+
+  // Instantaneous reactive binding: immediately update active session's
+  // account alias badge whenever gateway session.info broadcasts a live /gs switch.
+  useEffect(() => {
+    if (!activeAccountAlias || !activeSessionId) return;
+    setSessions((prev) =>
+      prev
+        ? prev.map((s) =>
+            s.id === activeSessionId && s.account_alias !== activeAccountAlias
+              ? { ...s, account_alias: activeAccountAlias }
+              : s,
+          )
+        : prev,
+    );
+  }, [activeAccountAlias, activeSessionId]);
 
   const reload = useCallback(() => setReloadNonce((n) => n + 1), []);
 
@@ -197,18 +229,35 @@ export function ChatSessionList({
               <span className="w-full truncate text-sm font-medium">
                 {rowLabel(s, t.sessions.untitledSession)}
               </span>
-              <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
-                <span>{timeAgo(s.last_active)}</span>
-                {s.message_count > 0 && (
+              <span className="flex w-full min-w-0 items-center gap-1.5 whitespace-nowrap overflow-hidden text-[0.6875rem] text-text-tertiary">
+                <span className="shrink-0 whitespace-nowrap">{timeAgo(s.last_active)}</span>
+                {(s.total_message_count ?? s.message_count) > 0 && (
                   <>
-                    <span aria-hidden>·</span>
-                    <span>{s.message_count} msgs</span>
+                    <span aria-hidden className="shrink-0">·</span>
+                    <span
+                      className="shrink-0 whitespace-nowrap"
+                      title={
+                        s.total_message_count && s.total_message_count > s.message_count
+                          ? `${s.total_message_count} total msgs (${s.message_count} active in context)`
+                          : undefined
+                      }
+                    >
+                      {s.total_message_count ?? s.message_count} msgs
+                    </span>
                   </>
                 )}
                 {s.source && s.source !== "cli" && (
                   <>
+                    <span aria-hidden className="shrink-0">·</span>
+                    <span className="truncate shrink min-w-0">{s.source}</span>
+                  </>
+                )}
+                {s.account_alias && (
+                  <>
                     <span aria-hidden>·</span>
-                    <span className="truncate">{s.source}</span>
+                    <span className="truncate font-mono-ui font-medium text-text-secondary">
+                      {s.account_alias}
+                    </span>
                   </>
                 )}
               </span>

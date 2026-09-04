@@ -543,10 +543,115 @@ def _path_env_key(run_env: dict) -> str | None:
     return next((k for k in run_env if k.upper() == "PATH"), None) if _IS_WINDOWS else "PATH"
 
 
+def _is_already_in_host_namespace() -> bool:
+    """Return True if the current process is already in the host (PID 1) mount namespace.
+
+    When Hermes runs inside a container with HERMES_USE_NSENTER=1, it enters
+    PID 1's namespaces via nsenter. If a child process is spawned on the host
+    (or if Hermes is already running on the host), it should not attempt to
+    re-run nsenter (which will fail with 'Operation not permitted' for unprivileged users).
+    """
+    if _IS_WINDOWS:
+        return False
+    try:
+        if os.path.exists("/proc/self/ns/mnt") and os.path.exists("/proc/1/ns/mnt"):
+            return os.stat("/proc/self/ns/mnt").st_ino == os.stat("/proc/1/ns/mnt").st_ino
+    except Exception:
+        pass
+    try:
+        # Fallback check: if /proc/1/comm is systemd/init and not running in a container
+        if os.path.exists("/proc/1/comm"):
+            with open("/proc/1/comm", "r", encoding="utf-8", errors="replace") as f:
+                comm = f.read().strip().lower()
+            if comm in ("systemd", "init") and not os.path.exists("/.dockerenv") and not os.path.exists("/run/.containerenv"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
-    return _scrubbed_env([(dict(os.environ | env), True)], frozenset(),
+    run_env = _scrubbed_env([(dict(os.environ | env), True)], frozenset(),
                          lambda p: _prepend_git_bash_dirs(_append_missing_sane_path_entries(p)))
+    run_env["HERMES_ACTIVE_TURN"] = "1"
+    return run_env
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    """Compare path spellings with host filesystem case semantics."""
+    left_parts = [os.path.normcase(part) for part in left.parts]
+    right_parts = [os.path.normcase(part) for part in right.parts]
+    return left_parts == right_parts
+
+
+def _build_hermes_repo_root_aliases(
+    resolved_root: Path,
+    lexical_root: Path,
+    configured_home: Path,
+) -> tuple[Path, ...]:
+    """Return exact repo-root spellings emitted by Hermes launchers.
+
+    ``gateway_windows._preserve_hermes_home_path`` maps a physical path under
+    the resolved HERMES_HOME back onto the configured HERMES_HOME spelling.
+    Mirror that producer contract here so a junction-backed install is matched
+    without treating arbitrary descendants of HERMES_HOME as Hermes-owned.
+    Additionally, when the repo itself is a junction under the configured root
+    (repo-level junction, possibly cross-drive), the single deterministic
+    candidate <root>/<repo dirname> is accepted only when strict resolve
+    proves it is the exact physical repo root.
+    """
+    aliases: list[Path] = []
+
+    def add(candidate: Path) -> None:
+        if not any(_same_path(candidate, existing) for existing in aliases):
+            aliases.append(candidate)
+
+    add(resolved_root)
+    add(lexical_root)
+
+    # Profile re-home: with --profile / sticky active_profile the configured
+    # home becomes <root>/profiles/<name>.  The repo root then lives beside
+    # the profiles directory (not under the profile home), so the home-
+    # relative mapping below cannot reach it.  Derive the root spelling
+    # lexically the same way get_default_hermes_root() does (parent of a
+    # "profiles" component) and run the same exact-ownership mapping against
+    # it -- this recovers the launcher's lexical root under profile re-home
+    # while still never matching arbitrary descendants of HERMES_HOME.
+    home_candidates = [configured_home]
+    if configured_home.parent.name == "profiles":
+        home_candidates.append(configured_home.parent.parent)
+
+    for home in home_candidates:
+        try:
+            resolved_home = home.resolve()
+            home_key = os.path.normcase(str(resolved_home))
+            root_key = os.path.normcase(str(resolved_root))
+            if os.path.commonpath([home_key, root_key]) == home_key:
+                relative_root = os.path.relpath(str(resolved_root), str(resolved_home))
+                add(home / relative_root)
+        except (OSError, ValueError):
+            pass
+
+    # Repo-level junction recovery: the repository itself may be a
+    # junction/symlink under the configured root (e.g. D:\hermes\hermes-agent
+    # -> C:\...\hermes-agent) while the import spelling (editable install)
+    # resolves to the physical location.  The home-relative mapping above
+    # cannot express a cross-drive link (commonpath raises on different
+    # drives), so prove the EXACT filesystem identity of the single
+    # deterministic candidate -- <lexical root>/<repo dirname> -- with a
+    # strict resolve before accepting it as Hermes-owned.  Fail-closed: a
+    # missing path (strict resolve raises), a real directory that is not the
+    # known physical root, or any unrelated spelling never becomes an alias.
+    for home in home_candidates:
+        repo_candidate = home / resolved_root.name
+        try:
+            if repo_candidate.resolve(strict=True) == resolved_root.resolve(strict=True):
+                add(repo_candidate)
+        except OSError:
+            pass
+
+    return tuple(aliases)
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---
@@ -686,6 +791,33 @@ def _kill_process_windows(proc) -> None:
         proc.wait(timeout=2.0)
 
 
+def _is_already_in_host_namespace() -> bool:
+    """Return True if the current process is already in the host (PID 1) mount namespace.
+
+    When Hermes runs inside a container with HERMES_USE_NSENTER=1, it enters
+    PID 1's namespaces via nsenter. If a child process is spawned on the host
+    (or if Hermes is already running on the host), it should not attempt to
+    re-run nsenter (which will fail with 'Operation not permitted' for unprivileged users).
+    """
+    if _IS_WINDOWS:
+        return False
+    try:
+        if os.path.exists("/proc/self/ns/mnt") and os.path.exists("/proc/1/ns/mnt"):
+            return os.stat("/proc/self/ns/mnt").st_ino == os.stat("/proc/1/ns/mnt").st_ino
+    except Exception:
+        pass
+    try:
+        # Fallback check: if /proc/1/comm is systemd/init and not running in a container
+        if os.path.exists("/proc/1/comm"):
+            with open("/proc/1/comm", "r", encoding="utf-8", errors="replace") as f:
+                comm = f.read().strip().lower()
+            if comm in ("systemd", "init") and not os.path.exists("/.dockerenv") and not os.path.exists("/run/.containerenv"):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host: every execute() spawns a fresh bash;
     the session snapshot preserves env vars across calls; CWD persists via the
@@ -724,6 +856,15 @@ class LocalEnvironment(BaseEnvironment):
             cache_dir.mkdir(parents=True, exist_ok=True)
             _prune_terminal_temp_once()
             return str(cache_dir).replace("\\", "/")
+        if os.getenv("HERMES_USE_NSENTER", "").lower() in ("1", "true", "yes") and not _is_already_in_host_namespace():
+            temp_dir = Path("/tmp/hermes_terminal")
+            try:
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(temp_dir, 0o777)
+                return str(temp_dir)
+            except Exception:
+                return "/tmp"
+
         def _posix(p: str) -> str:
             return p.rstrip("/") or "/"
         for env_var in ("TERMINAL_TEMP_DIR", "TMPDIR", "TMP", "TEMP"):
@@ -777,17 +918,45 @@ class LocalEnvironment(BaseEnvironment):
     def _run_bash(self, cmd_string: str, *, login: bool = False, timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
-        # Login invocations (init_session's env snapshot) source the user's rc /
-        # custom init files so nvm/asdf/pyenv land on PATH in the snapshot.
-        if login:
+        use_nsenter = os.getenv("HERMES_USE_NSENTER", "").lower() in ("1", "true", "yes")
+        if use_nsenter and _is_already_in_host_namespace():
+            use_nsenter = False
+
+        if login and not use_nsenter:
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
-        args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+
         self._recover_cwd()
+
+        if use_nsenter and not _IS_WINDOWS:
+            import shlex
+            host_user = os.getenv("HERMES_HOST_USER", "").strip()
+            host_uid = os.getenv("HERMES_UID", "1000")
+            host_gid = os.getenv("HERMES_GID", "1000")
+            home_dir = f"/home/{host_user}" if host_user else "/root"
+            hermes_home = f"{home_dir}/.hermes"
+            env_prefix = f"export HERMES_ACTIVE_TURN=1 HERMES_USE_NSENTER=0 HERMES_HOME={hermes_home} HOME={home_dir} USER={host_user or 'root'} LOGNAME={host_user or 'root'} XDG_RUNTIME_DIR=/run/user/{host_uid} DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{host_uid}/bus; "
+            if self.cwd:
+                wrapped_cmd = f"{env_prefix}cd {shlex.quote(self.cwd)} && {cmd_string}"
+            else:
+                wrapped_cmd = f"{env_prefix}{cmd_string}"
+            if host_user:
+                args = [
+                    "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
+                    "--", "setpriv", "--reuid", host_uid, "--regid", host_gid, "--init-groups",
+                    "/bin/bash", "-lc", wrapped_cmd
+                ]
+            else:
+                args = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "/bin/bash", "-lc", wrapped_cmd]
+            _popen_cwd = None
+        else:
+            args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+            _popen_cwd = self.cwd
+
         proc = subprocess.Popen(
             args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
-            start_new_session=True, cwd=self.cwd,
+            start_new_session=True, cwd=_popen_cwd,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):

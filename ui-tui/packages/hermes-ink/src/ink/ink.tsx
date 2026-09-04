@@ -610,10 +610,19 @@ export default class Ink {
     }, 160)
   }
 
+  private pendingTerminalFocusIn = false
+
   private handleTerminalFocusChange(isFocused: boolean): void {
-    if (!isFocused || !this.options.stdout.isTTY) {
+    if (!this.options.stdout.isTTY) {
       return
     }
+
+    if (!isFocused) {
+      this.pendingTerminalFocusIn = false
+      return
+    }
+
+    this.pendingTerminalFocusIn = true
 
     // Focus-in means the terminal emulator has just made this tab/pane
     // visible again. Some emulators throttle or coalesce hidden-tab output;
@@ -641,9 +650,11 @@ export default class Ink {
     // OS app-switch. Re-assert modes and stop; the focus report still reaches
     // TerminalFocusProvider.
     queueMicrotask(() => {
-      if (this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
+      if (!this.pendingTerminalFocusIn || this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
         return
       }
+
+      this.pendingTerminalFocusIn = false
 
       this.reassertTerminalModes(false)
 

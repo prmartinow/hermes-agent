@@ -1768,7 +1768,13 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
         if self._threshold_tokens is None:
             # Resolve the window first: it may floor threshold_percent as a side effect.
             _ctx = self.context_length
-            self._threshold_tokens = self._compute_threshold_tokens(_ctx, self.threshold_percent, self.max_tokens)
+            self._threshold_tokens = self._compute_threshold_tokens(
+                _ctx,
+                self.threshold_percent,
+                self.max_tokens,
+                model=getattr(self, "model", "") or "",
+                provider=getattr(self, "provider", "") or "",
+            )
             self._apply_threshold_tokens_cap()
         return self._threshold_tokens
 
@@ -2151,7 +2157,13 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
-        self.threshold_tokens = self._compute_threshold_tokens(context_length, self.threshold_percent, self.max_tokens)
+        self.threshold_tokens = self._compute_threshold_tokens(
+            context_length,
+            self.threshold_percent,
+            self.max_tokens,
+            model=model or getattr(self, "model", "") or "",
+            provider=getattr(self, "provider", "") or "",
+        )
         self._apply_threshold_tokens_cap()
         # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
         self._tail_token_budget = None
@@ -2217,41 +2229,62 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
 
     @staticmethod
     def _compute_threshold_tokens(
-        context_length: int, threshold_percent: float, max_tokens: int | None = None,
+        context_length: int,
+        threshold_percent: float,
+        max_tokens: int | None = None,
+        model: str = "",
+        provider: str = "",
     ) -> int:
         """Compute the compaction trigger in tokens from the effective input budget.
         Base is ``(context_length - max_tokens) * threshold_percent`` floored at MINIMUM_CONTEXT_LENGTH;
         when the floor binds it is capped at 85% of the budget so small windows can still fire.
 
-        The base value is ``effective_input_budget * threshold_percent``, floored at
-        ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress prematurely at 50%. BUT that floor
-        degenerates at small windows: for a model whose ``context_length`` is at/below the minimum (e.g. a
-        64K local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold equal the ENTIRE window —
-        auto-compression can never fire because the provider rejects the request before usage reaches 100%
-        (#14690).
-        The provider reserves ``max_tokens`` of output space out of the same window, so the usable INPUT
-        budget is ``context_length - max_tokens``. With a large ``max_tokens`` (e.g. 65536 on a custom
-        provider) the input budget is materially smaller than the raw window, and a threshold based on the
-        full window lets the session hit a provider 400 before compaction fires (#43547). The percentage and
-        the degenerate-window check below both operate on the effective input budget. ``max_tokens=None``
-        (provider default) conservatively assumes no reservation (full window).
-        """
-        effective_window = context_length - (max_tokens or 0)
-        if effective_window <= 0:
-            effective_window = context_length
-        pct_value = int(effective_window * threshold_percent)
-        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # The floor must not consume output headroom: cap at 85% when it is the binding term. Near-minimum windows
-        # otherwise trigger at ~98%, and providers that silently clip over-window prompts (ollama) never raise the
-        # overflow backstop, so the session wedges. An explicit threshold_percent above 85% is user intent; not capped.
-        trigger_cap = int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
-        if effective_window > 0 and floored > pct_value and floored > trigger_cap:
-            floored = max(pct_value, trigger_cap)
-        # A percentage at/above the window is unreachable; trigger at 85% instead.
-        if effective_window > 0 and floored >= effective_window:
-            return max(1, min(trigger_cap, effective_window - 1))
-        return floored
+        The base value is ``usable_input_budget * threshold_percent``, floored
+        at ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress
+        prematurely at 50%. BUT that floor degenerates at small windows: for a
+        model whose ``context_length`` is at/below the minimum (e.g. a 64K
+        local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold
+        equal the ENTIRE window — auto-compression can never fire because the
+        provider rejects the request before usage reaches 100% (#14690).
 
+        When the floor would meet or exceed the usable input budget, trigger at
+        ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the budget — high enough that a
+        small model uses most of its context before compacting, but below
+        100% so compaction fires before the provider rejects the request.
+
+        The provider reserves ``max_tokens`` of output space out of the same
+        window, so the usable INPUT budget is ``context_length - output_reservation``.
+        When ``max_tokens`` is None and model/provider are provided, we resolve
+        the authoritative native output ceiling via ``get_model_max_output_tokens``.
+        A hard invariant ceiling additionally preserves 1024 safety headroom for
+        system prompts and tool schemas.
+        """
+        if max_tokens is not None and max_tokens > 0:
+            output_reservation = max_tokens
+        elif model or provider:
+            from agent.model_metadata import get_model_max_output_tokens
+
+            output_reservation = get_model_max_output_tokens(
+                model=model, provider=provider, config_max_tokens=max_tokens
+            )
+        else:
+            output_reservation = 0
+
+        usable_input_budget = max(1, context_length - output_reservation)
+        pct_value = int(usable_input_budget * threshold_percent)
+        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
+        hard_input_cap = max(1, usable_input_budget - 1024)
+
+        if usable_input_budget > 0 and floored >= usable_input_budget:
+            return max(
+                1,
+                min(
+                    int(usable_input_budget * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
+                    hard_input_cap,
+                    usable_input_budget - 1,
+                ),
+            )
+        return min(floored, hard_input_cap)
     def __init__(
         self, model: str, threshold_percent: float = 0.50, protect_first_n: int = 3, protect_last_n: int = 20,
         summary_target_ratio: float = 0.20, quiet_mode: bool = False, summary_model_override: str = None,
