@@ -232,6 +232,34 @@ REFLECT_SCHEMA = {
                    "properties": {"query": {"type": "string", "description": "The question to reflect on."}}},
 }
 
+RETHINK_SCHEMA = {
+    "name": "rethink_memory",
+    "description": (
+        "Create, update, or delete standing repository procedural rules, coding "
+        "standards, formatting conventions, or architectural policies in procedural memory "
+        "with Git version tracking and automatic directive synchronization."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "rule_name": {
+                "type": "string",
+                "description": "Name/identifier of the procedural rule (without .md).",
+            },
+            "content": {
+                "type": "string",
+                "description": "Markdown content or text of the procedural rule.",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["update", "insert", "delete"],
+                "description": "Action to perform: 'update', 'insert', or 'delete'. Defaults to 'update'.",
+            },
+        },
+        "required": ["rule_name", "content"],
+    },
+}
+
 
 def _load_config() -> dict:
     """$HERMES_HOME/hindsight/config.json (profile-scoped), else ~/.hindsight/config.json
@@ -430,7 +458,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
             {"key": "prefetch_waits_for_retain", "description": "Have the background next-turn prefetch wait for the just-completed retain to become recall-visible on the server (local queue drain + async operation completion) before recalling, so recall includes the just-completed turn (runs off the reply path, adds no response latency)", "default": True},
-            {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
+            {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 100.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
@@ -756,7 +784,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # recall-visible; when True it first waits (bounded, off the reply path)
         # for the queue to drain AND the server-side op(s) to complete.
         self._prefetch_waits_for_retain = cfg.get("prefetch_waits_for_retain", True)
-        self._prefetch_retain_drain_timeout = float(cfg.get("prefetch_retain_drain_timeout", 10.0))
+        self._prefetch_retain_drain_timeout = float(cfg.get("prefetch_retain_drain_timeout", 100.0))
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
@@ -1052,7 +1080,7 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- tools -------------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, RETHINK_SCHEMA]
 
     def _tool_retain(self, args: dict) -> str:
         content, context = args["content"], args.get("context")
@@ -1080,11 +1108,37 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
         return text or "No relevant memories found."
 
+    def _tool_rethink(self, args: dict, session_id: str = "") -> Any:
+        rule_name = args["rule_name"]
+        content = args.get("content", "")
+        action = args.get("action", "update")
+        sess = self._session_id or session_id or "hindsight-rethink"
+        from hermes_constants import get_hermes_home
+        _agent_db_path = os.getenv("AGENT_MEMORY_DB_PATH", str(get_hermes_home() / "agent-memory" / "db"))
+        if _agent_db_path not in sys.path and os.path.isdir(_agent_db_path):
+            sys.path.insert(0, _agent_db_path)
+        from rule_mutator import mutate_rule  # type: ignore[import-not-found] # pyright: ignore[reportMissingImports]
+
+        logger.debug(
+            "Tool rethink_memory: rule_name=%s, action=%s, session=%s",
+            rule_name, action, sess,
+        )
+        res = mutate_rule(
+            rule_name=rule_name,
+            content=content,
+            action=action,
+            session_id=sess,
+            tool_caller="hindsight_plugin",
+        )
+        logger.debug("Tool rethink_memory: success: %s", res)
+        return res
+
     # tool name -> (required arg, handler, user-facing failure prefix)
     _TOOL_HANDLERS = {
         "hindsight_retain": ("content", _tool_retain, "Failed to store memory"),
         "hindsight_recall": ("query", _tool_recall, "Failed to search memory"),
         "hindsight_reflect": ("query", _tool_reflect, "Failed to reflect"),
+        "rethink_memory": ("rule_name", _tool_rethink, "Failed to rethink memory"),
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -1094,6 +1148,9 @@ class HindsightMemoryProvider(MemoryProvider):
         if not args.get(required, ""):
             return tool_error(f"Missing required parameter: {required}")
         try:
+            if tool_name == "rethink_memory":
+                sess_id = self._session_id or kwargs.get("session_id") or "hindsight-rethink"
+                return json.dumps({"result": handler(self, args, session_id=sess_id)})
             return json.dumps({"result": handler(self, args)})
         except Exception as e:
             logger.warning("%s failed: %s", tool_name, e, exc_info=True)

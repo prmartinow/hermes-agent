@@ -21,12 +21,75 @@ PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 STORAGE_DIR = "/tmp/hermes-results"
 SPILLOVER_SUBDIR = "cache/spillover"
 SPILLOVER_MAX_AGE_HOURS = 24
+from pathlib import Path
+from hermes_constants import get_hermes_home
+
+def _resolve_traces_path() -> str:
+    env_val = os.getenv("AGENT_MEMORY_TRACES_PATH")
+    if env_val:
+        return env_val
+    hermes_path = get_hermes_home() / "agent-memory" / "traces"
+    if hermes_path.exists():
+        return str(hermes_path)
+    for fallback in [Path.home() / ".hermes" / "agent-memory" / "traces", Path("/mnt/data/agent-memory/traces")]:
+        if fallback.exists():
+            return str(fallback)
+    return str(hermes_path)
+
+AGENT_MEMORY_TRACES_PATH = _resolve_traces_path()
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
 
 _spillover_prune_lock = threading.Lock()
 _spillover_pruned_once = False
+
+
+def _get_archiver_modules():
+    """Dynamically import archive_content and generate_symbolic_brief from agent-memory traces."""
+    try:
+        import sys
+        if AGENT_MEMORY_TRACES_PATH not in sys.path and os.path.isdir(AGENT_MEMORY_TRACES_PATH):
+            sys.path.insert(0, AGENT_MEMORY_TRACES_PATH)
+        import importlib
+        archiver_mod = importlib.import_module("archiver")
+        symbolic_mod = importlib.import_module("symbolic_brief")
+        archive_content_fn = getattr(archiver_mod, "archive_content", None)
+        generate_brief_fn = getattr(symbolic_mod, "generate_symbolic_brief", None)
+        return archive_content_fn, generate_brief_fn
+    except Exception as exc:
+        logger.debug("Failed to import agent-memory archiver/symbolic_brief: %s", exc)
+        return None, None
+
+
+def _archive_to_context_db(
+    content: str,
+    tool_name: str,
+    session_id: str = "hermes-session",
+    tool_caller: str = "hermes-agent",
+) -> str | None:
+    """Try archiving content to context.db and generating a symbolic brief.
+
+    Returns the brief string on success, or None on failure/unavailability.
+    """
+    archive_content_fn, generate_brief_fn = _get_archiver_modules()
+    if archive_content_fn is None or generate_brief_fn is None:
+        return None
+
+    try:
+        archive_meta = archive_content_fn(
+            raw_content=content,
+            tool_name=tool_name,
+            session_id=session_id,
+            tool_caller=tool_caller,
+        )
+        if not archive_meta or "archive_id" not in archive_meta:
+            return None
+        brief = generate_brief_fn(archive_meta, content)
+        return brief
+    except Exception as exc:
+        logger.warning("Context offload to context.db failed, falling back: %s", exc)
+        return None
 
 
 def get_spillover_dir():
@@ -189,16 +252,39 @@ def extract_persisted_path(content: str) -> str | None:
     return match.group(1).strip() if match else None
 
 
-def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, env=None,
-                              config: BudgetConfig = DEFAULT_BUDGET,
-                              threshold: int | float | None = None) -> str:
-    """Layer 2: persist an oversized result, return preview + path. ``threshold`` overrides
-    ``config.resolve_threshold(tool_name)``; falls back to inline truncation when no write
-    location succeeds."""
-    if threshold is None:
-        threshold = config.resolve_threshold(tool_name)
-    if threshold == float("inf") or len(content) <= threshold:
+def maybe_persist_tool_result(
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
+    env=None,
+    config: BudgetConfig = DEFAULT_BUDGET,
+    threshold: int | float | None = None,
+    session_id: str = "hermes-session",
+) -> str:
+    """Layer 2: persist an oversized result into context.db or local spillover file, return brief/preview.
+    ``threshold`` overrides ``config.resolve_threshold(tool_name)``; falls back to inline truncation when no write
+    location succeeds.
+    """
+    effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
+
+    if effective_threshold == float("inf") or len(content) <= effective_threshold:
         return content
+
+    # 1. Try agent-memory context.db offloading
+    brief = _archive_to_context_db(
+        content=content,
+        tool_name=tool_name,
+        session_id=session_id,
+        tool_caller="hermes-agent",
+    )
+    if brief is not None:
+        logger.info(
+            "Archived large tool result to context.db: %s (%s, %d chars -> symbolic brief)",
+            tool_name, tool_use_id, len(content),
+        )
+        return brief
+
+    # 2. Fallback: Host/sandbox spillover file
     filename = _safe_result_filename(tool_use_id)
     preview, has_more = generate_preview(content, max_chars=config.preview_size)
 
@@ -237,7 +323,7 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
     sizes = [len(msg.get("content", "")) for msg in tool_messages]
     total_size = sum(sizes)
     candidates = [(i, size) for i, size in enumerate(sizes)
-                  if PERSISTED_OUTPUT_TAG not in tool_messages[i].get("content", "")]
+                  if PERSISTED_OUTPUT_TAG not in tool_messages[i].get("content", "") and "[ARCHIVE_ID:" not in tool_messages[i].get("content", "")]
     if total_size <= config.turn_budget:
         return tool_messages
     for idx, size in sorted(candidates, key=lambda x: x[1], reverse=True):
