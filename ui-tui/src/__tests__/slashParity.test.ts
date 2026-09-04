@@ -30,6 +30,7 @@ const MUTATING_COMMANDS = [
   'personality',
   'queue',
   'reasoning',
+  'redo',
   'reload-mcp',
   'retry',
   'rollback',

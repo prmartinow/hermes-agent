@@ -292,6 +292,12 @@ export interface SessionUndoResponse {
   turns_undone?: number
 }
 
+export interface SessionRedoResponse {
+  messages?: GatewayTranscriptMessage[]
+  restored_count?: number
+  restored_turns?: number
+}
+
 export interface SessionUsageResponse {
   account_lines?: string[]
   active_subagents?: number

@@ -1079,6 +1079,160 @@ class SessionMessagesMixin:
         return {"rewound_count": len(rewound), "target_message": target_row, "new_head_id": new_head_id,
                 **({"replacement_message_id": replacement_message_id} if preserve_compaction_handoff else {})}
 
+    def redo_turn(
+        self,
+        session_id: str,
+        n: int = 1,
+    ) -> Dict[str, Any]:
+        """Reactivate the next *n* rewound user turns in *session_id*.
+
+        Walks forward from the current active head through inactive messages
+        (active=0, compacted=0) that were soft-deleted by /undo, reactivating
+        up to *n* user-originated turns and their associated tool calls and
+        assistant replies.
+
+        If a new turn has been committed to the session after the rewind,
+        the redo stack is invalidated (candidates must have id > max_active_id)
+        and this returns {"restored_turns": 0, "restored_count": 0, "messages": []}.
+
+        In-place compacted turns (compacted=1) are NEVER reactivated.
+        If the active head is a replacement scaffold from a composite carrier
+        rewind, the scaffold is deactivated and the original carrier row is
+        reactivated.
+        """
+        n = max(1, int(n))
+
+        def _do(conn):
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                None,
+                reject_active_turn_lease=True,
+                reject_active_compression_lock=True,
+            )
+
+            head_row = conn.execute(
+                "SELECT id, role, content, display_kind, _compressed_summary "
+                "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+
+            scaffold_deactivated = False
+            scaffold_id = None
+            if (
+                head_row is not None
+                and head_row["_compressed_summary"] == 1
+                and head_row["display_kind"] == "hidden"
+            ):
+                scaffold_id = int(head_row["id"])
+                inactive_rows = conn.execute(
+                    "SELECT id, role, content, display_kind, _compressed_summary, "
+                    "display_metadata, api_content, timestamp "
+                    "FROM messages WHERE session_id = ? AND id < ? AND active = 0 AND compacted = 0 "
+                    "ORDER BY id DESC",
+                    (session_id, scaffold_id),
+                ).fetchall()
+                for r in inactive_rows:
+                    from agent.context_compressor import split_user_originated_turn
+                    r_dict = dict(r)
+                    r_dict["content"] = self._decode_content(r_dict.get("content"))
+                    handoff, live = split_user_originated_turn(r_dict)
+                    if handoff is not None and live is not None:
+                        conn.execute("UPDATE messages SET active = 0 WHERE id = ?", (scaffold_id,))
+                        scaffold_deactivated = True
+                        break
+
+            max_active_row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+            max_active_id = int(max_active_row[0]) if max_active_row else 0
+
+            candidates = conn.execute(
+                f"SELECT id, {self._CONVERSATION_ROW_COLUMNS} "
+                "FROM messages WHERE session_id = ? AND active = 0 AND compacted = 0 "
+                "AND id > ? ORDER BY id ASC",
+                (session_id, max_active_id),
+            ).fetchall()
+
+            if not candidates:
+                if scaffold_deactivated and scaffold_id is not None:
+                    conn.execute("UPDATE messages SET active = 1 WHERE id = ?", (scaffold_id,))
+                return {
+                    "restored_turns": 0,
+                    "restored_count": 0,
+                    "reactivated_ids": [],
+                    "messages": [],
+                    "new_head_id": max_active_id or None,
+                }
+
+            from agent.context_compressor import user_originated_turn_view
+
+            rows_to_restore = []
+            turns_found = 0
+            for row in candidates:
+                row_dict = dict(row)
+                row_dict["content"] = self._decode_content(row_dict.get("content"))
+                if user_originated_turn_view(row_dict) is not None:
+                    if turns_found >= n:
+                        break
+                    turns_found += 1
+                rows_to_restore.append(row)
+
+            if turns_found == 0:
+                if scaffold_deactivated and scaffold_id is not None:
+                    conn.execute("UPDATE messages SET active = 1 WHERE id = ?", (scaffold_id,))
+                return {
+                    "restored_turns": 0,
+                    "restored_count": 0,
+                    "reactivated_ids": [],
+                    "messages": [],
+                    "new_head_id": max_active_id or None,
+                }
+
+            ids = [r["id"] for r in rows_to_restore]
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE messages SET active = 1 WHERE id IN ({placeholders})",
+                ids,
+            )
+            conn.execute(
+                "UPDATE sessions SET rewind_count = MAX(0, COALESCE(rewind_count, 0) - ?) "
+                "WHERE id = ?",
+                (turns_found, session_id),
+            )
+            message_count, tool_call_count = self._active_transcript_counts(
+                conn, session_id
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? "
+                "WHERE id = ?",
+                (message_count, tool_call_count, session_id),
+            )
+            new_head_row = conn.execute(
+                "SELECT MAX(id) FROM messages WHERE session_id = ? AND active = 1",
+                (session_id,),
+            ).fetchone()
+            new_head_id = (
+                new_head_row[0] if new_head_row and new_head_row[0] is not None else None
+            )
+            restored_messages = self._rows_to_conversation(
+                rows_to_restore,
+                session_id=session_id,
+                include_ancestors=False,
+                repair_alternation=False,
+                include_row_ids=True,
+            )
+            return {
+                "restored_turns": turns_found,
+                "restored_count": len(ids),
+                "reactivated_ids": ids,
+                "messages": restored_messages,
+                "new_head_id": new_head_id,
+            }
+
+        return self._execute_write(_do)
+
     def message_count(self, session_id: str = None) -> int:
         """Count messages, optionally for a specific session."""
         sql = "SELECT COUNT(*) FROM messages" + (" WHERE session_id = ?" if session_id else "")

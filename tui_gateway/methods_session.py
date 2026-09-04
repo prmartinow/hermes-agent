@@ -1892,6 +1892,87 @@ def _compress_live(rid, sid: str, session: dict, focus_topic: str) -> dict:
         _status_update(sid, "ready")
 
 
+@method("session.redo")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    assert session is not None
+    if session.get("running"):
+        return _err(
+            rid, 4009, "session busy — /interrupt the current turn before /redo"
+        )
+    count = params.get("count", 1)
+    try:
+        n = max(1, int(count))
+    except (ValueError, TypeError):
+        n = 1
+
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /redo"
+            )
+        session_key = str(session.get("session_key") or "").strip()
+        if not session_key:
+            return _err(rid, 4001, "no session key for redo")
+
+        with _session_db(session) as db:
+            if db is None:
+                return _err(rid, 5000, "session database unavailable")
+            try:
+                result = db.redo_turn(session_key, n)
+            except Exception as exc:
+                return _err(rid, 5008, f"redo: {exc}")
+
+        restored_turns = result.get("restored_turns", 0)
+        restored_messages = result.get("messages", [])
+        if restored_turns > 0 and restored_messages:
+            current_history = session.get("history", [])
+            current_history.extend(restored_messages)
+            session["history"] = current_history
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+            agent = session.get("agent")
+            if agent is not None:
+                agent._session_messages = current_history
+                if hasattr(agent, "_last_flushed_db_idx"):
+                    try:
+                        agent._last_flushed_db_idx = len(current_history)
+                    except Exception:
+                        pass
+                if hasattr(agent, "_db_flush_scan_prefix"):
+                    try:
+                        agent._db_flush_scan_prefix = list(current_history)
+                    except Exception:
+                        pass
+                if hasattr(agent, "_invalidate_system_prompt"):
+                    try:
+                        agent._invalidate_system_prompt()
+                    except Exception:
+                        pass
+                mm = getattr(agent, "_memory_manager", None)
+                if mm is not None:
+                    try:
+                        mm.on_session_switch(
+                            session_key,
+                            parent_session_id="",
+                            reset=False,
+                            rewound=False,
+                        )
+                    except Exception:
+                        pass
+
+    from tui_gateway.server import _history_to_messages
+    return _ok(
+        rid,
+        {
+            "restored_turns": restored_turns,
+            "restored_count": len(restored_messages),
+            "messages": _history_to_messages(restored_messages),
+        },
+    )
+
+
 @method("session.compress")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)

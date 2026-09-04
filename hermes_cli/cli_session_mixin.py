@@ -912,6 +912,59 @@ class CLISessionMixin:
         if prefill and removed_text:
             self._prefill_input_buffer(removed_text)
 
+    def redo_last(self, n: int = 1):
+        """Restore up to N undone user turns and their responses."""
+        from cli import logger
+        if not self._session_db or not self.session_id:
+            print("(._.) Redo requires a session database.")
+            return
+
+        if n < 1:
+            n = 1
+
+        try:
+            result = self._session_db.redo_turn(self.session_id, n)
+        except Exception as e:
+            logger.debug("redo: durable restore failed: %s", e)
+            print(f"(x_x) Redo failed: {e}")
+            return
+
+        restored_turns = result.get("restored_turns", 0)
+        restored_messages = result.get("messages", [])
+        if restored_turns == 0 or not restored_messages:
+            print("(._.) Nothing to redo.")
+            return
+
+        self.conversation_history.extend(restored_messages)
+
+        if self.agent is not None:
+            if hasattr(self.agent, "_invalidate_system_prompt"):
+                with contextlib.suppress(Exception):
+                    self.agent._invalidate_system_prompt()
+            if hasattr(self.agent, "_last_flushed_db_idx"):
+                with contextlib.suppress(Exception):
+                    self.agent._last_flushed_db_idx = len(self.conversation_history)
+            if hasattr(self.agent, "_session_messages"):
+                self.agent._session_messages = self.conversation_history
+            if hasattr(self.agent, "_db_flush_scan_prefix"):
+                self.agent._db_flush_scan_prefix = self.conversation_history[:]
+            _mm = getattr(self.agent, "_memory_manager", None)
+            if _mm is not None and self.session_id:
+                with contextlib.suppress(Exception):
+                    _mm.on_session_switch(
+                        self.session_id,
+                        parent_session_id="",
+                        reset=False,
+                        rewound=False,
+                    )
+
+        turn_word = "turn" if restored_turns == 1 else "turns"
+        print(
+            f"(^_^)b Redid {restored_turns} {turn_word} ({len(restored_messages)} message(s))."
+        )
+        remaining = len(self.conversation_history)
+        print(f"  {remaining} message(s) now in history.")
+
     @staticmethod
     def _undo_content_to_text(content) -> str:
         """Flatten message content (str or content-part list) to plain text."""
