@@ -6,15 +6,17 @@ Covers:
 3. Numerical arguments (/gs 2) are rejected with label instructions.
 4. Unknown labels (/gs xyz) are rejected with available label list.
 5. Bare /gs displays usage syntax.
-6. /gs immediately updates in-memory fast cache (_RESOLVED_SESSION_ACCOUNTS).
+6. Fallback reads last message display_metadata["gemini_account"] on cold restart.
 """
 
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
 from hermes_cli.auth import (
     get_gemini_account_label_map,
     handle_gs_command,
+    resolve_session_last_used_account,
 )
 
 
@@ -94,24 +96,24 @@ class TestGSCommand(unittest.TestCase):
             output = handle_gs_command("sess-123", "")
             self.assertIn("Usage: /gs <label>", output)
 
-    def test_gs_updates_in_memory_fast_cache(self):
-        """/gs immediately updates _RESOLVED_SESSION_ACCOUNTS for the session."""
-        from hermes_cli.auth import _RESOLVED_SESSION_ACCOUNTS, resolve_session_last_used_account
-        agent = MagicMock()
-        mock_pool = MagicMock()
-        mock_entry = MagicMock(id="gemini-2", label="alias2")
-        mock_pool.select.return_value = mock_entry
-        agent._credential_pool = mock_pool
+    def test_cold_start_fallback_reads_last_message_metadata(self):
+        """On cold start (empty in-memory cache), resolve_session_last_used_account reads last message metadata."""
+        from hermes_cli.auth import _RESOLVED_SESSION_ACCOUNTS, _RESOLVED_SESSION_ACCOUNTS_LOCK
 
-        def mock_status(idx):
-            return {"logged_in": True, "email": "user2@example.com"}
+        # Clear in-memory cache for session
+        with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+            _RESOLVED_SESSION_ACCOUNTS.pop("cold-session-1", None)
 
-        with patch("hermes_cli.auth.get_gemini_account_label_map", return_value={"alias2": 2, "alias1": 1}), \
-             patch("hermes_cli.auth.get_gemini_oauth_auth_status", side_effect=mock_status):
-            output = handle_gs_command(session_id="sess-fast-cache", arg="alias2", agent=agent)
-            self.assertEqual(output, "✓ Switched to alias2")
-            self.assertEqual(_RESOLVED_SESSION_ACCOUNTS.get("sess-fast-cache"), "gemini-2")
-            self.assertEqual(resolve_session_last_used_account("sess-fast-cache"), "gemini-2")
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"model_config": "{}"}
+        # Last message has display_metadata with gemini_account
+        mock_db.get_messages.return_value = [
+            {"id": "msg-1", "role": "user", "display_metadata": None},
+            {"id": "msg-2", "role": "assistant", "display_metadata": json.dumps({"gemini_account": "alias3"})},
+        ]
+
+        resolved = resolve_session_last_used_account("cold-session-1", db=mock_db)
+        self.assertEqual(resolved, "alias3")
 
 
 if __name__ == "__main__":

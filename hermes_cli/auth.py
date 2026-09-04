@@ -3100,11 +3100,6 @@ def handle_gs_command(
         except Exception as exc:
             logger.debug("Failed live credential swap during /gs: %s", exc)
 
-    if session_id:
-        target_account = str(target_acc_id or label).strip()
-        with _RESOLVED_SESSION_ACCOUNTS_LOCK:
-            _RESOLVED_SESSION_ACCOUNTS[str(session_id).strip()] = target_account
-
     return f"✓ Switched to {label}"
 
 

@@ -467,6 +467,19 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
         _sync_agent_compression_with_config(sid, session)
     _sync_bot_capabilities(sid, session)  # Bot Chat: adopt Settings->Capabilities edits
     st.agent = agent = session["agent"]
+    # Turn-start account & metadata synchronization: broadcast active
+    # account for this turn and update in-memory cache at turn start.
+    try:
+        turn_info = _session_info(agent, session)
+        _emit("session.info", sid, turn_info)
+        turn_acc = turn_info.get("gemini_account")
+        marker_key = getattr(st, "marker_key", None)
+        if marker_key and turn_acc:
+            from hermes_cli.auth import _RESOLVED_SESSION_ACCOUNTS, _RESOLVED_SESSION_ACCOUNTS_LOCK
+            with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+                _RESOLVED_SESSION_ACCOUNTS[marker_key] = turn_acc
+    except Exception:
+        logger.debug("failed turn-start session.info broadcast", exc_info=True)
     # Snapshot after the model sync: a deferred switch's history mutation belongs to this turn.
     with session["history_lock"]:
         st.history = list(session["history"])
