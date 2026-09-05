@@ -416,6 +416,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           return;
         }
 
+        // Force-close existing stale PTY session so the effect re-binds to the descendant
+        wsRef.current?.close();
         const next = new URLSearchParams(searchParams);
         next.set("resume", res.session_id);
         setSearchParams(next, { replace: true });
@@ -1110,6 +1112,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     let onScrollDisposable: { dispose(): void } | null = null;
     let eraseSuppressionTimer: ReturnType<typeof setTimeout> | null = null;
     let resumeMaxTimer: ReturnType<typeof setTimeout> | null = null;
+    let watchdogTimer: ReturnType<typeof setTimeout> | null = null;
     const clearEraseSuppressionTimer = () => {
       if (eraseSuppressionTimer) {
         clearTimeout(eraseSuppressionTimer);
@@ -1120,6 +1123,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (resumeMaxTimer) {
         clearTimeout(resumeMaxTimer);
         resumeMaxTimer = null;
+      }
+    };
+    const clearWatchdogTimer = () => {
+      if (watchdogTimer) {
+        clearTimeout(watchdogTimer);
+        watchdogTimer = null;
       }
     };
     let isReplayActive = Boolean(resumeParam);
@@ -1281,6 +1290,28 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // follow up with the authoritative measurement — at worst Ink
       // reflows once after the PTY boots, which is imperceptible.
       ws.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
+
+      // Liveness watchdog: verify physical canvas has content after hydration window.
+      // Strictly non-invasive: only fires if the terminal is completely blank.
+      clearWatchdogTimer();
+      watchdogTimer = setTimeout(() => {
+        watchdogTimer = null;
+        if (ws.readyState !== WebSocket.OPEN) return;
+        const buf = term.buffer.active;
+        let hasGlyphs = false;
+        for (let i = 0; i < buf.length; i++) {
+          const line = buf.getLine(i);
+          if (line && line.translateToString(true).trim().length > 0) {
+            hasGlyphs = true;
+            break;
+          }
+        }
+        if (!hasGlyphs) {
+          console.warn("[chat] Empty canvas detected after attach — sending autorecovery redraw");
+          ws.send("\x0c");
+          term.refresh(0, term.rows - 1);
+        }
+      }, 1200);
       // Resumed sessions replay scrollback over the socket. Start pinned to
       // the bottom so the latest output is in view; released once the user
       // scrolls up (#59591).
@@ -1404,6 +1435,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       wsRef.current = null;
       connectInFlightRef.current = false;
       clearConnectingTimer();
+      clearWatchdogTimer();
       if (unmounting) {
         return;
       }
@@ -1614,6 +1646,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+      clearWatchdogTimer();
     };
   }, [
     hasActivated,

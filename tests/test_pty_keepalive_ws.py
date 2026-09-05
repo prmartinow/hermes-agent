@@ -144,3 +144,25 @@ async def test_attach_token_reuses_default_chat_after_active_session_fallback(
         ws2.send_bytes(b"again")
 
     assert pty_keepalive_harness == [["x", "fresh"]]
+
+
+@pytest.mark.anyio
+async def test_attach_token_suppresses_redraw_when_buffer_large(pty_keepalive_harness):
+    """Reattaching to a session with >256 bytes in the ring buffer must NOT send TUI_FORCE_REDRAW."""
+    from starlette.testclient import TestClient
+
+    client = TestClient(web_server.app)
+    with client.websocket_connect("/api/pty?attach=TOK_BUF") as ws1:
+        ws1.send_bytes(b"init")
+
+    # Manually append >256 bytes to the session ring buffer to simulate replayed history
+    session = web_server.PTY_REGISTRY._sessions.get("TOK_BUF")
+    assert session is not None
+    session.buffer.append(b"X" * 300)
+
+    with client.websocket_connect("/api/pty?attach=TOK_BUF") as ws2:
+        ws2.send_bytes(b"after")
+
+    # Bridge written should NOT have \x0c between init and after because buffer > 256
+    assert bytes(pty_keepalive_harness.bridges[0].written) == b"initafter"
+
