@@ -777,5 +777,37 @@ def test_status_falls_through_to_generic_dispatcher_for_catalog_only_provider():
     assert out["has_refresh_token"] is True
 
 
+def test_gemini_oauth_catalog_and_start_dispatch():
+    """Verify gemini-oauth is present in /api/providers/oauth with PKCE flow and multi-account status."""
+    resp = client.get("/api/providers/oauth", headers=HEADERS)
+    assert resp.status_code == 200, resp.text
+    providers = {p["id"]: p for p in resp.json()["providers"]}
+
+    assert "gemini-oauth" in providers
+    g = providers["gemini-oauth"]
+    assert g["flow"] == "pkce"
+    assert g["cli_command"] == "hermes auth add gemini-oauth"
+    assert g["disconnectable"] is True
+    assert "accounts" in g["status"]
+    assert len(g["status"]["accounts"]) == 5
+    assert "doci_rankings" in g["status"]
+
+    # Test /start with PKCE flow
+    with patch(
+        "hermes_cli.auth._extract_gemini_oauth_credentials_from_agy",
+        return_value=("fake-client-id", "fake-client-secret"),
+    ):
+        start_resp = client.post(
+            "/api/providers/oauth/gemini-oauth/start?account=2",
+            headers=HEADERS,
+        )
+    assert start_resp.status_code == 200, start_resp.text
+    data = start_resp.json()
+    assert data["flow"] == "pkce"
+    assert "accounts.google.com" in data["auth_url"]
+    assert "session_id" in data
+
+
+
 
 
