@@ -770,6 +770,74 @@ def _cmd_undo(rid, params, session, name, arg):
     return _ok(rid, {"type": "prefill", "message": target_text, "notice": notice})
 
 
+def _cmd_redo(rid, params, session, name, arg):
+    if not session:
+        return _err(rid, 4001, "no active session to redo")
+    if busy := _busy_error(rid, session, "redo"):
+        return busy
+    if not (session_key := session.get("session_key", "")):
+        return _err(rid, 4001, "no session key for redo")
+    arg_str = (arg or "").strip()
+    try:
+        n = max(int(arg_str.split()[0]), 1) if arg_str else 1
+    except (ValueError, IndexError):
+        return _err(rid, 4004, f"redo: invalid count {arg_str!r} — use /redo or /redo N")
+
+    with session["history_lock"]:
+        if busy := _busy_error(rid, session, "redo"):
+            return busy
+        with _session_db(session) as db:
+            if db is None:
+                return _err(rid, 5000, "session database unavailable")
+            try:
+                result = db.redo_turn(session_key, n)
+            except Exception as exc:
+                return _err(rid, 5008, f"redo: {exc}")
+
+        restored_turns = result.get("restored_turns", 0)
+        restored_messages = result.get("messages", [])
+        if restored_turns == 0 or not restored_messages:
+            return _ok(rid, {"type": "notice", "notice": "Nothing to redo."})
+
+        current_history = session.get("history", [])
+        current_history.extend(restored_messages)
+        session["history"] = current_history
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+        agent = session.get("agent")
+        if agent is not None:
+            agent._session_messages = current_history
+            if hasattr(agent, "_last_flushed_db_idx"):
+                with contextlib.suppress(Exception):
+                    agent._last_flushed_db_idx = len(current_history)
+            if hasattr(agent, "_db_flush_scan_prefix"):
+                with contextlib.suppress(Exception):
+                    agent._db_flush_scan_prefix = list(current_history)
+            if hasattr(agent, "_invalidate_system_prompt"):
+                with contextlib.suppress(Exception):
+                    agent._invalidate_system_prompt()
+            mm = getattr(agent, "_memory_manager", None)
+            if mm is not None:
+                with contextlib.suppress(Exception):
+                    mm.on_session_switch(
+                        session_key,
+                        parent_session_id="",
+                        reset=False,
+                        rewound=False,
+                    )
+
+    turn_word = "turn" if restored_turns == 1 else "turns"
+    notice = f"↷ Redid {restored_turns} {turn_word} ({len(restored_messages)} message(s))."
+    return _ok(
+        rid,
+        {
+            "type": "notice",
+            "notice": notice,
+            "restored_turns": restored_turns,
+            "restored_count": len(restored_messages),
+        },
+    )
+
+
 def _is_snapshot_restore(arg: str) -> bool:
     return (arg.split(maxsplit=1)[0].lower() if arg else "") in {"restore", "rewind"}
 
@@ -804,11 +872,25 @@ def _cmd_compress(rid, params, session, name, arg):
         return _err(rid, 5009, f"compress failed: {exc}")
 
 
+def _cmd_gs(rid, params, session, name, arg):
+    try:
+        from hermes_cli.auth import handle_gs_command
+        output = handle_gs_command(
+            session_id=params.get("session_id", ""),
+            arg=arg,
+            db=_get_db(),
+            agent=(session or {}).get("agent"),
+        )
+        return _ok(rid, {"type": "exec", "output": output})
+    except Exception as exc:
+        return _err(rid, 4018, f"gs failed: {exc}")
+
+
 _SLASH_BUILTINS = {
     "queue": _cmd_queue, "q": _cmd_queue, "learn": _cmd_learn, "plan": _cmd_plan, "init": _cmd_init,
     "moa": _cmd_moa, "focus": _cmd_focus, "retry": _cmd_retry, "steer": _cmd_steer, "goal": _cmd_goal,
-    "loop": _cmd_loop, "undo": _cmd_undo, "snapshot": _cmd_snapshot, "snap": _cmd_snapshot,
-    "compress": _cmd_compress, "compact": _cmd_compress}
+    "loop": _cmd_loop, "undo": _cmd_undo, "redo": _cmd_redo, "snapshot": _cmd_snapshot, "snap": _cmd_snapshot,
+    "compress": _cmd_compress, "compact": _cmd_compress, "gs": _cmd_gs}
 
 
 @method("command.dispatch")

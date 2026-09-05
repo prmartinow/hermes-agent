@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import shlex
@@ -21,6 +22,7 @@ import threading
 import time
 import uuid
 import webbrowser  # noqa: F401  (tests patch auth_mod.webbrowser.open; same module object)
+import re
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
@@ -97,7 +99,8 @@ from hermes_cli.auth_constants import (  # noqa: F401  re-exported
     DEFAULT_XAI_OAUTH_BASE_URL, MINIMAX_OAUTH_CLIENT_ID, MINIMAX_OAUTH_SCOPE,
     MINIMAX_OAUTH_GLOBAL_BASE, MINIMAX_OAUTH_CN_BASE, MINIMAX_OAUTH_GLOBAL_INFERENCE,
     MINIMAX_OAUTH_CN_INFERENCE, MINIMAX_OAUTH_REFRESH_SKEW_SECONDS, DEFAULT_QWEN_BASE_URL,
-    DEFAULT_GITHUB_MODELS_BASE_URL, DEFAULT_COPILOT_ACP_BASE_URL, DEFAULT_OLLAMA_CLOUD_BASE_URL,
+    DEFAULT_GEMINI_OAUTH_BASE_URL, DEFAULT_GITHUB_MODELS_BASE_URL, DEFAULT_COPILOT_ACP_BASE_URL,
+    DEFAULT_OLLAMA_CLOUD_BASE_URL,
     DEFAULT_ACTUAL_BASE_URL, DEFAULT_ACTUAL_LOCAL_BASE_URL, STEPFUN_STEP_PLAN_INTL_BASE_URL,
     STEPFUN_STEP_PLAN_CN_BASE_URL, CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL,
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, XAI_OAUTH_CLIENT_ID, XAI_OAUTH_SCOPE,
@@ -116,7 +119,6 @@ try:
     import msvcrt
 except Exception:
     msvcrt = None
-
 def is_actual_local_base_url(base_url: str) -> bool:
     """Return True for Actual's loopback local API endpoint."""
     try:
@@ -183,6 +185,24 @@ _REGISTRY_ROWS: Tuple[Any, ...] = (
         "xai-oauth", "xAI Grok OAuth (SuperGrok / Premium+)", "oauth_external",
         inference_base_url=DEFAULT_XAI_OAUTH_BASE_URL),
     ProviderConfig("qwen-oauth", "Qwen OAuth", "oauth_external", inference_base_url=DEFAULT_QWEN_BASE_URL),
+    ProviderConfig("gemini-oauth", "Google Gemini (OAuth / Antigravity)", "oauth_external",
+                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
+    ProviderConfig("gemini-1", "Google Gemini Account 1", "oauth_external",
+                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
+    ProviderConfig("gemini-2", "Google Gemini Account 2", "oauth_external",
+                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
+    ProviderConfig("gemini-3", "Google Gemini Account 3", "oauth_external",
+                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
+    ProviderConfig("gemini-4", "Google Gemini Account 4", "oauth_external",
+                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
+    ProviderConfig("gemini-5", "Google Gemini Account 5", "oauth_external",
+                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
     ("lmstudio", "LM Studio", "http://127.0.0.1:1234/v1", ("LM_API_KEY",), "LM_BASE_URL"),
     ("copilot", "GitHub Copilot", DEFAULT_GITHUB_MODELS_BASE_URL,
      ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"), "COPILOT_API_BASE_URL"),
@@ -427,6 +447,12 @@ def format_auth_error(error: Exception) -> str:
         generic = _GENERIC_ENTITLEMENT_MESSAGES.get(error.code)
         if generic:
             return generic
+
+    if getattr(error, "code", None) == "gemini_validation_required" or is_gemini_validation_required_error(error):
+        challenge_url = extract_gemini_challenge_url(error)
+        if challenge_url:
+            return f"Google account verification required (VALIDATION_REQUIRED). Complete 1-click verification at: {challenge_url}"
+        return "Google account verification required (VALIDATION_REQUIRED). Please complete account verification."
     if error.code == "temporarily_unavailable":
         return f"{error} Please retry in a few seconds."
     return str(error)
@@ -1011,6 +1037,2977 @@ def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     return _load_provider_state(_load_auth_store(), provider_id)
 
 
+
+# =============================================================================
+# Google Gemini (Antigravity) OAuth — Cloud Code PA tokens & Antigravity bridge
+# Supports 5 distinct accounts (gemini-1 .. gemini-5) + live quota summary
+# =============================================================================
+
+DEFAULT_GEMINI_OAUTH_CLIENT_ID = ""
+DEFAULT_GEMINI_OAUTH_CLIENT_SECRET = ""
+DEFAULT_GEMINI_OAUTH_BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal"
+DEFAULT_GEMINI_QUOTA_BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal"
+DEFAULT_GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+DEFAULT_GEMINI_OAUTH_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+DEFAULT_GEMINI_OAUTH_SCOPE = (
+    "https://www.googleapis.com/auth/cloud-platform "
+    "https://www.googleapis.com/auth/userinfo.email "
+    "https://www.googleapis.com/auth/userinfo.profile"
+)
+GEMINI_OAUTH_REFRESH_SKEW_SECONDS = 300
+_LAST_ACTIVE_GEMINI_ACCOUNT_IDS = None
+
+
+_EXTRACTED_GEMINI_CREDS: Optional[tuple[str, str]] = None
+_GEMINI_QUOTA_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
+_GEMINI_QUOTA_CACHE_TTL = 30.0  # seconds
+_GEMINI_QUOTA_CACHE_LOCK = threading.Lock()
+
+_GEMINI_MODELS_CACHE: Dict[str, tuple[float, list[str], Dict[str, str]]] = {}
+_GEMINI_MODELS_CACHE_TTL = 600.0  # 10 minutes cache TTL for live models
+_GEMINI_MODELS_CACHE_LOCK = threading.Lock()
+
+_GEMINI_LAST_PRIMED_AT: Dict[Any, float] = {}
+_GEMINI_PRIMED_LOCK = threading.Lock()
+
+_GEMINI_REFRESH_LOCKS: Dict[int, threading.Lock] = {}
+_GEMINI_REFRESH_MAP_LOCK = threading.Lock()
+
+
+def _get_gemini_refresh_lock(acc_idx: int) -> threading.Lock:
+    """Return dedicated per-account refresh lock for thread-safe OAuth token exchange."""
+    with _GEMINI_REFRESH_MAP_LOCK:
+        if acc_idx not in _GEMINI_REFRESH_LOCKS:
+            _GEMINI_REFRESH_LOCKS[acc_idx] = threading.Lock()
+        return _GEMINI_REFRESH_LOCKS[acc_idx]
+
+
+def _extract_gemini_oauth_credentials_from_agy() -> tuple[str, str]:
+    """Dynamically extract installed-app Client ID and Secret from local agy binary."""
+    global _EXTRACTED_GEMINI_CREDS
+    if _EXTRACTED_GEMINI_CREDS is not None and all(_EXTRACTED_GEMINI_CREDS):
+        return _EXTRACTED_GEMINI_CREDS
+
+    import re
+    import shutil
+
+    client_id = os.getenv("HERMES_GEMINI_CLIENT_ID", "").strip()
+    client_secret = os.getenv("HERMES_GEMINI_CLIENT_SECRET", "").strip()
+    if client_id and client_secret:
+        _EXTRACTED_GEMINI_CREDS = (client_id, client_secret)
+        return _EXTRACTED_GEMINI_CREDS
+
+    candidate_paths: list[Path] = []
+    for env_var in ("HERMES_AGY_PATH", "AGY_PATH", "AGY_BIN_PATH"):
+        val = os.getenv(env_var, "").strip()
+        if val:
+            candidate_paths.append(Path(val))
+
+    which_agy = shutil.which("agy")
+    if which_agy:
+        candidate_paths.append(Path(which_agy))
+
+    candidate_paths.extend([
+        Path.home() / ".local/bin/agy",
+        Path("/usr/local/bin/agy"),
+        Path("/usr/bin/agy"),
+    ])
+
+    for p in candidate_paths:
+        if p.exists() and p.is_file():
+            try:
+                data = p.read_bytes()
+                id_match = re.search(rb"1071006060591-[a-zA-Z0-9_-]+\.apps\.googleusercontent\.com", data)
+                sec_match = re.search(rb"GOCSPX-[a-zA-Z0-9_-]{28}", data)
+                if id_match and not client_id:
+                    client_id = id_match.group(0).decode("ascii", "ignore")
+                if sec_match and not client_secret:
+                    client_secret = sec_match.group(0).decode("ascii", "ignore")
+                if client_id and client_secret:
+                    _EXTRACTED_GEMINI_CREDS = (client_id, client_secret)
+                    return _EXTRACTED_GEMINI_CREDS
+            except Exception:
+                pass
+
+    if client_id and client_secret:
+        _EXTRACTED_GEMINI_CREDS = (client_id, client_secret)
+        return _EXTRACTED_GEMINI_CREDS
+
+    return (
+        client_id or DEFAULT_GEMINI_OAUTH_CLIENT_ID,
+        client_secret or DEFAULT_GEMINI_OAUTH_CLIENT_SECRET,
+    )
+
+
+def fetch_gemini_quota_summary(
+    access_token: str,
+    project: str = "default-cli-project",
+    force: bool = False,
+    timeout_seconds: float = 8.0,
+) -> Dict[str, Any]:
+    """Fetch live user quota summary from Google Cloud Code PA gateway."""
+    if not access_token:
+        return {}
+    now = time.time()
+    if not force:
+        with _GEMINI_QUOTA_CACHE_LOCK:
+            if access_token in _GEMINI_QUOTA_CACHE:
+                cached_time, cached_data = _GEMINI_QUOTA_CACHE[access_token]
+                if now - cached_time < _GEMINI_QUOTA_CACHE_TTL:
+                    return cached_data
+
+    try:
+        from agent.gemini_cloudcode_adapter import get_antigravity_user_agent
+        quota_base_url = os.getenv("HERMES_GEMINI_QUOTA_BASE_URL", "").strip().rstrip("/") or DEFAULT_GEMINI_QUOTA_BASE_URL
+        resp = httpx.post(
+            f"{quota_base_url}:retrieveUserQuotaSummary",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "User-Agent": get_antigravity_user_agent(),
+            },
+            json={"project": project},
+            timeout=timeout_seconds,
+        )
+        if resp.status_code == 200:
+            data = resp.json() or {}
+            with _GEMINI_QUOTA_CACHE_LOCK:
+                _GEMINI_QUOTA_CACHE[access_token] = (now, data)
+            return data
+    except Exception as exc:
+        logger.debug("Failed to fetch Gemini quota summary: %s", exc)
+
+    with _GEMINI_QUOTA_CACHE_LOCK:
+        if access_token in _GEMINI_QUOTA_CACHE:
+            return _GEMINI_QUOTA_CACHE[access_token][1]
+    return {}
+
+
+def _format_relative_countdown(
+    reset_time_iso: Optional[str],
+    from_epoch: Optional[float] = None,
+    is_5h: bool = False,
+) -> Optional[str]:
+    """Format an ISO 8601 reset timestamp into a human relative countdown like '6d 21h 38m' or '2h 38m' relative to from_epoch (default now)."""
+    if not reset_time_iso or not isinstance(reset_time_iso, str):
+        return None
+    try:
+        from datetime import datetime, timezone
+        clean_iso = reset_time_iso.strip()
+        if clean_iso.endswith("Z"):
+            clean_iso = clean_iso[:-1] + "+00:00"
+        dt = datetime.fromisoformat(clean_iso)
+        ref_dt = datetime.fromtimestamp(from_epoch, tz=timezone.utc) if from_epoch is not None else datetime.now(timezone.utc)
+        diff_sec = int((dt - ref_dt).total_seconds())
+        if diff_sec <= 0:
+            return "ready"
+        # For 5h rolling quotas, handle cycle wrapping so countdown never exceeds 5 hours (18000s)
+        if is_5h:
+            while diff_sec > 5 * 3600 + 300:
+                diff_sec -= 5 * 3600
+            diff_sec = min(5 * 3600, diff_sec)
+        days = diff_sec // 86400
+        hours = (diff_sec % 86400) // 3600
+        minutes = (diff_sec % 3600) // 60
+        parts = []
+        if days > 0:
+            parts.append(f"{days}d")
+        if hours > 0 or days > 0:
+            parts.append(f"{hours}h")
+        parts.append(f"{minutes}m")
+        return " ".join(parts)
+    except Exception:
+        return None
+
+
+def format_gemini_quota_summary(quota_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse and format raw Cloud Code PA quota summary into structured metrics."""
+    if not quota_data or not isinstance(quota_data, dict):
+        return {}
+    groups = quota_data.get("groups", [])
+    result: Dict[str, Any] = {
+        "groups": groups,
+        "description": quota_data.get("description", ""),
+        "gemini_5h_percent": None,
+        "gemini_5h_reset": None,
+        "gemini_5h_countdown": None,
+        "gemini_5h_description": None,
+        "gemini_weekly_percent": None,
+        "gemini_weekly_reset": None,
+        "gemini_weekly_countdown": None,
+        "gemini_weekly_description": None,
+        "claude_5h_percent": None,
+        "claude_5h_reset": None,
+        "claude_5h_countdown": None,
+        "claude_5h_description": None,
+        "claude_weekly_percent": None,
+        "claude_weekly_reset": None,
+        "claude_weekly_countdown": None,
+        "claude_weekly_description": None,
+    }
+    for group in groups:
+        display_name = str(group.get("displayName") or "").lower()
+        buckets = group.get("buckets", [])
+        for bucket in buckets:
+            window = str(bucket.get("window") or "").lower()
+            remaining_fraction = bucket.get("remainingFraction")
+            pct = round(remaining_fraction * 100, 1) if remaining_fraction is not None else None
+            reset_time = bucket.get("resetTime")
+            desc = bucket.get("description")
+            countdown = _format_relative_countdown(reset_time)
+            if "gemini" in display_name:
+                if window == "5h":
+                    result["gemini_5h_percent"] = pct
+                    result["gemini_5h_reset"] = reset_time
+                    result["gemini_5h_countdown"] = countdown
+                    result["gemini_5h_description"] = desc
+                elif window == "weekly":
+                    result["gemini_weekly_percent"] = pct
+                    result["gemini_weekly_reset"] = reset_time
+                    result["gemini_weekly_countdown"] = countdown
+                    result["gemini_weekly_description"] = desc
+            elif "claude" in display_name or "gpt" in display_name or "3p" in display_name:
+                if window == "5h":
+                    result["claude_5h_percent"] = pct
+                    result["claude_5h_reset"] = reset_time
+                    result["claude_5h_countdown"] = countdown
+                    result["claude_5h_description"] = desc
+                elif window == "weekly":
+                    result["claude_weekly_percent"] = pct
+                    result["claude_weekly_reset"] = reset_time
+                    result["claude_weekly_countdown"] = countdown
+                    result["claude_weekly_description"] = desc
+    return result
+
+
+def format_gemini_user_facing_slug(model_id: str, raw_display_name: str = "") -> str:
+    """Format model ID into agy-style human display name (matching backend.UserFacingSlug in agy).
+
+    Priority:
+      1. Raw API displayName from Google if non-empty and not identical to slug.
+      2. Algorithmic dynamic slug formatter for future-proof resolution.
+    """
+    if raw_display_name and raw_display_name.strip() and raw_display_name.strip() != model_id:
+        return raw_display_name.strip()
+    mid = str(model_id or "").strip()
+    if not mid:
+        return ""
+
+    # Known brand acronym overrides
+    if mid.startswith("gpt-oss"):
+        parts = mid.split("-")
+        size = parts[2].upper() if len(parts) > 2 else ""
+        tier = f" ({parts[3].capitalize()})" if len(parts) > 3 else ""
+        return f"GPT-OSS {size}{tier}".strip()
+
+    # 1. Strip internal suffixes (-tiered)
+    import re
+    clean = re.sub(r"-tiered$", "", mid)
+
+    # 2. Extract effort / thinking tier if present
+    tier_match = re.search(r"-(high|medium|low|extra-low|thinking)$", clean)
+    tier_str = ""
+    if tier_match:
+        tier_name = tier_match.group(1).capitalize()
+        tier_str = f" ({tier_name})"
+        clean = clean[:tier_match.start()]
+
+    # 3. Format hyphenated version numbers (e.g. 4-6 -> 4.6, 3-8 -> 3.8)
+    clean = re.sub(r"(\d+)-(\d+)", r"\1.\2", clean)
+
+    # 4. Title case words and preserve version numbers
+    words = clean.split("-")
+    cap_words = [w if re.match(r"^\d+(\.\d+)*$", w) else w.capitalize() for w in words]
+    return (" ".join(cap_words) + tier_str).strip()
+
+
+def _expand_model_tier_slugs(mid_str: str, minfo: dict) -> list[tuple[str, str]]:
+    """Return list of (slug, display_name) for a model entry, expanding tiered models matching FetchTieredModels in agy."""
+    supports_thinking = bool(minfo.get("supportsThinking", False))
+    budget = minfo.get("thinkingBudget", 0)
+    dname = minfo.get("displayName") or ""
+
+    if supports_thinking and budget == -1 and mid_str.endswith("-tiered"):
+        base_slug = mid_str[:-7]
+        results = []
+        for eff in ("high", "medium", "low"):
+            v_slug = f"{base_slug}-{eff}"
+            v_dname = format_gemini_user_facing_slug(v_slug)
+            results.append((v_slug, v_dname))
+        return results
+
+    return [(mid_str, dname or format_gemini_user_facing_slug(mid_str, dname))]
+
+
+def fetch_gemini_available_models(
+    account: Any = 1,
+    *,
+    force: bool = False,
+    timeout_seconds: float = 8.0,
+) -> list[str]:
+    """Fetch live available model IDs directly from Google Cloud Code PA with a 10-minute cache."""
+    acc_idx = _normalize_gemini_account_id(account)
+    cache_key = f"acc_{acc_idx}"
+    now = time.time()
+
+    if not force:
+        with _GEMINI_MODELS_CACHE_LOCK:
+            if cache_key in _GEMINI_MODELS_CACHE:
+                cached_time, model_ids, _ = _GEMINI_MODELS_CACHE[cache_key]
+                if now - cached_time < _GEMINI_MODELS_CACHE_TTL:
+                    return list(model_ids)
+
+    try:
+        creds = resolve_gemini_oauth_runtime_credentials(acc_idx, refresh_if_expiring=True)
+        access_token = creds.get("api_key") or creds.get("access_token")
+        if access_token:
+            from agent.gemini_cloudcode_adapter import get_antigravity_user_agent
+            resp = httpx.post(
+                f"{DEFAULT_GEMINI_OAUTH_BASE_URL}:fetchAvailableModels",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                    "User-Agent": get_antigravity_user_agent(),
+                },
+                json={"project": "default-cli-project"},
+                timeout=timeout_seconds,
+            )
+            if resp.status_code == 200:
+                data = resp.json() or {}
+                models_dict = data.get("models") or {}
+                sorts = data.get("agentModelSorts") or []
+
+                ordered_ids: list[str] = []
+                seen_ids: set[str] = set()
+                display_names: Dict[str, str] = {}
+
+                def _add_model_entry(mid_raw: str, minfo: dict) -> None:
+                    mid_clean = str(mid_raw).strip()
+                    if not mid_clean or mid_clean.startswith(("tab_", "chat_", "models/")) or "image" in mid_clean:
+                        return
+                    for slug, dname in _expand_model_tier_slugs(mid_clean, minfo):
+                        if slug not in seen_ids:
+                            ordered_ids.append(slug)
+                            seen_ids.add(slug)
+                            display_names[slug] = dname
+
+                # 1. Prioritize recommended/agent sort models in order directly from Google API
+                for sort_group in sorts:
+                    for group in sort_group.get("groups", []):
+                        for mid in group.get("modelIds", []):
+                            mid_str = str(mid).strip()
+                            if mid_str and mid_str in models_dict:
+                                _add_model_entry(mid_str, models_dict.get(mid_str, {}))
+
+                # 2. Format any remaining valid user-facing models from Google API
+                for mid, minfo in models_dict.items():
+                    if isinstance(minfo, dict):
+                        _add_model_entry(str(mid).strip(), minfo)
+
+                if ordered_ids:
+                    with _GEMINI_MODELS_CACHE_LOCK:
+                        _GEMINI_MODELS_CACHE[cache_key] = (now, ordered_ids, display_names)
+                    return list(ordered_ids)
+    except Exception as exc:
+        logger.debug("Failed to fetch available Gemini models for account %s: %s", acc_idx, exc)
+
+    with _GEMINI_MODELS_CACHE_LOCK:
+        if cache_key in _GEMINI_MODELS_CACHE:
+            return list(_GEMINI_MODELS_CACHE[cache_key][1])
+    return []
+
+
+def get_gemini_model_display_names(account: Any = 1) -> Dict[str, str]:
+    """Return dictionary mapping model_id -> human display name for Gemini models."""
+    acc_idx = _normalize_gemini_account_id(account)
+    cache_key = f"acc_{acc_idx}"
+    with _GEMINI_MODELS_CACHE_LOCK:
+        if cache_key in _GEMINI_MODELS_CACHE:
+            return dict(_GEMINI_MODELS_CACHE[cache_key][2])
+    fetch_gemini_available_models(acc_idx)
+    with _GEMINI_MODELS_CACHE_LOCK:
+        if cache_key in _GEMINI_MODELS_CACHE:
+            return dict(_GEMINI_MODELS_CACHE[cache_key][2])
+    return {}
+
+
+def get_quota_for_gemini_model(model_id: str, quota_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a model ID to its corresponding Cloud Code PA quota group and remaining buckets."""
+    if not quota_data or not isinstance(quota_data, dict):
+        return {}
+    fmt = quota_data if "gemini_5h_percent" in quota_data else format_gemini_quota_summary(quota_data)
+    is_gemini = "gemini" in str(model_id or "").lower()
+    prefix = "gemini" if is_gemini else "claude"
+    return {
+        "group_name": "Gemini Models" if is_gemini else "Claude and GPT models",
+        "weekly_pct": fmt.get(f"{prefix}_weekly_percent"),
+        "weekly_reset": fmt.get(f"{prefix}_weekly_reset"),
+        "weekly_countdown": fmt.get(f"{prefix}_weekly_countdown"),
+        "five_hour_pct": fmt.get(f"{prefix}_5h_percent"),
+        "five_hour_reset": fmt.get(f"{prefix}_5h_reset"),
+        "five_hour_countdown": fmt.get(f"{prefix}_5h_countdown"),
+    }
+
+
+def _parse_time_diff_hours(time_val: Any, default_hours: float = 5.0) -> float:
+    """Parse an ISO timestamp or numeric timestamp into remaining hours from now."""
+    if time_val is None:
+        return default_hours
+    try:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if isinstance(time_val, (int, float)):
+            return max(0.001, (float(time_val) - now_ts) / 3600.0)
+        if isinstance(time_val, str) and time_val.strip():
+            clean = time_val.strip()
+            if clean.endswith("Z"):
+                clean = clean[:-1] + "+00:00"
+            dt = datetime.fromisoformat(clean)
+            return max(0.001, (dt.timestamp() - now_ts) / 3600.0)
+    except Exception:
+        pass
+    return default_hours
+
+
+def calculate_gemini_doci_score(
+    account: Any = 1,
+    model_group: str = "gemini",
+    active_leases: int = 0,
+) -> Dict[str, Any]:
+    """Calculate the Dynamic Opportunity-Cost Index (DOCI) for a Gemini account.
+
+    Enhanced Concurrency-Dampened DOCI (CD-DOCI) with smooth sigmoid barrier
+    and exponential lease dampener.
+
+    Formula:
+      Base_Score = S_5h * S_w * U_5h * U_w
+      Phi_Lease  = exp(-0.40 * max(0, active_leases))
+      Score      = Base_Score * Phi_Lease
+    Where:
+      - S_5h: Smooth sigmoidal 5-hour runway readiness:
+              barrier = sigma((C_5h - 0.20) / 0.025)
+              S_5h = barrier * min(1.0, (C_5h / 0.80)^2)
+      - U_5h: 5-hour replenishment urgency dampened ((5.0 / (T_5h_hours + 0.5))^0.6)
+      - S_w:  Weekly capacity readiness squared (C_w ^ 2.0)
+      - U_w:  Weekly replenishment urgency (7.0 / (T_w_days + 0.5))
+      - Phi_Lease: Concurrency lease dampener exp(-0.40 * L)
+    """
+    acc_idx = _normalize_gemini_account_id(account)
+    status = get_gemini_oauth_auth_status(acc_idx)
+    phi_lease = math.exp(-0.40 * max(0, int(active_leases or 0)))
+    if not status.get("logged_in"):
+        return {
+            "account_id": acc_idx,
+            "email": "",
+            "logged_in": False,
+            "score": 0.0,
+            "base_score": 0.0,
+            "active_leases": max(0, int(active_leases or 0)),
+            "phi_lease": round(phi_lease, 4),
+            "s_5h": 0.0,
+            "u_5h": 0.0,
+            "s_w": 0.0,
+            "u_w": 0.0,
+            "cap_5h": 0.0,
+            "cap_w": 0.0,
+            "t_5h_hours": 5.0,
+            "t_w_days": 7.0,
+        }
+
+    quota = status.get("quota") or {}
+    is_gemini = "gemini" in str(model_group or "gemini").lower()
+    prefix = "gemini" if is_gemini else "claude"
+
+    cap_5h_pct = quota.get(f"{prefix}_5h_percent")
+    reset_5h_str = quota.get(f"{prefix}_5h_reset")
+    cap_w_pct = quota.get(f"{prefix}_weekly_percent")
+    reset_w_str = quota.get(f"{prefix}_weekly_reset")
+
+    cap_5h_val = 100.0 if cap_5h_pct is None else float(cap_5h_pct)
+    cap_w_val = 100.0 if cap_w_pct is None else float(cap_w_pct)
+
+    cap_5h_norm = max(0.0, cap_5h_val / 100.0)
+    cap_w_norm = max(0.0, cap_w_val / 100.0)
+
+    # Hard safety gates: strictly gate when quota is completely exhausted (0.0)
+    if cap_5h_norm <= 0.0 or cap_w_norm <= 0.0:
+        return {
+            "account_id": acc_idx,
+            "email": status.get("email", ""),
+            "logged_in": True,
+            "score": 0.0,
+            "base_score": 0.0,
+            "active_leases": max(0, int(active_leases or 0)),
+            "phi_lease": round(phi_lease, 4),
+            "s_5h": 0.0,
+            "u_5h": 0.0,
+            "s_w": 0.0,
+            "u_w": 0.0,
+            "cap_5h": round(cap_5h_norm, 3),
+            "cap_w": round(cap_w_norm, 3),
+            "t_5h_hours": 5.0,
+            "t_w_days": 7.0,
+        }
+
+    # 1. S_5h: Direct continuous 5-hour capacity runway (no artificial 20% soft barrier)
+    s_5h = cap_5h_norm
+
+    # 2. U_5h: 5-hour replenishment urgency (dampened)
+    t_5h_hours = _parse_time_diff_hours(reset_5h_str, default_hours=5.0)
+    u_5h = (5.0 / (t_5h_hours + 0.5)) ** 0.6
+
+    # 3. S_w and U_w: Weekly burn-urgency values (squared headroom)
+    t_w_days = _parse_time_diff_hours(reset_w_str, default_hours=168.0) / 24.0
+    s_w = cap_w_norm ** 2.0
+    u_w = 7.0 / (t_w_days + 0.5)
+
+    # 4. Exponential lease dampener (lambda = 0.40) & Total CD-DOCI Score
+    base_score = s_5h * s_w * u_5h * u_w
+    score = base_score * phi_lease
+
+    return {
+        "account_id": acc_idx,
+        "email": status.get("email", ""),
+        "logged_in": True,
+        "score": round(score, 4),
+        "base_score": round(base_score, 4),
+        "active_leases": max(0, int(active_leases or 0)),
+        "phi_lease": round(phi_lease, 4),
+        "s_5h": round(s_5h, 3),
+        "u_5h": round(u_5h, 3),
+        "s_w": round(s_w, 3),
+        "u_w": round(u_w, 3),
+        "cap_5h": round(cap_5h_norm, 3),
+        "cap_w": round(cap_w_norm, 3),
+        "t_5h_hours": round(t_5h_hours, 2),
+        "t_w_days": round(t_w_days, 2),
+    }
+
+
+def select_optimal_gemini_account(
+    current_account_id: Optional[int] = None,
+    candidate_account_ids: Optional[List[int]] = None,
+    model_group: str = "gemini",
+) -> int:
+    """Select the optimal Gemini account preserving KV cache stickiness.
+
+    - STICKS to current_account_id as long as it is logged in and not exhausted (>0% 5h capacity).
+    - If uninitialized or exhausted, ranks candidate accounts by DOCI score and selects the top candidate.
+    """
+    candidates = candidate_account_ids or list(range(1, 6))
+
+    if current_account_id is not None:
+        curr_status = calculate_gemini_doci_score(current_account_id, model_group=model_group)
+        if curr_status.get("logged_in") and curr_status.get("cap_5h", 1.0) > 0.0:
+            return current_account_id
+
+    scored: List[tuple] = []
+    for acc in candidates:
+        d = calculate_gemini_doci_score(acc, model_group=model_group)
+        if d.get("logged_in") and d.get("score", 0.0) > 0.0:
+            scored.append((d["score"], acc))
+
+    if not scored:
+        return candidates[0] if candidates else 1
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]
+
+
+def get_all_gemini_accounts_doci_rankings(model_group: str = "gemini") -> List[Dict[str, Any]]:
+    """Return all 5 Gemini accounts sorted descending by DOCI score with rankings and status notes."""
+    rankings = []
+    for acc in range(1, 6):
+        d = calculate_gemini_doci_score(acc, model_group=model_group)
+        if d.get("logged_in"):
+            rankings.append(d)
+    rankings.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    for idx, item in enumerate(rankings, 1):
+        item["rank"] = idx
+        item["doci_score"] = item.get("score", 0.0)
+        t_w = item.get("t_w_days", 7.0)
+        t_5h = item.get("t_5h_hours", 5.0)
+        if t_w < 1.0:
+            item["status_note"] = f"Weekly Burn Priority (Expires in {round(t_w * 24)}h)"
+        elif t_5h < 2.5:
+            item["status_note"] = f"Mid-Cycle Replenishment Bonus (5h reset in {round(t_5h, 1)}h)"
+        else:
+            item["status_note"] = "Active Quota Runway"
+    return rankings
+
+
+def prime_sleeping_gemini_account_timer(
+    account: Any = 1,
+    model_group: str = "gemini",
+    *,
+    force: bool = False,
+    timeout_seconds: float = 10.0,
+) -> bool:
+    """Send a structured low-token igniting request to start a sleeping 5h quota reset timer.
+
+    Google's rolling 5-hour quota windows are 'sleeping' when fresh (100% full).
+    They only start counting down after the first request is made in that window.
+    This function:
+      1. Captures pre-state quota telemetry.
+      2. Executes an igniting request with metadata capture (latency, reply, tokens).
+      3. Verifies post-state quota telemetry to confirm the 5-hour rolling timer is anchored.
+      4. Logs the comprehensive audit trail.
+    """
+    acc_idx = _normalize_gemini_account_id(account)
+    try:
+        status = get_gemini_oauth_auth_status(acc_idx)
+        if not status.get("logged_in"):
+            return False
+
+        quota = status.get("quota") or {}
+        is_gemini = "gemini" in str(model_group or "gemini").lower()
+        prefix = "gemini" if is_gemini else "claude"
+
+        cap_5h_pct = quota.get(f"{prefix}_5h_percent")
+        reset_5h_str = quota.get(f"{prefix}_5h_reset")
+
+        # Parse target reset datetime
+        reset_dt = None
+        if reset_5h_str:
+            try:
+                reset_dt = datetime.fromisoformat(str(reset_5h_str).replace("Z", "+00:00"))
+            except Exception:
+                reset_dt = None
+
+        now_utc = datetime.now(timezone.utc)
+        now_ts = time.time()
+
+        # Check if timer is sleeping or expired
+        # When an account is floating at 100% with no token usage, Google outputs resetTime = now + 5h.
+        # But if it has not been primed since the window started, it needs ignition.
+        is_sleeping_or_expired = False
+        prime_key = f"{acc_idx}:{prefix}"
+        with _GEMINI_PRIMED_LOCK:
+            last_primed = _GEMINI_LAST_PRIMED_AT.get(prime_key) or _GEMINI_LAST_PRIMED_AT.get(acc_idx)
+        if cap_5h_pct is None or float(cap_5h_pct) >= 99.99:
+            # If the account has not been primed in the current session/window
+            if last_primed is None:
+                is_sleeping_or_expired = True
+            elif reset_dt and reset_dt > now_utc:
+                # If last prime happened before this window's start (e.g. over 4.8 hours ago)
+                window_start_ts = reset_dt.timestamp() - 18000.0
+                if last_primed < window_start_ts:
+                    is_sleeping_or_expired = True
+            elif (now_ts - last_primed) >= 17400.0:
+                is_sleeping_or_expired = True
+        elif reset_dt and reset_dt <= now_utc:
+            is_sleeping_or_expired = True
+
+        if not is_sleeping_or_expired and not force:
+            logger.debug(
+                "Gemini Account %s (%s) %s 5h window already active (resets in %s); skipping primer",
+                acc_idx,
+                status.get("email"),
+                model_group,
+                quota.get(f"{prefix}_5h_countdown"),
+            )
+            return False
+
+        # Resolve credentials
+        creds = resolve_gemini_oauth_runtime_credentials(acc_idx, refresh_if_expiring=True)
+        token = creds.get("api_key") or creds.get("access_token")
+        if not token:
+            return False
+
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+
+        prime_model = "gemini-3.7-flash-low" if is_gemini else "gpt-oss-120b-medium"
+        client = GeminiCloudCodeClient(
+            access_token=token,
+            project_id=creds.get("project_id"),
+            timeout=timeout_seconds,
+        )
+
+        ping_msg = "Say: Ready"
+        max_tokens = 32
+        t_start = time.time()
+
+        try:
+            resp = client._create_chat_completion(
+                model=prime_model,
+                messages=[{"role": "user", "content": ping_msg}],
+                max_tokens=max_tokens,
+                stream=False,
+            )
+            latency_ms = round((time.time() - t_start) * 1000, 1)
+
+            # Extract reply text
+            reply_text = ""
+            if resp and hasattr(resp, "choices") and resp.choices:
+                msg = getattr(resp.choices[0], "message", None)
+                reply_text = (getattr(msg, "content", None) or getattr(msg, "reasoning", None) or "").strip()
+
+            # Extract token usage
+            usage = getattr(resp, "usage", None)
+            prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage else 0
+            completion_tokens = getattr(usage, "completion_tokens", 0) if usage else 0
+            total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens) if usage else 0
+            token_usage_str = f"prompt={prompt_tokens}, completion={completion_tokens}, total={total_tokens}"
+
+            with _GEMINI_PRIMED_LOCK:
+                _GEMINI_LAST_PRIMED_AT[prime_key] = time.time()
+                _GEMINI_LAST_PRIMED_AT[acc_idx] = time.time()
+
+            # Immediate Verification Check
+            time.sleep(0.5)
+            raw_after = fetch_gemini_quota_summary(token, force=True)
+            fmt_after = format_gemini_quota_summary(raw_after)
+            after_frac = None
+            for g in raw_after.get("groups", []):
+                for b in g.get("buckets", []):
+                    if (is_gemini and b.get("bucketId") == "gemini-5h") or (not is_gemini and b.get("bucketId") == "3p-5h"):
+                        after_frac = b.get("remainingFraction")
+            after_reset = fmt_after.get(f"{prefix}_5h_reset")
+            new_countdown = fmt_after.get(f"{prefix}_5h_countdown")
+
+            is_anchored = (after_frac is not None and after_frac < 0.9999999)
+            verdict = "PASS (5-Hour Rolling Timer Anchored)" if is_anchored else "FAIL (Timer Still Floating)"
+
+            logger.info(
+                "✅ [GEMINI QUOTA IGNITION] Successfully ignited %s timer on Account %s (%s)\n"
+                "   • Pre-State:  remainingFraction=%s, resetTime=%s\n"
+                "   • Request:    model=%s, prompt=%r, max_tokens=%s\n"
+                "   • Response:   reply=%r, latency=%sms, tokens=(%s), status=200 OK\n"
+                "   • Post-State: remainingFraction=%s, resetTime=%s, countdown=%s\n"
+                "   • Verdict:    %s",
+                model_group,
+                acc_idx,
+                status.get("email"),
+                cap_5h_pct,
+                reset_5h_str,
+                prime_model,
+                ping_msg,
+                max_tokens,
+                reply_text,
+                latency_ms,
+                token_usage_str,
+                after_frac,
+                after_reset,
+                new_countdown,
+                verdict,
+            )
+            return True
+        except Exception as api_err:
+            logger.debug(
+                "Gemini primer request for Account %s returned error (expected if exhausted): %s",
+                acc_idx,
+                api_err,
+            )
+            return False
+        finally:
+            client.close()
+
+    except Exception as exc:
+        logger.debug("Failed to prime Gemini Account %s quota timer: %s", acc_idx, exc)
+        return False
+
+
+def prime_all_sleeping_gemini_accounts(model_group: str = "gemini", async_run: bool = True) -> None:
+    """Kick-start sleeping quota timers across all 5 accounts."""
+    import threading
+
+    def _run_all():
+        for acc in range(1, 6):
+            try:
+                prime_sleeping_gemini_account_timer(acc, model_group=model_group)
+            except Exception as e:
+                logger.debug("Error in prime_all_sleeping_gemini_accounts for acc %s: %s", acc, e)
+
+    if async_run:
+        threading.Thread(target=_run_all, daemon=True, name="gemini-quota-primer").start()
+    else:
+        _run_all()
+
+
+_GEMINI_WATCHER_STOP_EVENT: Optional[threading.Event] = None
+_GEMINI_WATCHER_THREAD: Optional[threading.Thread] = None
+
+
+def run_gemini_quota_check_cycle(model_groups: tuple[str, ...] = ("gemini", "claude")) -> None:
+    """Run one verification cycle across all 5 accounts for sleeping/expired quota timers concurrently."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _check_task(item: tuple[int, str]) -> None:
+        acc, group = item
+        try:
+            prime_sleeping_gemini_account_timer(acc, model_group=group, force=False)
+        except Exception as e:
+            logger.debug("Error in quota check cycle for acc %s (%s): %s", acc, group, e)
+
+    tasks = [(acc, group) for acc in range(1, 6) for group in model_groups]
+    try:
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            list(executor.map(_check_task, tasks))
+    except Exception as exc:
+        logger.debug("Error in concurrent quota check cycle: %s", exc)
+
+
+def _gemini_quota_watcher_loop(stop_event: threading.Event, interval_seconds: float = 60.0) -> None:
+    """Background loop that wakes up periodically to ignite sleeping or expired reset timers."""
+    logger.info("🚀 [GEMINI QUOTA WATCHER] Background daemon started (polling every %ss)", interval_seconds)
+    while not stop_event.is_set():
+        try:
+            run_gemini_quota_check_cycle()
+        except Exception as exc:
+            logger.debug("Gemini quota watcher cycle error: %s", exc)
+        stop_event.wait(timeout=interval_seconds)
+    logger.info("🛑 [GEMINI QUOTA WATCHER] Background daemon stopped")
+
+
+def start_gemini_quota_watcher_daemon(interval_seconds: float = 60.0) -> threading.Thread:
+    """Start the 24/7 background quota watcher daemon thread."""
+    global _GEMINI_WATCHER_STOP_EVENT, _GEMINI_WATCHER_THREAD
+    if _GEMINI_WATCHER_THREAD is not None and _GEMINI_WATCHER_THREAD.is_alive():
+        return _GEMINI_WATCHER_THREAD
+
+    _GEMINI_WATCHER_STOP_EVENT = threading.Event()
+    _GEMINI_WATCHER_THREAD = threading.Thread(
+        target=_gemini_quota_watcher_loop,
+        args=(_GEMINI_WATCHER_STOP_EVENT, interval_seconds),
+        daemon=True,
+        name="gemini-quota-watcher",
+    )
+    _GEMINI_WATCHER_THREAD.start()
+    return _GEMINI_WATCHER_THREAD
+
+
+def stop_gemini_quota_watcher_daemon() -> None:
+    """Stop the background quota watcher daemon thread."""
+    global _GEMINI_WATCHER_STOP_EVENT
+    if _GEMINI_WATCHER_STOP_EVENT is not None:
+        _GEMINI_WATCHER_STOP_EVENT.set()
+
+
+
+
+def _normalize_gemini_account_id(account: Any) -> int:
+    if isinstance(account, int):
+        return max(1, min(5, account))
+    raw = str(account or "").strip().lower()
+    if not raw or raw in {"gemini", "gemini-oauth", "gemini_oauth"}:
+        return 1
+    match = re.search(r"(\d+)", raw)
+    if match:
+        try:
+            val = int(match.group(1))
+            return max(1, min(5, val))
+        except ValueError:
+            pass
+    return 1
+
+
+def _antigravity_token_path(account: Any = 1) -> Path:
+    acc_idx = _normalize_gemini_account_id(account)
+    token_env = os.getenv("HERMES_GEMINI_TOKEN_PATH", "").strip()
+    if token_env:
+        if acc_idx > 1:
+            p = Path(token_env)
+            return p.with_name(f"{p.stem}-{acc_idx}{p.suffix}")
+        return Path(token_env)
+    base_dir = None
+    if os.getenv("GEMINI_HOME"):
+        base_dir = Path(os.getenv("GEMINI_HOME")) / "antigravity-cli"
+    else:
+        try:
+            from hermes_constants import get_hermes_home
+            hhome = get_hermes_home()
+            if "pytest" in str(hhome) or "tmp" in str(hhome):
+                base_dir = hhome / ".gemini" / "antigravity-cli"
+        except Exception:
+            pass
+    if base_dir is None:
+        base_dir = Path.home() / ".gemini" / "antigravity-cli"
+    if acc_idx == 1:
+        return base_dir / "antigravity-oauth-token"
+    return base_dir / f"antigravity-oauth-token-{acc_idx}"
+
+
+def _read_gemini_account_tokens(account: Any = 1) -> Dict[str, Any]:
+    acc_idx = _normalize_gemini_account_id(account)
+
+    # 1. Primary: Hermes native store (~/.hermes/auth.json)
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+        providers_dict = auth_store.get("providers", {})
+        provider_keys = (
+            [f"gemini-oauth-{acc_idx}", f"gemini-{acc_idx}"]
+            if acc_idx > 1
+            else ["gemini-oauth", "gemini-1", "gemini-oauth-1"]
+        )
+        for pkey in provider_keys:
+            if pkey in providers_dict:
+                entry = providers_dict[pkey]
+                if isinstance(entry, dict) and entry.get("access_token") and entry.get("refresh_token"):
+                    return {
+                        "access_token": entry.get("access_token", ""),
+                        "refresh_token": entry.get("refresh_token", ""),
+                        "expiry": entry.get("expires_at") or entry.get("expiry"),
+                        "token_type": "Bearer",
+                        "email": entry.get("email", ""),
+                        "name": entry.get("name", ""),
+                        "project_id": entry.get("project_id", ""),
+                        "account_id": acc_idx,
+                        "source": f"hermes_auth:{pkey}",
+                        "source_file": str(_auth_file_path()),
+                    }
+    except Exception:
+        pass
+
+    # 2. Secondary Discovery: ~/.gemini/antigravity-cli token files (agy)
+    candidate_token_files: List[Path] = [_antigravity_token_path(acc_idx)]
+
+    gemini_roots: List[Path] = []
+    if os.getenv("HERMES_GEMINI_TOKEN_PATH"):
+        candidate_token_files.append(Path(os.getenv("HERMES_GEMINI_TOKEN_PATH")))
+    if os.getenv("GEMINI_HOME"):
+        gemini_roots.append(Path(os.getenv("GEMINI_HOME")))
+    if os.getenv("ANTIGRAVITY_HOME"):
+        gemini_roots.append(Path(os.getenv("ANTIGRAVITY_HOME")))
+
+    gemini_roots.append(Path.home() / ".gemini")
+    try:
+        from hermes_constants import get_hermes_home
+        hhome = get_hermes_home()
+        gemini_roots.append(hhome / ".gemini")
+        if hhome.parent != hhome:
+            gemini_roots.append(hhome.parent / ".gemini")
+    except Exception:
+        pass
+
+    for groot in gemini_roots:
+        try:
+            if not groot.exists():
+                continue
+            cli_dir = groot / "antigravity-cli" if (groot / "antigravity-cli").is_dir() else groot
+            if acc_idx == 1:
+                candidate_token_files.extend([
+                    cli_dir / "antigravity-oauth-token",
+                    cli_dir / "antigravity-oauth-token-1",
+                    cli_dir / "antigravity-oauth-token.1",
+                ])
+            else:
+                candidate_token_files.extend([
+                    cli_dir / f"antigravity-oauth-token-{acc_idx}",
+                    cli_dir / f"antigravity-oauth-token.{acc_idx}",
+                ])
+        except (PermissionError, OSError):
+            continue
+
+    for tf in candidate_token_files:
+        if tf.exists():
+            try:
+                data = json.loads(tf.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    tok = data.get("token", data) if isinstance(data.get("token"), dict) else data
+                    if tok.get("access_token") and tok.get("refresh_token"):
+                        res = {
+                            "access_token": tok.get("access_token", ""),
+                            "refresh_token": tok.get("refresh_token", ""),
+                            "expiry": tok.get("expiry", ""),
+                            "token_type": tok.get("token_type", "Bearer"),
+                            "email": data.get("email", ""),
+                            "name": data.get("name", ""),
+                            "project_id": data.get("project_id", ""),
+                            "account_id": acc_idx,
+                            "source": "antigravity_cli" if acc_idx == 1 else f"antigravity_cli:{acc_idx}",
+                            "source_file": str(tf),
+                            "raw": data,
+                        }
+                        try:
+                            _save_gemini_account_tokens(acc_idx, res)
+                        except Exception:
+                            pass
+                        return res
+            except Exception:
+                pass
+
+    raise AuthError(
+        f"Google Gemini Account {acc_idx} credentials not found. Run `hermes auth add gemini-{acc_idx}` to connect.",
+        provider=f"gemini-{acc_idx}",
+        code="gemini_auth_missing",
+    )
+
+
+def has_gemini_oauth_credentials(account: Any = 1) -> bool:
+    """Return True if credentials exist for the given Gemini account."""
+    try:
+        toks = _read_gemini_account_tokens(account)
+        return bool(toks and toks.get("access_token") and toks.get("refresh_token"))
+    except Exception:
+        return False
+
+
+def _read_antigravity_tokens() -> Dict[str, Any]:
+    """Compatibility helper reading Account 1 tokens."""
+    return _read_gemini_account_tokens(1)
+
+
+def _save_gemini_account_tokens(account: Any, tokens: Dict[str, Any]) -> None:
+    acc_idx = _normalize_gemini_account_id(account)
+
+    # Update in ~/.hermes/auth.json (Primary store)
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            providers_dict = auth_store.setdefault("providers", {})
+            entry = {
+                "access_token": tokens.get("access_token", ""),
+                "refresh_token": tokens.get("refresh_token", ""),
+                "expiry": tokens.get("expiry"),
+                "email": tokens.get("email", ""),
+                "name": tokens.get("name", ""),
+                "project_id": tokens.get("project_id", ""),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            if acc_idx > 1:
+                providers_dict[f"gemini-oauth-{acc_idx}"] = entry
+                providers_dict[f"gemini-{acc_idx}"] = entry
+            else:
+                providers_dict["gemini-oauth"] = entry
+                providers_dict["gemini-1"] = entry
+            _save_auth_store(auth_store)
+    except Exception as exc:
+        logger.debug("Failed to save gemini account %s in auth.json: %s", acc_idx, exc)
+
+    try:
+        _save_antigravity_tokens(tokens, account=acc_idx)
+    except Exception:
+        pass
+
+
+def _gemini_oauth_pkce_login(account: Any = 1, timeout_seconds: float = 120.0) -> Dict[str, Any]:
+    """Run Hermes-native Google OAuth PKCE authorization flow for Gemini accounts.
+
+    Uses installed-app client credentials extracted from agy (or built-in defaults)
+    and prompts the user to authorize their Google account.
+    """
+    import secrets
+    import webbrowser
+    from urllib.parse import urlencode
+
+    acc_idx = _normalize_gemini_account_id(account)
+    client_id, client_secret = _extract_gemini_oauth_credentials_from_agy()
+    
+    # Generate PKCE verifier and challenge (S256)
+    import base64
+    import hashlib
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    oauth_state = secrets.token_urlsafe(32)
+
+    redirect_uri = "urn:ietf:wg:oauth:2.0:oob" if sys.platform != "darwin" and os.getenv("SSH_CONNECTION") else "http://localhost:8085/oauth2callback"
+    scopes = [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    ]
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(scopes),
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": oauth_state,
+        "access_type": "offline",
+        "prompt": "consent select_account",
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+
+    print()
+    print(f"Authorize Hermes for Google Gemini Account {acc_idx}.")
+    print()
+    print("╭─ Google Gemini Authorization ─────────────────────╮")
+    print("│                                                   │")
+    print("│  Open this link in your browser:                  │")
+    print("╰───────────────────────────────────────────────────╯")
+    print()
+    print(f"  {auth_url}")
+    print()
+
+    try:
+        from hermes_cli.auth import _can_open_graphical_browser as _can_open_gui
+    except Exception:
+        _can_open_gui = lambda: True
+
+    if _can_open_gui():
+        try:
+            webbrowser.open(auth_url)
+            print("  (Browser opened automatically)")
+        except Exception:
+            pass
+
+    print()
+    print("After authorizing, paste the authorization code below.")
+    print()
+    try:
+        auth_code = input("Authorization code: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        raise AuthError("OAuth login cancelled.", provider=f"gemini-{acc_idx}")
+
+    if not auth_code:
+        raise AuthError("No authorization code entered.", provider=f"gemini-{acc_idx}")
+
+    # If the user pasted the entire redirect URL or query string, extract the code param
+    if "code=" in auth_code or auth_code.startswith("http://") or auth_code.startswith("https://"):
+        try:
+            from urllib.parse import urlparse, parse_qs
+            parsed = urlparse(auth_code)
+            qs = parse_qs(parsed.query or parsed.path)
+            if "code" in qs and qs["code"]:
+                auth_code = qs["code"][0]
+            elif "?" in auth_code:
+                qs2 = parse_qs(auth_code.split("?", 1)[1])
+                if "code" in qs2 and qs2["code"]:
+                    auth_code = qs2["code"][0]
+        except Exception:
+            pass
+
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": auth_code,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+    }
+    if client_secret:
+        token_data["client_secret"] = client_secret
+
+    try:
+        resp = httpx.post(DEFAULT_GEMINI_OAUTH_TOKEN_URL, data=token_data, timeout=20.0)
+    except Exception as exc:
+        raise AuthError(f"Google OAuth token exchange failed: {exc}", provider=f"gemini-{acc_idx}") from exc
+
+    if resp.status_code != 200:
+        raise AuthError(f"Google OAuth token exchange failed (HTTP {resp.status_code}): {resp.text}", provider=f"gemini-{acc_idx}")
+
+    payload = resp.json()
+    access_token = payload.get("access_token", "")
+    refresh_token = payload.get("refresh_token", "")
+    expires_in = int(payload.get("expires_in", 3600))
+    from datetime import datetime, timezone, timedelta
+    expiry_str = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
+
+    email = ""
+    name = ""
+    try:
+        u_resp = httpx.get(DEFAULT_GEMINI_OAUTH_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=5.0)
+        if u_resp.status_code == 200:
+            u_info = u_resp.json()
+            email = u_info.get("email", "")
+            name = u_info.get("name", "")
+    except Exception:
+        pass
+
+    creds = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expiry": expiry_str,
+        "email": email,
+        "name": name,
+        "account_id": acc_idx,
+        "source": f"hermes_auth:gemini-{acc_idx}",
+    }
+    _save_gemini_account_tokens(acc_idx, creds)
+    return creds
+
+    try:
+        _save_antigravity_tokens(tokens, account=acc_idx)
+    except Exception:
+        pass
+
+
+def _save_antigravity_tokens(tokens: Dict[str, Any], account: Any = 1) -> Path:
+    acc_idx = _normalize_gemini_account_id(account)
+    auth_path = _antigravity_token_path(acc_idx)
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    secure_parent_dir(auth_path)
+    tmp_path = auth_path.with_name(f"{auth_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            raw = tokens.get("raw")
+            if isinstance(raw, dict):
+                raw["token"]["access_token"] = tokens.get("access_token", "")
+                if tokens.get("refresh_token"):
+                    raw["token"]["refresh_token"] = tokens["refresh_token"]
+                if tokens.get("expiry"):
+                    raw["token"]["expiry"] = tokens["expiry"]
+                fh.write(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+            else:
+                agy_format = {
+                    "token": {
+                        "access_token": tokens.get("access_token", ""),
+                        "refresh_token": tokens.get("refresh_token", ""),
+                        "token_type": tokens.get("token_type", "Bearer"),
+                        "expiry": tokens.get("expiry", ""),
+                    },
+                    "auth_method": "consumer",
+                }
+                fh.write(json.dumps(agy_format, indent=2, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        atomic_replace(tmp_path, auth_path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+    return auth_path
+
+
+def _gemini_access_token_is_expiring(expiry_val: Any, skew_seconds: int = GEMINI_OAUTH_REFRESH_SKEW_SECONDS) -> bool:
+    if not expiry_val:
+        return False
+    try:
+        if isinstance(expiry_val, (int, float)):
+            exp_ts = float(expiry_val)
+            if exp_ts > 1e11:
+                exp_ts /= 1000.0
+        elif isinstance(expiry_val, str):
+            from datetime import datetime
+            dt = datetime.fromisoformat(expiry_val.replace("Z", "+00:00"))
+            exp_ts = dt.timestamp()
+        else:
+            return True
+        return exp_ts <= (time.time() + max(0, int(skew_seconds)))
+    except Exception:
+        return True
+
+
+def _refresh_gemini_oauth_tokens(
+    tokens: Dict[str, Any],
+    account: Any = 1,
+    timeout_seconds: float = 20.0,
+) -> Dict[str, Any]:
+    acc_idx = _normalize_gemini_account_id(account)
+    refresh_token = str(tokens.get("refresh_token", "") or "").strip()
+    if not refresh_token:
+        raise AuthError(
+            f"Gemini Account {acc_idx} refresh token missing. Run `hermes auth add gemini-{acc_idx}` to re-authenticate.",
+            provider=f"gemini-{acc_idx}",
+            code="gemini_refresh_token_missing",
+        )
+
+    client_id, client_secret = _extract_gemini_oauth_credentials_from_agy()
+    post_data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }
+    if client_secret:
+        post_data["client_secret"] = client_secret
+
+    try:
+        response = httpx.post(
+            DEFAULT_GEMINI_OAUTH_TOKEN_URL,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            data=post_data,
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        raise AuthError(
+            f"Google Gemini Account {acc_idx} OAuth refresh failed: {exc}",
+            provider=f"gemini-{acc_idx}",
+            code="gemini_refresh_failed",
+        ) from exc
+
+    if response.status_code >= 400:
+        body = response.text.strip()
+        raise AuthError(
+            f"Google Gemini Account {acc_idx} OAuth refresh failed (HTTP {response.status_code}): {body}",
+            provider=f"gemini-{acc_idx}",
+            code="gemini_refresh_failed",
+        )
+
+    payload = response.json()
+    access_token = str(payload.get("access_token", "") or "").strip()
+    if not access_token:
+        raise AuthError(
+            f"Google Gemini Account {acc_idx} OAuth refresh response missing access_token.",
+            provider=f"gemini-{acc_idx}",
+            code="gemini_refresh_invalid_response",
+        )
+
+    from datetime import datetime, timezone, timedelta
+    expires_in = int(payload.get("expires_in", 3600))
+    expiry_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    expiry_str = expiry_dt.isoformat().replace("+00:00", "Z")
+
+    refreshed = dict(tokens)
+    refreshed["access_token"] = access_token
+    if payload.get("refresh_token"):
+        refreshed["refresh_token"] = payload["refresh_token"]
+    refreshed["expiry"] = expiry_str
+
+    _save_gemini_account_tokens(acc_idx, refreshed)
+    return refreshed
+
+
+def _mark_gemini_oauth_active(creds: Dict[str, Any], account: Any = 1) -> None:
+    """Set active_provider to gemini-oauth (or specific account) in auth.json without stripping tokens."""
+    acc_idx = _normalize_gemini_account_id(account)
+    provider_key = f"gemini-{acc_idx}" if acc_idx > 1 else "gemini-oauth"
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        providers = auth_store.setdefault("providers", {})
+        existing = providers.get(provider_key) or {}
+        state = dict(existing) if isinstance(existing, dict) else {}
+        if creds.get("base_url"):
+            state["base_url"] = str(creds["base_url"])
+        if creds.get("email"):
+            state["email"] = str(creds["email"])
+        if creds.get("access_token") and not state.get("access_token"):
+            state["access_token"] = str(creds["access_token"])
+        if creds.get("refresh_token") and not state.get("refresh_token"):
+            state["refresh_token"] = str(creds["refresh_token"])
+        if creds.get("expiry") and not state.get("expiry"):
+            state["expiry"] = creds["expiry"]
+        _save_provider_state(auth_store, provider_key, state)
+        _save_auth_store(auth_store)
+
+
+def resolve_gemini_oauth_runtime_credentials(
+    account: Any = 1,
+    *,
+    force_refresh: bool = False,
+    refresh_if_expiring: bool = True,
+    refresh_skew_seconds: int = GEMINI_OAUTH_REFRESH_SKEW_SECONDS,
+) -> Dict[str, Any]:
+    acc_idx = _normalize_gemini_account_id(account)
+    tokens = _read_gemini_account_tokens(acc_idx) or {}
+    access_token = str(tokens.get("access_token", "") or "").strip()
+    should_refresh = bool(force_refresh)
+    if not should_refresh and refresh_if_expiring:
+        should_refresh = _gemini_access_token_is_expiring(tokens.get("expiry"), refresh_skew_seconds)
+    if should_refresh:
+        lock = _get_gemini_refresh_lock(acc_idx)
+        with lock:
+            # Re-read tokens after acquiring lock to check if another thread already refreshed it
+            tokens = _read_gemini_account_tokens(acc_idx)
+            if force_refresh or _gemini_access_token_is_expiring(tokens.get("expiry"), refresh_skew_seconds):
+                tokens = _refresh_gemini_oauth_tokens(tokens, account=acc_idx)
+            access_token = str(tokens.get("access_token", "") or "").strip()
+
+    if not access_token:
+        raise AuthError(
+            f"Gemini Account {acc_idx} OAuth access token missing. Run `hermes auth add gemini-{acc_idx}`.",
+            provider=f"gemini-{acc_idx}",
+            code="gemini_access_token_missing",
+        )
+
+    email = tokens.get("email", "")
+    if not email:
+        try:
+            res = httpx.get(
+                DEFAULT_GEMINI_OAUTH_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=5.0,
+            )
+            if res.status_code == 200:
+                user_info = res.json()
+                email = user_info.get("email", "")
+                tokens["email"] = email
+                tokens["name"] = user_info.get("name", "")
+                _save_gemini_account_tokens(acc_idx, tokens)
+        except Exception:
+            pass
+
+    project_id = "default-cli-project"
+    base_url = os.getenv("HERMES_GEMINI_OAUTH_BASE_URL", "").strip().rstrip("/") or DEFAULT_GEMINI_OAUTH_BASE_URL
+    provider_slug = "gemini-oauth" if str(account or "").strip().lower() in {"", "1", "gemini-oauth", "gemini_oauth"} and acc_idx == 1 else f"gemini-{acc_idx}"
+    return {
+        "provider": provider_slug,
+        "account_id": acc_idx,
+        "base_url": base_url,
+        "api_key": access_token,
+        "access_token": access_token,
+        "project_id": project_id or "default-cli-project",
+        "refresh_token": tokens.get("refresh_token"),
+        "source": tokens.get("source", f"gemini_account_{acc_idx}"),
+        "email": email,
+        "expiry": tokens.get("expiry"),
+        "auth_file": tokens.get("source_file", ""),
+    }
+
+
+_CONFIG_ALIASES_CACHE: tuple[float, int, dict[str, str]] = (0.0, 0, {})
+_ALIASES_CACHE_LOCK = threading.Lock()
+
+
+def _get_account_aliases_map() -> dict[str, str]:
+    """Return cached dictionary mapping lowercased account identifier to alias.
+
+    Refreshes at most once every 5 seconds to eliminate disk I/O and deepcopy
+    overhead on high-frequency lookups while preserving responsiveness to config edits.
+    Automatically invalidates if load_config function identity changes (e.g. in tests).
+    """
+    global _CONFIG_ALIASES_CACHE
+    from hermes_cli.config import load_config
+
+    func_id = id(load_config)
+    now = time.time()
+    if _CONFIG_ALIASES_CACHE[1] == func_id and (now - _CONFIG_ALIASES_CACHE[0] < 5.0):
+        return _CONFIG_ALIASES_CACHE[2]
+    with _ALIASES_CACHE_LOCK:
+        if _CONFIG_ALIASES_CACHE[1] == func_id and (now - _CONFIG_ALIASES_CACHE[0] < 5.0):
+            return _CONFIG_ALIASES_CACHE[2]
+        try:
+            cfg = load_config()
+            raw_aliases = (cfg.get("display") or {}).get("account_aliases") or {}
+            parsed: dict[str, str] = {}
+            if isinstance(raw_aliases, dict):
+                for k, v in raw_aliases.items():
+                    val = str(v).strip()
+                    if val:
+                        parsed[str(k).strip().lower()] = val
+            _CONFIG_ALIASES_CACHE = (now, func_id, parsed)
+            return parsed
+        except Exception:
+            return _CONFIG_ALIASES_CACHE[2]
+
+
+def get_account_alias(email_or_account: Any, aliases: dict | None = None) -> str:
+    """Return configured alias for an account email/identifier from config.yaml display.account_aliases."""
+    if not email_or_account or not isinstance(email_or_account, str):
+        return ""
+    clean = email_or_account.strip()
+    clean_lower = clean.lower()
+    if aliases is not None:
+        if clean_lower in aliases:
+            return aliases[clean_lower]
+        for k, v in aliases.items():
+            if str(k).strip().lower() == clean_lower:
+                val = str(v).strip()
+                if val:
+                    return val
+        return clean
+
+    aliases_map = _get_account_aliases_map()
+    return aliases_map.get(clean_lower, clean)
+
+
+_RESOLVED_SESSION_ACCOUNTS_LOCK = threading.Lock()
+_RESOLVED_SESSION_ACCOUNTS: Dict[str, str] = {}
+
+
+def resolve_session_last_used_account(session_id: str, db=None) -> str:
+    """Discover and return the last-used Gemini account for a session.
+
+    Resolution hierarchy:
+    0. In-memory fast cache (O(1)).
+    1. Direct session model_config["gemini_account"] in state.db.
+    2. Message display_metadata["gemini_account"] from session history.
+    3. Historical agent.log entries matching [session_id] (bounded tail read).
+    4. Active pool default (only for brand-new / empty sessions).
+
+    Auto-heals state.db and in-memory cache so subsequent lookups are ~0ms.
+    """
+    if not session_id or not isinstance(session_id, str):
+        return ""
+    sid = session_id.strip()
+
+    with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+        if sid in _RESOLVED_SESSION_ACCOUNTS:
+            return _RESOLVED_SESSION_ACCOUNTS[sid]
+
+    from pathlib import Path
+    import json
+    sess = None
+
+    if db is not None:
+        try:
+            sess = db.get_session(sid)
+        except Exception:
+            sess = None
+
+    # 1. Stamped in state.db model_config
+    if sess:
+        cfg = sess.get("model_config") or {}
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except Exception:
+                cfg = {}
+        if isinstance(cfg, dict) and cfg.get("gemini_account"):
+            acc = str(cfg["gemini_account"]).strip()
+            with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+                _RESOLVED_SESSION_ACCOUNTS[sid] = acc
+            return acc
+
+    # 2. Check message display_metadata in state.db
+    if db is not None:
+        try:
+            msgs = db.get_messages(sid) or []
+            for m in reversed(msgs):
+                meta = m.get("display_metadata") or {}
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                if isinstance(meta, dict) and meta.get("gemini_account"):
+                    acc = str(meta["gemini_account"]).strip()
+                    with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+                        _RESOLVED_SESSION_ACCOUNTS[sid] = acc
+                    return acc
+        except Exception:
+            pass
+
+    # 3. Check agent.log history (bounded tail scan only, max 64KB)
+    try:
+        from hermes_constants import get_hermes_home
+        log_path = get_hermes_home() / "logs" / "agent.log"
+        if log_path.exists():
+            with open(log_path, "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 65536))
+                tail_bytes = f.read()
+            lines = tail_bytes.decode("utf-8", errors="ignore").splitlines()
+            for line in reversed(lines):
+                if f"[{sid}]" in line and ("Account:" in line or "switched active account to" in line):
+                    match = re.search(r"Account:\s*([^\s(]+)(?:\s*\(([^)]+)\))?", line)
+                    if match:
+                        acc = match.group(2) or match.group(1)
+                        with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+                            _RESOLVED_SESSION_ACCOUNTS[sid] = acc
+                        return acc
+                    match_sw = re.search(r"switched active account to\s*([^\s(]+)(?:\s*\(([^)]+)\))?", line)
+                    if match_sw:
+                        acc = match_sw.group(2) or match_sw.group(1)
+                        with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+                            _RESOLVED_SESSION_ACCOUNTS[sid] = acc
+                        return acc
+    except Exception:
+        pass
+
+    # 4. Fallback to active pool
+    try:
+        from agent.credential_pool import load_pool
+        pool = load_pool("gemini-oauth")
+        if pool:
+            curr = pool.current() or pool.peek()
+            if curr:
+                acc = curr.label or curr.id
+                with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+                    _RESOLVED_SESSION_ACCOUNTS[sid] = acc
+                return acc
+    except Exception:
+        pass
+
+    with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+        _RESOLVED_SESSION_ACCOUNTS[sid] = ""
+    return ""
+
+
+def record_account_event(
+    session_id: str | None,
+    to_account: str,
+    from_account: str | None = None,
+    event_type: str = "switch",
+    details: str = "",
+    timestamp: str | None = None,
+    session_title: str | None = None,
+) -> None:
+    """Record an account allocation, pin, or switch event in state.db."""
+    if not to_account:
+        return
+    import sqlite3
+    from datetime import datetime, timezone
+    from hermes_constants import get_hermes_home
+    try:
+        db_path = get_hermes_home() / "state.db"
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS gemini_account_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                session_id TEXT,
+                session_title TEXT,
+                from_account TEXT,
+                to_account TEXT,
+                to_account_alias TEXT,
+                event_type TEXT,
+                details TEXT
+            )
+        """)
+        if not session_title and session_id:
+            cursor.execute("SELECT title FROM sessions WHERE id = ? OR session_key = ?", (session_id, session_id))
+            row = cursor.fetchone()
+            if row and row[0]:
+                session_title = row[0]
+
+        ts = timestamp or datetime.now(timezone.utc).isoformat()
+        alias = get_account_alias(to_account)
+        cursor.execute("""
+            INSERT INTO gemini_account_events (timestamp, session_id, session_title, from_account, to_account, to_account_alias, event_type, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (ts, session_id, session_title or session_id or "System", from_account, to_account, alias, event_type, details))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def list_account_events(session_id: str | None = None, limit: int = 50, offset: int = 0, scope: str = "chats") -> dict:
+    """Return paginated list of Gemini account change/pinning events."""
+    import sqlite3
+    from hermes_constants import get_hermes_home
+    results = []
+    total = 0
+    try:
+        db_path = get_hermes_home() / "state.db"
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS gemini_account_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                session_id TEXT,
+                session_title TEXT,
+                from_account TEXT,
+                to_account TEXT,
+                to_account_alias TEXT,
+                event_type TEXT,
+                details TEXT
+            )
+        """)
+
+        cursor.execute("SELECT COUNT(*) FROM gemini_account_events")
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("SELECT id, title, model_config, started_at FROM sessions WHERE model LIKE '%gemini%' ORDER BY started_at ASC")
+            import json
+            from datetime import datetime, timezone
+            for srow in cursor.fetchall():
+                sid, stitle, cfg_str, started_at = srow["id"], srow["title"], srow["model_config"], srow["started_at"]
+                cfg = json.loads(cfg_str) if cfg_str else {}
+                acc = cfg.get("gemini_account")
+                if acc:
+                    alias = get_account_alias(acc)
+                    ts = datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat() if started_at else datetime.now(timezone.utc).isoformat()
+                    cursor.execute("""
+                        INSERT INTO gemini_account_events (timestamp, session_id, session_title, from_account, to_account, to_account_alias, event_type, details)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (ts, sid, stitle or sid, None, acc, alias, "session_pin", f"Chat initialized on {alias}"))
+            conn.commit()
+
+        query_base = """
+            SELECT 
+                e.*,
+                COALESCE(
+                    s.title,
+                    (SELECT substr(content, 1, 60) FROM messages WHERE session_id = e.session_id AND role = 'user' LIMIT 1),
+                    e.session_title,
+                    'Untitled Session'
+                ) as resolved_title
+            FROM gemini_account_events e
+            LEFT JOIN sessions s ON e.session_id = s.id OR e.session_id = s.session_key
+        """
+
+        where_clauses = []
+        params = []
+        if session_id:
+            where_clauses.append("e.session_id = ?")
+            params.append(session_id)
+        elif scope == "chats":
+            where_clauses.append("(s.parent_session_id IS NULL OR s.id = '20260821_214142_739584' OR s.title IS NOT NULL)")
+
+        where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        count_query = f"""
+            SELECT COUNT(*) 
+            FROM gemini_account_events e
+            LEFT JOIN sessions s ON e.session_id = s.id OR e.session_id = s.session_key
+            {where_sql}
+        """
+        cursor.execute(count_query, tuple(params))
+        total = cursor.fetchone()[0]
+
+        data_query = f"{query_base} {where_sql} ORDER BY e.id DESC LIMIT ? OFFSET ?"
+        data_params = tuple(params + [limit, offset])
+        cursor.execute(data_query, data_params)
+
+        for row in cursor.fetchall():
+            from_acc = row["from_account"]
+            to_acc = row["to_account"]
+            stitle = row["resolved_title"]
+            if not stitle or stitle == row["session_id"]:
+                stitle = "Untitled Session"
+            results.append({
+                "id": row["id"],
+                "timestamp": row["timestamp"],
+                "session_id": row["session_id"],
+                "session_title": stitle,
+                "from_account": from_acc,
+                "to_account": to_acc,
+                "from_alias": get_account_alias(from_acc) if from_acc else None,
+                "to_alias": get_account_alias(to_acc) if to_acc else row["to_account_alias"],
+                "event_type": row["event_type"],
+                "details": row["details"]
+            })
+        conn.close()
+    except Exception:
+        pass
+
+    return {"events": results, "total": total, "limit": limit, "offset": offset}
+
+
+def list_gemini_session_histories(limit: int = 100) -> dict:
+    """Return sessions with their nested Gemini account change history."""
+    import sqlite3
+    import json
+    import re
+    from datetime import datetime, timezone
+    from hermes_constants import get_hermes_home
+
+    out = []
+    conn = None
+    try:
+        db_path = get_hermes_home() / "state.db"
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # Ensure explicit account events table exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS gemini_account_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                session_id TEXT,
+                session_title TEXT,
+                from_account TEXT,
+                to_account TEXT,
+                to_account_alias TEXT,
+                event_type TEXT,
+                details TEXT
+            )
+        """)
+
+        cursor.execute("""
+            SELECT 
+                s.id,
+                s.title,
+                s.model,
+                s.model_config,
+                s.parent_session_id,
+                s.started_at,
+                s.last_activity_at,
+                s.message_count,
+                (SELECT COUNT(*) FROM messages WHERE session_id = s.id AND role = 'user') as user_turns,
+                (SELECT substr(content, 1, 60) FROM messages WHERE session_id = s.id AND role = 'user' LIMIT 1) as first_prompt
+            FROM sessions s
+            WHERE s.model LIKE '%gemini%' OR s.id IN (SELECT DISTINCT session_id FROM gemini_account_events WHERE session_id IS NOT NULL)
+            ORDER BY s.started_at DESC
+            LIMIT ?
+        """, (limit,))
+        sessions_raw = cursor.fetchall()
+
+        # Load explicit account events
+        cursor.execute("SELECT * FROM gemini_account_events ORDER BY id ASC")
+        events_raw = cursor.fetchall()
+
+        # Helper to convert arbitrary timestamp representations to numeric Unix epoch
+        def _to_epoch(ts_val) -> float:
+            if not ts_val:
+                return 0.0
+            if isinstance(ts_val, (int, float)):
+                return float(ts_val)
+            s_val = str(ts_val).strip()
+            try:
+                if "T" in s_val:
+                    return datetime.fromisoformat(s_val.replace("Z", "+00:00")).timestamp()
+                dt = datetime.strptime(s_val, "%Y-%m-%d %H:%M:%S")
+                return dt.astimezone().timestamp()
+            except Exception:
+                return 0.0
+
+        # Parse rotation logs from agent.log (bounded to the most recent 1MB)
+        log_swaps = {}
+        log_path = get_hermes_home() / "logs" / "agent.log"
+        if log_path.exists():
+            try:
+                max_log_bytes = 1024 * 1024
+                with open(log_path, "r", errors="ignore") as f:
+                    try:
+                        f.seek(0, os.SEEK_END)
+                        size = f.tell()
+                        if size > max_log_bytes:
+                            f.seek(size - max_log_bytes, os.SEEK_SET)
+                            f.readline()  # discard partial first line
+                        else:
+                            f.seek(0, os.SEEK_SET)
+                    except Exception:
+                        pass
+                    for line in f:
+                        if "switched active account to" in line or "Active account switched:" in line or "Quota exhausted" in line or "429" in line:
+                            sid_m = re.search(r"\[([0-9]{8}_[0-9]{6}_[a-f0-9]+)\]", line)
+                            ts_m = re.match(r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", line)
+                            acc_m = re.search(r"(?:switched active account to|Active account switched:)\s*([^\s(]+)(?:\s*\(([^)]+)\))?", line)
+                            if sid_m and acc_m:
+                                sid = sid_m.group(1)
+                                if sid not in log_swaps:
+                                    log_swaps[sid] = []
+                                raw_acc = acc_m.group(2) or acc_m.group(1)
+                                ts_str = ts_m.group(1) if ts_m else ""
+                                ep = _to_epoch(ts_str)
+                                log_swaps[sid].append({
+                                    "epoch": ep,
+                                    "id": f"switch_{len(log_swaps[sid])+1}",
+                                    "timestamp": datetime.fromtimestamp(ep, tz=timezone.utc).isoformat() if ep else ts_str,
+                                    "to_account": raw_acc,
+                                    "to_alias": get_account_alias(raw_acc),
+                                    "event_type": "quota_failover" if "429" in line or "exhaust" in line.lower() else "switch",
+                                    "details": f"Account rotated to {get_account_alias(raw_acc)}",
+                                })
+            except Exception:
+                pass
+
+        for s in sessions_raw:
+            sid = s["id"]
+            is_subagent = bool(s["parent_session_id"])
+            cfg = json.loads(s["model_config"]) if s["model_config"] else {}
+            current_raw = str(cfg.get("gemini_account") or "").strip()
+            current_alias = get_account_alias(current_raw) if current_raw else ""
+
+            # Fetch messages for this session to build true deduplicated conversational turns
+            cursor.execute("""
+                SELECT id, role, content, timestamp, tool_name, display_metadata
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY id ASC
+            """, (sid,))
+            msg_rows = cursor.fetchall()
+
+            timeline = []
+            seen_prompts = set()
+            seen_switches = set()
+            turn_idx = 0
+            current_turn = None
+
+            # Add initial pin if recorded
+            for e in events_raw:
+                if e["session_id"] == sid and e["event_type"] in {"session_pin", "initial_pin"}:
+                    ep = _to_epoch(e["timestamp"])
+                    alias = get_account_alias(e["to_account"]) if e["to_account"] else e["to_account_alias"]
+                    seen_switches.add((round(ep, -1), alias))
+                    timeline.append({
+                        "epoch": ep,
+                        "id": f"pin_{e['id']}",
+                        "timestamp": datetime.fromtimestamp(ep, tz=timezone.utc).isoformat() if ep else e["timestamp"],
+                        "event_type": "session_pin",
+                        "to_account": e["to_account"],
+                        "to_alias": alias,
+                        "details": e["details"] or f"Session pinned to {alias}",
+                    })
+
+            for r in msg_rows:
+                msg_id, role, content, ts, tool_name = r["id"], r["role"], r["content"], r["timestamp"], r["tool_name"]
+                raw_meta = r["display_metadata"] if "display_metadata" in r.keys() else None
+                msg_meta = {}
+                if raw_meta:
+                    if isinstance(raw_meta, str):
+                        try:
+                            msg_meta = json.loads(raw_meta)
+                        except Exception:
+                            msg_meta = {}
+                    elif isinstance(raw_meta, dict):
+                        msg_meta = raw_meta
+
+                gem_acc = msg_meta.get("gemini_account") if isinstance(msg_meta, dict) else None
+
+                if role == "user":
+                    prompt_txt = (content or "").strip()
+                    # Deduplicate prompt turns with identical timestamp and content prefix
+                    prompt_key = (round(ts or 0.0, 1), prompt_txt[:60])
+                    if prompt_key in seen_prompts:
+                        continue
+                    seen_prompts.add(prompt_key)
+
+                    turn_idx += 1
+                    if current_turn:
+                        timeline.append(current_turn)
+
+                    acc_alias = get_account_alias(str(gem_acc).strip()) if gem_acc else None
+                    ts_str = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else ""
+                    current_turn = {
+                        "epoch": float(ts or 0.0),
+                        "id": f"turn_{turn_idx}",
+                        "timestamp": ts_str,
+                        "turn_number": turn_idx,
+                        "event_type": "turn",
+                        "to_alias": acc_alias,
+                        "to_account": str(gem_acc).strip() if gem_acc else None,
+                        "api_calls": 0,
+                        "tools_used": [],
+                        "details": prompt_txt,
+                    }
+                elif current_turn:
+                    if role == "assistant":
+                        current_turn["api_calls"] += 1
+                        if gem_acc:
+                            acc_str = str(gem_acc).strip()
+                            acc_alias = get_account_alias(acc_str)
+                            if acc_alias:
+                                current_turn["to_alias"] = acc_alias
+                                current_turn["to_account"] = acc_str
+                    if tool_name and tool_name not in current_turn["tools_used"]:
+                        current_turn["tools_used"].append(tool_name)
+
+            if current_turn:
+                timeline.append(current_turn)
+
+            # Interleave rotation events from logs (deduped against existing pins/switches)
+            for sw in log_swaps.get(sid, []):
+                sw_key = (round(sw["epoch"], -1), sw["to_alias"])
+                if sw_key not in seen_switches:
+                    seen_switches.add(sw_key)
+                    timeline.append(sw)
+
+            # Strict numeric epoch chronological sorting
+            timeline.sort(key=lambda x: x.get("epoch", 0.0))
+
+            # Strip internal epoch field
+            for itm in timeline:
+                itm.pop("epoch", None)
+
+            # Derive title
+            first_prompt = ""
+            for itm in timeline:
+                if itm.get("event_type") == "turn" and itm.get("details"):
+                    first_prompt = itm["details"][:60]
+                    break
+            title = s["title"] or first_prompt or ("Background Subagent Task" if is_subagent else "Untitled Chat")
+
+            # Rotation changes count: accurately tally account transitions across timeline events & turns
+            rotation_count = 0
+            last_account = None
+            for itm in timeline:
+                etype = itm.get("event_type")
+                acc = itm.get("to_alias") or itm.get("to_account")
+                if etype in {"switch", "quota_failover"}:
+                    if acc and acc != last_account:
+                        if last_account is not None:
+                            itm["from_alias"] = last_account
+                        rotation_count += 1
+                        last_account = acc
+                    elif not acc:
+                        rotation_count += 1
+                elif etype == "turn":
+                    if acc:
+                        if last_account is not None and acc != last_account:
+                            itm["from_alias"] = last_account
+                            rotation_count += 1
+                        last_account = acc
+                elif etype in {"session_pin", "initial_pin"}:
+                    if acc:
+                        if last_account is not None and acc != last_account:
+                            itm["from_alias"] = last_account
+                            rotation_count += 1
+                        last_account = acc
+
+            if not current_alias and last_account:
+                current_alias = last_account
+                current_raw = last_account
+
+            out.append({
+                "session_id": sid,
+                "title": title,
+                "is_subagent": is_subagent,
+                "model": s["model"] or "",
+                "current_account": current_raw,
+                "current_alias": current_alias,
+                "started_at": s["started_at"],
+                "last_activity_at": s["last_activity_at"],
+                "message_count": s["message_count"] or 0,
+                "turns_count": max(turn_idx, 1 if timeline else 0),
+                "changes_count": rotation_count,
+                "events": timeline,
+            })
+    except Exception:
+        pass
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    return {"sessions": out, "total": len(out)}
+
+
+def _persist_session_gemini_account(db, sid: str, account: str, sess: dict | None = None) -> None:
+    """Helper to write discovered account to session model_config in state.db."""
+    try:
+        import json
+        if not sess:
+            sess = db.get_session(sid)
+        if sess and hasattr(db, "update_session_meta"):
+            cfg = sess.get("model_config") or {}
+            if isinstance(cfg, str):
+                try:
+                    cfg = json.loads(cfg)
+                except Exception:
+                    cfg = {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+            if cfg.get("gemini_account") != account:
+                cfg["gemini_account"] = account
+                db.update_session_meta(sid, json.dumps(cfg), model=sess.get("model"))
+    except Exception:
+        pass
+
+
+def get_gemini_account_label_map() -> Dict[str, int]:
+    """Dynamically resolve configured account labels to account indexes (1..5) from config.yaml display.account_aliases."""
+    label_map: Dict[str, int] = {}
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        aliases = (cfg.get("display") or {}).get("account_aliases") or {}
+    except Exception:
+        aliases = {}
+
+    for idx in range(1, 6):
+        try:
+            status = get_gemini_oauth_auth_status(idx)
+            raw_email = (status.get("email") or "").strip().lower()
+            alias = aliases.get(raw_email) or aliases.get(status.get("email", ""))
+            if not alias and raw_email:
+                alias = get_account_alias(raw_email)
+            if alias:
+                label_map[str(alias).strip().lower()] = idx
+        except Exception:
+            pass
+
+    return label_map
+
+
+def handle_gs_command(
+    session_id: Optional[str] = None,
+    arg: str = "",
+    db: Any = None,
+    agent: Any = None,
+) -> str:
+    """Handle /gs command to switch the active Gemini account for the session.
+
+    Syntax:
+        /gs <label>  -> Switches active account (from config.yaml display.account_aliases)
+    """
+    raw_arg = (arg or "").strip()
+    label_map = get_gemini_account_label_map()
+    available_labels = list(label_map.keys())
+    available_str = ", ".join(available_labels) if available_labels else "none configured"
+
+    if not raw_arg:
+        example = available_labels[0] if available_labels else "alias1"
+        return f"Usage: /gs <label> (e.g. /gs {example})"
+
+    label = raw_arg.lower()
+
+    if label.isdigit():
+        return f"✗ Invalid account. Use account labels: {available_str}"
+
+    if label not in label_map:
+        return f"✗ Unknown account '{raw_arg}'. Available: {available_str}"
+
+    acc_idx = label_map[label]
+
+    # Verify target account is authenticated
+    status = get_gemini_oauth_auth_status(acc_idx)
+    if not status.get("logged_in"):
+        return f"✗ Account '{label}' is not logged in"
+
+    # Swap live runtime credential on agent and set cursor for next turn
+    target_acc_id = None
+    if agent is not None:
+        try:
+            pool = getattr(agent, "_credential_pool", None)
+            if pool is not None:
+                entry = pool.select(preferred_account=label) or pool.select(preferred_account=acc_idx)
+                if entry is not None:
+                    target_acc_id = str(entry.id or entry.label or label).strip()
+                    if hasattr(agent, "_swap_credential"):
+                        agent._swap_credential(entry)
+                    pool._current_id = entry.id
+                    setattr(agent, "_credential_pool_entry_id", entry.id)
+        except Exception as exc:
+            logger.debug("Failed live credential swap during /gs: %s", exc)
+
+    return f"✓ Switched to {label}"
+
+
+# Backward-compatible alias
+handle_gswitch_command = handle_gs_command
+
+
+def get_gemini_oauth_auth_status(account: Any = 1) -> Dict[str, Any]:
+    acc_idx = _normalize_gemini_account_id(account)
+    try:
+        creds = resolve_gemini_oauth_runtime_credentials(acc_idx, refresh_if_expiring=True)
+        access_token = creds.get("api_key", "")
+        quota_raw = fetch_gemini_quota_summary(access_token)
+        quota = format_gemini_quota_summary(quota_raw)
+        raw_email = creds.get("email") or ""
+        return {
+            "logged_in": True,
+            "account_id": acc_idx,
+            "provider": f"gemini-{acc_idx}",
+            "auth_file": creds.get("auth_file", ""),
+            "source": creds.get("source"),
+            "email": raw_email,
+            "alias": get_account_alias(raw_email),
+            "api_key": access_token,
+            "expires_at": creds.get("expiry"),
+            "has_refresh_token": bool(creds.get("refresh_token")),
+            "quota": quota,
+        }
+    except AuthError as exc:
+        return {
+            "logged_in": False,
+            "account_id": acc_idx,
+            "provider": f"gemini-{acc_idx}",
+            "error": str(exc),
+        }
+
+
+def list_all_gemini_accounts() -> List[Dict[str, Any]]:
+    results = []
+    for idx in range(1, 6):
+        results.append(get_gemini_oauth_auth_status(idx))
+    return results
+
+
+def get_all_gemini_accounts_status(
+    model_group: str = "gemini",
+    *,
+    force_refresh: bool = False,
+    parallel: bool = True,
+) -> Dict[str, Any]:
+    """Fetch status and quota for all 5 Gemini accounts concurrently with DOCI scoring."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    if parallel:
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            accounts_data = list(executor.map(
+                lambda idx: get_gemini_oauth_auth_status(idx),
+                range(1, 6)
+            ))
+    else:
+        accounts_data = [get_gemini_oauth_auth_status(idx) for idx in range(1, 6)]
+
+    rankings = []
+    for acc_info in accounts_data:
+        if acc_info.get("logged_in"):
+            acc_idx = acc_info["account_id"]
+            d = calculate_gemini_doci_score(acc_idx, model_group=model_group)
+            d["alias"] = get_account_alias(d.get("email") or acc_info.get("email", ""))
+            rankings.append(d)
+    rankings.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    for idx, item in enumerate(rankings, 1):
+        item["rank"] = idx
+        item["doci_score"] = item.get("score", 0.0)
+        t_w = item.get("t_w_days", 7.0)
+        t_5h = item.get("t_5h_hours", 5.0)
+        if t_w < 1.0:
+            item["status_note"] = f"Weekly Burn Priority (Expires in {round(t_w * 24)}h)"
+        elif t_5h < 2.5:
+            item["status_note"] = f"Mid-Cycle Replenishment Bonus (5h reset in {round(t_5h, 1)}h)"
+        else:
+            item["status_note"] = "Active Quota Runway"
+
+    logged_count = len([a for a in accounts_data if a.get("logged_in")])
+    primary_acc = rankings[0]["account_id"] if rankings else 1
+    primary_info = next((a for a in accounts_data if a.get("account_id") == primary_acc), accounts_data[0] if accounts_data else {})
+
+    return {
+        "logged_in": logged_count > 0,
+        "source": "gemini_oauth_pool",
+        "source_label": f"Google Gemini OAuth ({logged_count}/5 Accounts Active)",
+        "token_preview": _truncate_token(primary_info.get("api_key")) if "_truncate_token" in globals() else (primary_info.get("api_key")[-6:] if primary_info.get("api_key") else None),
+        "expires_at": primary_info.get("expires_at"),
+        "has_refresh_token": bool(primary_info.get("has_refresh_token")),
+        "email": primary_info.get("email"),
+        "alias": get_account_alias(primary_info.get("email", "")),
+        "quota": primary_info.get("quota") or {},
+        "accounts": accounts_data,
+        "doci_rankings": rankings,
+    }
+
+
+def init_gemini_quota_snapshots_table(conn) -> None:
+    """Initialize the persistent 15-minute quota snapshot table in state.db if missing."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gemini_quota_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            time_label TEXT NOT NULL,
+            account_id INTEGER NOT NULL,
+            alias TEXT NOT NULL,
+            email TEXT,
+            gemini_5h_percent REAL,
+            gemini_5h_reset TEXT,
+            gemini_weekly_percent REAL,
+            gemini_weekly_reset TEXT,
+            gemini_doci_score REAL,
+            gemini_rank INTEGER,
+            claude_5h_percent REAL,
+            claude_5h_reset TEXT,
+            claude_weekly_percent REAL,
+            claude_weekly_reset TEXT,
+            claude_doci_score REAL,
+            claude_rank INTEGER,
+            doci_score REAL,
+            rank INTEGER
+        )
+    """)
+    # Add columns if migrating from an older table version
+    try:
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(gemini_quota_snapshots)").fetchall()]
+        for col, ctype in [
+            ("email", "TEXT"),
+            ("gemini_5h_reset", "TEXT"),
+            ("gemini_weekly_reset", "TEXT"),
+            ("claude_5h_reset", "TEXT"),
+            ("claude_weekly_reset", "TEXT"),
+            ("gemini_doci_score", "REAL"),
+            ("gemini_rank", "INTEGER"),
+            ("claude_doci_score", "REAL"),
+            ("claude_rank", "INTEGER"),
+        ]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE gemini_quota_snapshots ADD COLUMN {col} {ctype}")
+    except Exception:
+        pass
+
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_gemini_quota_snapshots_slot_acc
+        ON gemini_quota_snapshots (timestamp, account_id)
+    """)
+
+
+def record_gemini_quota_snapshots(
+    *,
+    db_path: Optional[Any] = None,
+    slot_epoch: Optional[float] = None,
+    force_refresh: bool = False,
+) -> int:
+    """Take a snapshot of all 5 Gemini accounts for the current/given 15m interval and persist to SQLite."""
+    import sqlite3
+    from datetime import datetime, timezone
+
+    if db_path is None:
+        db_path = get_hermes_home() / "state.db"
+
+    interval_sec = 900
+    now_ts = time.time()
+    if slot_epoch is None:
+        slot_epoch = float(int(now_ts // interval_sec) * interval_sec)
+    else:
+        slot_epoch = float(int(slot_epoch // interval_sec) * interval_sec)
+
+    time_label = datetime.fromtimestamp(slot_epoch).astimezone().strftime("%H:%M")
+
+    # Retrieve live status with DOCI rankings for both gemini and claude quotas
+    gemini_status = get_all_gemini_accounts_status(model_group="gemini", force_refresh=force_refresh, parallel=True)
+    claude_status = get_all_gemini_accounts_status(model_group="claude", force_refresh=False, parallel=True)
+
+    g_accs = {a.get("account_id"): a for a in (gemini_status.get("accounts") or [])}
+    c_accs = {a.get("account_id"): a for a in (claude_status.get("accounts") or [])}
+    g_rankings = {r.get("account_id"): r for r in (gemini_status.get("doci_rankings") or [])}
+    c_rankings = {r.get("account_id"): r for r in (claude_status.get("doci_rankings") or [])}
+
+    global _LAST_ACTIVE_GEMINI_ACCOUNT_IDS
+    active_now = {idx for idx in range(1, 6) if (g_accs.get(idx) or {}).get("logged_in")}
+    if _LAST_ACTIVE_GEMINI_ACCOUNT_IDS is not None:
+        dropped = _LAST_ACTIVE_GEMINI_ACCOUNT_IDS - active_now
+        if dropped:
+            logger.error("🚨 [GEMINI OAUTH LOSS] Active accounts dropped from %s to %s (missing accounts: %s)", sorted(list(_LAST_ACTIVE_GEMINI_ACCOUNT_IDS)), sorted(list(active_now)), sorted(list(dropped)))
+            try:
+                event_conn = sqlite3.connect(str(db_path), timeout=5.0)
+                with event_conn:
+                    init_gemini_account_events_table(event_conn)
+                    for d_acc in sorted(list(dropped)):
+                        event_conn.execute(
+                            "INSERT INTO gemini_account_events (timestamp, session_id, session_title, from_account, to_account, to_account_alias, event_type, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (datetime.now(timezone.utc).isoformat(), None, None, f"gemini-{d_acc}", None, get_account_alias(f"gemini-{d_acc}"), "account_dropped", f"Account #{d_acc} disappeared from active rotation")
+                        )
+                event_conn.close()
+            except Exception:
+                pass
+    _LAST_ACTIVE_GEMINI_ACCOUNT_IDS = active_now
+
+    records_inserted = 0
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        with conn:
+            init_gemini_quota_snapshots_table(conn)
+
+            for idx in range(1, 6):
+                g_data = g_accs.get(idx) or get_gemini_oauth_auth_status(idx)
+                c_data = c_accs.get(idx) or {}
+
+                email = g_data.get("email") or ""
+                raw_alias = get_account_alias(email) if email else ""
+                if not raw_alias or raw_alias == email or raw_alias.startswith("gemini-"):
+                    raw_alias = get_account_alias(f"gemini-{idx}")
+                alias = raw_alias if (raw_alias and raw_alias != email) else f"gemini-{idx}"
+
+                logged_in = bool(g_data.get("logged_in"))
+                g_quota = g_data.get("quota") or {}
+                c_quota = c_data.get("quota") or {}
+
+                g_5h = g_quota.get("gemini_5h_percent")
+                g_7d = g_quota.get("gemini_weekly_percent")
+                g_5h_res = g_quota.get("gemini_5h_reset")
+                g_7d_res = g_quota.get("gemini_weekly_reset")
+
+                c_5h = c_quota.get("claude_5h_percent") or g_quota.get("claude_5h_percent")
+                c_7d = c_quota.get("claude_weekly_percent") or g_quota.get("claude_weekly_percent")
+                c_5h_res = c_quota.get("claude_5h_reset") or g_quota.get("claude_5h_reset")
+                c_7d_res = c_quota.get("claude_weekly_reset") or g_quota.get("claude_weekly_reset")
+
+                g_5h_val = float(g_5h) if (logged_in and g_5h is not None) else (100.0 if logged_in else 0.0)
+                g_7d_val = float(g_7d) if (logged_in and g_7d is not None) else (100.0 if logged_in else 0.0)
+                c_5h_val = float(c_5h) if (logged_in and c_5h is not None) else (100.0 if logged_in else 0.0)
+                c_7d_val = float(c_7d) if (logged_in and c_7d is not None) else (100.0 if logged_in else 0.0)
+
+                g_rank_info = g_rankings.get(idx) or {}
+                g_score = float(g_rank_info.get("doci_score") or g_rank_info.get("score") or 0.0)
+                g_rank = int(g_rank_info.get("rank") or (5 if not logged_in else 1))
+
+                c_rank_info = c_rankings.get(idx) or {}
+                c_score = float(c_rank_info.get("doci_score") or c_rank_info.get("score") or 0.0)
+                c_rank = int(c_rank_info.get("rank") or (5 if not logged_in else 1))
+
+                email = (g_data.get("email") or c_data.get("email") or "").strip().lower()
+                conn.execute("""
+                    INSERT INTO gemini_quota_snapshots (
+                        timestamp, time_label, account_id, alias, email,
+                        gemini_5h_percent, gemini_5h_reset, gemini_weekly_percent, gemini_weekly_reset,
+                        gemini_doci_score, gemini_rank,
+                        claude_5h_percent, claude_5h_reset, claude_weekly_percent, claude_weekly_reset,
+                        claude_doci_score, claude_rank,
+                        doci_score, rank
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(timestamp, account_id) DO UPDATE SET
+                        time_label = excluded.time_label,
+                        alias = excluded.alias,
+                        email = excluded.email,
+                        gemini_5h_percent = excluded.gemini_5h_percent,
+                        gemini_5h_reset = excluded.gemini_5h_reset,
+                        gemini_weekly_percent = excluded.gemini_weekly_percent,
+                        gemini_weekly_reset = excluded.gemini_weekly_reset,
+                        gemini_doci_score = excluded.gemini_doci_score,
+                        gemini_rank = excluded.gemini_rank,
+                        claude_5h_percent = excluded.claude_5h_percent,
+                        claude_5h_reset = excluded.claude_5h_reset,
+                        claude_weekly_percent = excluded.claude_weekly_percent,
+                        claude_weekly_reset = excluded.claude_weekly_reset,
+                        claude_doci_score = excluded.claude_doci_score,
+                        claude_rank = excluded.claude_rank,
+                        doci_score = excluded.doci_score,
+                        rank = excluded.rank
+                """, (
+                    slot_epoch, time_label, idx, alias, email,
+                    g_5h_val, g_5h_res, g_7d_val, g_7d_res,
+                    g_score, g_rank,
+                    c_5h_val, c_5h_res, c_7d_val, c_7d_res,
+                    c_score, c_rank,
+                    g_score, g_rank
+                ))
+                records_inserted += 1
+        conn.close()
+    except Exception as exc:
+        logger.debug("Failed to record gemini quota snapshots: %s", exc)
+
+    return records_inserted
+
+
+def get_gemini_quota_timeline(
+    timespan: str = "24h",
+    model_group: str = "gemini",
+    *,
+    db=None,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """Generate 15-minute interval usage rates and DOCI rank timeline for the 5 Gemini accounts."""
+    import sqlite3
+    from datetime import datetime, timezone
+
+    # 1. Normalize model group and horizon timespan
+    is_gemini = "gemini" in str(model_group or "gemini").lower()
+    mg_key = "gemini" if is_gemini else "claude"
+
+    ts_str = str(timespan or "24h").strip().lower()
+    if ts_str == "7d":
+        duration_sec = 7 * 86400
+    elif ts_str == "72h":
+        duration_sec = 72 * 3600
+    elif ts_str == "48h":
+        duration_sec = 48 * 3600
+    else:  # "24h" (core view)
+        duration_sec = 24 * 3600
+        ts_str = "24h"
+
+    interval_sec = 900  # 15 minutes = 900 seconds
+    num_intervals = int(duration_sec // interval_sec)
+
+    now_ts = time.time()
+    current_slot_epoch = int(now_ts // interval_sec) * interval_sec
+    start_epoch = current_slot_epoch - (num_intervals - 1) * interval_sec
+
+    # 3. Retrieve live status for all 5 accounts
+    status_summary = get_all_gemini_accounts_status(model_group=mg_key, force_refresh=force_refresh, parallel=True)
+    live_accounts = status_summary.get("accounts") or []
+
+    # Map accounts 1..5
+    accounts_meta = []
+    account_lookup = {}
+
+    for idx in range(1, 6):
+        acc_data = next((a for a in live_accounts if a.get("account_id") == idx), None)
+        if not acc_data:
+            acc_data = get_gemini_oauth_auth_status(idx)
+
+        email = acc_data.get("email") or ""
+        raw_alias = get_account_alias(email) if email else ""
+        if not raw_alias or raw_alias == email or raw_alias.startswith("gemini-"):
+            raw_alias = get_account_alias(f"gemini-{idx}")
+        alias = raw_alias if (raw_alias and raw_alias != email) else f"gemini-{idx}"
+
+        logged_in = bool(acc_data.get("logged_in"))
+        quota = acc_data.get("quota") or {}
+
+        live_5h = quota.get(f"{mg_key}_5h_percent")
+        live_7d = quota.get(f"{mg_key}_weekly_percent")
+        live_5h_res = quota.get(f"{mg_key}_5h_reset")
+        live_7d_res = quota.get(f"{mg_key}_weekly_reset")
+        live_5h_cd = quota.get(f"{mg_key}_5h_countdown") or _format_relative_countdown(live_5h_res, is_5h=True)
+        live_7d_cd = quota.get(f"{mg_key}_weekly_countdown") or _format_relative_countdown(live_7d_res, is_5h=False)
+
+        cur_5h_val = float(live_5h) if (logged_in and live_5h is not None) else (100.0 if logged_in else 0.0)
+        cur_7d_val = float(live_7d) if (logged_in and live_7d is not None) else (100.0 if logged_in else 0.0)
+
+        meta = {
+            "account_id": idx,
+            "alias": alias,
+            "email": email,
+            "logged_in": logged_in,
+            "current_5h_pct": cur_5h_val,
+            "current_5h_reset": live_5h_cd,
+            "current_7d_pct": cur_7d_val,
+            "current_7d_reset": live_7d_cd,
+            "current_rank": 5,
+            "current_score": 0.0,
+            "quota": quota,
+        }
+        accounts_meta.append(meta)
+        account_lookup[idx] = meta
+
+    # Calculate initial current rank from DOCI rankings
+    live_rankings = status_summary.get("doci_rankings") or []
+    for r in live_rankings:
+        aid = r.get("account_id")
+        if aid in account_lookup:
+            account_lookup[aid]["current_rank"] = r.get("rank", 5)
+            account_lookup[aid]["current_score"] = r.get("doci_score") or r.get("score", 0.0)
+
+    # 4. Query gemini_quota_snapshots from state.db
+    stored_snapshots = {}
+    db_path = get_hermes_home() / "state.db"
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        conn.row_factory = sqlite3.Row
+
+        # Ensure snapshot table exists
+        init_gemini_quota_snapshots_table(conn)
+
+        # Query existing snapshots in range
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM gemini_quota_snapshots
+            WHERE timestamp >= ? AND timestamp <= ?
+            ORDER BY timestamp ASC, account_id ASC
+        """, (start_epoch, current_slot_epoch))
+        for row in cursor.fetchall():
+            s_epoch = int(row["timestamp"])
+            acc_id = row["account_id"]
+            row_dict = dict(row)
+            stored_snapshots[(s_epoch, acc_id)] = row_dict
+            row_email = (row_dict.get("email") or "").strip().lower()
+            if row_email:
+                stored_snapshots[(s_epoch, row_email)] = row_dict
+            row_alias = (row_dict.get("alias") or "").strip().lower()
+            if row_alias:
+                stored_snapshots[(s_epoch, row_alias)] = row_dict
+
+        # If current interval has no snapshot yet, record it now
+        if (current_slot_epoch, 1) not in stored_snapshots:
+            conn.close()
+            record_gemini_quota_snapshots(db_path=db_path, slot_epoch=current_slot_epoch)
+            conn = sqlite3.connect(str(db_path), timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM gemini_quota_snapshots
+                WHERE timestamp >= ? AND timestamp <= ?
+                ORDER BY timestamp ASC, account_id ASC
+            """, (start_epoch, current_slot_epoch))
+            for row in cursor.fetchall():
+                s_epoch = int(row["timestamp"])
+                acc_id = row["account_id"]
+                row_dict = dict(row)
+                stored_snapshots[(s_epoch, acc_id)] = row_dict
+                row_email = (row_dict.get("email") or "").strip().lower()
+                if row_email:
+                    stored_snapshots[(s_epoch, row_email)] = row_dict
+                row_alias = (row_dict.get("alias") or "").strip().lower()
+                if row_alias:
+                    stored_snapshots[(s_epoch, row_alias)] = row_dict
+
+        conn.close()
+    except Exception:
+        pass
+
+    # 5. Populate intervals from ground-truth snapshots
+    intervals_result = []
+
+    for k in range(num_intervals):
+        slot_epoch = start_epoch + k * interval_sec
+        dt_local = datetime.fromtimestamp(slot_epoch).astimezone()
+        time_label = dt_local.strftime("%H:%M")
+        date_label = dt_local.strftime("%b %d")
+        is_current = (k == num_intervals - 1)
+
+        acc_slot_data = {}
+
+        for idx in range(1, 6):
+            meta = account_lookup[idx]
+            alias = meta["alias"]
+            logged_in = meta["logged_in"]
+
+            # Check if persistent snapshot exists for (slot_epoch, email/alias/idx)
+            acc_email = (meta.get("email") or "").strip().lower()
+            snap = None
+            if acc_email:
+                snap = stored_snapshots.get((slot_epoch, acc_email))
+            if snap is None and alias:
+                snap = stored_snapshots.get((slot_epoch, alias.lower()))
+            if snap is None:
+                snap = stored_snapshots.get((slot_epoch, idx))
+            if snap is not None:
+                raw_5h = snap.get(f"{mg_key}_5h_percent")
+                raw_7d = snap.get(f"{mg_key}_weekly_percent")
+                raw_5h_res = snap.get(f"{mg_key}_5h_reset")
+                raw_7d_res = snap.get(f"{mg_key}_weekly_reset")
+
+                cd_5h = _format_relative_countdown(raw_5h_res, from_epoch=slot_epoch, is_5h=True) if raw_5h_res else None
+                cd_7d = _format_relative_countdown(raw_7d_res, from_epoch=slot_epoch, is_5h=False) if raw_7d_res else None
+
+                cap_5h = float(raw_5h) if raw_5h is not None else None
+                cap_7d = float(raw_7d) if raw_7d is not None else None
+                rank = snap.get(f"{mg_key}_rank") or snap.get("rank")
+                score = snap.get(f"{mg_key}_doci_score") or snap.get("doci_score")
+
+                acc_slot_data[alias] = {
+                    "account_id": idx,
+                    "alias": alias,
+                    "cap_5h": round(cap_5h, 1) if cap_5h is not None else None,
+                    "reset_5h": cd_5h,
+                    "cap_7d": round(cap_7d, 1) if cap_7d is not None else None,
+                    "reset_7d": cd_7d,
+                    "rank": int(rank) if rank is not None else None,
+                    "score": round(float(score), 4) if score is not None else None,
+                    "turns": 0,
+                    "logged_in": logged_in,
+                }
+            elif is_current:
+                live_5h_res = (meta.get("quota") or {}).get(f"{mg_key}_5h_reset")
+                live_7d_res = (meta.get("quota") or {}).get(f"{mg_key}_weekly_reset")
+                cd_5h = _format_relative_countdown(live_5h_res, from_epoch=slot_epoch, is_5h=True) if live_5h_res else None
+                cd_7d = _format_relative_countdown(live_7d_res, from_epoch=slot_epoch, is_5h=False) if live_7d_res else None
+
+                acc_slot_data[alias] = {
+                    "account_id": idx,
+                    "alias": alias,
+                    "cap_5h": meta["current_5h_pct"],
+                    "reset_5h": cd_5h,
+                    "cap_7d": meta["current_7d_pct"],
+                    "reset_7d": cd_7d,
+                    "rank": meta["current_rank"],
+                    "score": meta["current_score"],
+                    "turns": 0,
+                    "logged_in": logged_in,
+                }
+            else:
+                acc_slot_data[alias] = {
+                    "account_id": idx,
+                    "alias": alias,
+                    "cap_5h": None,
+                    "reset_5h": None,
+                    "cap_7d": None,
+                    "reset_7d": None,
+                    "rank": None,
+                    "score": None,
+                    "turns": 0,
+                    "logged_in": logged_in,
+                }
+
+        intervals_result.append({
+            "epoch": slot_epoch,
+            "timestamp": dt_local.isoformat(),
+            "time_label": time_label,
+            "date_label": date_label,
+            "is_current": is_current,
+            "accounts": acc_slot_data,
+        })
+
+    return {
+        "timespan": ts_str,
+        "model_group": mg_key,
+        "interval_minutes": 15,
+        "total_intervals": len(intervals_result),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "accounts_meta": accounts_meta,
+        "intervals": intervals_result,
+    }
+
+
+_GEMINI_QUOTA_BG_STARTED = False
+_GEMINI_QUOTA_BG_LOCK = threading.Lock()
+
+
+def _try_acquire_quota_refresher_lease(holder_id: str, ttl_seconds: float = 90.0) -> bool:
+    """Acquire or renew the background quota refresher leadership lease.
+
+    Guarantees that across multiple concurrent containers/processes sharing the
+    same HERMES_HOME, only one active leader executes the 60s Google Cloud Code
+    polling and writes snapshot rows into state.db.
+
+    If the current leader crashes, freezes, or is stopped, standby containers
+    automatically detect the expired lease (>90s old) and take over leadership.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        runtime_dir = get_hermes_home() / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        lease_path = runtime_dir / "quota_refresher.lease"
+        lock_path = runtime_dir / "quota_refresher.lock"
+
+        now = time.time()
+        with open(lock_path, "a") as lock_file:
+            if fcntl:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
+            try:
+                current_holder = None
+                expires_at = 0.0
+                acquired_at = now
+                if lease_path.exists():
+                    try:
+                        data = json.loads(lease_path.read_text(encoding="utf-8"))
+                        current_holder = data.get("holder")
+                        expires_at = float(data.get("expires_at", 0.0))
+                        acquired_at = float(data.get("acquired_at", now))
+                    except Exception:
+                        pass
+
+                # If another live leader holds the active lease, yield
+                if current_holder and current_holder != holder_id and now < expires_at:
+                    return False
+
+                # We are the current holder or lease is expired/unheld: claim/renew
+                new_data = {
+                    "holder": holder_id,
+                    "acquired_at": acquired_at if current_holder == holder_id else now,
+                    "updated_at": now,
+                    "expires_at": now + max(10.0, float(ttl_seconds)),
+                }
+                tmp_path = lease_path.with_suffix(f".tmp.{os.getpid()}")
+                tmp_path.write_text(json.dumps(new_data, indent=2), encoding="utf-8")
+                tmp_path.replace(lease_path)
+                return True
+            finally:
+                if fcntl:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+    except Exception:
+        # Fallback open on platforms without file locks or on transient I/O
+        return True
+
+
+def start_gemini_quota_background_refresher(interval_seconds: float = 60.0) -> None:
+    """Start a daemon background thread that refreshes Gemini quotas and takes snapshots."""
+    global _GEMINI_QUOTA_BG_STARTED
+    with _GEMINI_QUOTA_BG_LOCK:
+        if _GEMINI_QUOTA_BG_STARTED:
+            return
+        _GEMINI_QUOTA_BG_STARTED = True
+
+    holder_id = f"pid={os.getpid()}:port={os.environ.get('HERMES_PORT', '9119')}"
+
+    def _refresh_account(acc: int) -> None:
+        try:
+            if has_gemini_oauth_credentials(acc):
+                creds = resolve_gemini_oauth_runtime_credentials(acc, refresh_if_expiring=True)
+                tok = creds.get("api_key")
+                if tok:
+                    fetch_gemini_quota_summary(tok, force=False)
+        except Exception:
+            pass
+
+    def _loop():
+        from concurrent.futures import ThreadPoolExecutor
+
+        lease_ttl = max(90.0, float(interval_seconds) * 1.5)
+
+        # Initial snapshot on startup only if we acquire initial leadership
+        if _try_acquire_quota_refresher_lease(holder_id, ttl_seconds=lease_ttl):
+            try:
+                record_gemini_quota_snapshots(force_refresh=True)
+            except Exception:
+                pass
+
+        while True:
+            try:
+                if _try_acquire_quota_refresher_lease(holder_id, ttl_seconds=lease_ttl):
+                    with ThreadPoolExecutor(max_workers=5) as executor:
+                        list(executor.map(_refresh_account, range(1, 6)))
+                    record_gemini_quota_snapshots(force_refresh=False)
+            except Exception:
+                pass
+            time.sleep(interval_seconds)
+
+    t = threading.Thread(target=_loop, daemon=True, name="gemini-quota-refresher")
+    t.start()
+
+
+_AGY_UPDATE_BG_STARTED = False
+_AGY_UPDATE_BG_LOCK = threading.Lock()
+
+
+def start_agy_update_periodic_daemon(interval_seconds: float = 3600.0) -> None:
+    """Start a background daemon that runs `agy update` periodically when no active sessions are running."""
+    global _AGY_UPDATE_BG_STARTED
+    with _AGY_UPDATE_BG_LOCK:
+        if _AGY_UPDATE_BG_STARTED:
+            return
+        _AGY_UPDATE_BG_STARTED = True
+
+    def _loop():
+        import subprocess
+        # Initial sleep so startup update is not duplicated
+        time.sleep(min(300.0, interval_seconds))
+        while True:
+            try:
+                active_count = 0
+                try:
+                    from hermes_cli.active_sessions import active_session_registry_snapshot
+                    active_count = len(active_session_registry_snapshot())
+                except Exception:
+                    active_count = 0
+
+                if active_count == 0:
+                    logger.debug("Running periodic background `agy update` check...")
+                    subprocess.run(
+                        ["agy", "update"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=120,
+                    )
+            except Exception as exc:
+                logger.debug("Periodic agy update check skipped/failed: %s", exc)
+            time.sleep(interval_seconds)
+
+    t = threading.Thread(target=_loop, daemon=True, name="agy-periodic-updater")
+    t.start()
+
+
+# Auto-start background refresher & agy periodic updater
+try:
+    start_gemini_quota_background_refresher(60.0)
+    start_agy_update_periodic_daemon(3600.0)
+except Exception:
+    pass
+
+
+def extract_gemini_challenge_url(error_data: Any) -> Optional[str]:
+    """Extract interactive validation challenge URL from Google Cloud Code 403 / Error responses.
+
+    Inspects:
+      - google.rpc.Help links ([{"url": "...", "description": "..."}])
+      - google.rpc.ErrorInfo metadata (validation_url, challenge_url, url, verification_url)
+      - GeminiAPIError / AuthError / Exception details & response JSON
+      - Raw response dicts or text strings
+    """
+    if error_data is None:
+        return None
+
+    # If it's an Exception with challenge_url attribute
+    if hasattr(error_data, "challenge_url") and getattr(error_data, "challenge_url"):
+        return str(getattr(error_data, "challenge_url")).strip()
+
+    data_dict = None
+    if isinstance(error_data, dict):
+        data_dict = error_data
+    elif hasattr(error_data, "details") and isinstance(getattr(error_data, "details"), dict):
+        details = getattr(error_data, "details")
+        if details.get("challenge_url"):
+            return str(details["challenge_url"]).strip()
+        data_dict = details
+    elif hasattr(error_data, "response"):
+        resp = getattr(error_data, "response")
+        try:
+            if hasattr(resp, "json"):
+                data_dict = resp.json()
+            elif hasattr(resp, "text"):
+                data_dict = json.loads(resp.text)
+        except Exception:
+            pass
+
+    if data_dict is None and isinstance(error_data, str):
+        try:
+            parsed = json.loads(error_data)
+            if isinstance(parsed, dict):
+                data_dict = parsed
+        except Exception:
+            pass
+
+    if isinstance(data_dict, dict):
+        # 1. Direct key lookups
+        for k in ("challenge_url", "validation_url", "verification_url", "url"):
+            if data_dict.get(k) and isinstance(data_dict[k], str) and data_dict[k].startswith("http"):
+                return data_dict[k].strip()
+
+        # 2. Check wrapped response / error
+        err_obj = data_dict.get("error", data_dict)
+        if isinstance(err_obj, dict):
+            # Check details list
+            details_list = err_obj.get("details", [])
+            if isinstance(details_list, list):
+                # Search google.rpc.Help first
+                for item in details_list:
+                    if isinstance(item, dict):
+                        type_url = str(item.get("@type", ""))
+                        if type_url.endswith("/google.rpc.Help"):
+                            links = item.get("links", [])
+                            if isinstance(links, list):
+                                for link in links:
+                                    if isinstance(link, dict) and link.get("url"):
+                                        return str(link["url"]).strip()
+                # Search google.rpc.ErrorInfo metadata next
+                for item in details_list:
+                    if isinstance(item, dict):
+                        type_url = str(item.get("@type", ""))
+                        if type_url.endswith("/google.rpc.ErrorInfo"):
+                            md = item.get("metadata", {})
+                            if isinstance(md, dict):
+                                for k in ("challenge_url", "validation_url", "verification_url", "url"):
+                                    if md.get(k) and isinstance(md[k], str) and md[k].startswith("http"):
+                                        return md[k].strip()
+
+            # Check help_links in details dict
+            help_links = err_obj.get("help_links", [])
+            if isinstance(help_links, list):
+                for link in help_links:
+                    if isinstance(link, dict) and link.get("url"):
+                        return str(link["url"]).strip()
+
+    # Fallback string regex search for URLs in error message
+    err_str = str(error_data)
+    if "http" in err_str:
+        import re
+        m = re.search(r"https?://[^\s\"'>)]+", err_str)
+        if m:
+            return m.group(0).strip()
+
+    return None
+
+
+def is_gemini_validation_required_error(error_data: Any) -> bool:
+    """Return True if an error response indicates Google VALIDATION_REQUIRED challenge."""
+    if error_data is None:
+        return False
+    if hasattr(error_data, "code") and getattr(error_data, "code") == "gemini_validation_required":
+        return True
+    if isinstance(error_data, dict):
+        err = error_data.get("error", error_data)
+        if isinstance(err, dict):
+            details = err.get("details", [])
+            if isinstance(details, list):
+                for d in details:
+                    if isinstance(d, dict) and str(d.get("reason", "")).upper() == "VALIDATION_REQUIRED":
+                        return True
+            if str(err.get("reason", "")).upper() == "VALIDATION_REQUIRED":
+                return True
+            if str(err.get("status", "")).upper() == "VALIDATION_REQUIRED":
+                return True
+    err_str = str(error_data).upper()
+    return "VALIDATION_REQUIRED" in err_str
+
+
+def prompt_gemini_interactive_challenge(
+    challenge_url: str,
+    account: Any = 1,
+    *,
+    auto_open: bool = True,
+) -> bool:
+    """Display interactive 1-click challenge verification prompt for a Gemini account."""
+    if not challenge_url or not isinstance(challenge_url, str):
+        return False
+
+    acc_idx = _normalize_gemini_account_id(account)
+    clean_url = challenge_url.strip()
+
+    print()
+    print("╭─ Google Cloud Code Account Verification Required ──────╮")
+    print(f"│  Account {acc_idx} requires one-time interactive verification.  │")
+    print("│  Open the link below in your browser to complete:      │")
+    print("╰────────────────────────────────────────────────────────╯")
+    print()
+    print(f"  {clean_url}")
+    print()
+
+    if auto_open:
+        try:
+            from hermes_cli.auth import _can_open_graphical_browser
+            can_open = _can_open_graphical_browser()
+        except Exception:
+            can_open = sys.platform != "darwin" or not os.getenv("SSH_CONNECTION")
+        if can_open:
+            try:
+                webbrowser.open(clean_url)
+                print("  (Browser opened automatically for verification)")
+            except Exception:
+                pass
+    return True
+
+
+
+
+
 def nous_token_has_billing_scope() -> bool:
     """Return True if the currently-held Nous token carries ``billing:manage``.
 
@@ -1163,21 +4160,81 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
 
 def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
     """Clear auth state for a provider (the active one when *provider_id* is None). Used by
-    ``hermes logout``. Returns True if something was cleared."""
+    ``hermes logout`` and Web UI Disconnect. Returns True if something was cleared."""
     with _auth_store_lock():
         auth_store = _load_auth_store()
         target = provider_id or auth_store.get("active_provider")
         if not target:
             return False
+
+        targets = {target}
+        acc_idx = None
+        if target in {"gemini", "gemini-oauth", "gemini_oauth"} or re.match(r"^gemini(?:-oauth)?-([1-5])$", target):
+            m = re.match(r"^gemini(?:-oauth)?-([1-5])$", target)
+            acc_idx = int(m.group(1)) if m else 1
+            if acc_idx == 1:
+                targets.update(["gemini", "gemini-1", "gemini-oauth", "gemini-oauth-1"])
+            else:
+                targets.update([f"gemini-{acc_idx}", f"gemini-oauth-{acc_idx}"])
+
         cleared = False
-        for section in ("providers", "credential_pool"):
-            entries = _store_section(auth_store, section)
-            if target in entries:
-                del entries[target]
+        for t in targets:
+            for section in ("providers", "credential_pool"):
+                entries = _store_section(auth_store, section)
+                if t in entries:
+                    del entries[t]
+                    cleared = True
+            if auth_store.get("active_provider") == t:
+                auth_store["active_provider"] = None
                 cleared = True
-        if auth_store.get("active_provider") == target:
-            auth_store["active_provider"] = None
-            cleared = True
+
+        # When clearing a Gemini account, purge from credential pool list and delete secondary token file
+        if acc_idx is not None:
+            pool = _store_section(auth_store, "credential_pool")
+            for pool_key in ("gemini-oauth", "gemini_oauth", "gemini"):
+                if pool_key in pool and isinstance(pool[pool_key], list):
+                    orig_len = len(pool[pool_key])
+                    pool[pool_key] = [
+                        e for e in pool[pool_key]
+                        if not (
+                            isinstance(e, dict) and (
+                                e.get("source") == f"gemini_account_{acc_idx}"
+                                or e.get("extra", {}).get("account_id") == acc_idx
+                                or e.get("id") == f"gemini_account_{acc_idx}"
+                                or e.get("label") == f"gemini-{acc_idx}"
+                            )
+                        )
+                    ]
+                    if len(pool[pool_key]) != orig_len:
+                        cleared = True
+
+            try:
+                auth_file = _antigravity_token_path(acc_idx)
+                if auth_file.exists():
+                    auth_file.unlink()
+                    cleared = True
+                gem_roots = [Path.home() / ".gemini"]
+                try:
+                    from hermes_constants import get_hermes_home
+                    hhome = get_hermes_home()
+                    gem_roots.append(hhome / ".gemini")
+                except Exception:
+                    pass
+                for groot in gem_roots:
+                    cli_d = groot / "antigravity-cli" if (groot / "antigravity-cli").is_dir() else groot
+                    cand_names = [
+                        "antigravity-oauth-token", "antigravity-oauth-token-1", "antigravity-oauth-token.1"
+                    ] if acc_idx == 1 else [
+                        f"antigravity-oauth-token-{acc_idx}", f"antigravity-oauth-token.{acc_idx}"
+                    ]
+                    for cn in cand_names:
+                        cp = cli_d / cn
+                        if cp.exists():
+                            cp.unlink()
+                            cleared = True
+            except Exception:
+                pass
+
         if cleared:
             _save_auth_store(auth_store)
         return cleared
@@ -1895,6 +4952,11 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     target = (provider_id or get_active_provider() or "").strip().lower()
     if not target:
         return {"logged_in": False}
+    if target in {"gemini-oauth", "gemini_oauth"}:
+        return get_gemini_oauth_auth_status(1)
+    if re.match(r"^gemini(?:-oauth)?-([1-5])$", target):
+        m = re.match(r"^gemini(?:-oauth)?-([1-5])$", target)
+        return get_gemini_oauth_auth_status(int(m.group(1)))
     status_fn_name = _BESPOKE_STATUS_FUNCTIONS.get(target)
     if status_fn_name:
         return globals()[status_fn_name]()

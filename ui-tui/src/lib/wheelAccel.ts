@@ -17,6 +17,8 @@
 
 import { isXtermJs } from '@hermes/ink'
 
+import { DASHBOARD_TUI_MODE } from '../config/env.js'
+
 // ── Native (ghostty, iTerm2, WezTerm, …) ───────────────────────────────
 const WHEEL_ACCEL_WINDOW_MS = 40
 const WHEEL_ACCEL_STEP = 0.3
@@ -73,7 +75,7 @@ export function readScrollSpeedBase(): number {
 }
 
 export function initWheelAccelForHost(): WheelAccelState {
-  return initWheelAccel(isXtermJs(), readScrollSpeedBase())
+  return initWheelAccel(isXtermJs() || DASHBOARD_TUI_MODE, readScrollSpeedBase())
 }
 
 /** Compute rows for one wheel event, mutating `state`. Returns 0 when a
@@ -166,19 +168,32 @@ function xtermJsStep(state: WheelAccelState, dir: -1 | 1, now: number): number {
   state.time = now
   state.dir = dir
 
-  if (sameDir && gap < WHEEL_BURST_MS) {
-    return 1
-  }
-
   if (!sameDir || gap > WHEEL_DECAY_IDLE_MS) {
-    // Reversal or long idle — start at 2 so first click after a pause moves visibly.
-    state.mult = 2
+    // Reversal or long idle — start at 2 so first event after a pause moves visibly.
+    state.mult = state.base * 2
     state.frac = 0
+    state.burstCount = 0
+  } else if (gap < WHEEL_BURST_MS) {
+    // Sub-5ms same-packet microburst: return 1 on initial events, accelerate on sustained fast trackpad flick
+    state.burstCount = Math.min(30, (state.burstCount || 0) + 1)
+
+    if (state.burstCount <= 2) {
+      return 1
+    }
+
+    const velocityRamp = Math.min(24, state.base * (2 + Math.floor(state.burstCount / 2)))
+    state.mult = Math.max(state.mult, velocityRamp)
+  } else if (gap < 20) {
+    // High-speed trackpad swipe (5-20ms): accelerate dynamically with flick momentum
+    state.burstCount = Math.min(30, (state.burstCount || 0) + 1)
+    const velocityRamp = Math.min(20, state.base * (2 + Math.floor(state.burstCount / 2)))
+    state.mult = Math.max(state.mult, velocityRamp)
   } else {
+    // Steady or slow scroll (gap >= 20ms): stay smooth and in precision range
+    state.burstCount = Math.max(0, (state.burstCount || 0) - 2)
     const m = Math.pow(0.5, gap / WHEEL_DECAY_HALFLIFE_MS)
     const cap = gap >= WHEEL_DECAY_GAP_MS ? WHEEL_DECAY_CAP_SLOW : WHEEL_DECAY_CAP_FAST
-
-    state.mult = Math.min(cap, 1 + (state.mult - 1) * m + WHEEL_DECAY_STEP * m)
+    state.mult = Math.min(cap, state.base + (state.mult - state.base) * m + WHEEL_DECAY_STEP * m)
   }
 
   const total = state.mult + state.frac
@@ -186,5 +201,5 @@ function xtermJsStep(state: WheelAccelState, dir: -1 | 1, now: number): number {
 
   state.frac = total - rows
 
-  return rows
+  return Math.max(1, rows)
 }

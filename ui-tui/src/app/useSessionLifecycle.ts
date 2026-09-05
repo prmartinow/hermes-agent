@@ -2,7 +2,7 @@ import { writeFileSync } from 'node:fs'
 
 import type { ScrollBoxHandle } from '@hermes/ink'
 import { evictInkCaches } from '@hermes/ink'
-import { type RefObject, useCallback, useEffect, useMemo, useRef } from 'react'
+import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
 import { introMsg, toTranscriptMessages } from '../domain/messages.js'
@@ -12,9 +12,11 @@ import type {
   SessionActivateResponse,
   SessionCloseResponse,
   SessionCreateResponse,
+  SessionHistoryResponse,
   SessionInflightTurn,
   SessionResumeResponse,
   SessionTitleResponse,
+  SessionViewportMeta,
   SetupStatusResponse
 } from '../gatewayTypes.js'
 import { asRpcResult } from '../lib/rpc.js'
@@ -85,14 +87,42 @@ export const signalFreshSessionBoundary = (
   return true
 }
 
-const trimTail = (items: Msg[]) => {
+export const trimTail = (items: Msg[], turns = 1) => {
   const q = [...items]
 
-  while (q.at(-1)?.role === 'assistant' || q.at(-1)?.role === 'tool') {
-    q.pop()
+  for (let t = 0; t < turns; t++) {
+    while (
+      q.length > 0 &&
+      (q.at(-1)?.role === 'system' ||
+        (q.at(-1) as any)?.kind === 'slash' ||
+        (q.at(-1) as any)?.kind === 'system' ||
+        (q.at(-1) as any)?.kind === 'panel')
+    ) {
+      q.pop()
+    }
+
+    while (
+      q.length > 0 &&
+      (q.at(-1)?.role === 'assistant' ||
+        q.at(-1)?.role === 'tool' ||
+        (q.at(-1) as any)?.kind === 'trail' ||
+        (q.at(-1) as any)?.kind === 'diff')
+    ) {
+      q.pop()
+    }
+
+    if (q.length > 0 && q.at(-1)?.role === 'user') {
+      q.pop()
+    }
   }
 
-  if (q.at(-1)?.role === 'user') {
+  while (
+    q.length > 0 &&
+    (q.at(-1)?.role === 'system' ||
+      (q.at(-1) as any)?.kind === 'slash' ||
+      (q.at(-1) as any)?.kind === 'system' ||
+      (q.at(-1) as any)?.kind === 'panel')
+  ) {
     q.pop()
   }
 
@@ -141,6 +171,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const cancelResumeScrollRef = useRef<null | (() => void)>(null)
+  const [viewportMeta, setViewportMeta] = useState<SessionViewportMeta | null>(null)
+  const isFetchingBacklogRef = useRef(false)
 
   const resetSession = useCallback(() => {
     cancelResumeScrollRef.current?.()
@@ -148,6 +180,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     turnController.fullReset()
     setVoiceRecording(false)
     setVoiceProcessing(false)
+    setViewportMeta(null)
+    isFetchingBacklogRef.current = false
     patchUiState({ bgTasks: new Set(), info: null, sid: null, usage: ZERO })
     setHistoryItems([])
     setLastUserMsg('')
@@ -326,6 +360,49 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     [gw, resetSession, scrollRef, setHistoryItems, setSessionStartedAt, sys]
   )
 
+  const fetchOlderBacklog = useCallback(async () => {
+    const currentSid = getUiState().sid
+
+    if (!currentSid || !viewportMeta?.has_more_before || isFetchingBacklogRef.current) {
+      return
+    }
+
+    isFetchingBacklogRef.current = true
+
+    try {
+      const res = await rpc<SessionHistoryResponse>('session.history', {
+        before_index: viewportMeta.start_index,
+        limit: 50,
+        session_id: currentSid
+      })
+
+      if (res && res.messages && res.messages.length > 0 && getUiState().sid === currentSid) {
+        const olderMsgs = toTranscriptMessages(res.messages)
+        setHistoryItems(prev => {
+          const hasIntro = prev.length > 0 && prev[0]?.kind === 'intro'
+
+          if (hasIntro) {
+            return [prev[0]!, ...olderMsgs, ...prev.slice(1)]
+          }
+
+          return [...olderMsgs, ...prev]
+        })
+        setViewportMeta({
+          end_index: viewportMeta.end_index,
+          has_more_before: Boolean(res.has_more_before),
+          start_index: typeof res.start_index === 'number' ? res.start_index : 0,
+          total: viewportMeta.total
+        })
+      } else if (res && (!res.messages || res.messages.length === 0)) {
+        setViewportMeta(prev => (prev ? { ...prev, has_more_before: false } : null))
+      }
+    } catch {
+      // Non-fatal; can retry on next scroll up
+    } finally {
+      isFetchingBacklogRef.current = false
+    }
+  }, [rpc, setHistoryItems, viewportMeta])
+
   const resumeById = useCallback(
     (id: string) => {
       patchOverlayState({ sessions: false })
@@ -341,7 +418,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
         const previousSid = getUiState().sid
 
-        gw.request<SessionResumeResponse>('session.resume', { cols: colsRef.current, session_id: id })
+        gw.request<SessionResumeResponse>('session.resume', {
+          cols: colsRef.current,
+          session_id: id
+        })
           .then(raw => {
             const r = asRpcResult<SessionResumeResponse>(raw)
 
@@ -360,6 +440,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             const resumed = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
 
             setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
+            setViewportMeta(r.viewport ?? null)
             writeActiveSessionFile(r.resumed ?? r.session_id)
             patchUiState({
               busy: running,
@@ -402,24 +483,28 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     () => ({
       activateLiveSession,
       closeSession,
+      fetchOlderBacklog,
       guardBusySessionSwitch,
       newLiveSession,
       newSession,
       resetSession,
       resetVisibleHistory,
       resumeById,
-      trimLastExchange: trimTail
+      trimLastExchange: trimTail,
+      viewportMeta
     }),
     [
       activateLiveSession,
       closeSession,
+      fetchOlderBacklog,
       guardBusySessionSwitch,
       newLiveSession,
       newSession,
       resetSession,
       resetVisibleHistory,
       resumeById,
-      trimTail
+      trimTail,
+      viewportMeta
     ]
   )
 }

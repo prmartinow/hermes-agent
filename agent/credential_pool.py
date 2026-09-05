@@ -912,6 +912,7 @@ class CredentialPool:
         # re-acquire reentrantly.
         self._lock = threading.RLock()
         self._active_leases: Dict[str, int] = {}
+        self._active_session_leases: Dict[str, Set[str]] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
         # Monotonic timestamp of the last "no available entries" log (see
         # NO_AVAILABLE_ENTRIES_LOG_THROTTLE_SECONDS). Re-armed to None on every
@@ -923,6 +924,30 @@ class CredentialPool:
         # entries" and the caller's 401 retry loop runs unbounded. Reset when a
         # real entry is identified or an escape path returns None.
         self._unmatched_rotation_streak: int = 0
+
+    def clone(self) -> CredentialPool:
+        """Create a session-scoped view of this credential pool with an isolated cursor.
+
+        Returns a new CredentialPool instance initialized with the same provider
+        and entries, sharing the lock, shared entries list, and lease tracking
+        (so exhaustion cooldowns and rate limits remain globally synchronized),
+        but initializing an independent ``_current_id = None`` so subagents never
+        mutate the parent agent's active account pointer.
+        """
+        with self._lock:
+            cloned = CredentialPool.__new__(CredentialPool)
+            cloned.provider = self.provider
+            cloned._entries = self._entries
+            cloned._current_id = None
+            cloned._borrowed_root_ids = self._borrowed_root_ids
+            cloned._strategy = self._strategy
+            cloned._lock = self._lock
+            cloned._active_leases = self._active_leases
+            cloned._active_session_leases = self._active_session_leases
+            cloned._max_concurrent = self._max_concurrent
+            cloned._last_no_entries_log_at = self._last_no_entries_log_at
+            cloned._unmatched_rotation_streak = 0
+            return cloned
 
     # ---- read accessors ---------------------------------------------------
 
@@ -987,6 +1012,37 @@ class CredentialPool:
     def current(self) -> Optional[PooledCredential]:
         with self._lock:
             return self._current_unlocked()
+
+    def get_entry(self, credential_id: str) -> Optional[PooledCredential]:
+        """Return the matching pooled credential by ID, or failover if exhausted."""
+        if not credential_id:
+            return None
+        with self._lock:
+            entry = next((entry for entry in self._entries if entry.id == credential_id), None)
+            if entry is not None and self.provider in {"gemini-oauth", "gemini_oauth"}:
+                if _exhausted_until(entry, sole_credential=(len(self._entries) == 1)) is not None:
+                    available, _ = self._available_entries(clear_expired=True, refresh=False)
+                    if available:
+                        from hermes_cli.auth import _normalize_gemini_account_id, calculate_gemini_doci_score, get_account_alias
+
+                        def _doci_score(e: PooledCredential) -> float:
+                            acc_idx = e.extra.get("account_id") or _normalize_gemini_account_id(e.source)
+                            try:
+                                return float(calculate_gemini_doci_score(acc_idx).get("score", 0.0))
+                            except Exception:
+                                return 0.0
+
+                        candidates = [e for e in available if _doci_score(e) > 0.0] or available
+                        healthiest = max(candidates, key=_doci_score)
+                        pinned_name = get_account_alias(entry.label or entry.id) or str(entry.extra.get("account_id") or entry.label or entry.id)
+                        next_name = get_account_alias(healthiest.label or healthiest.id) or str(healthiest.extra.get("account_id") or healthiest.label or healthiest.id)
+                        logger.info(
+                            "🔄 [GEMINI ROTATION] Pinned Account %s exhausted/429 -> Temporarily failing over to healthiest CD-DOCI Account %s",
+                            pinned_name,
+                            next_name,
+                        )
+                        return healthiest
+            return entry
 
     def entry_id_for_api_key(self, api_key_hint: Any = None) -> Optional[str]:
         """Stable id for the runtime credential in use.
@@ -1247,6 +1303,55 @@ class CredentialPool:
                 return self._adopt(entry, **field_updates)
         except Exception as exc:
             logger.debug("Failed to sync %s entry from auth.json: %s", display, exc)
+        return entry
+
+    def _sync_gemini_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
+        """Sync a Gemini OAuth pool entry from auth.json if tokens differ."""
+        if self.provider not in {"gemini-oauth", "gemini_oauth"}:
+            return entry
+        try:
+            from hermes_cli.auth import _normalize_gemini_account_id, _read_gemini_account_tokens
+            acc_id = entry.extra.get("account_id") or _normalize_gemini_account_id(entry.source)
+            tokens = _read_gemini_account_tokens(acc_id)
+            if not tokens:
+                return entry
+            store_access = tokens.get("access_token", "")
+            store_refresh = tokens.get("refresh_token", "")
+            store_email = tokens.get("email", "")
+            entry_access = entry.access_token or ""
+            entry_refresh = entry.refresh_token or ""
+            entry_email = entry.label or ""
+            if (store_access and (
+                store_access != entry_access
+                or (store_refresh and store_refresh != entry_refresh)
+            )) or (store_email and store_email != entry_email):
+                logger.debug(
+                    "Pool entry %s: syncing Gemini OAuth tokens/email from auth.json for account %s",
+                    entry.id,
+                    acc_id,
+                )
+                field_updates: Dict[str, Any] = {}
+                if store_access:
+                    field_updates["access_token"] = store_access
+                if store_refresh:
+                    field_updates["refresh_token"] = store_refresh
+                if store_email:
+                    field_updates["label"] = store_email
+                if "access_token" in field_updates:
+                    field_updates.update({
+                        "last_status": None,
+                        "last_status_at": None,
+                        "last_error_code": None,
+                        "last_error_reason": None,
+                        "last_error_message": None,
+                        "last_error_reset_at": None,
+                    })
+                updated = replace(entry, **field_updates)
+                self._replace_entry(entry, updated)
+                self._persist()
+                return updated
+        except Exception as exc:
+            logger.debug("Failed to sync Gemini OAuth entry from auth.json: %s", exc)
         return entry
 
     def _sync_nous_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
@@ -1561,6 +1666,22 @@ class CredentialPool:
                         return entry
                 auth_mod.resolve_nous_runtime_credentials(force_refresh=force, stale_access_token=stale_key or None)
                 updated = self._sync_nous_entry_from_auth_store(entry)
+            elif self.provider in {"gemini-oauth", "gemini_oauth"}:
+                synced = self._sync_gemini_oauth_entry_from_auth_store(entry)
+                if synced is not entry:
+                    entry = synced
+                from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials, _normalize_gemini_account_id
+                acc_idx = entry.extra.get("account_id") or _normalize_gemini_account_id(entry.source)
+                creds = resolve_gemini_oauth_runtime_credentials(acc_idx, force_refresh=force)
+                synced_after = self._sync_gemini_oauth_entry_from_auth_store(entry)
+                updated = replace(
+                    synced_after,
+                    access_token=creds.get("api_key") or creds.get("access_token") or synced_after.access_token,
+                    refresh_token=creds.get("refresh_token") or synced_after.refresh_token,
+                    last_status=STATUS_OK,
+                    last_status_at=None,
+                    last_error_code=None,
+                )
             else:
                 return entry
         except _RefreshDone as done:
@@ -1752,20 +1873,37 @@ class CredentialPool:
 
     # ---- selection ---------------------------------------------------------
 
-    def select(self) -> Optional[PooledCredential]:
-        entry, pending_refresh = self._select_under_lock()
+    def select(
+        self,
+        *,
+        preferred_id: Optional[str] = None,
+        preferred_account: Optional[str] = None,
+    ) -> Optional[PooledCredential]:
+        entry, pending_refresh = self._select_under_lock(
+            preferred_id=preferred_id, preferred_account=preferred_account
+        )
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
             # Re-select now that the refreshed entries are back in the pool.
             if entry is None:
-                entry, _ = self._select_under_lock()
+                entry, _ = self._select_under_lock(
+                    preferred_id=preferred_id, preferred_account=preferred_account
+                )
         if entry is not None:
             self._unmatched_rotation_streak = 0
         return entry
 
-    def _select_under_lock(self) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
+    def _select_under_lock(
+        self,
+        *,
+        preferred_id: Optional[str] = None,
+        preferred_account: Optional[str] = None,
+    ) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
+        """Run selection under the lock, returning entry + pending refreshes."""
         with self._lock:
-            return self._select_unlocked()
+            return self._select_unlocked(
+                preferred_id=preferred_id, preferred_account=preferred_account
+            )
 
     def _refresh_pending_entries(self, pending: List[PooledCredential]) -> None:
         """Refresh deferred single-use-token entries OUTSIDE the pool lock.
@@ -1784,7 +1922,11 @@ class CredentialPool:
         Claude Code CLI, another profile) leaving fresh tokens on disk while
         the pool entry is frozen behind ``last_error_reset_at``.
         """
-        if entry.source != _RESYNC_SOURCE.get(self.provider) or entry.last_status not in {STATUS_EXHAUSTED, STATUS_DEAD}:
+        if entry.last_status not in {STATUS_EXHAUSTED, STATUS_DEAD}:
+            return entry
+        if self.provider in {"gemini-oauth", "gemini_oauth"}:
+            return self._sync_gemini_oauth_entry_from_auth_store(entry)
+        if entry.source != _RESYNC_SOURCE.get(self.provider):
             return entry
         if self.provider == "anthropic":
             return self._sync_anthropic_entry_from_credentials_file(entry)
@@ -1871,6 +2013,12 @@ class CredentialPool:
             self._entries = [e for e in self._entries if e.id not in pruned_ids]
         if cleared_any:
             self._persist(removed_ids=entries_to_prune)
+            if self.provider in {"gemini-oauth", "gemini_oauth"}:
+                try:
+                    from hermes_cli.auth import prime_all_sleeping_gemini_accounts
+                    prime_all_sleeping_gemini_accounts(async_run=True)
+                except Exception as exc:
+                    logger.debug("Failed to kick-start reset Gemini accounts: %s", exc)
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:
@@ -1882,7 +2030,13 @@ class CredentialPool:
         self._last_no_entries_log_at = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
-    def _select_unlocked(self, *, refresh: bool = True) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
+    def _select_unlocked(
+        self,
+        *,
+        refresh: bool = True,
+        preferred_id: Optional[str] = None,
+        preferred_account: Optional[str] = None,
+    ) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         """Select the best available entry; returns ``(entry, pending_refresh)``."""
         available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh)
         if not available:
@@ -1893,6 +2047,62 @@ class CredentialPool:
         # The pool recovered; re-arm the throttle so a later re-exhaustion
         # logs immediately.
         self._last_no_entries_log_at = None
+
+        if self.provider in {"gemini-oauth", "gemini_oauth"}:
+            from hermes_cli.auth import _normalize_gemini_account_id, calculate_gemini_doci_score, get_account_alias
+
+            def _find_matching_entry(target_val: Any, candidate_list: List[PooledCredential]) -> Optional[PooledCredential]:
+                if not target_val:
+                    return None
+                target_str = str(target_val).strip().lower()
+                for cand in candidate_list:
+                    cand_acc = str(cand.extra.get("account_id") or _normalize_gemini_account_id(cand.source)).strip().lower()
+                    cand_id = str(cand.id or "").strip().lower()
+                    cand_email = str(cand.label or "").strip().lower()
+                    cand_alias = str(get_account_alias(cand.label or cand.id) or "").strip().lower()
+                    if target_str in {cand_id, cand_acc, cand_email, cand_alias}:
+                        return cand
+                return None
+
+            def _gemini_doci_score(e: PooledCredential) -> float:
+                acc_idx = e.extra.get("account_id") or _normalize_gemini_account_id(e.source)
+                active_count = self.get_active_session_count(acc_idx) or self.get_active_session_count(e.id)
+                try:
+                    res = calculate_gemini_doci_score(acc_idx, active_leases=active_count)
+                except TypeError:
+                    res = calculate_gemini_doci_score(acc_idx)
+                return float(res.get("score", 0.0))
+
+            # 1. Target candidate: explicit override / preferred_account OR current session stickiness
+            target = preferred_id or preferred_account or self._current_id
+            if target:
+                active_entry = _find_matching_entry(target, available)
+                if active_entry is not None:
+                    # Account remains 100% locked until real 429 exhaustion to preserve Google KV prompt cache hits
+                    self._current_id = active_entry.id
+                    return active_entry, pending_refresh
+
+            # 2. Fresh Turn 1 selection or automatic 429 failover: Pick via CD-DOCI scoring
+            candidates = [e for e in available if _gemini_doci_score(e) > 0.0] or available
+            if len(candidates) > 2:
+                sample = random.sample(candidates, 2)
+                entry = max(sample, key=_gemini_doci_score)
+            elif len(candidates) == 2:
+                entry = max(candidates, key=_gemini_doci_score)
+            else:
+                entry = candidates[0]
+
+            if target and _find_matching_entry(target, self._entries) is not None:
+                orig_name = str(target)
+                next_name = get_account_alias(entry.label or entry.id) or str(entry.extra.get("account_id") or entry.label or entry.id)
+                logger.info(
+                    "🔄 [GEMINI ROTATION] Active Account %s exhausted/429 -> Failing over to healthiest CD-DOCI Account %s",
+                    orig_name,
+                    next_name,
+                )
+
+            self._current_id = entry.id
+            return entry, pending_refresh
 
         if self._strategy == STRATEGY_RANDOM:
             entry = random.choice(available)
@@ -2046,7 +2256,61 @@ class CredentialPool:
             self._current_id = None
             next_entry, _pending = self._select_unlocked(refresh=False)
             if next_entry:
-                logger.info("credential pool: rotated to %s", next_entry.label or next_entry.id[:8])
+                _next_label = next_entry.label or next_entry.id[:8]
+                logger.info("credential pool: rotated to %s", _next_label)
+
+            if self.provider in {"gemini-oauth", "gemini_oauth"}:
+                try:
+                    from hermes_cli.auth import _normalize_gemini_account_id, calculate_gemini_doci_score, get_account_alias
+                    old_acc = entry.extra.get("account_id") or _normalize_gemini_account_id(entry.source)
+                    old_name = get_account_alias(entry.label or entry.id) or str(old_acc)
+                    try:
+                        old_doci = calculate_gemini_doci_score(old_acc, active_leases=self.get_active_session_count(old_acc))
+                    except TypeError:
+                        old_doci = calculate_gemini_doci_score(old_acc)
+
+                    if next_entry:
+                        new_acc = next_entry.extra.get("account_id") or _normalize_gemini_account_id(next_entry.source)
+                        new_name = get_account_alias(next_entry.label or next_entry.id) or str(new_acc)
+                        try:
+                            new_doci = calculate_gemini_doci_score(new_acc, active_leases=self.get_active_session_count(new_acc))
+                        except TypeError:
+                            new_doci = calculate_gemini_doci_score(new_acc)
+                        logger.info(
+                            "🔄 [GEMINI ROTATION] Pinned Account %s exhausted/429 -> Temporarily failing over to healthiest CD-DOCI Account %s",
+                            old_name,
+                            new_name,
+                        )
+                        logger.info(
+                            "🔄 [GEMINI ROTATION] Switched from Account %s (%s) -> Account %s (%s) | Reason: HTTP %s (%s) | Prev (Acc %s): 5h: %s%% (resets: %s), W: %s%% (resets: %s), DOCI: %.4f | Selected (Acc %s): 5h: %s%% (resets: %s), W: %s%% (resets: %s), DOCI: %.4f",
+                            old_acc,
+                            entry.label or entry.id[:8],
+                            new_acc,
+                            next_entry.label or next_entry.id[:8],
+                            status_code,
+                            failure_reason or updated_entry.last_error_reason or "exhausted",
+                            old_acc,
+                            int(old_doci.get("cap_5h", 0.0) * 100),
+                            f"{old_doci.get('t_5h_hours', 0.0):.1f}h",
+                            int(old_doci.get("cap_w", 0.0) * 100),
+                            f"{old_doci.get('t_w_days', 0.0):.1f}d",
+                            old_doci.get("score", 0.0),
+                            new_acc,
+                            int(new_doci.get("cap_5h", 0.0) * 100),
+                            f"{new_doci.get('t_5h_hours', 0.0):.1f}h",
+                            int(new_doci.get("cap_w", 0.0) * 100),
+                            f"{new_doci.get('t_w_days', 0.0):.1f}d",
+                            new_doci.get("score", 0.0),
+                        )
+                    else:
+                        logger.warning(
+                            "⚠️ [GEMINI ROTATION] Account %s (%s) exhausted (HTTP %s) — All Gemini pool accounts are currently exhausted!",
+                            old_acc,
+                            entry.label or entry.id[:8],
+                            status_code,
+                        )
+                except Exception as exc:
+                    logger.debug("Gemini rotation logging error: %s", exc)
             return next_entry
 
     # ---- leases ------------------------------------------------------------
@@ -2082,11 +2346,29 @@ class CredentialPool:
             if not available:
                 return None, pending_refresh
 
-            below_cap = [e for e in available if self._active_leases.get(e.id, 0) < self._max_concurrent]
-            chosen = min(
-                below_cap or available,
-                key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
-            )
+            below_cap = [
+                entry for entry in available
+                if self._active_leases.get(entry.id, 0) < self._max_concurrent
+            ]
+            candidates = below_cap if below_cap else available
+            if self.provider in {"gemini-oauth", "gemini_oauth"}:
+                from hermes_cli.auth import _normalize_gemini_account_id, calculate_gemini_doci_score
+                def _gemini_doci_score(e: PooledCredential) -> float:
+                    acc_idx = e.extra.get("account_id") or _normalize_gemini_account_id(e.source)
+                    active_count = self._active_leases.get(e.id, 0)
+                    try:
+                        res = calculate_gemini_doci_score(acc_idx, active_leases=active_count)
+                    except TypeError:
+                        res = calculate_gemini_doci_score(acc_idx)
+                    return float(res.get("score", 0.0))
+
+                scored_candidates = [e for e in candidates if _gemini_doci_score(e) > 0.0] or candidates
+                chosen = max(scored_candidates, key=_gemini_doci_score)
+            else:
+                chosen = min(
+                    candidates,
+                    key=lambda entry: (self._active_leases.get(entry.id, 0), entry.priority),
+                )
             self._active_leases[chosen.id] = self._active_leases.get(chosen.id, 0) + 1
             self._current_id = chosen.id
             return chosen.id, pending_refresh
@@ -2098,6 +2380,67 @@ class CredentialPool:
                 self._active_leases.pop(credential_id, None)
             else:
                 self._active_leases[credential_id] = count - 1
+
+    def acquire_session_lease(self, session_id: str, account_id: Any) -> None:
+        """Register an active session lease for an account/credential."""
+        if not session_id or account_id is None:
+            return
+        with self._lock:
+            acc_key = str(account_id)
+            for k, sessions in list(self._active_session_leases.items()):
+                if k != acc_key:
+                    sessions.discard(session_id)
+                    if not sessions:
+                        self._active_session_leases.pop(k, None)
+            self._active_session_leases.setdefault(acc_key, set()).add(session_id)
+
+    def release_session_lease(self, session_id: str, account_id: Optional[Any] = None) -> None:
+        """Release an active session lease."""
+        if not session_id:
+            return
+        with self._lock:
+            if account_id is not None:
+                acc_key = str(account_id)
+                keys_to_check = {acc_key}
+                for entry in self._entries:
+                    acc_val = entry.extra.get("account_id")
+                    if entry.id == acc_key and acc_val is not None:
+                        keys_to_check.add(str(acc_val))
+                    elif acc_val is not None and str(acc_val) == acc_key:
+                        keys_to_check.add(entry.id)
+                for k in keys_to_check:
+                    sessions = self._active_session_leases.get(k)
+                    if sessions:
+                        sessions.discard(session_id)
+                        if not sessions:
+                            self._active_session_leases.pop(k, None)
+            else:
+                for k, sessions in list(self._active_session_leases.items()):
+                    sessions.discard(session_id)
+                    if not sessions:
+                        self._active_session_leases.pop(k, None)
+
+    def get_active_session_count(self, account_id: Any) -> int:
+        """Return the number of active sessions bound to the given account/credential."""
+        if account_id is None:
+            return 0
+        with self._lock:
+            key = str(account_id)
+            count = len(self._active_session_leases.get(key, set()))
+            if count > 0:
+                return count
+            for entry in self._entries:
+                acc_val = entry.extra.get("account_id")
+                if entry.id == key and acc_val is not None:
+                    other_key = str(acc_val)
+                    other_count = len(self._active_session_leases.get(other_key, set()))
+                    if other_count > 0:
+                        return other_count
+                elif acc_val is not None and str(acc_val) == key:
+                    other_count = len(self._active_session_leases.get(entry.id, set()))
+                    if other_count > 0:
+                        return other_count
+            return 0
 
     # ---- explicit refresh / admin ------------------------------------------
 
@@ -2242,7 +2585,11 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
         if isinstance(known_fingerprint, str) and known_fingerprint:
             token_changed = fingerprint_secret_value(incoming_token) != known_fingerprint
     for key, value in payload.items():
-        if key in {"id", "priority"} or value is None or (key == "label" and existing.label):
+        if key in {"id", "priority"} or value is None:
+            continue
+        if key == "label":
+            if value and value != existing.label:
+                field_updates["label"] = value
             continue
         if key in _field_names:
             if getattr(existing, key) != value:
@@ -2507,6 +2854,46 @@ def _seed_minimax_singleton(seed: _Seeder) -> None:
         logger.debug("MiniMax OAuth token seed failed: %s", exc)
 
 
+def _seed_gemini_singletons(seed: _Seeder) -> None:
+    try:
+        from hermes_cli.auth import (
+            _read_gemini_account_tokens,
+            resolve_gemini_oauth_runtime_credentials,
+        )
+        for acc_idx in range(1, 6):
+            tokens = _read_gemini_account_tokens(acc_idx)
+            if not tokens.get("access_token") and not tokens.get("refresh_token"):
+                continue
+            token = ""
+            creds = tokens
+            try:
+                creds = resolve_gemini_oauth_runtime_credentials(acc_idx, refresh_if_expiring=True)
+                token = creds.get("api_key", "")
+            except Exception as exc:
+                logger.debug("Gemini OAuth account %s proactive refresh during seed failed (retaining cached): %s", acc_idx, exc)
+                token = tokens.get("access_token", "")
+                creds = tokens
+
+            if token or tokens.get("refresh_token"):
+                source_name = f"gemini_account_{acc_idx}"
+                seed.upsert(
+                    source_name,
+                    {
+                        "source": source_name,
+                        "auth_type": AUTH_TYPE_OAUTH,
+                        "access_token": token or "",
+                        "refresh_token": creds.get("refresh_token") or tokens.get("refresh_token"),
+                        "expires_at_ms": creds.get("expires_at_ms"),
+                        "base_url": creds.get("base_url", ""),
+                        "label": creds.get("email") or tokens.get("email") or f"gemini-{acc_idx}",
+                        "priority": acc_idx,
+                        "account_id": acc_idx,
+                    },
+                )
+    except Exception as exc:
+        logger.debug("Gemini OAuth token seed failed: %s", exc)
+
+
 def _seed_tokens_singleton(seed: _Seeder, auth_store: Dict[str, Any]) -> None:
     """Codex / xAI: surface the auth.json ``providers.<id>.tokens`` singleton as ``device_code``.
 
@@ -2546,6 +2933,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         _seed_copilot_singleton(seed)
     elif provider == "qwen-oauth":
         _seed_qwen_singleton(seed)
+    elif provider in {"gemini-oauth", "gemini_oauth"}:
+        _seed_gemini_singletons(seed)
     elif provider == "minimax-oauth":
         _seed_minimax_singleton(seed)
     elif provider in _TOKENS_SINGLETON_PROVIDERS:
@@ -2682,6 +3071,9 @@ def _prune_stale_seeded_entries(
         # requested (an `hermes auth` command that confirmed the source is gone).
         if entry.source.startswith("env:"):
             return prune_env_sources
+        # Never prune an OAuth entry that has a valid refresh_token on cold boots
+        if entry.auth_type == AUTH_TYPE_OAUTH and entry.refresh_token:
+            return False
         # File-backed singletons and Hermes PKCE disappear when their backing file is gone.
         return is_borrowed_credential_source(entry.source, entry.provider) or entry.source == "hermes_pkce"
 
@@ -2817,3 +3209,12 @@ def load_pool(provider: str) -> CredentialPool:
     if provider in SINGLE_USE_REFRESH_POOL_PROVIDERS and not _profile_owns_pool_provider(provider):
         pool._borrowed_root_ids = set(disk_ids)
     return pool
+
+    if provider in {"gemini-oauth", "gemini_oauth"}:
+        try:
+            from hermes_cli.auth import prime_all_sleeping_gemini_accounts
+            prime_all_sleeping_gemini_accounts(async_run=True)
+        except Exception:
+            pass
+
+    return CredentialPool(provider, entries)

@@ -13,11 +13,14 @@ import {
   buildToolTrailLine,
   buildVerboseToolTrailLine,
   estimateTokensRough,
+  extractThoughtTitle,
   isTransientTrailLine,
   sameToolTrailGroup,
+  THINKING_BOUNDARY_RE,
   toolTrailLabel
 } from '../lib/text.js'
-import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '../types.js'
+import { parseTodos } from '../lib/todo.js'
+import type { ActiveTool, ActivityItem, Msg, SubagentProgress } from '../types.js'
 
 import type { Notice } from './interfaces.js'
 import { resetFlowOverlays } from './overlayStore.js'
@@ -45,39 +48,7 @@ const diffSegmentBody = (msg: Msg): null | string => {
 
 const hasDetails = (msg: Msg): boolean => Boolean(msg.thinking || msg.tools?.length || msg.toolTokens)
 
-const isTodoStatus = (status: unknown): status is TodoItem['status'] =>
-  status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'cancelled'
 
-const parseTodos = (value: unknown): null | TodoItem[] => {
-  if (!Array.isArray(value)) {
-    return null
-  }
-
-  return value
-    .map(item => {
-      if (!item || typeof item !== 'object') {
-        return null
-      }
-
-      const row = item as Record<string, unknown>
-      const status = row.status
-
-      if (!isTodoStatus(status)) {
-        return null
-      }
-
-      const id = String(row.id ?? '').trim()
-      const parent = String(row.parent ?? '').trim()
-
-      return {
-        content: String(row.content ?? '').trim(),
-        id,
-        status,
-        ...(parent && parent !== id ? { parent } : {})
-      }
-    })
-    .filter((item): item is TodoItem => Boolean(item?.id && item.content))
-}
 
 const textSegments = (segments: Msg[]) =>
   segments.filter(msg => msg.role === 'assistant' && msg.kind !== 'diff').map(msg => msg.text)
@@ -378,11 +349,14 @@ class TurnController {
       return
     }
 
+    const { title } = extractThoughtTitle(thinking)
+
     const msg: Msg = {
       kind: 'trail',
       role: 'system',
       text: '',
       thinking,
+      thinkingTitle: title || undefined,
       thinkingTokens: estimateTokensRough(thinking),
       toolTokens: this.toolTokenAcc || undefined,
       ...(live ? { isLiveReasoning: true } : {})
@@ -399,7 +373,10 @@ class TurnController {
   }
 
   private closeReasoningSegment() {
-    this.syncReasoningSegment(false)
+    if (this.activeReasoningText.trim()) {
+      this.syncReasoningSegment(false)
+    }
+
     this.activeReasoningText = ''
     this.reasoningSegmentIndex = null
   }
@@ -475,10 +452,6 @@ class TurnController {
       text: '',
       tools: this.pendingSegmentTools
     })
-
-    if (next.length === this.segmentMessages.length + 1) {
-      return false
-    }
 
     this.segmentMessages = next
     this.pendingSegmentTools = []
@@ -626,21 +599,43 @@ class TurnController {
 
     const finalThinking = hasReasoningSegment ? '' : savedReasoning.trim()
 
+    const thinkingMsg: Msg | null = finalThinking
+      ? {
+          kind: 'trail',
+          role: 'system',
+          text: '',
+          thinking: finalThinking,
+          thinkingTokens: estimateTokensRough(finalThinking)
+        }
+      : null
+
+    // If we have tool tokens and there is a tool-carrying segment, attach toolTokens to it
+    let finalSegments = segments
+
+    if (savedToolTokens) {
+      const lastToolIdx = finalSegments.findLastIndex(msg => Boolean(msg.kind === 'trail' && msg.tools?.length))
+
+      if (lastToolIdx >= 0) {
+        finalSegments = finalSegments.map((msg, i) =>
+          i === lastToolIdx ? { ...msg, toolTokens: savedToolTokens } : msg
+        )
+      }
+    }
+
     const finalDetails: Msg = {
       kind: 'trail',
       role: 'system',
       text: '',
-      thinking: finalThinking || undefined,
-      thinkingTokens: finalThinking ? estimateTokensRough(finalThinking) : undefined,
-      toolTokens: savedToolTokens || undefined,
-      ...(tools.length && { tools })
+      ...(tools.length && { tools }),
+      ...(savedToolTokens && !finalSegments.some(m => Boolean(m.toolTokens)) ? { toolTokens: savedToolTokens } : {})
     }
 
     // Archive prepended so the trail msg anchors under the user prompt,
     // not between thinking/tools and final assistant text.
     const finalMessages: Msg[] = [
       ...archiveDoneTodos(),
-      ...segments,
+      ...(thinkingMsg ? [thinkingMsg] : []),
+      ...finalSegments,
       ...(hasDetails(finalDetails) ? [finalDetails] : [])
     ]
 
@@ -788,12 +783,30 @@ class TurnController {
     this.reasoningText += text
     this.activeReasoningText += text
 
+    // Check for thinking paragraph / title boundary to decouple discrete thinking steps
+    if (this.activeReasoningText.length > 60) {
+      const match = THINKING_BOUNDARY_RE.exec(this.activeReasoningText)
+
+      if (match && match.index > 30) {
+        const completed = this.activeReasoningText.slice(0, match.index).trim()
+        const remainder = this.activeReasoningText.slice(match.index).trimStart()
+
+        if (completed) {
+          this.activeReasoningText = completed
+          this.syncReasoningSegment(false)
+          this.activeReasoningText = remainder
+          this.reasoningSegmentIndex = null
+          this.syncReasoningSegment(true)
+        }
+      }
+    }
+
     if (this.reasoningText.length > 80_000) {
       this.reasoningText = this.reasoningText.slice(-60_000)
     }
 
     this.scheduleReasoning()
-    this.syncReasoningSegment()
+    this.syncReasoningSegment(true)
     this.pulseReasoningStreaming()
   }
 
@@ -808,6 +821,10 @@ class TurnController {
   ) {
     if (this.interrupted) {
       return
+    }
+
+    if (this.reasoningSegmentIndex !== null) {
+      this.closeReasoningSegment()
     }
 
     this.recordTodos(todos)

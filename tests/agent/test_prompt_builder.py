@@ -1148,6 +1148,38 @@ class TestParallelToolCallGuidance:
         assert PARALLEL_TOOL_CALL_GUIDANCE.lstrip().startswith("#")
 
 
+class TestGoogleModelOperationalGuidance:
+    """Behavior contracts for Google/Gemini/Gemma operational directives."""
+
+    def test_is_nonempty_string(self):
+        assert isinstance(GOOGLE_MODEL_OPERATIONAL_GUIDANCE, str)
+        assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE.strip()
+
+    def test_has_a_heading(self):
+        assert GOOGLE_MODEL_OPERATIONAL_GUIDANCE.lstrip().startswith("# Google model operational directives")
+
+    def test_guidance_covers_iterative_tool_execution(self):
+        text = GOOGLE_MODEL_OPERATIONAL_GUIDANCE.lower()
+        assert "iterative tool execution" in text
+        assert "step-by-step" in text
+        assert "monolithic" in text
+
+    def test_guidance_covers_output_headroom_safety(self):
+        text = GOOGLE_MODEL_OPERATIONAL_GUIDANCE.lower()
+        assert "output headroom safety" in text
+        assert "thinking tokens" in text
+        assert "headroom" in text
+
+    def test_guidance_covers_core_operational_rules(self):
+        text = GOOGLE_MODEL_OPERATIONAL_GUIDANCE.lower()
+        assert "absolute paths" in text
+        assert "verify first" in text
+        assert "dependency checks" in text
+        assert "conciseness" in text
+        assert "non-interactive commands" in text
+        assert "keep going" in text
+
+
 
 # =========================================================================
 # Budget warning history stripping

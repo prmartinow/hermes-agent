@@ -57,6 +57,7 @@ interface SessionInfo {
   cwd?: string;
   model?: string;
   provider?: string;
+  gemini_account?: string;
   credential_warning?: string;
   title?: string;
 }
@@ -92,6 +93,7 @@ interface ChatSidebarProps {
   className?: string;
   onDashboardNewSessionRequest?: () => void;
   onSessionTitleChange?: (title: string | null) => void;
+  onAccountAliasChange?: (alias: string | null) => void;
 }
 
 /** Build the ``session.create`` params for the sidecar session.
@@ -115,6 +117,7 @@ export function ChatSidebar({
   className,
   onDashboardNewSessionRequest,
   onSessionTitleChange,
+  onAccountAliasChange,
 }: ChatSidebarProps) {
   // `version` bumps on reconnect; gw is derived so we never call setState
   // for it inside an effect (React 19's set-state-in-effect rule). The
@@ -197,6 +200,9 @@ export function ChatSidebar({
     const offSessionInfo = gw.on<SessionInfo>("session.info", (ev) => {
       if (ev.payload) {
         setInfo((prev) => ({ ...prev, ...ev.payload }));
+        if (ev.payload.gemini_account !== undefined) {
+          onAccountAliasChange?.(ev.payload.gemini_account || null);
+        }
       }
     });
 

@@ -190,6 +190,19 @@ class CLILoopsMixin:
             return True  # confirmation cancelled — command handled, keep REPL alive
         self.undo_last(_undo_n)
 
+    def _cmd_redo(self, cmd_original: str):
+        _redo_n = 1
+        _redo_parts = cmd_original.split()
+        if len(_redo_parts) > 1:
+            try:
+                _redo_n = int(_redo_parts[1])
+            except ValueError:
+                print(f"(._.) Invalid count {_redo_parts[1]!r} — use /redo or /redo N.")
+                return True
+            if _redo_n < 1:
+                _redo_n = 1
+        self.redo_last(_redo_n)
+
     def _cmd_skills(self, cmd_original: str):
         with self._busy_command(self._slow_command_status(cmd_original)):
             self._handle_skills_command(cmd_original)

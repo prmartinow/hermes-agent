@@ -541,11 +541,13 @@ def _hydrate_from_history(agent: Any, conversation_history: Optional[List[Any]])
 
 def _tick_memory_nudge(agent: Any) -> bool:
     """Advance the turn-based memory nudge counter; ``True`` when the review should fire."""
-    if (agent._memory_nudge_interval > 0
+    _raw_nudge = getattr(agent, "_memory_nudge_interval", 0)
+    _nudge_int = _raw_nudge if isinstance(_raw_nudge, int) else 0
+    if (_nudge_int > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
-        if agent._turns_since_memory >= agent._memory_nudge_interval:
+        if agent._turns_since_memory >= _nudge_int:
             agent._turns_since_memory = 0
             return True
     return False
@@ -777,6 +779,41 @@ def build_turn_context(
     set_session_context(agent.session_id)
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
     agent._restore_primary_runtime()
+    # Enforce strict session KV-cache stickiness for pooled Gemini OAuth accounts
+    if getattr(agent, "provider", "") in {"gemini-oauth", "gemini_oauth"}:
+        try:
+            pool = getattr(agent, "_credential_pool", None)
+            if pool is not None and pool.has_available():
+                pinned_acc = None
+                # Child subagents must NEVER inherit parent's G-Switch account PIN — always unpinned dynamic CD-DOCI mode
+                is_subagent = (
+                    getattr(agent, "platform", None) == "subagent"
+                    or (isinstance(getattr(agent, "_subagent_id", None), str) and bool(agent._subagent_id))
+                    or (isinstance(getattr(agent, "_delegate_role", None), str) and bool(agent._delegate_role))
+                    or (isinstance(getattr(agent, "parent_session_id", None), str) and bool(agent.parent_session_id))
+                )
+                if not is_subagent:
+                    db = getattr(agent, "_session_db", None)
+                    sid = getattr(agent, "session_id", None)
+                    if db and sid and hasattr(db, "get_session"):
+                        sess_row = db.get_session(sid)
+                        if sess_row:
+                            cfg_raw = sess_row.get("model_config")
+                            if isinstance(cfg_raw, str):
+                                import json
+                                cfg_raw = json.loads(cfg_raw)
+                            if isinstance(cfg_raw, dict):
+                                pinned_acc = cfg_raw.get("gemini_account")
+                    if not pinned_acc:
+                        pinned_acc = getattr(agent, "_credential_pool_entry_id", None)
+                if pinned_acc and not is_subagent:
+                    entry = pool.select(preferred_account=pinned_acc)
+                else:
+                    entry = pool.select()
+                if entry is not None and getattr(entry, "id", None) != getattr(agent, "_credential_pool_entry_id", None):
+                    agent._swap_credential(entry)
+        except Exception:
+            pass
     _publish_runtime_main(agent)
     _refresh_mcp_tools_between_turns(agent)
 

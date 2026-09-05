@@ -312,6 +312,16 @@ class AIAgent(
                 model_config["yolo_mode"] = True
         except Exception:
             pass
+        if getattr(self, "provider", None) in {"gemini-oauth", "gemini_oauth"}:
+            try:
+                pool = getattr(self, "_credential_pool", None)
+                if pool:
+                    curr = pool.current()
+                    if curr:
+                        model_config = dict(model_config or {})
+                        model_config["gemini_account"] = curr.label or curr.id
+            except Exception:
+                pass
         return model_config
 
     def _ensure_db_session(self) -> None:

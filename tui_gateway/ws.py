@@ -57,7 +57,7 @@ def _sanitize_ws_text(text: str) -> str:
 
 # Max seconds a pool-dispatched handler blocks waiting for the loop to flush a WS frame before we
 # give up waiting (the transport is NOT marked dead).
-_WS_WRITE_TIMEOUT_S = 10.0
+_WS_WRITE_TIMEOUT_S = 30.0
 _WS_LOG_PAYLOAD_PREVIEW = 240
 
 # Per-token streaming frames are coalesced: buffered and flushed as a batch on a short timer instead

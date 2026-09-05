@@ -85,6 +85,16 @@ fi
 # is a no-op if the dir already exists. (#18482, salvages #18488)
 mkdir -p "$HERMES_HOME"
 
+# --- nsenter setuid-root permissions for host-namespace operations ---
+if [ -x /usr/bin/nsenter ]; then
+    chmod 4755 /usr/bin/nsenter 2>/dev/null || true
+fi
+
+# --- agy executable permissions ---
+if [ -f /usr/local/bin/agy ]; then
+    chmod 0755 /usr/local/bin/agy 2>/dev/null || true
+fi
+
 # Numeric UID/GID validation: must be digits only, non-root, 1-65534.
 # NAS hosts such as Unraid commonly use low non-root IDs (99:100).
 validate_uid_gid() {

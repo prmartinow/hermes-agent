@@ -160,6 +160,41 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         and sanitize_context(content).strip() != content.strip()
     ):
         api_content = content
+    _msg_disp_meta = msg.get("display_metadata")
+    if role == "assistant" and getattr(agent, "provider", None) in {"gemini-oauth", "gemini_oauth"}:
+        if not isinstance(_msg_disp_meta, dict) or not _msg_disp_meta.get("gemini_account"):
+            try:
+                from hermes_cli.auth import get_account_alias
+                pool = getattr(agent, "_credential_pool", None)
+                entry_id = getattr(agent, "_credential_pool_entry_id", None)
+                curr = None
+                if entry_id and pool:
+                    _all_entries = pool.entries() if hasattr(pool, "entries") else getattr(pool, "_entries", [])
+                    curr = next((e for e in _all_entries if getattr(e, "id", None) == entry_id), None)
+                if curr is None and pool:
+                    curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
+                raw_lbl = (curr.label or curr.id) if curr else entry_id
+                if raw_lbl:
+                    _acc_alias = get_account_alias(raw_lbl)
+                    if _acc_alias:
+                        if isinstance(_msg_disp_meta, dict):
+                            _msg_disp_meta = dict(_msg_disp_meta)
+                            _msg_disp_meta["gemini_account"] = _acc_alias
+                        elif isinstance(_msg_disp_meta, str):
+                            try:
+                                _parsed_meta = json.loads(_msg_disp_meta)
+                                if isinstance(_parsed_meta, dict):
+                                    _parsed_meta["gemini_account"] = _acc_alias
+                                    _msg_disp_meta = _parsed_meta
+                                else:
+                                    _msg_disp_meta = {"gemini_account": _acc_alias}
+                            except Exception:
+                                _msg_disp_meta = {"gemini_account": _acc_alias}
+                        else:
+                            _msg_disp_meta = {"gemini_account": _acc_alias}
+                        msg["display_metadata"] = _msg_disp_meta
+            except Exception:
+                pass
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
         "role": role, "content": _durable_content(content), "tool_name": msg.get("tool_name"),
@@ -168,7 +203,7 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
         "timestamp": timestamp, "api_content": api_content,
-        "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
+        "display_kind": _summary_display_kind(msg), "display_metadata": _msg_disp_meta,
         "platform_message_id": msg.get("platform_message_id"),  # load-bearing for restart drain-window recovery dedup
     }
     if isinstance(msg.get("_row_id"), int):
@@ -209,7 +244,7 @@ def _db_flush_write(agent, batch_rows: List[Dict[str, Any]], batch_msgs: List[Di
         session_id=agent.session_id, messages=batch_rows,
         compression_lock_holder=getattr(agent, "_active_compression_lock_holder", None),
         turn_lease_holder=getattr(agent, "_active_session_turn_lease_holder", None),
-        turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 300.0) or 300.0,
+        turn_lease_ttl_seconds=getattr(agent, "_active_session_turn_lease_ttl_seconds", 45.0) or 45.0,
     )
     sync_flushed_message_markers(batch_msgs, batch_rows)
 

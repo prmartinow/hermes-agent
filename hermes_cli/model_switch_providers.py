@@ -20,7 +20,11 @@ from utils import base_url_host_matches
 logger = logging.getLogger("hermes_cli.model_switch")
 
 # Aggregators whose full catalogs (70+ models) must stay visible: never capped by max_models.
-_UNCAPPED_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "opencode-go"})
+_UNCAPPED_PICKER_PROVIDERS: frozenset[str] = frozenset({
+    "opencode-zen",
+    "opencode-go",
+    "gemini-oauth",
+})
 
 
 def _save_discovered_models_to_config(
@@ -278,8 +282,16 @@ def _auth_store_has_provider(*keys: str) -> bool:
     try:
         from hermes_cli.auth import _load_auth_store
         store = _load_auth_store()
-        providers_store = store.get("providers", {})
-        return bool(store and any(k in providers_store for k in keys))
+        providers_store = store.get("providers", {}) if store else {}
+        if any(k in providers_store for k in keys):
+            return True
+        _gemini_keys = {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"}
+        for k in keys:
+            if k in _gemini_keys:
+                from hermes_cli.auth import has_gemini_oauth_credentials
+                if has_gemini_oauth_credentials(account=k):
+                    return True
+        return False
     except Exception as exc:
         logger.debug("Auth store check failed for %s: %s", keys[0] if keys else "", exc)
         return False
@@ -633,10 +645,29 @@ class _PickerBuild:
     def add_builtin_row(
         self, slug: str, name: str, is_current: bool, model_ids: list, source: str, *, uncapped_ok: bool = True,
     ) -> None:
-        self.results.append({
+        capped = _cap_models(model_ids, self.max_models, slug if uncapped_ok else "")
+        row_dict = {
             "slug": slug, "name": name, "is_current": is_current, "is_user_defined": False,
-            "models": _cap_models(model_ids, self.max_models, slug if uncapped_ok else ""),
-            "total_models": len(model_ids), "source": source})
+            "models": capped,
+            "total_models": len(model_ids), "source": source}
+        if slug in {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"}:
+            try:
+                from hermes_cli.auth import (
+                    resolve_gemini_oauth_runtime_credentials,
+                    fetch_gemini_quota_summary,
+                    get_gemini_model_display_names,
+                    get_quota_for_gemini_model,
+                )
+                creds = resolve_gemini_oauth_runtime_credentials(slug, refresh_if_expiring=True)
+                token = creds.get("api_key") or creds.get("access_token")
+                quota_raw = fetch_gemini_quota_summary(token)
+                row_dict["model_display_names"] = get_gemini_model_display_names(slug)
+                row_dict["model_quotas"] = {
+                    mid: get_quota_for_gemini_model(mid, quota_raw) for mid in capped
+                }
+            except Exception as _gerr:
+                logger.debug("Failed to populate Gemini model quotas for %s: %s", slug, _gerr)
+        self.results.append(row_dict)
         self.seen_slugs.add(slug.lower())
         self.record_builtin_endpoint(slug)
 

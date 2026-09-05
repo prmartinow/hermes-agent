@@ -215,6 +215,10 @@ async def _lifespan(app: "FastAPI"):
 
     # Reap idle/dead keep-alive PTY sessions (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
+    from hermes_cli.web_server_chat import _default_pty_spawn
+    PTY_REGISTRY.configure_standby_spawn(_default_pty_spawn)
+    asyncio.create_task(PTY_REGISTRY.ensure_standby())
+
     # Periodic authenticated self-test feeding the ``dashboard`` component on /api/status.
     selftest_task = asyncio.create_task(_dashboard_selftest_loop())
     # Live auto-archive timer, independent of list requests.
@@ -235,9 +239,21 @@ async def _lifespan(app: "FastAPI"):
 
     threading.Thread(target=_boot_local_runtime, daemon=True, name="local-runtime-boot").start()
 
+    # 24/7 Gemini Quota Watcher Daemon — automatically ignites sleeping/expired quota windows
+    try:
+        from hermes_cli.auth import start_gemini_quota_watcher_daemon
+        start_gemini_quota_watcher_daemon(interval_seconds=60.0)
+    except Exception:
+        pass
+
     try:
         yield
     finally:
+        try:
+            from hermes_cli.auth import stop_gemini_quota_watcher_daemon
+            stop_gemini_quota_watcher_daemon()
+        except Exception:
+            pass
         hosted_room_start_cancel.set()
         _hosted_groups.stop_hosted_room_service(timeout=5.0)
         hosted_room_start_thread.join(timeout=1.0)
