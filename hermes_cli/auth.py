@@ -2446,27 +2446,60 @@ def resolve_gemini_oauth_runtime_credentials(
     }
 
 
-def get_account_alias(email_or_account: Any) -> str:
+_CONFIG_ALIASES_CACHE: tuple[float, int, dict[str, str]] = (0.0, 0, {})
+_ALIASES_CACHE_LOCK = threading.Lock()
+
+
+def _get_account_aliases_map() -> dict[str, str]:
+    """Return cached dictionary mapping lowercased account identifier to alias.
+
+    Refreshes at most once every 5 seconds to eliminate disk I/O and deepcopy
+    overhead on high-frequency lookups while preserving responsiveness to config edits.
+    Automatically invalidates if load_config function identity changes (e.g. in tests).
+    """
+    global _CONFIG_ALIASES_CACHE
+    from hermes_cli.config import load_config
+
+    func_id = id(load_config)
+    now = time.time()
+    if _CONFIG_ALIASES_CACHE[1] == func_id and (now - _CONFIG_ALIASES_CACHE[0] < 5.0):
+        return _CONFIG_ALIASES_CACHE[2]
+    with _ALIASES_CACHE_LOCK:
+        if _CONFIG_ALIASES_CACHE[1] == func_id and (now - _CONFIG_ALIASES_CACHE[0] < 5.0):
+            return _CONFIG_ALIASES_CACHE[2]
+        try:
+            cfg = load_config()
+            raw_aliases = (cfg.get("display") or {}).get("account_aliases") or {}
+            parsed: dict[str, str] = {}
+            if isinstance(raw_aliases, dict):
+                for k, v in raw_aliases.items():
+                    val = str(v).strip()
+                    if val:
+                        parsed[str(k).strip().lower()] = val
+            _CONFIG_ALIASES_CACHE = (now, func_id, parsed)
+            return parsed
+        except Exception:
+            return _CONFIG_ALIASES_CACHE[2]
+
+
+def get_account_alias(email_or_account: Any, aliases: dict | None = None) -> str:
     """Return configured alias for an account email/identifier from config.yaml display.account_aliases."""
     if not email_or_account or not isinstance(email_or_account, str):
         return ""
     clean = email_or_account.strip()
     clean_lower = clean.lower()
-    try:
-        from hermes_cli.config import load_config
+    if aliases is not None:
+        if clean_lower in aliases:
+            return aliases[clean_lower]
+        for k, v in aliases.items():
+            if str(k).strip().lower() == clean_lower:
+                val = str(v).strip()
+                if val:
+                    return val
+        return clean
 
-        cfg = load_config()
-        aliases = (cfg.get("display") or {}).get("account_aliases") or {}
-        if isinstance(aliases, dict):
-            for k, v in aliases.items():
-                if str(k).strip().lower() == clean_lower:
-                    val = str(v).strip()
-                    if val:
-                        return val
-    except Exception:
-        pass
-
-    return clean
+    aliases_map = _get_account_aliases_map()
+    return aliases_map.get(clean_lower, clean)
 
 
 _RESOLVED_SESSION_ACCOUNTS_LOCK = threading.Lock()
@@ -2746,6 +2779,7 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
     from hermes_constants import get_hermes_home
 
     out = []
+    conn = None
     try:
         db_path = get_hermes_home() / "state.db"
         conn = sqlite3.connect(str(db_path), timeout=5.0)
@@ -2805,12 +2839,23 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
             except Exception:
                 return 0.0
 
-        # Parse rotation logs from agent.log
+        # Parse rotation logs from agent.log (bounded to the most recent 1MB)
         log_swaps = {}
         log_path = get_hermes_home() / "logs" / "agent.log"
         if log_path.exists():
             try:
+                max_log_bytes = 1024 * 1024
                 with open(log_path, "r", errors="ignore") as f:
+                    try:
+                        f.seek(0, os.SEEK_END)
+                        size = f.tell()
+                        if size > max_log_bytes:
+                            f.seek(size - max_log_bytes, os.SEEK_SET)
+                            f.readline()  # discard partial first line
+                        else:
+                            f.seek(0, os.SEEK_SET)
+                    except Exception:
+                        pass
                     for line in f:
                         if "switched active account to" in line or "Active account switched:" in line or "Quota exhausted" in line or "429" in line:
                             sid_m = re.search(r"\[([0-9]{8}_[0-9]{6}_[a-f0-9]+)\]", line)
@@ -2998,6 +3043,12 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
             })
     except Exception:
         pass
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     return {"sessions": out, "total": len(out)}
 

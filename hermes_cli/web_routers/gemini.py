@@ -22,7 +22,7 @@ async def get_gemini_account_history(
 
 
 @router.get("/api/gemini/session-histories")
-async def get_gemini_session_histories(
+def get_gemini_session_histories(
     limit: int = Query(100, ge=1, le=500),
 ):
     from hermes_cli.auth import list_gemini_session_histories

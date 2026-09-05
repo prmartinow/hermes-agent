@@ -416,8 +416,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           return;
         }
 
-        // Force-close existing stale PTY session so the effect re-binds to the descendant
-        wsRef.current?.close();
+        // Update search params to the latest descendant session; the main effect cleanup
+        // will cleanly close the old socket with unmounting=true, preventing reconnect flashes.
         const next = new URLSearchParams(searchParams);
         next.set("resume", res.session_id);
         setSearchParams(next, { replace: true });

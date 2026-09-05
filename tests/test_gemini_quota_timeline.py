@@ -407,3 +407,38 @@ def test_gemini_quota_timeline_multiple_stored_slots(temp_db, monkeypatch):
     # Slot 0 (24h ago) is unrecorded
     assert intervals[0]["accounts"]["alias1"]["cap_5h"] is None
     assert intervals[0]["accounts"]["alias1"]["rank"] is None
+
+
+def test_get_gemini_session_histories_is_sync_def():
+    """Verify endpoint is synchronous so FastAPI runs it on threadpool, avoiding event loop stalls."""
+    import inspect
+    from hermes_cli.web_routers.gemini import get_gemini_session_histories
+
+    assert not inspect.iscoroutinefunction(get_gemini_session_histories), (
+        "get_gemini_session_histories must NOT be async def to prevent freezing FastAPI event loop"
+    )
+
+
+def test_get_account_alias_caching(monkeypatch):
+    """Verify get_account_alias caches config loads and performs fast lookups."""
+    import hermes_cli.auth as auth_mod
+    from hermes_cli.auth import get_account_alias
+
+    # Reset cache
+    auth_mod._CONFIG_ALIASES_CACHE = (0.0, {})
+
+    call_count = 0
+
+    def mock_load():
+        nonlocal call_count
+        call_count += 1
+        return {"display": {"account_aliases": {"user1@test.com": "AliasOne"}}}
+
+    monkeypatch.setattr("hermes_cli.config.load_config", mock_load)
+
+    # 100 consecutive calls should hit cache and only invoke load_config once
+    for _ in range(100):
+        alias = get_account_alias("user1@test.com")
+        assert alias == "AliasOne"
+
+    assert call_count == 1
