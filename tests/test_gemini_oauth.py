@@ -300,7 +300,7 @@ def test_provider_catalog_includes_gemini_oauth_on_accounts_tab():
 
 
 def test_web_server_oauth_catalog_resolves_gemini_oauth_status(tmp_path):
-    from hermes_cli.web_server import _build_oauth_catalog, _resolve_provider_status
+    from hermes_cli.web_routers.oauth import _build_oauth_catalog, _resolve_provider_status
 
     token_file = tmp_path / "antigravity-oauth-token"
     token_file.write_text(json.dumps({
@@ -905,7 +905,7 @@ def test_gemini_quota_watcher_daemon():
 
 
 def test_unified_gemini_oauth_provider_models_and_aliases():
-    from hermes_cli.models import CANONICAL_PROVIDERS, PROVIDER_GROUPS, _PROVIDER_LABELS
+    from hermes_cli.models_catalog_static import CANONICAL_PROVIDERS, PROVIDER_GROUPS, _PROVIDER_LABELS
     from hermes_cli.providers import HERMES_OVERLAYS, ALIASES
 
     # 1. Exactly one canonical provider entry for gemini oauth pool
@@ -931,7 +931,7 @@ def test_unified_gemini_oauth_provider_models_and_aliases():
 
 
 def test_web_server_gemini_oauth_multi_account_status(tmp_path):
-    from hermes_cli.web_server import _build_oauth_catalog, _resolve_provider_status
+    from hermes_cli.web_routers.oauth import _build_oauth_catalog, _resolve_provider_status
 
     # Verify oauth catalog has single gemini-oauth row
     rows = _build_oauth_catalog()
