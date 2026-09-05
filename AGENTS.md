@@ -435,6 +435,17 @@ To maximize throughput and ensure full capacity is replenished as early as possi
 4. **Immediate Verification**: Re-queries `retrieveUserQuotaSummary` to verify that `remainingFraction < 0.99999` and that a fixed 5-hour countdown is actively ticking down.
 5. **Audit Logging & Daemon**: Emits structured verification logs to `agent.log`. The 24/7 background daemon (`start_gemini_quota_watcher_daemon()`) runs in the background, polling every 60 seconds to automatically ignite any reset or sleeping account across both model groups.
 
+### Upstream Synchronization Workflow (3-Branch Architecture)
+Hermes Agent operates on a strict 3-branch Git architecture (`main` -> `dev` -> `local`). Upstream synchronization is run interactively via `scripts/sync_upstream.sh` ("Rebase Dev, Rebuild Serving"):
+- **Script**: `scripts/sync_upstream.sh`
+- **Workflow**:
+  1. Stashes any active local modifications.
+  2. Fetches `upstream` (`NousResearch/hermes-agent`) and `origin`.
+  3. Fast-forwards pristine `main` to `upstream/main` (`--ff-only`) and pushes to `origin/main`.
+  4. Rebases the consolidated `dev` topic branch cleanly onto `main` and pushes with lease to `origin/dev`.
+  5. Rebuilds active serving branch `local` from fresh `main` via `git merge --no-ff dev`.
+  6. Compiles UI/TUI assets (`npm run build:ink && npm run build`), pushes `local` to `origin/local`, and builds/deploys the container release.
+  7. Restores original branch and stash, logging all actions to `~/.hermes/logs/upstream_sync.log`.
 ---
 
 ## Routing Table — working in X → read X/AGENTS.md

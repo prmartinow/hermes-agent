@@ -149,8 +149,8 @@ This implementation plan establishes full behavioral and wire-level alignment be
 ## 6. Git Branching & Sanitation Protocol
 
 1. **Branch Isolation**:
-   - All code edits must be committed directly to topic branch `gemini`.
-   - Feature changes must not contaminate `main` or `bug-fixes`.
+   - All code edits must be committed directly to consolidated topic branch `dev`.
+   - Feature changes live linearly on `dev` and must never be committed directly to `main` or `local`.
 2. **Sanitation Verification**:
    - Execute strict regex scans across all staged files prior to commit:
      ```bash
@@ -158,7 +158,7 @@ This implementation plan establishes full behavioral and wire-level alignment be
      ```
    - Confirm zero host paths, zero private LAN IPs, and zero credentials.
 3. **Integration into Serving Branch**:
-   - Push topic branch to `origin/gemini`.
-   - Switch to serving branch `local` and perform `--no-ff` merge of `gemini`.
-   - Recompile asset bundles (`npm run build`).
+   - Push topic branch to `origin/dev`.
+   - Switch to serving branch `local` and perform `--no-ff` merge of `dev`.
+   - Recompile asset bundles (`npm run build:ink && npm run build`).
    - Push updated baseline to `origin/local`.

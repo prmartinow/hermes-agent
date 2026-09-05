@@ -3,11 +3,11 @@
 # scripts/sync_upstream.sh
 #
 # Manual Upstream Synchronization for Hermes Agent
-# Strategy: "Rebase Topics, Rebuild Serving"
+# Strategy: "Rebase Dev, Rebuild Serving"
 #
 # 1. Fast-forward pristine 'main' from upstream/main
-# 2. Rebase each topic branch (bug-fixes, gemini, memory, mobile) onto main
-# 3. Rebuild active serving branch ('local') cleanly: main + 4 topic merges
+# 2. Rebase 'dev' topic branch onto main
+# 3. Rebuild active serving branch ('local') cleanly: main + dev (--no-ff)
 # 4. Rebuild UI/TUI assets
 # ==============================================================================
 
@@ -18,7 +18,7 @@ REPO_DIR="${HERMES_AGENT_DIR:-$SCRIPT_DIR}"
 LOG_FILE="${HOME}/.hermes/logs/upstream_sync.log"
 mkdir -p "$(dirname "${LOG_FILE}")"
 
-# Topics defined by the 5-branch architecture in github-ops skill
+# Single consolidated topic branch defined by the 3-branch architecture in github-ops skill
 TOPIC_BRANCHES=("dev")
 
 DRY_RUN=0
@@ -35,15 +35,15 @@ Options:
   --dry-run        Check status and report without modifying branches
   --skip-build     Skip compiling UI/TUI assets after rebuilding local
   --no-push        Update and rebase locally, do not push to origin
-  --rebuild-only   Skip upstream fetch & rebase; rebuild local from existing topics
-  --topic <name>   Rebase only a specific topic branch (e.g. bug-fixes, gemini)
+  --rebuild-only   Skip upstream fetch & rebase; rebuild local from dev
+  --topic <name>   Rebase only a specific topic branch (defaults to dev)
   -h, --help       Show this help message
 
 Workflow:
   1. git fetch origin & upstream
   2. Fast-forward 'main' to upstream/main (ff-only)
-  3. Rebase topic branches on latest main
-  4. Rebuild 'local' = main + non-ff merge of each topic branch
+  3. Rebase 'dev' topic branch on latest main
+  4. Rebuild 'local' = main + non-ff merge of 'dev'
   5. Recompile assets and push to origin
 EOF
     exit 0
@@ -88,7 +88,7 @@ restore_state() {
 trap restore_state EXIT
 
 log "======================================================================"
-log "Hermes Upstream Sync: Rebase Topics, Rebuild Serving"
+log "Hermes Upstream Sync: Rebase Dev, Rebuild Serving"
 log "Repository: ${REPO_DIR}"
 log "Original branch: ${ORIGINAL_BRANCH}"
 log "======================================================================"
@@ -132,7 +132,7 @@ if [ "$REBUILD_ONLY" -eq 0 ]; then
     fi
 
     # --------------------------------------------------------------------------
-    # 3. Rebase Topic Branches onto latest 'main'
+    # 3. Rebase 'dev' Topic Branch onto latest 'main'
     # --------------------------------------------------------------------------
     TARGETS=("${TOPIC_BRANCHES[@]}")
     if [ -n "$SPECIFIC_TOPIC" ]; then

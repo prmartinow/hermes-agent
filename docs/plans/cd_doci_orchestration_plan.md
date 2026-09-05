@@ -35,9 +35,9 @@ This orchestration plan operationalizes the mathematical and architectural findi
   (tests/agent/test_cd_doci_rotation.py)
                  │
                  ▼
-  [ Stage 4: Deployment & Service Restart ]
-  Node F: 4-Branch Git Rollout & Live Validation
-  (gemini -> origin/gemini -> local -> origin/local -> systemd)
+   [ Stage 4: Deployment & Container Rollout ]
+   Node F: 3-Branch Git Rollout & Live Validation
+   (dev -> origin/dev -> local -> origin/local -> container)
 ```
 
 ---
@@ -112,13 +112,13 @@ This orchestration plan operationalizes the mathematical and architectural findi
 
 ---
 
-### Node F: 4-Branch Git Rollout & Service Deployment
-* **Objective**: Commit, merge, deploy, and verify against live systemd service.
+### Node F: 3-Branch Git Rollout & Container Deployment
+* **Objective**: Commit, merge, deploy, and verify against live container.
 * **Execution Sequence**:
-  1. Commit on `gemini` feature branch $\to$ push `origin/gemini`.
-  2. Switch to `local` branch $\to$ merge `gemini` $\to$ push `origin/local`.
-  3. Rebuild web assets (`npm --prefix web run build`).
-  4. Restart `hermes-dashboard.service` and verify active status.
+  1. Commit on `dev` consolidated topic branch $\to$ push `origin/dev`.
+  2. Switch to `local` branch $\to$ merge `dev` ($\text{--no-ff}$) $\to$ push `origin/local`.
+  3. Rebuild web/UI assets (`npm run build:ink && npm run build`).
+  4. Deploy container release and verify health endpoint.
   5. Playwright CDP visual inspection of `/gemini/timeline`.
 
 ---
