@@ -236,17 +236,17 @@ Because the serving container (`hermes-agent-serving`) bakes application code in
 
 ## 7. Rollback Strategy
 
-If any unexpected regression occurs, the serving container can be immediately rolled back to previous versions:
+If any unexpected regression occurs, the serving container can be immediately rolled back to `v0.17`:
 ```bash
-./scripts/container_release.sh rollback v0.18
+./scripts/container_release.sh rollback v0.17
 ```
 
 ---
 
-## 8. Follow-up: Event Loop Stalls & Reconnect Elimination (v0.19)
+## 8. Follow-up: Event Loop Stalls & Reconnect Elimination (Consolidated into v0.18)
 
 ### A. Problem Statement
-Following the v0.18 deployment, users observed:
+Following initial deployment, users observed:
 1. "Chats take ages to load"
 2. A transient banner flashing above the Web TUI: `"Chat connection interrupted. Reconnecting..."` before the history loaded.
 
@@ -263,7 +263,7 @@ Stack traces isolated the exact bottleneck:
 5. Because the asyncio event loop was frozen for ~9s (> `PTY_TICKET_TIMEOUT_MS = 8000`), the client-side ticket request timed out, invoking `failTicketAttempt()` and displaying `"Chat connection interrupted. Reconnecting..."`.
 6. Additionally, a manual `wsRef.current?.close()` at line 419 in `web/src/pages/ChatPage.tsx` fired during descendant resolution before React Router could run its teardown hook with `unmounting = true`, triggering close code 1006 and an extraneous reconnect loop.
 
-### C. Architectural Fixes in v0.19
+### C. Architectural Fixes (Consolidated into v0.18)
 1. **Threadpool Offloading**:
    - Converted `get_gemini_session_histories` from `async def` to sync `def` in `hermes_cli/web_routers/gemini.py`.
    - FastAPI automatically routes sync endpoints to `anyio.to_thread.run_sync`, keeping the `MainThread` event loop completely unblocked.

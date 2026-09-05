@@ -6,7 +6,7 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Container Name | Target Port | Active Image Tag | Compose Configuration | Role |
 | :--- | :---: | :--- | :--- | :--- |
-| **`hermes-agent-serving`** | `9119` | `hermes-agent:v0.19` (`v0.19`, `local`) | `docker-compose.local.yml` | Active production serving & leader lease holder |
+| **`hermes-agent-serving`** | `9119` | `hermes-agent:v0.18` (`v0.18`, `local`) | `docker-compose.local.yml` | Active production serving & leader lease holder |
 
 ---
 
@@ -14,8 +14,7 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Version | Image ID | Git Commit | Build Date (UTC) | Core Changes & Fixes | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`v0.19`** | `2ebee7f2de1e` | `061b6366a5` | 2026-09-05 08:57 | Release v0.19: Offload session history to threadpool, cache account aliases, eliminate event loop stalls, remove premature socket abort on descendant resolution | **Active (Serving :9119)** |
-| **`v0.18`** | `d8dc4634dc1d` | `3be97fff07` | 2026-09-05 08:32 | Release v0.18: Web TUI black screen autorecovery, zero-glyph watchdog, descendant session PTY sync, PTY keepalive redraw buffer threshold | Available (Previous Serving) |
+| **`v0.18`** | `26ebf27b7cfa` | `f6d06107ee` | 2026-09-05 09:00 | Release v0.18: Web TUI black screen autorecovery, descendant PTY sync, event loop non-blocking offload, account alias caching, zero-glyph watchdog, redraw threshold | **Active (Serving :9119)** |
 | **`v0.17`** | `d7fa1846e1ba` | `b4295a19cc` | 2026-09-03 14:13 | Release v0.17: single container architecture baseline, agy v1.1.25, approval regex O(N^2) anchor fix, heartbeat restoration | Available (Previous Serving) |
 | **`v0.16`** | `a6bc3a522f48` | `869610dbbe` | 2026-09-03 07:15 | Single container architecture baseline, agy v1.1.25, main-wrapper background spawn guard | Available (Previous Serving) |
 | **`v0.15`** (Pruned) | `2fd7a9a2d368` | `491b688d0c` | 2026-09-02 20:14 | Rebuilt candidate v0.15: latest fixes, single container workflow, main-wrapper background guard | Pruned |
