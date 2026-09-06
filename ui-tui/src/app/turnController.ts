@@ -630,13 +630,13 @@ class TurnController {
       ...(savedToolTokens && !finalSegments.some(m => Boolean(m.toolTokens)) ? { toolTokens: savedToolTokens } : {})
     }
 
-    // Archive prepended so the trail msg anchors under the user prompt,
-    // not between thinking/tools and final assistant text.
+    // Archive appended so the trail msg anchors trailing after tools and thinking,
+    // directly above the final assistant text.
     const finalMessages: Msg[] = [
-      ...archiveDoneTodos(),
       ...(thinkingMsg ? [thinkingMsg] : []),
       ...finalSegments,
-      ...(hasDetails(finalDetails) ? [finalDetails] : [])
+      ...(hasDetails(finalDetails) ? [finalDetails] : []),
+      ...archiveDoneTodos()
     ]
 
     if (finalText) {

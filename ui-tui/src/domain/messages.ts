@@ -115,6 +115,16 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       const assistantText = typeof text === 'string' ? text : ''
 
       if (pendingTodos && pendingTodos.length) {
+        if (pending.length) {
+          out.push({
+            kind: 'trail',
+            role: 'assistant',
+            text: '',
+            tools: pending
+          })
+          pending = []
+        }
+
         const done = isTodoDone(pendingTodos)
         out.push({
           kind: 'trail',
@@ -144,6 +154,11 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       out.push(msg)
       pending = []
     } else if (role === 'user' || role === 'system') {
+      if (pending.length) {
+        out.push({ kind: 'trail', role: 'assistant', text: '', tools: pending })
+        pending = []
+      }
+
       if (pendingTodos && pendingTodos.length) {
         const done = isTodoDone(pendingTodos)
         out.push({
@@ -156,15 +171,14 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
         pendingTodos = null
       }
 
-      if (pending.length) {
-        out.push({ kind: 'trail', role: 'assistant', text: '', tools: pending })
-        pending = []
-      }
-
       if (hasText) {
         out.push({ role, text: text!, ...(createdAt !== undefined && { createdAt }) })
       }
     }
+  }
+
+  if (pending.length) {
+    out.push({ kind: 'trail', role: 'assistant', text: '', tools: pending })
   }
 
   if (pendingTodos && pendingTodos.length) {
@@ -176,10 +190,7 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       todos: pendingTodos,
       ...(done ? { todoCollapsedByDefault: true } : { todoIncomplete: true })
     })
-  }
-
-  if (pending.length) {
-    out.push({ kind: 'trail', role: 'assistant', text: '', tools: pending })
+    pendingTodos = null
   }
 
   return out

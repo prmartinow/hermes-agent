@@ -56,7 +56,7 @@ describe('toTranscriptMessages', () => {
     expect(result[1]?.thinkingTokens).toBeGreaterThan(0)
   })
 
-  it('rehydrates completed todo_list tool calls into collapsed trail messages', () => {
+  it('rehydrates completed todo_list tool calls into collapsed trail messages trailing after tools', () => {
     const todos = [
       { content: 'Step 1', id: '1', status: 'completed' },
       { content: 'Step 2', id: '2', status: 'completed' }
@@ -69,24 +69,24 @@ describe('toTranscriptMessages', () => {
     ]
 
     const result = toTranscriptMessages(rows)
-    expect(result).toHaveLength(3)
+    expect(result).toHaveLength(4)
     expect(result[0]).toEqual({ role: 'user', text: 'solve problem' })
-    expect(result[1]).toEqual({
+    expect(result[1]?.tools?.[0]).toContain('Todo List')
+    expect(result[2]).toEqual({
       kind: 'trail',
       role: 'system',
       text: '',
       todoCollapsedByDefault: true,
       todos
     })
-    expect(result[2]).toEqual({
+    expect(result[3]).toEqual({
       createdAt: undefined,
       role: 'assistant',
-      text: 'All tasks completed.',
-      tools: expect.arrayContaining([expect.stringContaining('Todo List')])
+      text: 'All tasks completed.'
     })
   })
 
-  it('rehydrates in-progress todo_list tool calls with todoIncomplete flag', () => {
+  it('rehydrates in-progress todo_list tool calls with todoIncomplete flag trailing after tools', () => {
     const todos = [
       { content: 'Step 1', id: '1', status: 'completed' },
       { content: 'Step 2', id: '2', status: 'in_progress' }
@@ -99,8 +99,9 @@ describe('toTranscriptMessages', () => {
     ]
 
     const result = toTranscriptMessages(rows)
-    expect(result).toHaveLength(3)
-    expect(result[1]).toEqual({
+    expect(result).toHaveLength(4)
+    expect(result[1]?.tools?.[0]).toContain('Todo List')
+    expect(result[2]).toEqual({
       kind: 'trail',
       role: 'system',
       text: '',
@@ -120,15 +121,14 @@ describe('toTranscriptMessages', () => {
     const result = toTranscriptMessages(rows)
     expect(result).toHaveLength(3)
     expect(result[0]).toEqual({ role: 'user', text: 'plan work' })
-    expect(result[1]).toEqual({
+    expect(result[1]?.tools?.[0]).toContain('Todo List')
+    expect(result[2]).toEqual({
       kind: 'trail',
       role: 'system',
       text: '',
       todoIncomplete: true,
       todos
     })
-    expect(result[2]?.kind).toBe('trail')
-    expect(result[2]?.role).toBe('assistant')
   })
 
   it('preserves trailing tool calls when turn ends on tools or service restarts mid-turn', () => {
