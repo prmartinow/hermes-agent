@@ -2048,6 +2048,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         if model is None:
             continue  # skip provider if we don't know a valid aux model
         logger.debug("Auxiliary text client: %s (%s)%s", pconfig.name, model, via)
+        if provider_id in {"gemini-oauth", "gemini_oauth"} or re.match(r"^gemini(?:-oauth)?-[1-5]$", provider_id):
+            from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+            return GeminiCloudCodeClient(access_token=api_key, base_url=raw_base_url), model
         # Native Gemini, else OpenAI-wire + Anthropic rewrap.
         base_url = _to_openai_base_url(raw_base_url)
         if provider_id == "gemini":
@@ -4185,6 +4188,10 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     if isinstance(sync_client, BedrockAuxiliaryClient):
         return AsyncBedrockAuxiliaryClient(sync_client), model
     with contextlib.suppress(ImportError):
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient, AsyncGeminiCloudCodeClient
+        if isinstance(sync_client, GeminiCloudCodeClient):
+            return AsyncGeminiCloudCodeClient(sync_client), model
+    with contextlib.suppress(ImportError):
         from agent.gemini_native_adapter import GeminiNativeClient, AsyncGeminiNativeClient
         if isinstance(sync_client, GeminiNativeClient):
             return AsyncGeminiNativeClient(sync_client), model
@@ -4758,6 +4765,33 @@ def _resolve_registry_branch(req: _ResolveRequest) -> _ResolveResult:
     return _route_client(req, client, final_model) if client is not None else (None, None)
 
 
+def _resolve_gemini_oauth_branch(req: _ResolveRequest) -> _ResolveResult:
+    """Google Gemini OAuth (Antigravity / Cloud Code PA)."""
+    try:
+        from hermes_cli.auth import resolve_gemini_oauth_runtime_credentials, _normalize_gemini_account_id
+        from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+        from agent.gemini_native_adapter import bare_gemini_model_id
+
+        acc_idx = _normalize_gemini_account_id(req.provider)
+        creds = resolve_gemini_oauth_runtime_credentials(account=acc_idx, refresh_if_expiring=True)
+        access_token = creds.get("api_key") or creds.get("access_token")
+        base_url = creds.get("base_url") or "https://cloudcode-pa.googleapis.com/v1internal"
+        if not access_token:
+            logger.warning(
+                "resolve_provider_client: %s requested but no Google OAuth token found (run: hermes auth add %s)",
+                req.provider, req.provider,
+            )
+            return None, None
+        client = GeminiCloudCodeClient(access_token=access_token, base_url=base_url)
+        default = "gemini-3.6-flash-low"
+        raw_model = req.model or default
+        final_model = bare_gemini_model_id(raw_model)
+        return _route_client(req, client, final_model)
+    except Exception as exc:
+        logger.warning("resolve_provider_client: %s credential resolution failed: %s", req.provider, exc)
+        return None, None
+
+
 # Explicit providers with a dedicated branch; anything else falls through to named custom
 # providers → azure-foundry → PROVIDER_REGISTRY (order preserved from the original if-chain).
 _EXPLICIT_PROVIDER_BRANCHES: Dict[str, Callable[[_ResolveRequest], _ResolveResult]] = {
@@ -4766,6 +4800,8 @@ _EXPLICIT_PROVIDER_BRANCHES: Dict[str, Callable[[_ResolveRequest], _ResolveResul
     "nous": _resolve_nous_branch,
     "openai-codex": _resolve_openai_codex_branch,
     "xai-oauth": _resolve_xai_oauth_branch,
+    "gemini-oauth": _resolve_gemini_oauth_branch,
+    "gemini_oauth": _resolve_gemini_oauth_branch,
     "custom": _resolve_custom_branch,
 }
 
@@ -4833,6 +4869,8 @@ def resolve_provider_client(
         explicit_base_url, explicit_api_key, api_mode, main_runtime, is_vision, task,
     )
     branch = _EXPLICIT_PROVIDER_BRANCHES.get(provider)
+    if branch is None and (provider and re.match(r"^gemini(?:-oauth)?-[1-5]$", str(provider))):
+        branch = _resolve_gemini_oauth_branch
     if branch is not None:
         return branch(req)
     # Named custom providers; an ImportError anywhere in the arm falls through to the built-ins.

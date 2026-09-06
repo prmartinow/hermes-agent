@@ -110,6 +110,7 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     """Build the scrubbed child environment both execution paths share."""
     from hermes_constants import apply_subprocess_home_env
     child_env = _scrub_child_env(os.environ)
+    child_env["HERMES_ACTIVE_TURN"] = "1"
     child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
     child_env["HERMES_RPC_TOKEN"] = rpc_token
     child_env["PYTHONDONTWRITEBYTECODE"] = "1"

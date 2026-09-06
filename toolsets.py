@@ -78,6 +78,12 @@ TOOLSETS = {
         "X (Twitter) Search.",
         ["x_search"],
     ),
+    "google_search": _ts(
+        "Native Google Search Grounding for Gemini models. Direct "
+        "server-side web search returning citations and grounding "
+        "metadata without consuming client iteration budget.",
+        ["google_search"],
+    ),
     "vision": _ts("Image analysis and vision tools", ["vision_analyze"]),
     "video": _ts("Video analysis and understanding tools (opt-in, not in default toolset)", ["video_analyze"]),
     "image_gen": _ts("Creative generation tools (images)", ["image_generate"]),
@@ -442,6 +448,20 @@ def get_toolset_info(name: str) -> Dict[str, Any]:
         "resolved_tools": resolved_tools, "tool_count": len(resolved_tools),
         "is_composite": bool(toolset["includes"]),
     }
+
+
+def is_google_search_grounding_toolset(name: str) -> bool:
+    """Return True if the toolset name represents native Google Search Grounding."""
+    return (name or "").strip().lower() in {
+        "google_search", "google_grounding", "google-search", "google-grounding"
+    }
+
+
+def is_google_grounding_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
+    """Return True if Google Search Grounding is enabled in the active toolset list."""
+    if not enabled_toolsets:
+        return False
+    return any(is_google_search_grounding_toolset(ts) for ts in enabled_toolsets)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

@@ -26,6 +26,7 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
+    RETHINK_SCHEMA,
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
@@ -237,11 +238,18 @@ class TestSchemas:
         assert "content" in RETAIN_SCHEMA["parameters"]["required"]
 
 
-    def test_get_tool_schemas_returns_three(self, provider):
+    def test_rethink_schema_has_content(self):
+        assert RETHINK_SCHEMA["name"] == "rethink_memory"
+        assert "rule_name" in RETHINK_SCHEMA["parameters"]["properties"]
+        assert "content" in RETHINK_SCHEMA["parameters"]["properties"]
+        assert "action" in RETHINK_SCHEMA["parameters"]["properties"]
+        assert set(RETHINK_SCHEMA["parameters"]["required"]) == {"rule_name", "content"}
+
+    def test_get_tool_schemas_returns_four(self, provider):
         schemas = provider.get_tool_schemas()
-        assert len(schemas) == 3
+        assert len(schemas) == 4
         names = {s["name"] for s in schemas}
-        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect"}
+        assert names == {"hindsight_retain", "hindsight_recall", "hindsight_reflect", "rethink_memory"}
 
     def test_context_mode_returns_no_tools(self, provider_with_config):
         p = provider_with_config(memory_mode="context")
@@ -516,6 +524,35 @@ class TestToolHandlers:
             "hindsight_reflect", {"query": "summarize"}
         ))
         assert result["result"] == "Synthesized answer"
+
+
+    def test_rethink_memory_missing_rule_name(self, provider):
+        result = json.loads(provider.handle_tool_call(
+            "rethink_memory", {"content": "# Rule"}
+        ))
+        assert "error" in result
+        assert "rule_name" in result["error"]
+
+
+    def test_rethink_memory_success(self, provider, monkeypatch):
+        fake_mutate = MagicMock(return_value={"status": "updated", "rule": "coding_style"})
+        monkeypatch.setattr("sys.path", sys.path)
+        fake_module = SimpleNamespace(mutate_rule=fake_mutate)
+        monkeypatch.setitem(sys.modules, "rule_mutator", fake_module)
+
+        result = json.loads(provider.handle_tool_call(
+            "rethink_memory",
+            {"rule_name": "coding_style", "content": "# Rule", "action": "update"},
+            session_id="test-session",
+        ))
+        assert result["result"] == {"status": "updated", "rule": "coding_style"}
+        fake_mutate.assert_called_once_with(
+            rule_name="coding_style",
+            content="# Rule",
+            action="update",
+            session_id="test-session",
+            tool_caller="hindsight_plugin",
+        )
 
 
     def test_unknown_tool(self, provider):

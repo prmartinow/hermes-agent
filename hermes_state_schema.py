@@ -406,8 +406,12 @@ class SessionSchemaMixin:
             if "no such table" in str(exc).lower():
                 return False
             if "decode to utf-8" not in str(exc).lower():
-                raise
+                logger.debug("FTS table probe failed for %s (%s); disabling FTS capability", table_name, exc)
+                return False
             decode_exc = exc
+        except Exception as exc:
+            logger.debug("FTS table probe encountered unexpected error for %s (%s); disabling FTS capability", table_name, exc)
+            return False
         logger.warning(
             "%s probe encountered invalid UTF-8 in FTS content; "
             "search may return incomplete results until FTS is rebuilt: %s", table_name, decode_exc,

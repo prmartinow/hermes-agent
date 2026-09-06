@@ -1722,6 +1722,8 @@ def _lower_threshold_to_aux_context(
         recomputed_threshold = _CC._compute_threshold_tokens(
             main_ctx, _CC._effective_threshold_percent(main_ctx, safe_pct / 100),
             getattr(compressor, "max_tokens", None),
+            model=getattr(agent, "model", "") or "",
+            provider=getattr(agent, "provider", "") or "",
         )
     threshold_suggestion_viable = recomputed_threshold is None or recomputed_threshold <= aux_context
     # "model (provider)" labels for both sides; empty/"auto" provider falls back to the client's base_url hostname.

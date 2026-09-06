@@ -98,3 +98,41 @@ def test_empty_list_at_nonzero_revision_is_a_real_clear():
     state = server._normalize_todo_state({"todos": [], "revision": 2})
 
     assert state == {"todos": [], "revision": 2}
+
+def test_history_to_messages_attaches_structured_todos_for_todo_tool():
+    todos = [
+        {"id": "1", "content": "Step 1", "status": "completed"},
+        {"id": "2", "content": "Step 2", "status": "in_progress"},
+    ]
+    history = [
+        {"role": "user", "content": "solve task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "todo_list",
+                        "arguments": json.dumps({"todos": todos}),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": json.dumps({"todos": todos, "revision": 1}),
+        },
+        {"role": "assistant", "content": "Working on step 2."},
+    ]
+
+    messages = server._history_to_messages(history)
+    assert len(messages) == 3
+    assert messages[0] == {"role": "user", "text": "solve task"}
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["name"] == "todo_list"
+    assert messages[1]["todos"] == todos
+    assert messages[2] == {"role": "assistant", "text": "Working on step 2."}
+

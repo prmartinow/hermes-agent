@@ -211,8 +211,11 @@ def _build_child_agent(
         child._delegate_parent_ref = None  # non-weakref-able test doubles
     # Sidebar marker: subagent sessions stay out of session pickers even when a
     # parent delete orphans them (mirrors /branch's ``_branched_from``).
-    if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
-        child._session_init_model_config["_delegate_from"] = parent_sid
+    if getattr(child, "_session_init_model_config", None) is not None:
+        # Subagents must never inherit parent's G-Switch account PIN — always unpinned dynamic CD-DOCI mode
+        child._session_init_model_config.pop("gemini_account", None)
+        if parent_sid:
+            child._session_init_model_config["_delegate_from"] = parent_sid
     # Shared pool lets children rotate credentials on rate limits.
     child_pool = _resolve_child_credential_pool(rt["provider"], parent_agent, rt["base_url"])
     if child_pool is not None:

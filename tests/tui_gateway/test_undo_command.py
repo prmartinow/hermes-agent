@@ -110,3 +110,112 @@ def test_undo_returns_prefill_with_target_text(server, session_with_history):
     assert all("_row_id" in message for message in s["history"])
 
 
+def test_undo_with_leading_model_switch_marker(server, db):
+    """Regression test for 'undo: session history changed before the rewind could be persisted'.
+    When a session starts with a model_switch marker (role='user', display_kind='model_switch')
+    followed by user prompts, repair_message_sequence must not merge them.
+    Both command.dispatch /undo and session.undo must cleanly rewind the target turns."""
+    from agent.replay_cleanup import sanitize_replay_history
+
+    sid = "sid-model-switch-undo"
+    session_key = "tui-ms-undo-1"
+    db.create_session(session_key, source="tui")
+
+    # Step 1: Model switch marker
+    db.append_message(
+        session_key,
+        "user",
+        "[System: The active model for this chat has changed to gemini-3.8-flash-high via provider gemini-oauth.]",
+        display_kind="model_switch",
+    )
+    # Step 2: First turn
+    db.append_message(session_key, "user", "first user message")
+    db.append_message(session_key, "assistant", "first assistant reply")
+    # Step 3: Second turn
+    db.append_message(session_key, "user", "second user message")
+    db.append_message(session_key, "assistant", "second assistant reply")
+
+    # Replay/resume history as session.resume does:
+    raw_history, _ = db.get_resume_conversations(session_key)
+    history = sanitize_replay_history(raw_history)
+
+    agent = MagicMock()
+    agent._memory_manager = MagicMock()
+    agent._last_flushed_db_idx = len(history)
+    s = {
+        "session_key": session_key,
+        "history": list(history),
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "agent": agent,
+        "attached_images": [],
+        "cols": 120,
+    }
+    server._sessions[sid] = s
+    server._db = db
+
+    # Undo last turn (second user message)
+    resp = _call(server, "command.dispatch", session_id=sid, name="undo", arg="")
+    assert "error" not in resp, f"Undo failed: {resp.get('error')}"
+    result = resp["result"]
+    assert result["type"] == "prefill"
+    assert result["message"] == "second user message"
+
+    # Undo first turn (first user message)
+    resp2 = _call(server, "command.dispatch", session_id=sid, name="undo", arg="")
+    assert "error" not in resp2, f"Undo 2 failed: {resp2.get('error')}"
+    result2 = resp2["result"]
+    assert result2["type"] == "prefill"
+    assert result2["message"] == "first user message"
+
+    # Remaining in-memory history should retain the model_switch marker
+    assert len(s["history"]) == 1
+    assert s["history"][0]["display_kind"] == "model_switch"
+
+
+def test_session_undo_rpc_with_model_switch_marker(server, db):
+    """Test session.undo RPC directly when leading timeline marker exists."""
+    from agent.replay_cleanup import sanitize_replay_history
+
+    sid = "sid-ms-rpc-undo"
+    session_key = "tui-ms-rpc-undo-1"
+    db.create_session(session_key, source="tui")
+
+    db.append_message(
+        session_key,
+        "user",
+        "[System: The active model for this chat has changed to gemini-3.8-flash-high via provider gemini-oauth.]",
+        display_kind="model_switch",
+    )
+    db.append_message(session_key, "user", "question 1")
+    db.append_message(session_key, "assistant", "answer 1")
+
+    raw_history, _ = db.get_resume_conversations(session_key)
+    history = sanitize_replay_history(raw_history)
+
+    agent = MagicMock()
+    agent._memory_manager = MagicMock()
+    agent._last_flushed_db_idx = len(history)
+    s = {
+        "session_key": session_key,
+        "history": list(history),
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "agent": agent,
+        "attached_images": [],
+        "cols": 120,
+    }
+    server._sessions[sid] = s
+    server._db = db
+
+    resp = _call(server, "session.undo", session_id=sid)
+    assert "error" not in resp, f"session.undo failed: {resp.get('error')}"
+    assert resp["result"]["removed"] >= 2
+    assert len(s["history"]) == 1
+    assert s["history"][0]["display_kind"] == "model_switch"
+
+
+
+

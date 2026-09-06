@@ -186,6 +186,13 @@ export interface SessionCreateResponse {
   session_id: string
 }
 
+export interface SessionViewportMeta {
+  end_index: number
+  has_more_before: boolean
+  start_index: number
+  total: number
+}
+
 export interface SessionResumeResponse {
   inflight?: null | SessionInflightTurn
   info?: SessionInfo
@@ -196,6 +203,16 @@ export interface SessionResumeResponse {
   session_id: string
   started_at?: number
   status?: LiveSessionStatus
+  viewport?: SessionViewportMeta
+}
+
+export interface SessionHistoryResponse {
+  count?: number
+  end_index?: number
+  has_more_before?: boolean
+  messages: GatewayTranscriptMessage[]
+  session_id?: string
+  start_index?: number
 }
 
 export type LiveSessionStatus = 'idle' | 'starting' | 'waiting' | 'working'
@@ -270,10 +287,19 @@ export interface SessionSaveResponse {
 }
 
 export interface SessionUndoResponse {
+  prefill?: string
   removed?: number
+  turns_undone?: number
+}
+
+export interface SessionRedoResponse {
+  messages?: GatewayTranscriptMessage[]
+  restored_count?: number
+  restored_turns?: number
 }
 
 export interface SessionUsageResponse {
+  account_lines?: string[]
   active_subagents?: number
   avg_latency_s?: number
   avg_tps?: number
@@ -281,6 +307,7 @@ export interface SessionUsageResponse {
   cache_read?: number
   cache_write?: number
   calls?: number
+  completion?: number
   compressions?: number
   context_max?: number
   context_percent?: number
@@ -288,9 +315,32 @@ export interface SessionUsageResponse {
   cost_status?: 'estimated' | 'exact'
   cost_usd?: number
   credits_lines?: string[]
+  gemini_account?: string
   input?: number
   model?: string
   output?: number
+  prompt?: number
+  quota?: {
+    claude_5h_countdown?: string | null
+    claude_5h_description?: string | null
+    claude_5h_percent?: number | null
+    claude_5h_reset?: string | null
+    claude_weekly_countdown?: string | null
+    claude_weekly_description?: string | null
+    claude_weekly_percent?: number | null
+    claude_weekly_reset?: string | null
+    gemini_5h_countdown?: string | null
+    gemini_5h_description?: string | null
+    gemini_5h_percent?: number | null
+    gemini_5h_reset?: string | null
+    gemini_weekly_countdown?: string | null
+    gemini_weekly_description?: string | null
+    gemini_weekly_percent?: number | null
+    gemini_weekly_reset?: string | null
+  }
+  quota_rows?: any[]
+  quota_title?: string
+  reasoning?: number
   total?: number
   // Shared dollar usage model (two-bar view) so /usage renders the same bars
   // as /subscription. Dollars only — never "credits".
@@ -713,6 +763,22 @@ export type GatewayEvent =
       }
       session_id?: string
       type: 'tool.complete'
+    }
+  | {
+      payload: {
+        revision?: number
+        todos?: unknown[]
+      }
+      session_id?: string
+      type: 'todo.updated'
+    }
+  | {
+      payload: {
+        revision?: number
+        todos?: unknown[]
+      }
+      session_id?: string
+      type: 'todo.updated'
     }
   | {
       payload: {

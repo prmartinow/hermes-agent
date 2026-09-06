@@ -286,6 +286,27 @@ export async function buildWsUrl(
   });
 }
 
+/**
+ * Synchronous variant of ``buildWsUrl`` for loopback / insecure mode where
+ * the session token is already in memory. Returns null when gated auth is active
+ * and a ticket must be fetched via REST.
+ */
+export function buildWsUrlSync(
+  path: string,
+  params?: Record<string, string>,
+): string | null {
+  if (window.__HERMES_AUTH_REQUIRED__) {
+    return null;
+  }
+  const token = window.__HERMES_SESSION_TOKEN__ ?? "";
+  return buildHermesWebSocketUrl({
+    authParam: ["token", token],
+    basePath: BASE,
+    params,
+    path,
+  });
+}
+
 /** Build a ``?profile=<name>`` query suffix, or "" when unset.
  *
  * Used by the skills/toolsets endpoints so the dashboard can manage a
@@ -340,6 +361,7 @@ function appendSessionFilters(url: string, options: SessionQueryOptions): string
 
 export const api = {
   buildWsUrl,
+  buildWsUrlSync,
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
@@ -387,13 +409,35 @@ export const api = {
       ),
     );
   },
-  getSessionMessages: (id: string, profile = getManagementProfile()) =>
-    fetchJSON<SessionMessagesResponse>(
-      appendProfileParam(
-        `/api/sessions/${encodeURIComponent(id)}/messages?limit=500&order=latest`,
-        profile,
-      ),
-    ),
+  getSessionMessages: (
+    id: string,
+    profileOrOptions?: string | { profile?: string; limit?: number; offset?: number; order?: "latest" | "oldest"; all?: boolean; include_ancestors?: boolean },
+    profile = getManagementProfile()
+  ) => {
+    let endpoint = `/api/sessions/${encodeURIComponent(id)}/messages?include_compacted=true&include_ancestors=true`;
+    let effectiveProfile = profile;
+    if (typeof profileOrOptions === "string") {
+      effectiveProfile = profileOrOptions || profile;
+      endpoint += "&limit=500&order=latest";
+    } else if (profileOrOptions && typeof profileOrOptions === "object") {
+      if (profileOrOptions.profile) effectiveProfile = profileOrOptions.profile;
+      if (profileOrOptions.all) {
+        endpoint += "&all=true";
+      } else if (profileOrOptions.limit !== undefined) {
+        endpoint += `&limit=${profileOrOptions.limit}`;
+      } else {
+        endpoint += "&limit=500";
+      }
+      if (profileOrOptions.offset !== undefined) endpoint += `&offset=${profileOrOptions.offset}`;
+      if (profileOrOptions.order) endpoint += `&order=${profileOrOptions.order}`;
+      else if (!profileOrOptions.all) endpoint += "&order=latest";
+    } else {
+      endpoint += "&limit=500&order=latest";
+    }
+    return fetchJSON<SessionMessagesResponse>(
+      appendProfileParam(endpoint, effectiveProfile),
+    );
+  },
   getSessionDetail: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionInfo>(
       appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
@@ -440,6 +484,28 @@ export const api = {
     ),
   getSessionStats: (profile = getManagementProfile()) =>
     fetchJSON<SessionStoreStats>(appendProfileParam("/api/sessions/stats", profile)),
+  getGeminiAccountHistory: (options?: { session_id?: string; scope?: string; limit?: number; offset?: number }) => {
+    const params = new URLSearchParams();
+    if (options?.session_id) params.set("session_id", options.session_id);
+    if (options?.scope) params.set("scope", options.scope);
+    if (options?.limit) params.set("limit", String(options.limit));
+    if (options?.offset) params.set("offset", String(options.offset));
+    const qs = params.toString();
+    return fetchJSON<GeminiAccountHistoryResponse>(`/api/gemini/account-history${qs ? `?${qs}` : ""}`);
+  },
+  getGeminiSessionHistories: (options?: { limit?: number }) => {
+    const params = new URLSearchParams();
+    if (options?.limit) params.set("limit", String(options.limit));
+    const qs = params.toString();
+    return fetchJSON<GeminiSessionHistoriesResponse>(`/api/gemini/session-histories${qs ? `?${qs}` : ""}`);
+  },
+  getGeminiQuotaTimeline: (options?: { timespan?: string; model_group?: string }) => {
+    const params = new URLSearchParams();
+    if (options?.timespan) params.set("timespan", options.timespan);
+    if (options?.model_group) params.set("model_group", options.model_group);
+    const qs = params.toString();
+    return fetchJSON<GeminiQuotaTimelineResponse>(`/api/gemini/quota-timeline${qs ? `?${qs}` : ""}`);
+  },
   exportSessionUrl: (id: string, profile = getManagementProfile()) =>
     appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile),
   importSessions: (
@@ -842,9 +908,9 @@ export const api = {
         method: "DELETE",
       },
     ),
-  startOAuthLogin: (providerId: string) =>
+  startOAuthLogin: (providerId: string, accountId?: number) =>
     fetchJSON<OAuthStartResponse>(
-      `/api/providers/oauth/${encodeURIComponent(providerId)}/start`,
+      `/api/providers/oauth/${encodeURIComponent(providerId)}/start${accountId !== undefined ? `?account=${encodeURIComponent(accountId)}` : ""}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1933,16 +1999,109 @@ export interface DiskPressureStatus {
   used_percent?: number | null;
 }
 
+export interface GeminiAccountEvent {
+  id: number | string;
+  timestamp: string;
+  session_id?: string | null;
+  session_title?: string | null;
+  from_account?: string | null;
+  to_account: string;
+  from_alias?: string | null;
+  to_alias: string;
+  event_type: string;
+  turn_number?: number;
+  api_calls?: number;
+  tools_used?: string[];
+  latency?: string;
+  tokens_in?: number;
+  tokens_out?: number;
+  details: string;
+}
+
+export interface GeminiSessionAccountHistory {
+  session_id: string;
+  title: string;
+  is_subagent: boolean;
+  model?: string;
+  current_account: string;
+  current_alias: string;
+  started_at: number;
+  last_activity_at: number;
+  message_count: number;
+  turns_count: number;
+  changes_count: number;
+  events: GeminiAccountEvent[];
+}
+
+export interface GeminiSessionHistoriesResponse {
+  sessions: GeminiSessionAccountHistory[];
+  total: number;
+}
+
+export interface GeminiAccountHistoryResponse {
+  events: GeminiAccountEvent[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface GeminiAccountIntervalData {
+  account_id: number;
+  alias: string;
+  cap_5h: number | null;
+  reset_5h?: string | null;
+  cap_7d: number | null;
+  reset_7d?: string | null;
+  rank: number | null;
+  score: number | null;
+  turns: number;
+  logged_in: boolean;
+}
+
+export interface GeminiQuotaInterval {
+  epoch: number;
+  timestamp: string;
+  time_label: string;
+  date_label: string;
+  is_current: boolean;
+  accounts: Record<string, GeminiAccountIntervalData>;
+}
+
+export interface GeminiAccountMeta {
+  account_id: number;
+  alias: string;
+  email?: string | null;
+  logged_in: boolean;
+  current_5h_pct?: number | null;
+  current_5h_reset?: string | null;
+  current_7d_pct?: number | null;
+  current_7d_reset?: string | null;
+  current_rank?: number | null;
+  current_score?: number | null;
+}
+
+export interface GeminiQuotaTimelineResponse {
+  timespan: string;
+  model_group: string;
+  interval_minutes: number;
+  total_intervals: number;
+  generated_at: string;
+  accounts_meta: GeminiAccountMeta[];
+  intervals: GeminiQuotaInterval[];
+}
+
 export interface SessionInfo {
   id: string;
   source: string | null;
   model: string | null;
+  account_alias?: string | null;
   title: string | null;
   started_at: number;
   ended_at: number | null;
   last_active: number;
   is_active: boolean;
   message_count: number;
+  total_message_count?: number;
   tool_call_count: number;
   input_tokens: number;
   output_tokens: number;
@@ -2058,7 +2217,7 @@ export interface SessionMessagesResponse {
   session_id: string;
   messages: SessionMessage[];
   pagination?: {
-    limit: number;
+    limit: number | null;
     offset: number;
     order: "latest" | "oldest";
     returned: number;
@@ -2513,6 +2672,57 @@ export interface ModelAssignmentResponse {
 
 // ── OAuth provider types ────────────────────────────────────────────────
 
+export interface GeminiAccountQuota {
+  gemini_5h_percent?: number | null;
+  gemini_5h_reset?: string | null;
+  gemini_5h_countdown?: string | null;
+  gemini_5h_description?: string | null;
+  gemini_weekly_percent?: number | null;
+  gemini_weekly_reset?: string | null;
+  gemini_weekly_countdown?: string | null;
+  gemini_weekly_description?: string | null;
+  claude_5h_percent?: number | null;
+  claude_5h_reset?: string | null;
+  claude_5h_countdown?: string | null;
+  claude_5h_description?: string | null;
+  claude_weekly_percent?: number | null;
+  claude_weekly_reset?: string | null;
+  claude_weekly_countdown?: string | null;
+  claude_weekly_description?: string | null;
+}
+
+export interface GeminiAccountStatus {
+  account_id: number;
+  logged_in: boolean;
+  email?: string | null;
+  alias?: string | null;
+  name?: string | null;
+  source?: string | null;
+  source_label?: string | null;
+  token_preview?: string | null;
+  expires_at?: string | null;
+  has_refresh_token?: boolean;
+  quota?: GeminiAccountQuota;
+}
+
+export interface DociRanking {
+  account_id: number;
+  email?: string;
+  alias?: string;
+  logged_in: boolean;
+  score: number;
+  doci_score?: number;
+  rank?: number;
+  status_note?: string;
+  s_5h?: number;
+  u_5h?: number;
+  s_w?: number;
+  cap_5h?: number;
+  cap_w?: number;
+  t_5h_hours?: number;
+  t_w_days?: number;
+}
+
 export interface OAuthProviderStatus {
   logged_in: boolean;
   source?: string | null;
@@ -2522,6 +2732,11 @@ export interface OAuthProviderStatus {
   has_refresh_token?: boolean;
   last_refresh?: string | null;
   error?: string;
+  email?: string;
+  alias?: string;
+  accounts?: GeminiAccountStatus[];
+  doci_rankings?: DociRanking[];
+  quota?: GeminiAccountQuota;
 }
 
 export interface OAuthProvider {

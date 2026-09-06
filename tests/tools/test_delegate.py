@@ -1274,7 +1274,8 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         parent._credential_pool = mock_pool
 
         result = _resolve_child_credential_pool("openrouter", parent)
-        self.assertIs(result, mock_pool)
+        mock_pool.clone.assert_called_once()
+        self.assertIs(result, mock_pool.clone.return_value)
 
     # --- Custom-endpoint identity resolution (issue #7833) ---
 

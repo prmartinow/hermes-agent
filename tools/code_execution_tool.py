@@ -238,6 +238,39 @@ def retry(fn, max_attempts=3, delay=2):
                 time.sleep(delay * (2 ** attempt))
     raise last_err
 
+
+def share_to_session(session_id: str, content: str, source_label: str = "") -> dict:
+    """Safely deliver context/notes to another active Hermes session.
+    Uses the Dual Atomic Write pattern (SessionDB + LiveSessionStreamWriter)
+    to update the recipient transcript and live Web TUI screen without
+    causing SQLite lock contention or turn lease deadlocks.
+    """
+    try:
+        from hermes_state import SessionDB
+        from agent.live_session_stream import LiveSessionStreamWriter
+
+        header = ("[Shared Note from " + str(source_label) + "]\\n\\n") if source_label else "[Shared Note]\\n\\n"
+        formatted_content = f"{header}{content}"
+
+        db = SessionDB()
+        try:
+            msg_id = db.append_message(
+                session_id=session_id,
+                role="user",
+                content=formatted_content,
+            )
+        finally:
+            db.close()
+
+        writer = LiveSessionStreamWriter(session_id)
+        writer.write_event("message.complete", {
+            "role": "user",
+            "content": formatted_content,
+        })
+        return {"success": True, "message_id": msg_id, "session_id": session_id}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
 '''
 
 # ---- UDS transport (local backend) ---------------------------------------

@@ -7,6 +7,7 @@ import { isSectionName, nextDetailsMode, parseDetailsMode, SECTION_NAMES } from 
 import type {
   ConfigGetValueResponse,
   ConfigSetResponse,
+  SessionRedoResponse,
   SessionSaveResponse,
   SessionStatusResponse,
   SessionSteerResponse,
@@ -14,6 +15,7 @@ import type {
   SessionUndoResponse,
   SystemBatteryResponse
 } from '../../../gatewayTypes.js'
+import { toTranscriptMessages } from '../../../domain/messages.js'
 import { writeClipboardText } from '../../../lib/clipboard.js'
 import { writeOsc52Clipboard } from '../../../lib/osc52.js'
 import {
@@ -723,18 +725,67 @@ export const coreCommands: SlashCommand[] = [
   {
     help: 'undo last exchange',
     name: 'undo',
-    run: (_arg, ctx) => {
+    run: (arg, ctx) => {
       if (!ctx.sid) {
         return ctx.transcript.sys('nothing to undo')
       }
 
-      ctx.gateway.rpc<SessionUndoResponse>('session.undo', { session_id: ctx.sid }).then(
+      const count = arg ? parseInt(arg.trim(), 10) : 1
+      const turns = isNaN(count) || count < 1 ? 1 : count
+
+      let fallbackText = ''
+      const history = ctx.local.getHistoryItems()
+
+      for (let i = history.length - 1; i >= 0; i--) {
+        if (history[i]?.role === 'user') {
+          fallbackText = history[i]?.text || ''
+
+          break
+        }
+      }
+
+      ctx.gateway.rpc<SessionUndoResponse>('session.undo', { count: turns, session_id: ctx.sid }).then(
         ctx.guarded<SessionUndoResponse>(r => {
           if ((r.removed ?? 0) > 0) {
-            ctx.transcript.setHistoryItems((prev: Msg[]) => ctx.transcript.trimLastExchange(prev))
+            const actualTurns = r.turns_undone ?? turns
+
+            ctx.transcript.setHistoryItems((prev: Msg[]) => ctx.transcript.trimLastExchange(prev, actualTurns))
+            const prefill = r.prefill ?? fallbackText
+
+            if (prefill) {
+              ctx.composer.setInput(prefill)
+            }
+
             ctx.transcript.sys(`undid ${r.removed} messages`)
           } else {
             ctx.transcript.sys('nothing to undo')
+          }
+        })
+      )
+    }
+  },
+
+  {
+    help: 'redo last undone exchange',
+    name: 'redo',
+    run: (arg, ctx) => {
+      if (!ctx.sid) {
+        return ctx.transcript.sys('nothing to redo')
+      }
+
+      const count = arg ? parseInt(arg.trim(), 10) : 1
+      const turns = isNaN(count) || count < 1 ? 1 : count
+
+      ctx.gateway.rpc<SessionRedoResponse>('session.redo', { count: turns, session_id: ctx.sid }).then(
+        ctx.guarded<SessionRedoResponse>(r => {
+          if ((r.restored_turns ?? 0) > 0 && r.messages && r.messages.length > 0) {
+            const newMsgs = toTranscriptMessages(r.messages)
+            ctx.transcript.setHistoryItems((prev: Msg[]) => [...prev, ...newMsgs])
+            ctx.composer.setInput('')
+            const turnWord = r.restored_turns === 1 ? 'turn' : 'turns'
+            ctx.transcript.sys(`redid ${r.restored_turns} ${turnWord} (${r.restored_count ?? r.messages.length} message(s))`)
+          } else {
+            ctx.transcript.sys('nothing to redo')
           }
         })
       )

@@ -23,6 +23,15 @@ describe('resolvePtyKeyboardShortcut', () => {
     ).toBe('copy')
   })
 
+  it('copies terminal selection with Cmd+C on macOS and non-macOS', () => {
+    expect(
+      resolvePtyKeyboardShortcut(key({ metaKey: true, key: 'c' }), true, true),
+    ).toBe('copy')
+    expect(
+      resolvePtyKeyboardShortcut(key({ metaKey: true, key: 'c' }), false, true),
+    ).toBe('copy')
+  })
+
   it('preserves Ctrl+C interrupt when nothing is selected', () => {
     expect(
       resolvePtyKeyboardShortcut(key({ ctrlKey: true, key: 'c' }), false, false),

@@ -3173,9 +3173,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         "profile": ("_handle_profile_command", False), "toolsets": ("show_toolsets", False),
         "config": ("show_config", False), "redraw": ("_cmd_redraw", True), "clear": ("_cmd_clear", True),
         "history": ("show_history", False), "title": ("_cmd_title", True), "new": ("_cmd_new", True),
-        "model": ("_handle_model_switch", True), "codex-runtime": ("_handle_codex_runtime", True),
+        "model": ("_handle_model_switch", True), "gs": ("_handle_gs", True), "codex-runtime": ("_handle_codex_runtime", True),
         "retry": ("_cmd_retry", True), "prompt": ("_handle_prompt_compose_command", True),
-        "undo": ("_cmd_undo", True), "save": ("save_conversation", True), "skills": ("_cmd_skills", True),
+        "undo": ("_cmd_undo", True), "redo": ("_cmd_redo", True), "save": ("save_conversation", True), "skills": ("_cmd_skills", True),
         "platforms": ("_show_gateway_status", False), "status": ("_show_session_status", False),
         "context": ("_show_context_breakdown", True), "egress": ("_cmd_egress", True),
         "statusbar": ("_cmd_statusbar", True), "verbose": ("_toggle_verbose", False), "yolo": ("_toggle_yolo", False),
@@ -3187,6 +3187,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLITuiMix
         "agents": ("_handle_agents_command", False), "bg": ("_handle_background_command", True),
         "queue": ("_cmd_queue", True), "steer": ("_cmd_steer", True), "moa": ("_cmd_moa", True),
     }
+
+    def _handle_gs(self, cmd_original: str) -> None:
+        """Handle /gs command — switch Gemini account for this chat by label."""
+        from hermes_cli.auth import handle_gs_command
+        parts = cmd_original.split(None, 1)
+        raw_args = parts[1].strip() if len(parts) > 1 else ""
+        out = handle_gs_command(
+            session_id=getattr(self, "session_id", None),
+            arg=raw_args,
+            db=getattr(self, "_session_db", None),
+            agent=getattr(self, "agent", None),
+        )
+        if out:
+            self._console_print(f"  {out}")
 
     @classmethod
     def _slash_handler(cls, canonical: str) -> tuple[str, bool] | None:
@@ -4531,6 +4545,14 @@ def main(
         configure_windows_stdio()
 
     os.environ["HERMES_INTERACTIVE"] = "1"  # terminal_tool: interactive sudo prompts with timeout
+    if os.environ.get("HERMES_ACTIVE_TURN") == "1":
+        sys.stderr.write(
+            "Error: Recursive interactive Hermes CLI execution is blocked within an active turn.\n"
+            "Spawning nested CLI processes against the shared state.db causes SQLite lock starvation.\n"
+            "  • For subagent tasks, use delegate_task.\n"
+            "  • For cross-session communication, use the Dual Atomic Write workflow (SessionDB + LiveSessionStreamWriter / share_to_session).\n"
+        )
+        sys.exit(1)
     # The banner names affected plugins; the raw per-name compat warnings would only duplicate it on stderr.
     with suppress(Exception):
         from hermes_cli.plugin_compat import quiet_for_interactive

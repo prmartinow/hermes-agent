@@ -1723,6 +1723,44 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
     if assistant_tool_calls:
         msg["tool_calls"] = [_assistant_tool_call_dict(agent, tc, i) for i, tc in enumerate(assistant_tool_calls)]
+
+    # Attach verified active account metadata (e.g. Gemini OAuth account alias) for provenance
+    _acc_alias = None
+    try:
+        if getattr(agent, "provider", None) in {"gemini-oauth", "gemini_oauth"}:
+            from hermes_cli.auth import get_account_alias
+            pool = getattr(agent, "_credential_pool", None)
+            entry_id = getattr(agent, "_credential_pool_entry_id", None)
+            curr = None
+            if entry_id and pool:
+                _all_entries = pool.entries() if hasattr(pool, "entries") else getattr(pool, "_entries", [])
+                curr = next((e for e in _all_entries if getattr(e, "id", None) == entry_id), None)
+            if curr is None and pool:
+                curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
+            raw_lbl = (curr.label or curr.id) if curr else entry_id
+            if raw_lbl:
+                _acc_alias = get_account_alias(raw_lbl)
+    except Exception:
+        _acc_alias = None
+
+    if _acc_alias:
+        _existing_meta = msg.get("display_metadata")
+        if not _existing_meta:
+            msg["display_metadata"] = {"gemini_account": _acc_alias}
+        elif isinstance(_existing_meta, dict):
+            _existing_meta["gemini_account"] = _acc_alias
+            msg["display_metadata"] = _existing_meta
+        elif isinstance(_existing_meta, str):
+            try:
+                import json
+                _parsed_meta = json.loads(_existing_meta)
+                if isinstance(_parsed_meta, dict):
+                    _parsed_meta["gemini_account"] = _acc_alias
+                    msg["display_metadata"] = _parsed_meta
+                else:
+                    msg["display_metadata"] = {"gemini_account": _acc_alias}
+            except Exception:
+                msg["display_metadata"] = {"gemini_account": _acc_alias}
     return msg
 
 

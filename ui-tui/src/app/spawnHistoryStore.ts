@@ -71,13 +71,29 @@ export const pushSnapshot = (
   const now = Date.now()
   const started = meta.startedAt ?? Math.min(...subagents.map(s => s.startedAt ?? now))
 
+  // Seal subagents on turn completion so duration is frozen and running status is marked completed
+  const sealedSubagents = subagents.map(item => {
+    const s = { ...item }
+
+    if (s.status === 'running' || s.status === 'queued') {
+      s.status = 'completed'
+    }
+
+    if (s.durationSeconds == null) {
+      const sStarted = s.startedAt ?? (Number.isFinite(started) ? started : now)
+      s.durationSeconds = Math.max(0, (now - sStarted) / 1000)
+    }
+
+    return s
+  })
+
   const snap: SpawnSnapshot = {
     finishedAt: now,
     id: `snap-${now.toString(36)}`,
-    label: summarizeLabel(subagents),
+    label: summarizeLabel(sealedSubagents),
     sessionId: meta.sessionId ?? null,
     startedAt: Number.isFinite(started) ? started : now,
-    subagents: subagents.map(item => ({ ...item }))
+    subagents: sealedSubagents
   }
 
   const next = [snap, ...$spawnHistory.get()].slice(0, HISTORY_LIMIT)

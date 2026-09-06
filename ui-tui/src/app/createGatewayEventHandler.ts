@@ -821,10 +821,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (text !== undefined) {
           const value = String(text)
           scheduleThinkingStatus(value || statusFromBusy())
-
-          if (value) {
-            turnController.recordReasoningDelta(value)
-          }
         }
 
         return
@@ -1228,6 +1224,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.todos,
             resultText
           )
+        }
+
+        return
+      }
+
+      case 'todo.updated': {
+        if (ev.payload && 'todos' in ev.payload) {
+          turnController.recordTodos(ev.payload.todos)
         }
 
         return

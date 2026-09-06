@@ -121,4 +121,41 @@ describe('/usage slash command', () => {
     expect(body).toContain('free models only')
     expect(body).toContain('/subscription')
   })
+
+  it('renders active Gemini OAuth quota matrix panel and reasoning tokens', async () => {
+    const { panel, run, sys } = buildCtx({
+      'session.usage': baseUsage({
+        calls: 5,
+        gemini_account: 'alias1',
+        input: 10000,
+        model: 'gemini-3.7-flash',
+        output: 2000,
+        quota: {
+          gemini_5h_countdown: '3h 18m',
+          gemini_5h_percent: 88.5,
+          gemini_weekly_countdown: '5d 14h',
+          gemini_weekly_percent: 94.2
+        },
+        reasoning: 800,
+        total: 12000
+      })
+    })
+
+    await run('')
+
+    const quotaCall = panel.mock.calls.find(c => c[0] === 'Active Account Quota (alias1)')
+    expect(quotaCall).toBeDefined()
+    const quotaRows = quotaCall?.[1]?.[0]?.rows as [string, string][]
+    expect(quotaRows).toEqual([
+      ['Account', 'alias1'],
+      ['Gemini 5h Limit', '88.5% remaining (12% used) · resets in 3h 18m'],
+      ['Gemini Weekly Limit', '94.2% remaining (6% used) · resets in 5d 14h']
+    ])
+
+    const usageCall = panel.mock.calls.find(c => c[0] === 'Usage')
+    expect(usageCall).toBeDefined()
+    const usageRows = usageCall?.[1]?.[0]?.rows as [string, string][]
+    expect(usageRows).toContainEqual(['Reasoning tokens', '800'])
+    expect(usageRows).toContainEqual(['Model', 'gemini-3.7-flash'])
+  })
 })

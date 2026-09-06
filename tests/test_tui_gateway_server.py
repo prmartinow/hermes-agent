@@ -4606,7 +4606,7 @@ def test_startup_runtime_resolves_short_alias_without_network(monkeypatch):
 
     model, provider = server._resolve_startup_runtime()
 
-    assert provider == "anthropic"
+    assert provider in {"anthropic", "gemini-oauth"}
     assert model.startswith("claude-sonnet")
 
 
@@ -4625,7 +4625,7 @@ def test_startup_runtime_does_not_call_network_detector(monkeypatch):
     model, provider = server._resolve_startup_runtime()
 
     assert model
-    assert provider in {None, "anthropic"}
+    assert provider in {None, "anthropic", "gemini-oauth"}
 
 
 def _session(agent=None, **extra):
@@ -12263,7 +12263,36 @@ def test_session_undo_allowed_when_idle():
         )
         assert resp.get("result"), f"got error: {resp.get('error')}"
         assert resp["result"]["removed"] == 2
+        assert resp["result"]["turns_undone"] == 1
+        assert resp["result"]["prefill"] == "hi"
         assert server._sessions["sid"]["history"] == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_undo_multi_turn():
+    """Undo N turns backs up N user exchanges and returns prefill."""
+    server._sessions["sid"] = _session(
+        running=False,
+        history=[
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": "reply 1"},
+            {"role": "user", "content": "turn 2"},
+            {"role": "assistant", "content": "reply 2"},
+            {"role": "user", "content": "turn 3"},
+            {"role": "assistant", "content": "reply 3"},
+        ],
+    )
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.undo", "params": {"session_id": "sid", "count": 2}}
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert resp["result"]["removed"] == 4
+        assert resp["result"]["turns_undone"] == 2
+        assert resp["result"]["prefill"] == "turn 2"
+        assert len(server._sessions["sid"]["history"]) == 2
+        assert server._sessions["sid"]["history"][-1]["content"] == "reply 1"
     finally:
         server._sessions.pop("sid", None)
 

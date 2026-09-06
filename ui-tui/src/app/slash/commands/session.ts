@@ -720,8 +720,58 @@ export const sessionCommands: SlashCommand[] = [
           }
         }
 
+        let showedAccount = false
+
+        if (r?.quota_rows && Array.isArray(r.quota_rows) && r.quota_rows.length > 0) {
+          const quotaTitle = r.quota_title || (r.gemini_account ? `Active Account Quota (${r.gemini_account})` : 'Active Account Quota')
+          ctx.transcript.panel(quotaTitle, [{ rows: r.quota_rows }])
+          showedAccount = true
+        } else if (r?.quota) {
+          const q = r.quota
+          const qRows: [string, string][] = []
+          if (r.gemini_account) {
+            qRows.push(['Account', r.gemini_account])
+          }
+          if (q.gemini_5h_percent !== null && q.gemini_5h_percent !== undefined) {
+            const rem = q.gemini_5h_percent
+            const used = Math.max(0, Math.round(100 - rem))
+            const cd = q.gemini_5h_countdown ? ` · resets in ${q.gemini_5h_countdown}` : ''
+            qRows.push(['Gemini 5h Limit', `${rem}% remaining (${used}% used)${cd}`])
+          } else if (q.gemini_5h_countdown) {
+            qRows.push(['Gemini 5h Limit', `resets in ${q.gemini_5h_countdown}`])
+          }
+          if (q.gemini_weekly_percent !== null && q.gemini_weekly_percent !== undefined) {
+            const rem = q.gemini_weekly_percent
+            const used = Math.max(0, Math.round(100 - rem))
+            const cd = q.gemini_weekly_countdown ? ` · resets in ${q.gemini_weekly_countdown}` : ''
+            qRows.push(['Gemini Weekly Limit', `${rem}% remaining (${used}% used)${cd}`])
+          } else if (q.gemini_weekly_countdown) {
+            qRows.push(['Gemini Weekly Limit', `resets in ${q.gemini_weekly_countdown}`])
+          }
+          if (q.claude_5h_percent !== null && q.claude_5h_percent !== undefined) {
+            const rem = q.claude_5h_percent
+            const used = Math.max(0, Math.round(100 - rem))
+            const cd = q.claude_5h_countdown ? ` · resets in ${q.claude_5h_countdown}` : ''
+            qRows.push(['Claude/3P 5h Limit', `${rem}% remaining (${used}% used)${cd}`])
+          }
+          if (q.claude_weekly_percent !== null && q.claude_weekly_percent !== undefined) {
+            const rem = q.claude_weekly_percent
+            const used = Math.max(0, Math.round(100 - rem))
+            const cd = q.claude_weekly_countdown ? ` · resets in ${q.claude_weekly_countdown}` : ''
+            qRows.push(['Claude/3P Weekly Limit', `${rem}% remaining (${used}% used)${cd}`])
+          }
+          if (qRows.length > 0) {
+            const quotaTitle = r.gemini_account ? `Active Account Quota (${r.gemini_account})` : 'Active Account Quota'
+            ctx.transcript.panel(quotaTitle, [{ rows: qRows }])
+            showedAccount = true
+          }
+        } else if (r?.account_lines && r.account_lines.length > 0) {
+          ctx.transcript.panel('Account limits', [{ text: r.account_lines.join('\n') }])
+          showedAccount = true
+        }
+
         if (!r?.calls) {
-          if (!showedBalance) {
+          if (!showedBalance && !showedAccount) {
             sys('no API calls yet')
           }
 
@@ -735,10 +785,22 @@ export const sessionCommands: SlashCommand[] = [
         const rows: [string, string][] = [
           ['Model', r.model ?? ''],
           ['Input tokens', f(r.input)],
-          ['Output tokens', f(r.output)],
+          ['Output tokens', f(r.output)]
+        ]
+if (r.reasoning) {
+          rows.push(['Reasoning tokens', f(r.reasoning)])
+        }
+
+        rows.push(
           ['Total tokens', f(r.total)],
           ['API calls', f(r.calls)]
-        ]
+        )
+
+        if (r.reasoning) {
+          rows.push(['Reasoning tokens', f(r.reasoning)])
+        }
+
+        rows.push(['Total tokens', f(r.total)], ['API calls', f(r.calls)])
 
         const sections: PanelSection[] = [{ rows }]
 

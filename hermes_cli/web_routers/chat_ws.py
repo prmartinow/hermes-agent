@@ -486,14 +486,22 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
     try:
-        session, _created = await PTY_REGISTRY.attach_or_spawn(attach_token, spawn=_spawn)
+        session, _created = await PTY_REGISTRY.attach_or_spawn(
+            attach_token, spawn=_spawn, allow_standby=bool(not resume and not profile)
+        )
     except (PtyUnavailableError, FileNotFoundError, OSError, RegistryFull) as exc:
         await _pty_fail(ws, f"Chat unavailable: {exc}")
         return
 
-    # A fresh xterm can't rebuild the TUI from an arbitrary tail of alternate-
-    # screen differential output; reused PTYs emit a full frame after replay.
-    if not await session.attach(ws, force_redraw=not _created):
+    # Replay buffered PTY output to the newly attached socket. Avoid sending
+    # TUI_FORCE_REDRAW (form feed / Ctrl+L) when the buffer already contains
+    # replayed history (> 256 bytes) to prevent duplicate history frames.
+    # When reattaching to an existing session whose buffer holds only the
+    # initial 141-byte reset/clear sequence (<= 256 bytes), force_redraw is safe
+    # and required to repaint the TUI canvas. Freshly created sessions do not
+    # need force_redraw.
+    needs_redraw = (not _created) and (len(session.buffer.snapshot()) <= 256)
+    if not await session.attach(ws, force_redraw=needs_redraw):
         await _close_stalled_pty_input(ws, path="keepalive-redraw")
         PTY_REGISTRY.detach(attach_token, ws)
         return

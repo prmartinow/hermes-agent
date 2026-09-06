@@ -85,6 +85,7 @@ export async function readClipboardText(
       const result = await run(attempt.cmd, [...attempt.args], {
         encoding: 'utf8',
         maxBuffer: CLIPBOARD_MAX_BUFFER,
+        timeout: 400,
         windowsHide: true
       })
 

@@ -1104,7 +1104,6 @@ def _publish_session_id(session_id: str) -> None:
         if not delegated_child:
             os.environ["HERMES_SESSION_ID"] = session_id
 
-
 def _init_session_state(agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
     checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb):
     agent.session_start = datetime.now()
@@ -1112,6 +1111,14 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
         f"{agent.session_start.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     )
     _publish_session_id(agent.session_id)
+
+    # Initialize live session stream writer for real-time cross-process streaming
+    agent._live_stream_writer = None
+    try:
+        from agent.live_session_stream import LiveSessionStreamWriter
+        agent._live_stream_writer = LiveSessionStreamWriter(agent.session_id)
+    except Exception:
+        pass
 
     # ~/.hermes/sessions/ — kept unconditionally for request_dump_*.json debug breadcrumbs.
     agent.logs_dir = get_hermes_home() / "sessions"

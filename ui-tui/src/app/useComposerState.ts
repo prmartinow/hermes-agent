@@ -334,8 +334,8 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
             return handleResolvedPaste({ bracketed: false, cursor, text: preferredText, value })
           }
 
-          // No text on the clipboard — an image paste looks exactly like this.
-          return pasteClipboardImage(value, cursor, false)
+          // No text on the clipboard — quietly probe if there's an image on the system clipboard.
+          return pasteClipboardImage(value, cursor, true)
         })
       }
 
@@ -350,13 +350,19 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
    */
   const appendAttachment = useCallback(
     (attach: (value: string, cursor: number) => Promise<ComposerPasteResult | null>) => {
-      const current = inputRef.current
+      void (async () => {
+        const result = await attach('', 0)
 
-      void attach(current, current.length).then(next => {
-        if (next) {
-          setInput(next.value)
+        if (!result) {
+          return
         }
-      })
+
+        const current = inputRef.current
+        const cleanCurrent = /^\/(?:image|paste)\b/i.test(current) ? '' : current
+        const next = insertAtCursor(cleanCurrent, cleanCurrent.length, result.value)
+
+        setInput(next.value)
+      })()
     },
     [setInput]
   )

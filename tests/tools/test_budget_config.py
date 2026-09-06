@@ -16,6 +16,7 @@ from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_TURN_BUDGET_CHARS,
+    DEFAULT_TOOL_THRESHOLDS,
     PINNED_THRESHOLDS,
     BudgetConfig,
     budget_for_context_window,
@@ -36,6 +37,15 @@ class TestModuleConstants:
 
     def test_default_preview_size(self):
         assert DEFAULT_PREVIEW_SIZE_CHARS == 1_500
+
+    def test_default_tool_thresholds(self):
+        assert DEFAULT_TOOL_THRESHOLDS["terminal"] == 5_120
+        assert DEFAULT_TOOL_THRESHOLDS["execute_code"] == 5_120
+        assert DEFAULT_TOOL_THRESHOLDS["code_execution"] == 5_120
+        assert DEFAULT_BUDGET.resolve_threshold("terminal") == 5_120
+        assert DEFAULT_BUDGET.resolve_threshold("execute_code") == 5_120
+        assert DEFAULT_BUDGET.resolve_threshold("code_execution") == 5_120
+        assert DEFAULT_BUDGET.resolve_threshold("read_file") == float("inf")
 
 
 class TestPinnedThresholds:

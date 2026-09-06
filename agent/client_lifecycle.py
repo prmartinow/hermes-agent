@@ -807,12 +807,46 @@ class ClientLifecycleMixin:
             self._client_kwargs["default_headers"] = merged
 
     def _swap_credential(self, entry) -> None:
+        old_entry_id = getattr(self, "_credential_pool_entry_id", None)
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(runtime_base)
         stripped_base = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+
+        if getattr(self, "provider", None) in {"gemini-oauth", "gemini_oauth"}:
+            try:
+                from hermes_cli.auth import get_account_alias
+                import json
+                raw_label = getattr(entry, "label", None) or getattr(entry, "id", "")
+                alias = get_account_alias(raw_label)
+                if old_entry_id != self._credential_pool_entry_id:
+                    switch_msg = f"🔄 [Gemini Pool] Active account switched: {alias}"
+                    logger.info("gemini pool: switched active account to %s (%s)", alias, raw_label)
+                    if hasattr(self, "_on_commentary") and callable(self._on_commentary):
+                        try:
+                            self._on_commentary(switch_msg)
+                        except Exception:
+                            pass
+                    elif not getattr(self, "quiet_mode", False):
+                        print(f"\n{switch_msg}")
+                if getattr(self, "_session_db", None) and hasattr(self._session_db, "update_session_meta") and getattr(self, "session_id", None):
+                    try:
+                        sess = self._session_db.get_session(self.session_id)
+                        if sess:
+                            cfg = sess.get("model_config") or {}
+                            if isinstance(cfg, str):
+                                cfg = json.loads(cfg)
+                            if not isinstance(cfg, dict):
+                                cfg = {}
+                            cfg["gemini_account"] = raw_label
+                            self._session_db.update_session_meta(self.session_id, json.dumps(cfg), model=self.model)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         if self.api_mode == "anthropic_messages":
             with suppress(Exception):
                 self._anthropic_client.close()
@@ -824,6 +858,8 @@ class ClientLifecycleMixin:
         self.api_key, self.base_url = runtime_key, stripped_base
         # Inlined (not _sync_client_kwargs_credentials): tests call this unbound on a SimpleNamespace agent.
         self._client_kwargs["api_key"] = self.api_key
+        if "access_token" in self._client_kwargs:
+            self._client_kwargs["access_token"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
         self._replace_primary_openai_client(reason="credential_rotation")
