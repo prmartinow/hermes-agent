@@ -83,6 +83,11 @@ export type Patch =
       // Populated by log-update when a scrollback diff triggers the reset.
       debug?: { triggerY: number; prevLine: string; nextLine: string }
     }
+  | {
+      type: 'clearScreen'
+      reason: FlickerReason
+      debug?: { triggerY: number; prevLine: string; nextLine: string }
+    }
   | { type: 'cursorHide' }
   | { type: 'cursorShow' }
   | { type: 'cursorMove'; x: number; y: number }

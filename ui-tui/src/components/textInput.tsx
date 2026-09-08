@@ -1698,7 +1698,9 @@ export function TextInput({
         return
       }
 
-      commit(v, c)
+      // While assistant is busy streaming, decouple typing from synchronous parent commits
+      // (syncParent=!busy) to avoid freezing the event loop with 3000-line transcript re-renders.
+      commit(v, c, true, !busy, true)
     },
     { isActive: focus }
   )

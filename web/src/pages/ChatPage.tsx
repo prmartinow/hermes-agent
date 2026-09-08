@@ -582,13 +582,30 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     // Wheel events scroll the terminal locally in the browser buffer and
     // update the native scrollbar without sending SGR wheel sequences to PTY.
+    let wheelPartialScroll = 0;
     term.attachCustomWheelEventHandler((ev: WheelEvent) => {
       const delta = ev.deltaY;
       if (!delta) return false;
 
-      // Calculate proportional line step matching OS trackpad/wheel sensitivity
-      const step = Math.max(1, Math.round(Math.abs(delta) / 40));
-      term.scrollLines(delta > 0 ? step : -step);
+      // Calculate line delta: on trackpads (DOM_DELTA_PIXEL with small deltas),
+      // damp velocity and accumulate fractional lines so rapid 120Hz events don't catapult to top.
+      let amount =
+        ev.deltaMode === WheelEvent.DOM_DELTA_LINE
+          ? delta
+          : ev.deltaMode === WheelEvent.DOM_DELTA_PAGE
+            ? delta * (term.rows || 24)
+            : delta / 40;
+
+      if (ev.deltaMode === WheelEvent.DOM_DELTA_PIXEL && Math.abs(delta) < 50) {
+        amount *= 0.3;
+      }
+
+      wheelPartialScroll += amount;
+      const wholeLines = Math.trunc(wheelPartialScroll);
+      if (wholeLines !== 0) {
+        wheelPartialScroll -= wholeLines;
+        term.scrollLines(wholeLines);
+      }
 
       // Suppress xterm's default SGR wheel generation (\x1b[<64... / \x1b[<65...)
       ev.preventDefault();
