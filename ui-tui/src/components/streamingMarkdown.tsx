@@ -106,7 +106,7 @@ export const advanceScan = (text: string, state: StreamScanState) => {
       /^#{1,6}\s+/.test(line) || /^(?:---|\*\*\*|___)\s*$/.test(line)
     )
 
-    if ((isBlankLine || isHeadingOrRule) && i > 0 && !state.codeOpen && !state.mathOpener) {
+    if ((isBlankLine ? i > 0 : isHeadingOrRule) && !state.codeOpen && !state.mathOpener) {
       const block = text.slice(state.settledLen, nl + 1)
 
       if (/\S/.test(block)) {
