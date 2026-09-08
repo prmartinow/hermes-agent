@@ -504,6 +504,11 @@ function fullResetSequence_CAUSES_FLICKER(
   const screen = new VirtualScreen({ x: 0, y: startY }, frame.viewport.width)
   renderFrame(screen, frame, stylePool, altScreen)
 
+  // Restore cursor to frame's target cursor position so typing does NOT overwrite the status bar!
+  if (!altScreen && frame.cursor) {
+    moveCursorTo(screen, frame.cursor.x, frame.cursor.y)
+  }
+
   const patchType = altScreen ? 'clearTerminal' : 'clearScreen'
   return [{ type: patchType, reason, debug }, ...screen.diff]
 }
@@ -595,11 +600,7 @@ function renderFrameSlice(
     // CR+LF at end of row — \r resets to column 0, \n moves to next line.
     // Without \r, the terminal cursor stays at whatever column content ended
     // (since we skip trailing spaces, this can be mid-row).
-    if (y < endY - 1) {
-      screen.txn(prev => [[CARRIAGE_RETURN, NEWLINE], { dx: -prev.x, dy: 1 }])
-    } else {
-      screen.txn(prev => [[CARRIAGE_RETURN], { dx: -prev.x, dy: 0 }])
-    }
+    screen.txn(prev => [[CARRIAGE_RETURN, NEWLINE], { dx: -prev.x, dy: 1 }])
   }
 
   // Reset any open style/hyperlink at end of slice
