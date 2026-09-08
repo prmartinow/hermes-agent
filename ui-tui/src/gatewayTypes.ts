@@ -675,6 +675,8 @@ export type GatewayEvent =
   | { payload?: { heartbeat?: boolean; skin?: GatewaySkin }; session_id?: string; type: 'gateway.ready' }
   | { payload?: GatewaySkin; session_id?: string; type: 'skin.changed' }
   | { payload: SessionInfo; session_id?: string; type: 'session.info' }
+  | { payload?: { history_version?: number; notice?: string; remaining_count?: number; rewound_count?: number; turns_undone?: number }; session_id?: string; type: 'session.rewound' }
+  | { payload?: { history_version?: number; notice?: string; restored_count?: number; restored_turns?: number }; session_id?: string; type: 'session.restored' }
   | { payload?: { text?: string; timestamp?: number; user_message?: string }; session_id?: string; type: 'turn.steer' }
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }

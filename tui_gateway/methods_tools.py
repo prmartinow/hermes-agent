@@ -818,6 +818,14 @@ def _cmd_redo(rid, params, session, name, arg):
 
     turn_word = "turn" if restored_turns == 1 else "turns"
     notice = f"↷ Redid {restored_turns} {turn_word} ({len(restored_messages)} message(s))."
+    from tui_gateway.server import _emit, _emit_settled_session_info
+    _emit("session.restored", session_key, {
+        "restored_turns": restored_turns,
+        "restored_count": len(restored_messages),
+        "history_version": session.get("history_version"),
+        "notice": notice,
+    })
+    _emit_settled_session_info(session_key, session, agent)
     return _ok(
         rid,
         {
