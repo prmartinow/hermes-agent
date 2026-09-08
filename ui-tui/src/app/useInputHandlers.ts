@@ -676,6 +676,13 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         })
       }
 
+      // In Dashboard TUI mode, Ctrl+C is reserved for copy / interrupt / clear.
+      // Never trigger a new session or exit on idle Ctrl+C — users press Ctrl+C
+      // expecting clipboard copy. Ctrl+D remains the dedicated new chat shortcut.
+      if (DASHBOARD_TUI_MODE) {
+        return
+      }
+
       return handleIdleHotkeyExit(actions, DASHBOARD_TUI_MODE, () => {
         gateway.gw.publishLocalEvent({
           payload: { reason: 'idle_exit_hotkey' },
