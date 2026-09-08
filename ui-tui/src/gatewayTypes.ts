@@ -16,7 +16,10 @@ export type GatewaySkin = HermesSkin
 
 /** Distributive form of the shared `GatewayEvent<K>` so `switch (ev.type)`
  *  narrows `ev.payload` per case (the generic-defaulted interface does not). */
-export type AnyGatewayEvent = { [K in GatewayEventName]: GatewayEvent<K> }[GatewayEventName]
+export type AnyGatewayEvent = { [K in GatewayEventName]: GatewayEvent<K> }[GatewayEventName] | { payload?: { text?: string; timestamp?: number; user_message?: string }; session_id?: string; type: 'turn.steer' }
+
+export interface SessionViewportMeta { end_index: number; has_more_before: boolean; start_index: number; total: number }
+export interface SessionHistoryResponse { count?: number; end_index?: number; has_more_before?: boolean; messages: TranscriptMessage[]; session_id?: string; start_index?: number }
 
 export interface GatewayCompletionItem {
   display: string
@@ -234,10 +237,19 @@ export interface SessionSaveResponse {
 }
 
 export interface SessionUndoResponse {
+  prefill?: string
   removed?: number
+  turns_undone?: number
+}
+
+export interface SessionRedoResponse {
+  messages?: TranscriptMessage[]
+  restored_count?: number
+  restored_turns?: number
 }
 
 export interface SessionUsageResponse {
+  account_lines?: string[]
   active_subagents?: number
   avg_latency_s?: number
   avg_tps?: number
@@ -245,6 +257,7 @@ export interface SessionUsageResponse {
   cache_read?: number
   cache_write?: number
   calls?: number
+  completion?: number
   compressions?: number
   context_max?: number
   context_percent?: number
@@ -254,9 +267,32 @@ export interface SessionUsageResponse {
   cost_status?: 'estimated' | 'exact'
   cost_usd?: number
   credits_lines?: string[]
+  gemini_account?: string
   input?: number
   model?: string
   output?: number
+  prompt?: number
+  quota?: {
+    claude_5h_countdown?: string | null
+    claude_5h_description?: string | null
+    claude_5h_percent?: number | null
+    claude_5h_reset?: string | null
+    claude_weekly_countdown?: string | null
+    claude_weekly_description?: string | null
+    claude_weekly_percent?: number | null
+    claude_weekly_reset?: string | null
+    gemini_5h_countdown?: string | null
+    gemini_5h_description?: string | null
+    gemini_5h_percent?: number | null
+    gemini_5h_reset?: string | null
+    gemini_weekly_countdown?: string | null
+    gemini_weekly_description?: string | null
+    gemini_weekly_percent?: number | null
+    gemini_weekly_reset?: string | null
+  }
+  quota_rows?: any[]
+  quota_title?: string
+  reasoning?: number
   total?: number
   // Shared dollar usage model (two-bar view) so /usage renders the same bars
   // as /subscription. Dollars only — never "credits".

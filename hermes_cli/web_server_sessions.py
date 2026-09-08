@@ -2,6 +2,7 @@
 heal, latest-descendant lookup and the auto-archive ticker.
 """
 
+import json
 import logging
 import asyncio
 import threading
@@ -19,6 +20,15 @@ _DESCENDANTS_SQL = """
                 SELECT s.id, s.parent_session_id, s.started_at
                 FROM sessions s
                 JOIN descendants d ON s.parent_session_id = d.id
+                WHERE (s.model_config IS NULL OR (
+                    json_extract(COALESCE(s.model_config, '{}'), '$._branched_from') IS NULL
+                    AND json_extract(COALESCE(s.model_config, '{}'), '$._delegate_from') IS NULL
+                    AND json_extract(COALESCE(s.model_config, '{}'), '$._reset_from') IS NULL
+                    AND s.model_config NOT LIKE '%_branched_from%'
+                    AND s.model_config NOT LIKE '%_delegate_from%'
+                    AND s.model_config NOT LIKE '%_reset_from%'
+                ))
+                AND COALESCE(s.source, '') != 'tool'
             )
             SELECT id, parent_session_id, started_at FROM descendants
             """
@@ -34,12 +44,25 @@ def _session_latest_descendant(session_id: str, db):
     if not sid or not db.get_session(sid):
         return None, []
 
-    conn = getattr(db, "_conn", None)
+    conn = getattr(db, "_conn", None) or getattr(db, "conn", None)
     if conn is not None:
         keys = ("id", "parent_session_id", "started_at")
         rows = [dict(zip(keys, row)) for row in conn.execute(_DESCENDANTS_SQL, (sid,)).fetchall()]
     else:
-        rows = db.list_sessions_rich(limit=10000, offset=0, compact_rows=True)
+        all_rows = db.list_sessions_rich(limit=10000, offset=0, compact_rows=True)
+        rows = []
+        for row in all_rows:
+            cfg = row.get("model_config") or {}
+            if isinstance(cfg, str):
+                try:
+                    cfg = json.loads(cfg)
+                except Exception:
+                    cfg = {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+            if cfg.get("_branched_from") or cfg.get("_delegate_from") or cfg.get("_reset_from") or row.get("source") == "tool":
+                continue
+            rows.append(row)
 
     children = {}
     for row in rows:

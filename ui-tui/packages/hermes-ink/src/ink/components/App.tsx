@@ -691,6 +691,23 @@ export default class App extends PureComponent<Props, State> {
 
 // Helper to process all keys within a single discrete update context.
 // discreteUpdates expects (fn, a, b, c, d) -> fn(a, b, c, d)
+function isPlainPrintableKey(item: ParsedInput): item is ParsedKey & { sequence: string } {
+  return (
+    item.kind === 'key' &&
+    !item.ctrl &&
+    !item.meta &&
+    !item.shift &&
+    !item.option &&
+    !item.super &&
+    !item.fn &&
+    !item.isPasted &&
+    typeof item.sequence === 'string' &&
+    item.sequence.length === 1 &&
+    item.sequence >= ' ' &&
+    item.sequence <= '~'
+  )
+}
+
 function processKeysInBatch(app: App, items: ParsedInput[], _unused1: undefined, _unused2: undefined): void {
   // Update interaction time for notification timeout tracking.
   // This is called from the central input handler to avoid having multiple
@@ -704,7 +721,41 @@ function processKeysInBatch(app: App, items: ParsedInput[], _unused1: undefined,
     updateLastInteractionTime()
   }
 
-  for (const item of items) {
+  const coalesced: ParsedInput[] = []
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!
+
+    if (isPlainPrintableKey(item)) {
+      let batchSequence: string = item.sequence
+
+      while (i + 1 < items.length) {
+        const next = items[i + 1]
+
+        if (next && isPlainPrintableKey(next)) {
+          batchSequence += next.sequence
+          i++
+        } else {
+          break
+        }
+      }
+
+      if (batchSequence.length > 1) {
+        coalesced.push({
+          ...item,
+          name: batchSequence,
+          raw: batchSequence,
+          sequence: batchSequence
+        })
+      } else {
+        coalesced.push(item)
+      }
+    } else {
+      coalesced.push(item)
+    }
+  }
+
+  for (const item of coalesced) {
     // Terminal responses (DECRPM, DA1, OSC replies, etc.) are not user
     // input — route them to the querier to resolve pending promises.
     if (item.kind === 'response') {

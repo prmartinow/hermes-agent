@@ -850,10 +850,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (text !== undefined) {
           const value = String(text)
           scheduleThinkingStatus(value || statusFromBusy())
-
-          if (value) {
-            turnController.recordReasoningDelta(value)
-          }
         }
 
         return
@@ -1278,6 +1274,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'todo.updated': {
+        if (ev.payload && 'todos' in ev.payload) {
+          turnController.recordTodos(ev.payload.todos)
+        }
+
+        return
+      }
+
       case 'request.cancel': {
         // The backend withdrew a server→client request (timeout / interrupt /
         // session close): tear down whichever card carries that id. A clarify
@@ -1483,6 +1487,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (typeof text === 'string' && text.trim()) {
           turnController.recordInterimMessage(text)
+        }
+
+        return
+      }
+
+      case 'turn.steer': {
+        const text = ev.payload?.text ?? ev.payload?.user_message
+
+        if (typeof text === 'string' && text.trim()) {
+          turnController.recordSteer(text.trim())
         }
 
         return

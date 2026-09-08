@@ -10,13 +10,11 @@ export type PtyKeyboardShortcut =
 
 export function resolvePtyKeyboardShortcut(
   ev: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "key" | "metaKey" | "shiftKey">,
-  isMac: boolean,
+  _isMac: boolean,
   hasTerminalSelection: boolean,
 ): PtyKeyboardShortcut {
   const key = ev.key.toLowerCase();
-  const copyPressed = isMac
-    ? ev.metaKey && !ev.ctrlKey
-    : ev.ctrlKey && !ev.altKey && !ev.metaKey;
+  const copyPressed = (ev.metaKey || ev.ctrlKey) && !ev.altKey;
 
   if (copyPressed && key === "c" && hasTerminalSelection) {
     return "copy";

@@ -105,6 +105,7 @@ export const MessageLine = memo(function MessageLine({
           reasoningTokens={msg.thinkingTokens}
           sections={sections}
           t={t}
+          thinkingTitle={msg.thinkingTitle}
           tools={tools}
           toolTokens={msg.toolTokens}
           trail={msg.tools ?? []}
@@ -276,6 +277,7 @@ export const MessageLine = memo(function MessageLine({
             reasoningTokens={msg.thinkingTokens}
             sections={sections}
             t={t}
+            thinkingTitle={msg.thinkingTitle}
             toolTokens={msg.toolTokens}
             trail={msg.tools}
           />

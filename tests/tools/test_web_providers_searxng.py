@@ -214,6 +214,7 @@ class TestCheckWebApiKey:
         # Disable the keyless free tier — with it on, zero credentials still
         # resolves (Parallel/Exa anonymous MCP; see test_web_keyless_fallback.py).
         monkeypatch.setattr(web_search_registry, "_keyless_tier_enabled", lambda: False)
+        monkeypatch.setattr("hermes_cli.auth.has_gemini_oauth_credentials", lambda *a, **kw: False)
         assert web_tools.check_web_api_key() is False
 
 

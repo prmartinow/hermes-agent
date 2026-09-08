@@ -2149,6 +2149,54 @@ def _session_info(agent, session: dict | None = None) -> dict:
         info["update_command"] = recommended_update_command()
     if live_agent and (warn := _probe_credentials(agent)):
         info["credential_warning"] = warn
+    model_str = str(info.get("model") or getattr(agent, "model", "") or mirror.get("model", "")).lower()
+    provider_str = str(info.get("provider") or getattr(agent, "provider", "") or mirror.get("provider", "")).lower()
+    if "gemini" in model_str or "gemini" in provider_str:
+        gemini_acc = None
+        # 1. Active agent credential pool entry IF explicitly bound
+        entry_id = getattr(agent, "_credential_pool_entry_id", None)
+        if entry_id:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import get_account_alias
+                pool = getattr(agent, "_credential_pool", None)
+                _all = pool.entries() if hasattr(pool, "entries") else getattr(pool, "_entries", [])
+                curr = next((e for e in _all if getattr(e, "id", None) == entry_id), None)
+                raw_lbl = (curr.label or curr.id) if curr else entry_id
+                if raw_lbl:
+                    gemini_acc = get_account_alias(raw_lbl)
+
+        # 2. Session model_config / mirror (saved session state takes precedence over unbound pool cursor)
+        if not gemini_acc:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import get_account_alias
+                cfg = sess.get("model_config") or mirror.get("model_config") or {}
+                if isinstance(cfg, str):
+                    import json
+                    cfg = json.loads(cfg)
+                if isinstance(cfg, dict) and cfg.get("gemini_account"):
+                    gemini_acc = get_account_alias(cfg["gemini_account"])
+
+        # 3. Fallback to pool current/peek only when session has no saved account
+        if not gemini_acc:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import get_account_alias
+                pool = getattr(agent, "_credential_pool", None)
+                if pool:
+                    curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
+                    raw_lbl = (curr.label or curr.id) if curr else None
+                    if raw_lbl:
+                        gemini_acc = get_account_alias(raw_lbl)
+
+        # 3. Fallback to state.db / last-used resolver
+        if not gemini_acc and session_key:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import resolve_session_last_used_account, get_account_alias
+                raw_acc = resolve_session_last_used_account(session_key, db=_get_db())
+                if raw_acc:
+                    gemini_acc = get_account_alias(raw_acc)
+
+        if gemini_acc:
+            info["gemini_account"] = gemini_acc
     return info
 
 
@@ -3176,7 +3224,7 @@ _TUI_EXTRA: list[tuple[str, str, str]] = [
 # Commands that queue onto _pending_input in the CLI; the slash worker has no reader for that queue, so
 # slash.exec routes them to command.dispatch instead.
 _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset({
-    "retry", "queue", "q", "steer", "plan", "goal", "loop", "proactive", "moa", "undo", "learn",
+    "retry", "queue", "q", "steer", "plan", "goal", "loop", "proactive", "moa", "undo", "redo", "learn",
     "init", "compress", "compact",
 })
 

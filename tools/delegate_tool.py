@@ -31,8 +31,7 @@ from tools.delegate_tool_config import (  # noqa: F401
     _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
     _get_max_spawn_depth, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
     _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials,
-    _subagent_auto_approve, _subagent_auto_deny,
+    _resolve_child_runtime, _resolve_delegation_credentials, _subagent_auto_approve, _subagent_auto_deny,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (  # noqa: F401
@@ -168,14 +167,10 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
-
+    override_max_tokens: Optional[int] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
-    # Configuration block that owns the selected provider/model route. Internal
-    # callers such as /review pass auxiliary.review here so fallback policy is
-    # not accidentally read from the general delegation block.
-    routing_cfg: Optional[Dict[str, Any]] = None,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -195,9 +190,6 @@ def _build_child_agent(
     subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
 
-    # General delegation behavior (reasoning, compression, capabilities) stays
-    # global. Only fallback policy follows the owner of a per-call route such
-    # as auxiliary.review.
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
     child_prompt = _build_child_system_prompt(
@@ -219,9 +211,8 @@ def _build_child_agent(
     rt = _resolve_child_runtime(
         parent_agent, delegation_cfg, parent_api_key, model=model, override_provider=override_provider,
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
-        override_acp_command=override_acp_command,
+        override_max_tokens=override_max_tokens, override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
-        routing_cfg=routing_cfg,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
@@ -272,8 +263,11 @@ def _build_child_agent(
         child._delegate_parent_ref = None  # non-weakref-able test doubles
     # Sidebar marker: subagent sessions stay out of session pickers even when a
     # parent delete orphans them (mirrors /branch's ``_branched_from``).
-    if parent_sid and getattr(child, "_session_init_model_config", None) is not None:
-        child._session_init_model_config["_delegate_from"] = parent_sid
+    if getattr(child, "_session_init_model_config", None) is not None:
+        # Subagents must never inherit parent's G-Switch account PIN — always unpinned dynamic CD-DOCI mode
+        child._session_init_model_config.pop("gemini_account", None)
+        if parent_sid:
+            child._session_init_model_config["_delegate_from"] = parent_sid
     # Shared pool lets children rotate credentials on rate limits.
     child_pool = _resolve_child_credential_pool(rt["provider"], parent_agent, rt["base_url"])
     if child_pool is not None:
@@ -343,7 +337,6 @@ def _run_single_child(
         duration = run.elapsed()
         entry = _build_result_entry(child, result, task_index, duration, schema)
         run.append_sibling_write_reminder(entry)
-        run.account_background_processes(entry)
         run.emit_complete(result, entry, duration)
         return run.attach_worktree(entry)
     except Exception as exc:
@@ -361,7 +354,7 @@ def _run_single_child(
 
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
-    top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
+    top_role: str, max_iterations: int, parent_agent,
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
@@ -372,9 +365,8 @@ def _build_children(
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
         "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
-        "override_acp_command": creds.get("command"),
+        "override_max_tokens": creds.get("max_output_tokens"), "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
-        "routing_cfg": routing_cfg,
     }
     children = []
     for i, t in enumerate(task_list):
@@ -465,11 +457,9 @@ def delegate_task(
             max_iterations, default_max_iter,
         )
     # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
-    # a per-call routing owner shaped like the delegation config section. Keep
-    # the route and its fallback policy together through child construction.
-    routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    # a per-call override shaped like the delegation config section.
     try:
-        creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
+        creds = _resolve_delegation_credentials(credentials_cfg if credentials_cfg else cfg, parent_agent)
     except ValueError as exc:
         # Explicit-pin preflight failures (e.g. pinned delegation.command missing from PATH) refuse the
         # spawn loudly (#80450).
@@ -495,7 +485,7 @@ def delegate_task(
 
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
     )
     if err:
         return tool_error(err)
@@ -654,10 +644,12 @@ DELEGATE_TASK_SCHEMA = {
                         ),
                         "group": _p(
                             "string",
-                            "Optional result-delivery bucket within this call (only when delegation.independent_completions "
-                            "is enabled; otherwise the whole call returns as one message). Tasks sharing a group return "
-                            "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
-                            "order execution; if B needs A's output, dispatch B after A returns.",
+                            "Optional result-delivery bucket within this call; all tasks still run in parallel. "
+                            "Use the same group when you want to review results together (comparison, synthesis, "
+                            "or one coordinated decision): ONE message arrives after all tasks in that group finish. "
+                            "Omit when each result is useful to act on separately: it arrives as soon as that task "
+                            "finishes. Different groups report independently. This does not order execution; if B "
+                            "needs A's output, dispatch B after A returns.",
                         ),
                     },
                     "required": ["goal"],

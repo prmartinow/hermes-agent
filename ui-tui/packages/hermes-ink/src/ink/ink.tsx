@@ -280,6 +280,7 @@ export default class Ink {
   // tracking, and tmux users routinely opt into the hover-free 'wheel'
   // subset to silence prompt-row clipboard probes).
   private altScreenMouseTracking: MouseTrackingMode = 'off'
+  private inlineMouseTracking: MouseTrackingMode = 'off'
   // True when the previous frame's screen buffer cannot be trusted for
   // blit — selection overlay mutated it, resetFramesForAltScreen()
   // replaced it with blanks, or forceRedraw() reset it to 0×0. Forces
@@ -610,10 +611,19 @@ export default class Ink {
     }, 160)
   }
 
+  private pendingTerminalFocusIn = false
+
   private handleTerminalFocusChange(isFocused: boolean): void {
-    if (!isFocused || !this.options.stdout.isTTY) {
+    if (!this.options.stdout.isTTY) {
       return
     }
+
+    if (!isFocused) {
+      this.pendingTerminalFocusIn = false
+      return
+    }
+
+    this.pendingTerminalFocusIn = true
 
     // Focus-in means the terminal emulator has just made this tab/pane
     // visible again. Some emulators throttle or coalesce hidden-tab output;
@@ -641,9 +651,11 @@ export default class Ink {
     // OS app-switch. Re-assert modes and stop; the focus report still reaches
     // TerminalFocusProvider.
     queueMicrotask(() => {
-      if (this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
+      if (!this.pendingTerminalFocusIn || this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
         return
       }
+
+      this.pendingTerminalFocusIn = false
 
       this.reassertTerminalModes(false)
 
@@ -1433,6 +1445,13 @@ export default class Ink {
       this.options.stdout.write(DISABLE_MOUSE_TRACKING + enableMouseTrackingFor(mode))
     }
   }
+  setInlineMouseTracking(mode: MouseTrackingMode): void {
+    if (this.inlineMouseTracking === mode) {
+      return
+    }
+    this.inlineMouseTracking = mode
+  }
+
   get isAltScreenActive(): boolean {
     return this.altScreenActive
   }
@@ -1446,7 +1465,8 @@ export default class Ink {
    * session), or after unmount.
    */
   get expectsMouseTracking(): boolean {
-    return this.altScreenActive && !this.isPaused && !this.isUnmounted && this.altScreenMouseTracking !== 'off'
+    const active = this.altScreenActive || this.inlineMouseTracking !== 'off'
+    return active && !this.isPaused && !this.isUnmounted && (this.altScreenMouseTracking !== 'off' || this.inlineMouseTracking !== 'off')
   }
 
   /**
@@ -1492,7 +1512,7 @@ export default class Ink {
       )
     }
 
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return
     }
 
@@ -1500,7 +1520,8 @@ export default class Ink {
     // DISABLE first so we land in the exact preset state even if an
     // external app or tmux left DEC 1003 hover asserted out from under us
     // since the last assertion.
-    this.options.stdout.write(DISABLE_MOUSE_TRACKING + enableMouseTrackingFor(this.altScreenMouseTracking))
+    const mode = this.altScreenActive ? this.altScreenMouseTracking : this.inlineMouseTracking
+    this.options.stdout.write(DISABLE_MOUSE_TRACKING + enableMouseTrackingFor(mode))
 
     // Alt-screen re-entry — destructive (ERASE_SCREEN). Only for callers that
     // have a strong signal the terminal actually dropped mode 1049.
@@ -1975,7 +1996,7 @@ export default class Ink {
    * nodeCache rects map 1:1 to terminal cells (no scrollback offset).
    */
   dispatchClick(col: number, row: number): boolean {
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return false
     }
 
@@ -1984,7 +2005,7 @@ export default class Ink {
     return dispatchClick(this.rootNode, col, row, blank)
   }
   dispatchMouseDown(col: number, row: number, button: number): dom.DOMElement | undefined {
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return undefined
     }
 
@@ -2000,7 +2021,7 @@ export default class Ink {
     )
   }
   dispatchMouseUp(target: dom.DOMElement, col: number, row: number, button: number): void {
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return
     }
 
@@ -2008,7 +2029,7 @@ export default class Ink {
     dispatchMouse(this.rootNode, col, row, 'onMouseUp', button, isEmptyCellAt(this.frontFrame.screen, col, row), target)
   }
   dispatchMouseDrag(target: dom.DOMElement, col: number, row: number, button: number): void {
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return
     }
 

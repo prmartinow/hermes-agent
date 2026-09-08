@@ -236,7 +236,7 @@ def _resolve_child_credential_pool(
                 return parent_pool
             return _loaded_pool(child_key)
         if parent_pool is not None and effective_provider == parent_provider:
-            return parent_pool
+            return parent_pool.clone() if hasattr(parent_pool, "clone") else parent_pool
         return _loaded_pool(effective_provider)
     except Exception as exc:
         if effective_provider == "custom":

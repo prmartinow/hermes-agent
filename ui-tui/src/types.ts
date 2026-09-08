@@ -143,6 +143,7 @@ export interface Msg {
   // [HH:MM] label when `display.timestamps` is on (#41531).
   createdAt?: number
   thinking?: string
+  thinkingTitle?: string
   // MoA reference-model output stored in `thinking` (see turnController's
   // recordMoaReference): unlike ordinary model reasoning, this is the
   // user-facing mixture-of-agents process the user opted into, so it stays
@@ -183,7 +184,7 @@ export interface McpServerStatus {
 }
 
 /** The gateway's `session.info` / resume `info` block — generated from `tui_gateway/contracts`. */
-export type SessionInfo = SessionLiveInfo
+export type SessionInfo = SessionLiveInfo & { gemini_account?: string }
 export type { ProjectInfo }
 
 export interface SudoReq {
