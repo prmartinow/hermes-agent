@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Debian 13 still ships SQLite 3.46.1, which contains the upstream WAL-reset
 # corruption bug. Build a pinned shared library for the runtime image instead
 # of relying on a distro backport that trixie does not currently provide.
@@ -203,7 +204,7 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
+RUN --mount=type=cache,target=/root/.npm npm install --prefer-offline --no-audit --fetch-retries=5 && \
     for i in 1 2 3; do \
         npx playwright install --with-deps chromium --only-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
@@ -222,7 +223,7 @@ COPY plugins/platforms/photon/sidecar/package.json \
      plugins/platforms/photon/sidecar/package-lock.json \
      plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs \
      plugins/platforms/photon/sidecar/
-RUN cd plugins/platforms/photon/sidecar && \
+RUN --mount=type=cache,target=/root/.npm cd plugins/platforms/photon/sidecar && \
     npm ci --no-audit --fetch-retries=5 && \
     npm cache clean --force
 
@@ -271,7 +272,7 @@ RUN cd plugins/platforms/photon/sidecar && \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
