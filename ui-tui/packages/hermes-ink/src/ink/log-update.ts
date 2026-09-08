@@ -499,8 +499,9 @@ function fullResetSequence_CAUSES_FLICKER(
   debug?: { triggerY: number; prevLine: string; nextLine: string },
   altScreen = false
 ): Diff {
-  // After clearTerminal (alt-screen) or clearScreen (inline), cursor is at (0, 0)
-  const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
+  const startY = altScreen ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
+  // Virtual cursor origin must match startY so rowsToAdvance doesn't emit thousands of spurious LFs in inline mode
+  const screen = new VirtualScreen({ x: 0, y: startY }, frame.viewport.width)
   renderFrame(screen, frame, stylePool, altScreen)
 
   const patchType = altScreen ? 'clearTerminal' : 'clearScreen'
@@ -594,7 +595,11 @@ function renderFrameSlice(
     // CR+LF at end of row — \r resets to column 0, \n moves to next line.
     // Without \r, the terminal cursor stays at whatever column content ended
     // (since we skip trailing spaces, this can be mid-row).
-    screen.txn(prev => [[CARRIAGE_RETURN, NEWLINE], { dx: -prev.x, dy: 1 }])
+    if (y < endY - 1) {
+      screen.txn(prev => [[CARRIAGE_RETURN, NEWLINE], { dx: -prev.x, dy: 1 }])
+    } else {
+      screen.txn(prev => [[CARRIAGE_RETURN], { dx: -prev.x, dy: 0 }])
+    }
   }
 
   // Reset any open style/hyperlink at end of slice
