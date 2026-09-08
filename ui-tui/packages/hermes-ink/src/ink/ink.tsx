@@ -1046,7 +1046,7 @@ export default class Ink {
     const flickers: FrameEvent['flickers'] = []
 
     for (const patch of diff) {
-      if (patch.type === 'clearTerminal') {
+      if (patch.type === 'clearTerminal' || patch.type === 'clearScreen') {
         flickers.push({
           desiredHeight: frame.screen.height,
           availableHeight: frame.viewport.height,

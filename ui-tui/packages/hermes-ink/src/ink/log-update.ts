@@ -150,7 +150,7 @@ export class LogUpdate {
       next.viewport.height !== prev.viewport.height ||
       (prev.viewport.width !== 0 && next.viewport.width !== prev.viewport.width)
     ) {
-      return fullResetSequence_CAUSES_FLICKER(next, 'resize', stylePool)
+      return fullResetSequence_CAUSES_FLICKER(next, 'resize', stylePool, undefined, altScreen)
     }
 
     // DECSTBM scroll optimization: when a ScrollBox's scrollTop changed,
@@ -496,13 +496,15 @@ function fullResetSequence_CAUSES_FLICKER(
   frame: Frame,
   reason: FlickerReason,
   stylePool: StylePool,
-  debug?: { triggerY: number; prevLine: string; nextLine: string }
+  debug?: { triggerY: number; prevLine: string; nextLine: string },
+  altScreen = false
 ): Diff {
-  // After clearTerminal, cursor is at (0, 0)
+  // After clearTerminal (alt-screen) or clearScreen (inline), cursor is at (0, 0)
   const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
   renderFrame(screen, frame, stylePool)
 
-  return [{ type: 'clearTerminal', reason, debug }, ...screen.diff]
+  const patchType = altScreen ? 'clearTerminal' : 'clearScreen'
+  return [{ type: patchType, reason, debug }, ...screen.diff]
 }
 
 function renderFrame(screen: VirtualScreen, frame: Frame, stylePool: StylePool): void {
