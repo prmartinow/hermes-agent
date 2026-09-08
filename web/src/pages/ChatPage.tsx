@@ -986,19 +986,27 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
         const row = Math.floor((e.clientY - rect.top) / dims.height);
 
-        // Status bar and composer chrome (bottom 4 rows)
-        if (row >= term.rows - 4) return false;
+        // 1. Any click on the bottom half of the terminal (composer, status bar, prompt).
+        // Composer can expand up to half the screen when writing large multi-line prompts.
+        if (row >= Math.floor(term.rows / 2)) return false;
 
-        // Interactive controls across transcript (status dividers)
+        // 2. Interactive controls, confirmation modals, approval dialogs across the viewport
         const line = term.buffer.active.getLine(term.buffer.active.viewportY + row);
         if (line) {
           const lineText = line.translateToString(true);
-          if (lineText.includes("─") && lineText.includes("│")) {
+          const isInteractive =
+            /\[(Allow|Deny|Yes|No|Confirm|Cancel|Retry|Select|\s*\d+\s*)\]/i.test(lineText) ||
+            /Allow\s+this|Deny|Confirm|Cancel|Permission/i.test(lineText) ||
+            /[┌┐└┘├┤─│▸▾❯›]/.test(lineText) ||
+            lineText.trim().startsWith("❯") ||
+            lineText.trim().startsWith("?");
+
+          if (isInteractive) {
             return false;
           }
         }
 
-        // Everywhere else across normal transcript text: force selection naturally
+        // Everywhere else across normal transcript prose: force selection naturally
         return true;
       };
 
@@ -1193,13 +1201,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           /* ignore */
         }
       }
-      if (
-        (fontChanged || dimsChanged) &&
-        wsRef.current &&
-        wsRef.current.readyState === WebSocket.OPEN
-      ) {
-        wsRef.current.send(`\x1b[RESIZE:${term.cols};${term.rows}]`);
-      }
+      // PTY resize emission is handled with settling debounce below
     };
     syncMetricsRef.current = syncTerminalMetrics;
 
@@ -1521,6 +1523,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const beginResumeReplay = () => {
       isReplayActive = true;
       stickToBottomRef.current = true;
+      try {
+        term.reset();
+      } catch {
+        /* ignore */
+      }
       if (!eraseSuppressionTimer) {
         eraseSuppressionTimer = setTimeout(() => {
           eraseSuppressionTimer = null;
@@ -1775,10 +1782,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         forwardPtyData(data);
       });
 
+      let ptyResizeTimer: ReturnType<typeof setTimeout> | null = null;
       onResizeDisposable = term.onResize(({ cols, rows }) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(`\x1b[RESIZE:${cols};${rows}]`);
-        }
+        if (ptyResizeTimer) clearTimeout(ptyResizeTimer);
+        ptyResizeTimer = setTimeout(() => {
+          ptyResizeTimer = null;
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(`\x1b[RESIZE:${cols};${rows}]`);
+          }
+        }, 120);
       });
 
       // Release the stick-to-bottom pin the moment the user scrolls up, so
