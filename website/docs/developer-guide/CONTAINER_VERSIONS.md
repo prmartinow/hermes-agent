@@ -6,7 +6,7 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Container Name | Target Port | Active Image Tag | Compose Configuration | Role |
 | :--- | :---: | :--- | :--- | :--- |
-| **`hermes-agent-serving`** | `9119` | `hermes-agent:v0.22` (`v0.22`, `local`) | `docker-compose.local.yml` | Active production serving & leader lease holder |
+| **`hermes-agent-serving`** | `9119` | `hermes-agent:v0.23` (`v0.23`, `local`) | `docker-compose.local.yml` | Active production serving & leader lease holder |
 
 ---
 
@@ -14,8 +14,8 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Version | Image ID | Git Commit | Build Date (UTC) | Core Changes & Fixes | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`v0.23`** | `b265a7472f3a` | `f80afa7a09` | 2026-09-08 14:40 | Candidate release v0.23: interactive trace inspector drawer, subagent credential inheritance, and runtime hardening | Built (Available) |
-| **`v0.22`** | `599cd168d76c` | `0609aabca1` | 2026-09-07 23:08 | Candidate release v0.22: interactive tool & thinking trace inspector drawer with drag-selection protection | **Active (Serving :9119)** |
+| **`v0.23`** | `4b4c90e11e8a` | `66ec0b0ecf` | 2026-09-08 15:35 | Rebuilt release v0.23: BuildKit cache mounts, fast dependency caching, and inspector drawer | **Active (Serving :9119)** |
+| **`v0.22`** | `599cd168d76c` | `0609aabca1` | 2026-09-07 23:08 | Candidate release v0.22: interactive tool & thinking trace inspector drawer with drag-selection protection | Available (Previous Serving) |
 | **`v0.21`** (`stable`) | `f943c52f5879` | `f7176e33c1` | 2026-09-07 20:38 | Candidate release v0.21: latest Web TUI terminal hydration, privilege-drop shim, subagent account persistence | Available (`stable` / Fallback Target) |
 | **`v0.20`** (Pruned) | `e7a76204d565` | `9d030f0c3c` | 2026-09-07 18:35 | Release v0.20: universal privilege-drop shim (UID 1000), in-image provenance metadata, bootstrap hardening, Web TUI scrollbar stability | Pruned |
 | **`v0.19`** (Pruned) | `0ef774828a52` | `818d0a2ea7` | 2026-09-06 15:45 | Candidate release v0.19: event-loop non-blocking DB offload, web TUI autorecovery, and latest updates | Pruned |
