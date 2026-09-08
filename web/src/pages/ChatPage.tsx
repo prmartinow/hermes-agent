@@ -574,7 +574,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       rightClickSelectsWord: true,
       // Browser-embedded chat runs the TUI in inline mode. Keep transcript
       // history in xterm.js so the browser wheel can scroll it directly.
-      scrollback: 50000,
+      scrollback: 100000,
       scrollOnUserInput: false,
       theme: terminalTheme,
     });
