@@ -329,8 +329,16 @@ export function useVirtualHistory(
   let start = 0
   let end = n
 
+  // In inline mode, the terminal renderer only draws the active visible viewport slice
+  // (see renderFrame in log-update.ts). Mounting the entire transcript (e.g. 3,800+ messages)
+  // freezes Yoga layout and React reconciliation for 15+ seconds on resize without displaying
+  // any of those unmounted historical rows.
+  // Bound the mounted slice to the visible tail window (maxMounted).
+  const maxInline = Math.max(coldStartCount, 120)
+  const inlineStart = isInline ? Math.max(0, n - maxInline) : 0
+
   if (isInline) {
-    start = 0
+    start = inlineStart
     end = n
   } else if (frozenRange) {
     start = frozenRange[0]
@@ -674,7 +682,7 @@ export function useVirtualHistory(
     end: isInline ? n : effEnd,
     measureRef,
     offsets,
-    start: isInline ? 0 : effStart,
+    start: isInline ? inlineStart : effStart,
     topSpacer: isInline ? 0 : (offsets[effStart] ?? 0)
   }
 }
