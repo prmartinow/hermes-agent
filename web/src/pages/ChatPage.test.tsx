@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, type ReactNode } from "react";
+import { act, useEffect, useState, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -17,6 +17,7 @@ class FakeWebglAddon {
 }
 
 class FakeTerminal {
+  static instances: FakeTerminal[] = [];
   options: Record<string, unknown>;
   rows = 24;
   cols = 80;
@@ -24,18 +25,22 @@ class FakeTerminal {
     registerOscHandler: vi.fn(),
   };
   unicode = { activeVersion: "" };
+  scrollLines = vi.fn();
+  customWheelHandler?: (ev: WheelEvent) => boolean;
 
   constructor(options: Record<string, unknown>) {
     this.options = options;
+    FakeTerminal.instances.push(this);
   }
 
   attachCustomKeyEventHandler() {
     return true;
   }
 
-  attachCustomWheelEventHandler() {
+  attachCustomWheelEventHandler = vi.fn((handler: (ev: WheelEvent) => boolean) => {
+    this.customWheelHandler = handler;
     return true;
-  }
+  });
 
   clearSelection() {}
 
@@ -61,6 +66,10 @@ class FakeTerminal {
     return { dispose() {} };
   }
 
+  onSelectionChange() {
+    return { dispose() {} };
+  }
+
   get buffer() {
     // Minimal active-buffer surface for the resume follow-scroll pin
     // (isViewportPinnedToBottom reads viewportY/baseY).
@@ -68,6 +77,8 @@ class FakeTerminal {
   }
 
   scrollToBottom() {}
+
+  scrollToLine(_line?: number) {}
 
   open() {}
 
@@ -80,7 +91,15 @@ class FakeTerminal {
 
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
 const apiMocks = vi.hoisted(() => ({
-  buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
+  buildWsUrl: vi.fn(async (path: string, params?: Record<string, string>) => {
+    const qs = params ? new URLSearchParams(params).toString() : "channel=chat-1";
+    return `ws://localhost${path}?${qs}`;
+  }),
+  buildWsUrlSync: vi.fn(() => null),
+  getSessions: vi.fn(async () => ({ sessions: [] as import("@/lib/api").SessionInfo[], total: 0, limit: 20, offset: 0 })),
+  getSessionDetail: vi.fn(async (id: string) => ({ title: `Session ${id}` })),
+  getSessionLatestDescendant: vi.fn(async (id: string) => ({ session_id: id })),
+  getSessionMessages: vi.fn(async () => ({ messages: [] })),
 }));
 
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: FakeFitAddon }));
@@ -98,8 +117,25 @@ vi.mock("@/components/Backdrop", () => ({ Backdrop: () => null }));
 vi.mock("@/plugins", () => ({
   PluginSlot: () => null,
 }));
+const headerSlot = vi.hoisted(() => {
+  const listeners = new Set<(node: React.ReactNode) => void>();
+  return {
+    setEnd: (node: React.ReactNode) => {
+      for (const listener of listeners) listener(node);
+    },
+    subscribe: (listener: (node: React.ReactNode) => void) => {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    },
+  };
+});
 vi.mock("@/contexts/usePageHeader", () => ({
-  usePageHeader: () => ({ setEnd: vi.fn(), setTitle: vi.fn() }),
+  usePageHeader: () => ({
+    setEnd: (node: React.ReactNode) => headerSlot.setEnd(node),
+    setTitle: vi.fn(),
+  }),
 }));
 vi.mock("@/contexts/useProfileScope", () => ({
   useProfileScope: () => ({ profile: "" }),
@@ -190,6 +226,7 @@ async function render(ui: ReactNode) {
 }
 
 beforeEach(() => {
+  FakeTerminal.instances = [];
   FakeWebSocket.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   apiMocks.buildWsUrl.mockReset();
@@ -326,11 +363,19 @@ describe("ChatPage", () => {
 describe("ChatPage side panel collapse", () => {
   async function renderChat() {
     const { default: ChatPage } = await import("./ChatPage");
-    await render(
-      <MemoryRouter initialEntries={["/chat"]}>
-        <ChatPage isActive />
-      </MemoryRouter>,
-    );
+    function TestWrapper() {
+      const [endNode, setEndNode] = useState<React.ReactNode>(null);
+      useEffect(() => {
+        return headerSlot.subscribe(setEndNode);
+      }, []);
+      return (
+        <MemoryRouter initialEntries={["/chat"]}>
+          <div>{endNode}</div>
+          <ChatPage isActive />
+        </MemoryRouter>
+      );
+    }
+    await render(<TestWrapper />);
   }
 
   it("collapses the desktop side panel and persists the choice", async () => {
@@ -455,5 +500,25 @@ describe("ChatPage PTY ticket connect deadline", () => {
     // force-close a wedged handshake — the two must not both fire.
     await advance(PTY_TICKET_TIMEOUT_MS);
     expect(apiMocks.buildWsUrl).toHaveBeenCalledTimes(1);
+  });
+
+  it("attaches custom wheel event handler to decouple scrolling and suppress SGR emission", async () => {
+    await renderChat();
+    await advance(0);
+    const term = FakeTerminal.instances[0];
+    expect(term.attachCustomWheelEventHandler).toHaveBeenCalled();
+    expect(term.customWheelHandler).toBeDefined();
+
+    const ev = {
+      deltaY: 120,
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn(),
+    } as unknown as WheelEvent;
+
+    const handled = term.customWheelHandler!(ev);
+    expect(handled).toBe(false);
+    expect(ev.preventDefault).toHaveBeenCalled();
+    expect(ev.stopPropagation).toHaveBeenCalled();
+    expect(term.scrollLines).toHaveBeenCalledWith(3);
   });
 });

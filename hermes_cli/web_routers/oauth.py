@@ -7,6 +7,7 @@ Extracted from ``hermes_cli.web_server``; helpers/state that tests monkeypatch o
 import asyncio
 import logging
 import os
+import re
 import secrets
 import sys
 import threading
@@ -17,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_oauth import (
-    _external_process_cli_command, _minimax_poller, _nous_poller, _oauth_profile_name, _oauth_sessions, _oauth_sessions_lock, _truncate_token, _xai_device_poller,
+    _external_process_cli_command, _minimax_poller, _nous_poller, _oauth_profile_name, _oauth_session_profile, _oauth_sessions, _oauth_sessions_lock, _truncate_token, _xai_device_poller,
 )
 from hermes_cli.web_models import OAuthSubmitBody
 from hermes_cli.web_routers._common import scoped_to_thread
@@ -300,6 +301,22 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
         if status_fn is not None:
             return status_fn()
         from hermes_cli import auth as hauth
+        if provider_id in {"gemini-oauth", "gemini_oauth"}:
+            from hermes_cli.web_server_oauth import _gemini_oauth_status
+            return _gemini_oauth_status()
+        m = re.match(r"^gemini(?:-oauth)?-([1-5])$", provider_id)
+        if m:
+            acc_idx = int(m.group(1))
+            st = hauth.get_gemini_oauth_auth_status(acc_idx)
+            return {
+                "logged_in": bool(st.get("logged_in")),
+                "source": f"gemini_account_{acc_idx}",
+                "source_label": f"Google Gemini Account {acc_idx}",
+                "token_preview": _truncate_token(st.get("api_key") or st.get("access_token")),
+                "expires_at": st.get("expires_at"),
+                "has_refresh_token": bool(st.get("has_refresh_token")),
+                "quota": st.get("quota") or {},
+            }
         entry = _PROVIDER_STATUS.get(provider_id)
         if entry is not None:
             getter, shape = entry
@@ -435,6 +452,185 @@ async def _start_device_code_flow(provider_id: str, profile: Optional[str] = Non
     return await starter(profile)
 
 
+def _start_gemini_pkce(
+    provider_id: str,
+    profile: Optional[str] = None,
+    account: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Begin Google Gemini PKCE flow. Returns the auth URL the UI should open."""
+    import base64
+    import hashlib
+    import secrets
+    import urllib.parse
+    from hermes_cli.auth import (
+        _extract_gemini_oauth_credentials_from_agy,
+        has_gemini_oauth_credentials,
+    )
+
+    acc_idx = int(account) if account is not None and 1 <= int(account) <= 5 else 1
+    if account is None:
+        m = re.match(r"^gemini(?:-oauth)?-([1-5])$", provider_id)
+        if m:
+            acc_idx = int(m.group(1))
+        elif provider_id in {"gemini-oauth", "gemini_oauth"}:
+            for _ai in range(1, 6):
+                if not has_gemini_oauth_credentials(_ai):
+                    acc_idx = _ai
+                    break
+
+    client_id, client_secret = _extract_gemini_oauth_credentials_from_agy()
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+
+    sid, sess = _new_oauth_session(provider_id, "pkce", profile=profile)
+    sess["verifier"] = verifier
+    sess["client_id"] = client_id
+    sess["client_secret"] = client_secret
+    sess["account_id"] = acc_idx
+
+    redirect_uri = (
+        "urn:ietf:wg:oauth:2.0:oob"
+        if sys.platform != "darwin" and os.getenv("SSH_CONNECTION")
+        else "http://localhost:8085/oauth2callback"
+    )
+    sess["redirect_uri"] = redirect_uri
+    scopes = [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+    ]
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(scopes),
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        "state": sid,
+        "access_type": "offline",
+        "prompt": "consent select_account",
+    }
+    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
+    return {
+        "session_id": sid,
+        "flow": "pkce",
+        "auth_url": auth_url,
+        "expires_in": _OAUTH_SESSION_TTL_SECONDS,
+    }
+
+
+def _submit_gemini_pkce(
+    provider_id: str,
+    session_id: str,
+    code_input: str,
+    profile: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Exchange authorization code for Gemini tokens and persist."""
+    from datetime import datetime, timedelta, timezone
+    import urllib.parse
+    import httpx
+    from hermes_cli.auth import (
+        DEFAULT_GEMINI_OAUTH_TOKEN_URL,
+        DEFAULT_GEMINI_OAUTH_USERINFO_URL,
+        _mark_gemini_oauth_active,
+        _save_gemini_account_tokens,
+    )
+
+    with _oauth_sessions_lock:
+        sess = _oauth_sessions.get(session_id)
+    if not sess or sess["provider"] != provider_id or sess["flow"] != "pkce":
+        raise HTTPException(status_code=404, detail="Unknown or expired session")
+    if sess["status"] != "pending":
+        return {"ok": False, "status": sess["status"], "message": sess.get("error_message")}
+
+    code = code_input.strip()
+    if not code:
+        return {"ok": False, "status": "error", "message": "No code provided"}
+
+    # If the user pasted the entire redirect URL or query string, extract the code param
+    if "code=" in code or code.startswith("http://") or code.startswith("https://"):
+        try:
+            parsed = urllib.parse.urlparse(code)
+            qs = urllib.parse.parse_qs(parsed.query or parsed.path)
+            if "code" in qs and qs["code"]:
+                code = qs["code"][0]
+            elif "?" in code:
+                qs2 = urllib.parse.parse_qs(code.split("?", 1)[1])
+                if "code" in qs2 and qs2["code"]:
+                    code = qs2["code"][0]
+        except Exception:
+            pass
+
+    token_data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": sess["client_id"],
+        "redirect_uri": sess.get("redirect_uri", "urn:ietf:wg:oauth:2.0:oob"),
+        "code_verifier": sess["verifier"],
+    }
+    if sess.get("client_secret"):
+        token_data["client_secret"] = sess["client_secret"]
+
+    try:
+        resp = httpx.post(DEFAULT_GEMINI_OAUTH_TOKEN_URL, data=token_data, timeout=20.0)
+    except Exception as exc:
+        with _oauth_sessions_lock:
+            sess["status"] = "error"
+            sess["error_message"] = f"Token exchange failed: {exc}"
+        return {"ok": False, "status": "error", "message": sess["error_message"]}
+
+    if resp.status_code != 200:
+        with _oauth_sessions_lock:
+            sess["status"] = "error"
+            sess["error_message"] = f"Google token exchange failed (HTTP {resp.status_code}): {resp.text}"
+        return {"ok": False, "status": "error", "message": sess["error_message"]}
+
+    payload = resp.json()
+    access_token = payload.get("access_token", "")
+    refresh_token = payload.get("refresh_token", "")
+    expires_in = int(payload.get("expires_in", 3600))
+    expiry_str = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
+
+    email = ""
+    name = ""
+    try:
+        u_resp = httpx.get(DEFAULT_GEMINI_OAUTH_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=5.0)
+        if u_resp.status_code == 200:
+            u_info = u_resp.json()
+            email = u_info.get("email", "")
+            name = u_info.get("name", "")
+    except Exception:
+        pass
+
+    acc_idx = sess.get("account_id", 1)
+    creds = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expiry": expiry_str,
+        "email": email,
+        "name": name,
+        "account_id": acc_idx,
+        "source": f"hermes_auth:gemini-{acc_idx}",
+    }
+
+    try:
+        with _profile_scope(_oauth_session_profile(session_id, profile)):
+            _save_gemini_account_tokens(acc_idx, creds)
+            _mark_gemini_oauth_active(creds, account=acc_idx)
+    except Exception as e:
+        with _oauth_sessions_lock:
+            sess["status"] = "error"
+            sess["error_message"] = f"Save failed: {e}"
+        return {"ok": False, "status": "error", "message": sess["error_message"]}
+
+    with _oauth_sessions_lock:
+        sess["status"] = "approved"
+    _log.info("oauth/pkce: %s login completed (session=%s)", provider_id, session_id)
+    return {"ok": True, "status": "approved", "email": email}
+
+
 def _oauth_provider_disconnect_command(provider: Dict[str, Any]) -> Optional[str]:
     """Shell command that clears an external provider's credentials, or None.
 
@@ -546,6 +742,8 @@ async def disconnect_oauth_provider(provider_id: str, request: Request, profile:
     def _run():
         catalog_by_id = {p["id"]: p for p in _build_oauth_catalog()}
         provider = catalog_by_id.get(provider_id)
+        if provider is None and (provider_id in {"gemini-oauth", "gemini_oauth"} or re.match(r"^gemini(?:-oauth)?-([1-5])$", provider_id)):
+            provider = {"id": provider_id, "name": f"Google Gemini ({provider_id})", "flow": "pkce"}
         if provider is None:
             raise HTTPException(400, f"Unknown provider: {provider_id}. Available: {', '.join(sorted(catalog_by_id))}")
         # Flow-only rejection first so external providers never reach status resolution.
@@ -594,17 +792,26 @@ def _validate_oauth_profile(profile: Optional[str]) -> str:
 
 
 @router.post("/api/providers/oauth/{provider_id}/start")
-async def start_oauth_login(provider_id: str, request: Request, profile: Optional[str] = None):
+async def start_oauth_login(
+    provider_id: str,
+    request: Request,
+    profile: Optional[str] = None,
+    account: Optional[int] = None,
+):
     """Initiate an OAuth login flow. Token-protected."""
     _require_token(request)
     _gc_oauth_sessions()
     _validate_oauth_profile(profile)
-    catalog_entry = next((p for p in _OAUTH_PROVIDER_CATALOG if p["id"] == provider_id), None)
-    if catalog_entry is None:
+    valid = {p["id"] for p in _OAUTH_PROVIDER_CATALOG}
+    if provider_id not in valid and not (provider_id.startswith("gemini-") or provider_id == "gemini-oauth"):
         raise HTTPException(status_code=400, detail=f"Unknown provider {provider_id}")
+    catalog_entry = next((p for p in _OAUTH_PROVIDER_CATALOG if p["id"] == provider_id), {"id": provider_id, "flow": "pkce"})
     if catalog_entry["flow"] == "external":
         raise HTTPException(400, f"{provider_id} uses an external CLI; run `{catalog_entry['cli_command']}` manually")
     try:
+        if catalog_entry["flow"] == "pkce":
+            if provider_id.startswith("gemini-") or provider_id == "gemini-oauth":
+                return _start_gemini_pkce(provider_id, profile=profile, account=account)
         if catalog_entry["flow"] == "device_code":
             return await _start_device_code_flow(provider_id, profile=profile)
     except HTTPException:
@@ -621,6 +828,10 @@ async def submit_oauth_code(
 ):
     """Submit the auth code for PKCE flows. Token-protected."""
     _require_token(request)
+    if provider_id.startswith("gemini-") or provider_id == "gemini-oauth":
+        return await asyncio.get_running_loop().run_in_executor(
+            None, _submit_gemini_pkce, provider_id, body.session_id, body.code, profile,
+        )
     raise HTTPException(status_code=400, detail=f"submit not supported for {provider_id}")
 
 

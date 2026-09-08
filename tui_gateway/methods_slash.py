@@ -67,8 +67,7 @@ def _format_live_usage_output(sid: str, session: dict, arg: str) -> str:
              ("Total tokens:", n("total")), ("API calls:", n("calls"))]
     if usage.get("context_max"):
         pct = int(usage.get("context_percent") or 0)
-        mark = "~" if usage.get("context_estimated") else ""
-        rows.append(("Current context:", f"{mark}{n('context_used')} / {n('context_max')} ({mark}{pct}%)"))
+        rows.append(("Current context:", f"{n('context_used')} / {n('context_max')} ({pct}%)"))
     rows += [("Messages:", f"{message_count:,}"), ("Compressions:", n("compressions"))]
     model = usage.get("model") or _metadata_mirror(session).get("model") or getattr(agent, "model", "") or "(unknown)"
     lines = ["Session Token Usage", "────────────────────────────────────────", f"Model: {model}"]
@@ -134,14 +133,13 @@ def _format_live_context_output(sid: str, session: dict, arg: str) -> str:
     if model := mirror.get("model") or usage.get("model") or "":
         lines.append(f"Model: {model}")
     lines.append(f"Provider: {mirror.get('provider') or 'auto'}")
-    context_used = int(usage.get("context_used") or 0)
-    mark = "~" if usage.get("context_estimated") else ""
+    context_used = int(usage.get("context_used") or usage.get("total") or 0)
     context_max = int(usage.get("context_max") or 0)
     if context_used and context_max:
         lines.append(
-            f"Context usage: {mark}{context_used:,} / {context_max:,} tokens ({mark}{(context_used / context_max) * 100:.1f}%)")
+            f"Context usage: ~{context_used:,} / {context_max:,} tokens ({(context_used / context_max) * 100:.1f}%)")
     elif context_used:
-        lines.append(f"Context usage: {mark}{context_used:,} tokens")
+        lines.append(f"Context usage: ~{context_used:,} tokens")
     if usage.get("compressions"):
         lines.append(f"Compressions: {int(usage.get('compressions') or 0):,}")
     return "\n".join(lines)
@@ -186,6 +184,19 @@ def _format_live_status_output(sid: str, session: dict, arg: str) -> str:
     return str(response.get("result", {}).get("output") or "")
 
 
+def _format_live_gs_output(sid: str, session: Optional[dict], arg: str) -> str:
+    try:
+        from hermes_cli.auth import handle_gs_command
+        return handle_gs_command(
+            session_id=sid,
+            arg=arg,
+            db=_session_db(session) if session else _get_db(),
+            agent=(session or {}).get("agent"),
+        )
+    except Exception as exc:
+        return f"✗ Failed to switch account: {exc}"
+
+
 # name → (reply when there is no session, formatter(sid, session, arg) or a fixed reply).
 # A None no-session reply means the formatter handles a missing session itself.
 _LIVE_SLASH_OUTPUT = {
@@ -202,7 +213,8 @@ _LIVE_SLASH_OUTPUT = {
     "clear": (None, "Screen clear is terminal-only; desktop/TUI chat left unchanged."),
     "models": (None, "Use /model to view or switch the current model; desktop users can also open the model picker."),
     "rename": (None, "Use /title <name> to rename this session."),
-    "effort": (None, "Use /reasoning <effort> to change reasoning effort.")}
+    "effort": (None, "Use /reasoning <effort> to change reasoning effort."),
+    "gs": (None, _format_live_gs_output)}
 
 
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:

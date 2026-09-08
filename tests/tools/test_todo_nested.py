@@ -165,3 +165,70 @@ class TestToolRoundTrip:
         fresh = TodoStore()
         replayed = fresh.write(out["todos"], merge=False)
         assert replayed[1]["parent"] == "a"
+
+class TestModelMultiTieredInvocation:
+    def test_model_invokes_multi_tiered_goals_and_verifies_summary_aggregation(self):
+        """Simulate model decomposing tasks into goals, sub-goals, and sub-sub-goals.
+        
+        Verifies that multi-level parent-child hierarchy is preserved and summary
+        counters aggregate accurately across all tiers.
+        """
+        store = TodoStore()
+
+        # Tier 1 (Root goals), Tier 2 (Sub-goals), Tier 3 (Sub-sub-goals)
+        model_payload = [
+            {"id": "goal-1", "content": "Architect and investigate trailing ToDo", "status": "in_progress"},
+            {"id": "sub-1-1", "content": "Analyze layout and DOM placement", "status": "completed", "parent": "goal-1"},
+            {"id": "sub-1-1-1", "content": "Audit TranscriptPane virtual rows", "status": "completed", "parent": "sub-1-1"},
+            {"id": "sub-1-2", "content": "Analyze ComposerPane sticky chrome", "status": "in_progress", "parent": "goal-1"},
+            {"id": "goal-2", "content": "Implement UI trailing ToDo", "status": "pending"},
+            {"id": "sub-2-1", "content": "Mount LiveTodoPanel in ComposerPane", "status": "pending", "parent": "goal-2"},
+            {"id": "sub-2-2", "content": "Legacy inline row experiment", "status": "cancelled", "parent": "goal-2"},
+        ]
+
+        # 1. Initial invocation (merge=False)
+        raw_output = todo_tool(todos=model_payload, merge=False, store=store)
+        data = json.loads(raw_output)
+
+        assert len(data["todos"]) == 7
+        by_id = {t["id"]: t for t in data["todos"]}
+
+        # Verify multi-tier hierarchy links
+        assert "parent" not in by_id["goal-1"]
+        assert by_id["sub-1-1"]["parent"] == "goal-1"
+        assert by_id["sub-1-1-1"]["parent"] == "sub-1-1"
+        assert by_id["sub-1-2"]["parent"] == "goal-1"
+        assert "parent" not in by_id["goal-2"]
+        assert by_id["sub-2-1"]["parent"] == "goal-2"
+        assert by_id["sub-2-2"]["parent"] == "goal-2"
+
+        # Verify exact summary aggregation across all tiers
+        summary = data["summary"]
+        assert summary["total"] == 7
+        assert summary["completed"] == 2      # sub-1-1, sub-1-1-1
+        assert summary["in_progress"] == 2    # goal-1, sub-1-2
+        assert summary["pending"] == 2        # goal-2, sub-2-1
+        assert summary["cancelled"] == 1      # sub-2-2
+
+        # 2. Incremental progress update by model (merge=True)
+        update_payload = [
+            {"id": "sub-1-2", "status": "completed"},
+            {"id": "goal-1", "status": "completed"},
+            {"id": "goal-2", "status": "in_progress"},
+            {"id": "sub-2-1", "status": "in_progress"},
+        ]
+        raw_updated = todo_tool(todos=update_payload, merge=True, store=store)
+        updated_data = json.loads(raw_updated)
+
+        updated_summary = updated_data["summary"]
+        assert updated_summary["total"] == 7
+        assert updated_summary["completed"] == 4    # goal-1, sub-1-1, sub-1-1-1, sub-1-2
+        assert updated_summary["in_progress"] == 2  # goal-2, sub-2-1
+        assert updated_summary["pending"] == 0
+        assert updated_summary["cancelled"] == 1    # sub-2-2
+
+        # 3. Read call (todos=None) matches latest aggregated state
+        read_output = json.loads(todo_tool(todos=None, store=store))
+        assert read_output["summary"] == updated_summary
+        assert read_output["revision"] == updated_data["revision"]
+

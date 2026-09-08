@@ -64,40 +64,6 @@ def _valid_credential_pair(api_key: Any, base_url: Any) -> bool:
     return bool(isinstance(api_key, str) and api_key.strip() and isinstance(base_url, str) and base_url.strip())
 
 
-def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb_base_url: str, fb_api_mode: str) -> None:
-    """Install the fallback client(s) in place, honoring request_timeout_seconds (None = SDK default)."""
-    timeout = get_provider_request_timeout(fb_provider, fb_model)
-    # The SDK exposes an empty/stale api_key when a rotating source is installed.
-    key_provider = vars(fb_client).get("_api_key_provider")
-    credential = key_provider if callable(key_provider) else fb_client.api_key
-    if fb_api_mode == "anthropic_messages":
-        from agent.anthropic_adapter import build_anthropic_client
-        from agent.anthropic_credentials import resolve_anthropic_token, _is_oauth_token
-        is_anthropic = fb_provider == "anthropic"
-        effective_key = credential or (resolve_anthropic_token() if is_anthropic else None) or ""
-        agent.api_key = agent._anthropic_api_key = effective_key
-        agent._anthropic_base_url = fb_base_url
-        agent._anthropic_client = build_anthropic_client(effective_key, fb_base_url, timeout=timeout)
-        agent._is_anthropic_oauth = (
-            _is_oauth_token(effective_key)
-            if is_anthropic and isinstance(effective_key, str) else False
-        )
-        agent.client, agent._client_kwargs = None, {}
-        return
-    agent.api_key = credential
-    agent.client = fb_client
-    # Keep provider headers resolve_provider_client() baked into fb_client (SDK: _custom_headers), else
-    # later request-client rebuilds drop them and User-Agent-sentinel providers (Kimi Coding) 403.
-    fb_headers = getattr(fb_client, "_custom_headers", None) or getattr(fb_client, "default_headers", None)
-    agent._client_kwargs = {"api_key": credential, "base_url": fb_base_url}
-    if fb_headers:
-        agent._client_kwargs["default_headers"] = dict(fb_headers)
-    if timeout is not None:
-        agent._client_kwargs["timeout"] = timeout
-        # Rebuild now so the timeout applies to the very next request, not only after a rotation rebuild.
-        agent._replace_primary_openai_client(reason="fallback_timeout_apply")
-
-
 class ClientLifecycleMixin:
     def _close_task_resources(self, task_id: str) -> None:
         """Release task resources without treating a shared environment as process ownership."""
@@ -913,12 +879,46 @@ class ClientLifecycleMixin:
             self._client_kwargs["default_headers"] = merged
 
     def _swap_credential(self, entry) -> None:
+        old_entry_id = getattr(self, "_credential_pool_entry_id", None)
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
         self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(runtime_base)
         stripped_base = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+
+        if getattr(self, "provider", None) in {"gemini-oauth", "gemini_oauth"}:
+            try:
+                from hermes_cli.auth import get_account_alias
+                import json
+                raw_label = getattr(entry, "label", None) or getattr(entry, "id", "")
+                alias = get_account_alias(raw_label)
+                if old_entry_id != self._credential_pool_entry_id:
+                    switch_msg = f"🔄 [Gemini Pool] Active account switched: {alias}"
+                    logger.info("gemini pool: switched active account to %s (%s)", alias, raw_label)
+                    if hasattr(self, "_on_commentary") and callable(self._on_commentary):
+                        try:
+                            self._on_commentary(switch_msg)
+                        except Exception:
+                            pass
+                    elif not getattr(self, "quiet_mode", False):
+                        print(f"\n{switch_msg}")
+                if getattr(self, "_session_db", None) and hasattr(self._session_db, "update_session_meta") and getattr(self, "session_id", None):
+                    try:
+                        sess = self._session_db.get_session(self.session_id)
+                        if sess:
+                            cfg = sess.get("model_config") or {}
+                            if isinstance(cfg, str):
+                                cfg = json.loads(cfg)
+                            if not isinstance(cfg, dict):
+                                cfg = {}
+                            cfg["gemini_account"] = raw_label
+                            self._session_db.update_session_meta(self.session_id, json.dumps(cfg), model=self.model)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         if self.api_mode == "anthropic_messages":
             with suppress(Exception):
                 self._anthropic_client.close()
@@ -930,6 +930,8 @@ class ClientLifecycleMixin:
         self.api_key, self.base_url = runtime_key, stripped_base
         # Inlined (not _sync_client_kwargs_credentials): tests call this unbound on a SimpleNamespace agent.
         self._client_kwargs["api_key"] = self.api_key
+        if "access_token" in self._client_kwargs:
+            self._client_kwargs["access_token"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
         self._replace_primary_openai_client(reason="credential_rotation")

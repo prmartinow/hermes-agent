@@ -127,6 +127,42 @@ def _external_process_cli_command(provider_id: str, default: str) -> str:
     return default
 
 
+def _gemini_oauth_status() -> Dict[str, Any]:
+    """Status for Google Gemini multi-account OAuth pool with DOCI telemetry."""
+    from hermes_cli import auth as hauth
+    try:
+        accounts_data = [hauth.get_gemini_oauth_auth_status(idx) for idx in range(1, 6)]
+        active_count = sum(1 for acc in accounts_data if acc.get("logged_in"))
+        logged_in = active_count > 0
+        first_logged_in = next((acc for acc in accounts_data if acc.get("logged_in")), accounts_data[0] if accounts_data else {})
+        try:
+            doci_rankings = hauth.get_all_gemini_accounts_doci_rankings()
+        except Exception:
+            doci_rankings = []
+        return {
+            "logged_in": logged_in,
+            "source": "gemini-oauth",
+            "source_label": f"Google Gemini OAuth ({active_count}/5 Accounts Active)" if active_count else "Google Gemini OAuth",
+            "token_preview": _truncate_token(first_logged_in.get("api_key") or first_logged_in.get("access_token")),
+            "expires_at": first_logged_in.get("expires_at"),
+            "has_refresh_token": True,
+            "accounts": accounts_data,
+            "doci_rankings": doci_rankings,
+        }
+    except Exception as exc:
+        return {
+            "logged_in": False,
+            "source": "gemini-oauth",
+            "source_label": "Google Gemini OAuth",
+            "token_preview": None,
+            "expires_at": None,
+            "has_refresh_token": False,
+            "error": str(exc),
+            "accounts": [],
+            "doci_rankings": [],
+        }
+
+
 # Hand-tuned OAuth/account cards: the bits not derivable from the unified provider catalog
 # (``flow``, ``status_fn``, ``cli_command``, display order). OVERRIDE BASE for
 # ``_build_oauth_catalog()``, which unions them with every accounts-tab provider so new
@@ -134,6 +170,9 @@ def _external_process_cli_command(provider_id: str, default: str) -> str:
 # the Anthropic credential-status card and the synthetic ``claude-code`` row.
 # ``flow``: ``device_code`` = show code + URL + poll; ``external`` = delegated to a terminal/CLI.
 _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
+    {"id": "gemini-oauth", "name": "Google Gemini (Antigravity OAuth)", "flow": "pkce",
+     "cli_command": "hermes auth add gemini-oauth", "docs_url": "https://antigravity.google",
+     "status_fn": _gemini_oauth_status},
     # status_fn None → dispatched via auth.get_<provider>_auth_status.
     {"id": "nous", "name": "Nous Portal", "flow": "device_code", "cli_command": "hermes auth add nous",
      "docs_url": "https://portal.nousresearch.com", "status_fn": None},

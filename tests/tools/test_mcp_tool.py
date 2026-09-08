@@ -2979,7 +2979,7 @@ class TestMCPDiscoveryCrossProcessLock:
         if sys.platform == "win32":
             import portalocker
 
-            portalocker.lock(fh, portalocker.LOCK_EX | portalocker.LOCK_NB)
+            self._lock_exclusive(fh)
         else:
             import fcntl
 

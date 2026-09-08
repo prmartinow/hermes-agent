@@ -115,7 +115,7 @@ def _admit_prompt_turn(
     return images, agent
 
 
-def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True) -> str:
+def _record_turn_marker(session: dict, text: Any) -> str:
     """Write the durable crash marker; returns the session key it was written under (compression
     can rotate session_key mid-turn).  A surviving marker means the process died mid-turn.
     The key is published before the disk write so an interrupt racing startup can retire
@@ -127,8 +127,7 @@ def _record_turn_marker(session: dict, text: Any, *, auto_continue: bool = True)
     if isinstance(marker_text, str) and marker_text.strip():
         with session["history_lock"]:
             session["_active_turn_marker_key"] = marker_key
-        record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt,
-                          auto_continue=auto_continue)
+        record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         with session["history_lock"]:
             marker_cancelled = bool(session.get("_turn_cancel_requested"))
         if marker_cancelled:
@@ -396,14 +395,22 @@ def _run_post_turn_followups(
             session_key=session.get("session_key", ""),
             owns_event=lambda e: _session_owns_notification_event(sid, session, e),
             skip_poll_observed=False)
-        from tools.process_registry_notifications import format_process_notification
-        deferred = []
-        _notif_handle_ready(
-            sid, session, [event for event, _text in drained],
-            session.setdefault("_notification_emitted", set()), process_registry,
-            format_process_notification, deferred, owned=True)
-        for event in deferred:
-            process_registry.completion_queue.put(event)
+        for index, (_evt, synth) in enumerate(drained):
+            with session["history_lock"]:
+                if session.get("running"):
+                    for pending_evt, _pending_synth in drained[index:]:
+                        process_registry.completion_queue.put(pending_evt)
+                    break
+                session["running"] = True
+            from tools.async_delegation import (
+                claim_event_delivery, complete_event_delivery, release_event_delivery)
+            _claim = claim_event_delivery(_evt, "tui-post-turn")
+            if _claim is None:
+                continue
+            _dispatch_followup_turn(
+                rid, sid, session, synth, "completion notification dispatch",
+                on_done=lambda: complete_event_delivery(_evt, _claim),
+                on_error=lambda: release_event_delivery(_evt, _claim))
     except Exception as _drain_exc:
         _hook_failure("completion queue drain", _drain_exc)
 
@@ -464,6 +471,19 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
         _sync_agent_compression_with_config(sid, session)
     _sync_bot_capabilities(sid, session)  # Bot Chat: adopt Settings->Capabilities edits
     st.agent = agent = session["agent"]
+    # Turn-start account & metadata synchronization: broadcast active
+    # account for this turn and update in-memory cache at turn start.
+    try:
+        turn_info = _session_info(agent, session)
+        _emit("session.info", sid, turn_info)
+        turn_acc = turn_info.get("gemini_account")
+        marker_key = getattr(st, "marker_key", None)
+        if marker_key and turn_acc:
+            from hermes_cli.auth import _RESOLVED_SESSION_ACCOUNTS, _RESOLVED_SESSION_ACCOUNTS_LOCK
+            with _RESOLVED_SESSION_ACCOUNTS_LOCK:
+                _RESOLVED_SESSION_ACCOUNTS[marker_key] = turn_acc
+    except Exception:
+        logger.debug("failed turn-start session.info broadcast", exc_info=True)
     # Snapshot after the model sync: a deferred switch's history mutation belongs to this turn.
     with session["history_lock"]:
         st.history = list(session["history"])
@@ -780,16 +800,11 @@ def _run_prompt_submit(
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
             receipt_committed=terminal_callback is None)
-        st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None)
+        st.marker_key = _record_turn_marker(session, text)
         goal_followup = None
         try:
             prepared = _prepare_turn_input(sid, session, st, text, images)
             if prepared is None:
-                if st.terminal_callback is not None and not st.receipt_attempted:
-                    st.receipt_attempted = True
-                    st.terminal_callback({
-                        "status": "failed", "text": "", "error": "Context injection refused."})
-                    st.receipt_committed = True
                 return
             prompt, run_message, cols, streamer = prepared
             _invoke_agent(

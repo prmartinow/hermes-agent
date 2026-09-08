@@ -401,7 +401,6 @@ import {
   sandboxFallbackFromEnv,
   spawnUpdaterProcess,
   stagedUpdaterSupportsPrewrittenMarker,
-  windowsUpdatePrerequisiteError,
   wrapHandoffForDetachedConsole
 } from './updater-process'
 import {
@@ -4049,16 +4048,6 @@ async function applyUpdates(opts: { stopSafeBlockers?: boolean } = {}) {
     // Emergency backup and header verification before the update touches
     // anything.  Runs while the backend is still alive.
     preflightStateDb(HERMES_HOME, rememberLog)
-
-    if (IS_WINDOWS && resolveUpdateScriptHandoff(updateRoot)) {
-      const message = windowsUpdatePrerequisiteError(updateRoot)
-
-      if (message) {
-        emitUpdateProgress({ stage: 'error', message, percent: null })
-
-        return { ok: false, error: message }
-      }
-    }
 
     // Stop our own backend(s) and wait for the venv shim to unlock BEFORE we
     // spawn the updater. Without this the updater races a still-locked
@@ -8158,7 +8147,6 @@ interface GatewayFileSaveContext {
 }
 
 interface GatewayFileSavePayload {
-  sessionId?: string
   connectionId?: unknown
   path?: unknown
   profile?: unknown
@@ -8199,10 +8187,8 @@ async function saveGatewayFile(payload: GatewayFileSavePayload = {}) {
   const fallbackName = path.basename(filePath) || suggested || 'download'
   const ctx = { suggested, fallbackName }
 
-  const requestPaths = gatewayFileRequestPaths(
-    filePath,
-    requestPath => gatewayFileRequestPath(connection, connectionId, profile, requestPath),
-    payload.sessionId
+  const requestPaths = gatewayFileRequestPaths(filePath, requestPath =>
+    gatewayFileRequestPath(connection, connectionId, profile, requestPath)
   )
 
   const url = `${connection.baseUrl}${requestPaths.download}`

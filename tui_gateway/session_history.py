@@ -207,7 +207,34 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             name = tc_name or m.get("tool_name") or "tool"
             args = tc_args or {}
             # `context` is an 80-char preview; ship args so a full-call renderer isn't truncated.
-            messages.append({"role": "tool", "name": name, "context": _tool_ctx(name, args), **({"args": args} if args else {})})
+            tool_msg = {"role": "tool", "name": name, "context": _tool_ctx(name, args), **({"args": args} if args else {})}
+            if name in ("todo_list", "todo"):
+                if content_text and '"todos"' in content_text:
+                    try:
+                        parsed = json.loads(content_text)
+                        if isinstance(parsed, dict) and "todos" in parsed and isinstance(parsed["todos"], list):
+                            tool_msg["todos"] = parsed["todos"]
+                    except Exception:
+                        pass
+                if "todos" not in tool_msg and isinstance(args.get("todos"), list):
+                    tool_msg["todos"] = args["todos"]
+            messages.append(tool_msg)
+            if content_text:
+                from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
+                if STEER_MARKER_OPEN in content_text:
+                    remaining = content_text
+                    while STEER_MARKER_OPEN in remaining:
+                        _, after_open = remaining.split(STEER_MARKER_OPEN, 1)
+                        if STEER_MARKER_CLOSE not in after_open:
+                            break
+                        steer_body, remaining = after_open.split(STEER_MARKER_CLOSE, 1)
+                        steer_text = steer_body.strip()
+                        if steer_text:
+                            steer_msg = {"role": "user", "text": steer_text}
+                            ts = m.get("timestamp")
+                            if isinstance(ts, (int, float)) and ts > 0:
+                                steer_msg["timestamp"] = float(ts)
+                            messages.append(steer_msg)
             continue
         # Assistant detail sidecars can carry the only visible reply or reasoning after resume/reload.
         has_assistant_detail = role == "assistant" and any(m.get(key) for key in _HISTORY_ASSISTANT_DETAIL_KEYS)

@@ -34,8 +34,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: 
 from tui_gateway import git_probe
 from tui_gateway._env import env_float, env_int
 from tui_gateway.turn_marker import clear_turn_marker, read_turn_marker, record_turn_start  # noqa: F401
-from tui_gateway.transport import (FanoutTransport, StdioTransport, Transport, bind_transport,
-                                   current_transport, reset_transport)
+from tui_gateway.transport import (StdioTransport, Transport, bind_transport, current_transport, reset_transport)
 
 logger = logging.getLogger(__name__)
 
@@ -461,12 +460,13 @@ def _profile_home(profile: str | None) -> Path | None:
     """Resolve a named profile's home on THIS host, or None for the launch profile."""
     if not (name := (profile or "").strip()):
         return None
-    from hermes_cli import profiles as profiles_mod
-    home = Path(profiles_mod.get_profile_dir(name))
-    if not home.is_dir():
-        raise FileNotFoundError(f"Profile '{name}' does not exist.")
-    if home.resolve() == Path(_hermes_home).resolve():
-        return None  # already the launch profile (no override needed)
+    try:
+        from hermes_cli import profiles as profiles_mod
+        home = Path(profiles_mod.get_profile_dir(name))
+    except Exception:
+        return None
+    if home.resolve() == Path(_hermes_home).resolve() or not home.exists():
+        return None  # already the launch profile (no override needed), or no such profile
     _served_profile_homes.add(home)  # the change watcher must stat every served sibling store too
     return home
 
@@ -741,20 +741,16 @@ def handle_request(req: dict) -> dict | None:
 
 def _current_session_steer_authority(session_id: str) -> tuple[Transport | None, dict | None]:
     """Unforgeable steering authority for this RPC context: the public session id is only a lookup
-    hint; authority requires the ContextVar-bound transport to be ATTACHED to the live in-memory record
-    under that id, so transport detachment, session removal or id reuse invalidates an earlier generation."""
+    hint; authority is the identity of BOTH the ContextVar-bound transport and the live in-memory
+    record under that id, so transport rebinding, removal or id reuse invalidates an earlier generation."""
     transport = current_transport()
     if transport is None or not session_id:
         return None, None
     expected_session = _current_runtime_session_record.get()
     with _sessions_lock:
         session = _sessions.get(session_id)
-        # Membership, not slot identity: a mirrored session stores a FanoutTransport in the slot, so slot
-        # identity alone would reject every client, the peer that commissioned the subagent included.
-        # Authority is membership in the slot, which also grants it to any client attached to mirror the
-        # session (see tests/tui_gateway/test_multi_client_fanout.py).
         if (session is None or (expected_session is not None and session is not expected_session)
-                or not _session_transport_contains(session, transport)):
+                or session.get("transport") is not transport):
             return None, None
         return transport, session
 
@@ -1906,8 +1902,25 @@ def _get_usage(agent) -> dict:
     }
     comp = getattr(agent, "context_compressor", None)
     if comp:
-        from agent.context_breakdown import context_usage_fields
-        usage.update(context_usage_fields(comp))
+        # context_used is *current-window* occupancy — never usage["total"] (cumulative: an external engine
+        # showed 1.9m/120k clamped to 100%). Falsy last_prompt_tokens emits NO gauge; the -1 "compression
+        # just ran" sentinel clamps to 0 (matches cli.py _get_status_bar_snapshot).
+        # Do NOT fall back to usage["total"] (cumulative lifetime session_total_tokens): for an external
+        # context engine that doesn't report last_prompt_tokens that substitution showed lifetime totals as
+        # the live context fill, yielding impossible readings such as 1.9m/120k clamped to 100% (#50421).
+        # Per the issue, populate context_used/percent only from a *real* current-occupancy value and "leave
+        # it unknown otherwise" — so a falsy last_prompt_tokens (0 or missing, i.e. an engine that doesn't
+        # track per-window occupancy) intentionally emits no gauge rather than a fabricated 0% or the old
+        # cumulative reading. The built-in compressor always reports a real last_prompt_tokens once a turn
+        # runs, so it is unaffected. Clamp the -1 "compression just ran, awaiting real usage" sentinel
+        # (conversation_compression.py) to 0 so the transitional turn reads as unknown (no gauge) instead of
+        # leaking context_used=-1.
+        last_prompt = max(0, getattr(comp, "last_prompt_tokens", 0) or 0)
+        ctx_max = getattr(comp, "context_length", 0) or 0
+        if ctx_max and last_prompt:
+            usage.update(
+                context_used=last_prompt, context_max=ctx_max,
+                context_percent=max(0, min(100, round(last_prompt / ctx_max * 100))))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     # Cache-hit ratio + rolling latency/tps (CLI status-bar parity). Omitted, not fabricated, when there is no
     # data (Codex reports no latency; zero cache reads shows no hit% rather than an alarming 0).
@@ -2092,6 +2105,54 @@ def _session_info(agent, session: dict | None = None) -> dict:
         info["update_command"] = recommended_update_command()
     if live_agent and (warn := _probe_credentials(agent)):
         info["credential_warning"] = warn
+    model_str = str(info.get("model") or getattr(agent, "model", "") or mirror.get("model", "")).lower()
+    provider_str = str(info.get("provider") or getattr(agent, "provider", "") or mirror.get("provider", "")).lower()
+    if "gemini" in model_str or "gemini" in provider_str:
+        gemini_acc = None
+        # 1. Active agent credential pool entry IF explicitly bound
+        entry_id = getattr(agent, "_credential_pool_entry_id", None)
+        if entry_id:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import get_account_alias
+                pool = getattr(agent, "_credential_pool", None)
+                _all = pool.entries() if hasattr(pool, "entries") else getattr(pool, "_entries", [])
+                curr = next((e for e in _all if getattr(e, "id", None) == entry_id), None)
+                raw_lbl = (curr.label or curr.id) if curr else entry_id
+                if raw_lbl:
+                    gemini_acc = get_account_alias(raw_lbl)
+
+        # 2. Session model_config / mirror (saved session state takes precedence over unbound pool cursor)
+        if not gemini_acc:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import get_account_alias
+                cfg = sess.get("model_config") or mirror.get("model_config") or {}
+                if isinstance(cfg, str):
+                    import json
+                    cfg = json.loads(cfg)
+                if isinstance(cfg, dict) and cfg.get("gemini_account"):
+                    gemini_acc = get_account_alias(cfg["gemini_account"])
+
+        # 3. Fallback to pool current/peek only when session has no saved account
+        if not gemini_acc:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import get_account_alias
+                pool = getattr(agent, "_credential_pool", None)
+                if pool:
+                    curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
+                    raw_lbl = (curr.label or curr.id) if curr else None
+                    if raw_lbl:
+                        gemini_acc = get_account_alias(raw_lbl)
+
+        # 3. Fallback to state.db / last-used resolver
+        if not gemini_acc and session_key:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import resolve_session_last_used_account, get_account_alias
+                raw_acc = resolve_session_last_used_account(session_key, db=_get_db())
+                if raw_acc:
+                    gemini_acc = get_account_alias(raw_acc)
+
+        if gemini_acc:
+            info["gemini_account"] = gemini_acc
     return info
 
 
@@ -3103,7 +3164,7 @@ _TUI_EXTRA: list[tuple[str, str, str]] = [
 # Commands that queue onto _pending_input in the CLI; the slash worker has no reader for that queue, so
 # slash.exec routes them to command.dispatch instead.
 _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset({
-    "retry", "queue", "q", "steer", "plan", "goal", "loop", "proactive", "moa", "undo", "learn",
+    "retry", "queue", "q", "steer", "plan", "goal", "loop", "proactive", "moa", "undo", "redo", "learn",
     "init", "compress", "compact",
 })
 
@@ -3193,7 +3254,6 @@ from . import (  # noqa: E402
     session_compression as _session_compression, model_switch as _model_switch,
     compute_host_bridge as _compute_host_bridge, session_workdir as _session_workdir,
     session_lifecycle as _session_lifecycle, session_reaper as _session_reaper,
-    session_transports as _session_transports,
     methods_browser_control as _methods_browser_control, methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete, methods_config as _methods_config,
     methods_config_set as _methods_config_set, methods_images as _methods_images,
@@ -3203,7 +3263,7 @@ from . import (  # noqa: E402
     methods_session_control as _methods_session_control)
 
 for _m in (
-    _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
+    _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
     _session_compression, _change_watcher, _tool_progress, _session_notifications,
     _prompt_attachments, _session_history, _agent_callbacks, _session_auto_continue,
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,

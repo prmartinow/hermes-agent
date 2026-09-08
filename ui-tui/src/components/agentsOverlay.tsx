@@ -119,7 +119,7 @@ const displayElapsedSeconds = (item: SubagentProgress, nowMs: number): number | 
 }
 
 const indentFor = (depth: number): string => '  '.repeat(Math.max(0, depth))
-const formatRowId = (n: number): string => String(n + 1).padStart(2, ' ')
+const formatRowId = (n: number, digits: number = 2): string => String(n + 1).padStart(digits, ' ')
 const cycle = <T,>(order: readonly T[], current: T): T => order[(order.indexOf(current) + 1) % order.length]!
 
 const statusGlyph = (item: SubagentProgress, t: Theme) => {
@@ -178,10 +178,9 @@ function GanttStrip({
   const totalSpan = Math.max(1, globalEnd - globalStart)
   const totalSeconds = (globalEnd - globalStart) / 1000
 
-  // 5-col id gutter ("  12  ") so the bar doesn't press against the id.
-  // 10-col right reserve: pad + up to `12m 30s`-style label without
-  // truncate-end against a full-width bar.
-  const idGutter = 5
+  // Dynamic ID gutter sizing so bars align with ruler ticks for any span count.
+  const maxIdDigits = Math.max(2, String(spans.length).length)
+  const idGutter = maxIdDigits + 3
   const labelReserve = 10
   const barWidth = Math.max(10, cols - idGutter - labelReserve)
   const startIdx = Math.max(0, Math.min(Math.max(0, spans.length - maxRows), cursor - Math.floor(maxRows / 2)))
@@ -245,7 +244,7 @@ function GanttStrip({
         return (
           <Text key={node.item.id} wrap="truncate-end">
             <Text bold={active} color={accent}>
-              {formatRowId(idx)}
+              {formatRowId(idx, maxIdDigits)}
               {'  '}
             </Text>
 
@@ -262,13 +261,13 @@ function GanttStrip({
       })}
 
       <Text color={t.color.muted} dim>
-        {'    '}
+        {' '.repeat(maxIdDigits + 2)}
         {ruler}
       </Text>
 
       {totalSeconds > 0 ? (
         <Text color={t.color.muted} dim>
-          {'    '}
+          {' '.repeat(maxIdDigits + 2)}
           {rulerLabels}
         </Text>
       ) : null}
@@ -458,13 +457,22 @@ function ListRow({
   const heatIdx = hotnessBucket(node.aggregate.hotness, peak, palette.length)
   const heatMarker = heatIdx >= 2 ? palette[heatIdx]! : null
 
-  const goal = compactPreview(node.item.goal || 'subagent', width - 28 - node.item.depth * 2)
   const toolsCount = node.aggregate.totalTools > 0 ? ` ·${node.aggregate.totalTools}t` : ''
   const kids = node.children.length ? ` ·${node.children.length}↓` : ''
   const line = node.item.status === 'running' ? node.item.tools.at(-1) : undefined
   const paren = line ? line.indexOf('(') : -1
   const toolShort = line ? (paren > 0 ? line.slice(0, paren) : line).trim() : ''
   const trailing = toolShort ? ` · ${compactPreview(toolShort, 14)}` : ''
+
+  const idWidth = 4
+  const glyphWidth = 2
+  const heatWidth = heatMarker ? 1 : 0
+  const badgesWidth = toolsCount.length + kids.length + trailing.length
+  const maxGoalWidth = Math.max(
+    10,
+    width - idWidth - glyphWidth - heatWidth - badgesWidth - node.item.depth * 2 - 2
+  )
+  const goal = compactPreview(node.item.goal || 'subagent', maxGoalWidth)
   // Selection chip, not `inverse` — inverse swaps against the terminal's
   // unknowable defaults (black slab on transparent profiles).
   const row = listRowStyle(t, active)
@@ -621,13 +629,9 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
 
   // ── Derived state ──────────────────────────────────────────────────
 
-  const activeSnapshot = historyIndex > 0 ? history[historyIndex - 1] : null
-  // Instant fallback to history[0] the moment the live list clears — avoids
-  // a one-frame "no subagents" flash while the auto-follow effect fires.
-  const justFinishedSnapshot = historyIndex === 0 && liveSubagents.length === 0 ? (history[0] ?? null) : null
-  const effectiveSnapshot = activeSnapshot ?? justFinishedSnapshot
-  const replayMode = effectiveSnapshot != null
-  const subagents = replayMode ? effectiveSnapshot.subagents : liveSubagents
+  const replayMode = historyIndex > 0 && history.length > 0
+  const activeSnapshot = replayMode ? (history[historyIndex - 1] ?? null) : null
+  const subagents = activeSnapshot ? activeSnapshot.subagents : liveSubagents
 
   const tree = useMemo(() => buildSubagentTree(subagents), [subagents])
   const totals = useMemo(() => treeTotals(tree), [tree])
@@ -639,8 +643,15 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
   const selected = rows[cursor] ?? null
 
   const cols = stdout?.columns ?? 80
-  const rowsH = Math.max(8, (stdout?.rows ?? 24) - 10)
-  const listWindowStart = Math.max(0, cursor - Math.floor(rowsH / 2))
+  const effectiveCols = Math.max(20, cols - 2)
+  const hasGantt = rows.length > 0
+  const ganttRows = hasGantt ? Math.min(6, rows.length) + 4 : 0
+  const fixedOverhead = 2 /* paddingY */ + 2 /* header */ + ganttRows + 3 /* footer */
+  const rowsH = Math.max(3, (stdout?.rows ?? 24) - fixedOverhead)
+  const listWindowStart = Math.max(
+    0,
+    Math.min(Math.max(0, rows.length - rowsH), cursor - Math.floor(rowsH / 2))
+  )
 
   // ── Effects ────────────────────────────────────────────────────────
 
@@ -875,9 +886,9 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
     : ''
 
   const title =
-    replayMode && effectiveSnapshot
-      ? `${historyIndex > 0 ? `Replay ${historyIndex}/${history.length}` : 'Last turn'} · finished ${new Date(
-          effectiveSnapshot.finishedAt
+    replayMode && activeSnapshot
+      ? `Replay ${historyIndex}/${history.length} · finished ${new Date(
+          activeSnapshot.finishedAt
         ).toLocaleTimeString()}`
       : `Spawn tree${delegation.paused ? ' · ⏸ paused' : ''}`
 
@@ -915,7 +926,14 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
         </Box>
       ) : mode === 'list' ? (
         <Box flexDirection="column" flexGrow={1} flexShrink={1} minHeight={0}>
-          <GanttStrip cols={cols} cursor={cursor} flatNodes={rows} maxRows={6} now={now} t={t} />
+          <GanttStrip
+            cols={effectiveCols}
+            cursor={cursor}
+            flatNodes={rows}
+            maxRows={6}
+            now={activeSnapshot ? activeSnapshot.finishedAt : now}
+            t={t}
+          />
 
           <Box flexDirection="column" flexGrow={0} flexShrink={0} overflow="hidden">
             {rows.slice(listWindowStart, listWindowStart + rowsH).map((node, i) => (
@@ -926,7 +944,7 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
                 node={node}
                 peak={peak}
                 t={t}
-                width={cols}
+                width={effectiveCols}
               />
             ))}
           </Box>
@@ -935,7 +953,15 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
         <Box flexDirection="row" flexGrow={1} flexShrink={1} minHeight={0}>
           <ScrollBox flexDirection="column" flexGrow={1} flexShrink={1} ref={detailScrollRef}>
             <Box flexDirection="column" paddingBottom={4} paddingRight={1}>
-              {selected ? <Detail id={formatRowId(cursor).trim()} node={selected} t={t} /> : null}
+              {selected ? (
+                <Detail id={formatRowId(cursor).trim()} node={selected} t={t} />
+              ) : (
+                <Box flexDirection="column" paddingY={2}>
+                  <Text color={t.color.muted}>
+                    No subagent selected matching current filter. Press Esc or h to return to list.
+                  </Text>
+                </Box>
+              )}
             </Box>
           </ScrollBox>
 

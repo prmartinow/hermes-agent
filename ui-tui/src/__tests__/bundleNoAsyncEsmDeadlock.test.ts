@@ -97,6 +97,8 @@ describe('TUI bundle (issue #31227)', () => {
   it('has the @hermes/ink entry-exports module compiled to sync init', () => {
     // Sanity check that the alias swap to packages/hermes-ink/src/entry-exports.ts
     // is still active and producing the expected synchronous init shape.
-    expect(bundleSrc).toMatch(/var init_entry_exports = __esm\(\{\s*"packages\/hermes-ink\/src\/entry-exports\.ts"\(\)/)
+    expect(bundleSrc).toMatch(
+      /var init_entry_exports\s*=\s*__esm\(\{\s*"packages\/hermes-ink\/src\/entry-exports\.ts"\(\)/
+    )
   })
 })

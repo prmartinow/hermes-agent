@@ -150,6 +150,10 @@ def _rewind_or_err(rid, session, keep: int, value_err: tuple, fail_prefix: str, 
         return None, _err(rid, 5008, f"{fail_prefix}{exc}")
 
 
+def _clip(text: str, n: int = 120) -> str:
+    return text[:n] + ("…" if len(text) > n else "")
+
+
 def _exec_out(rid, output: str) -> dict:
     """command.dispatch display-only result."""
     return _ok(rid, {"type": "exec", "output": output})
@@ -372,7 +376,7 @@ def _catalog_quick_commands(cat: _Catalog) -> None:
         qtype = qc.get("type", "")
         default_desc = {"exec": f"exec: {qc.get('command', '')}", "alias": f"alias → {qc.get('target', '')}"}
         desc = str(qc.get("description") or default_desc.get(qtype, qtype or "quick command"))
-        cat.add(f"/{qname}", desc, "User commands")
+        cat.add(f"/{qname}", _clip(desc), "User commands")
 
 
 def _catalog_plugin_commands(cat: _Catalog) -> None:
@@ -383,7 +387,7 @@ def _catalog_plugin_commands(cat: _Catalog) -> None:
         key = f"/{pname}"
         if not isinstance(info, dict) or key.lower() in cat.canon:
             continue
-        cat.add(key, str(info.get("description") or "Plugin command"), "Plugin commands")
+        cat.add(key, _clip(str(info.get("description") or "Plugin command")), "Plugin commands")
         mode = info.get("argument_mode")
         if mode not in {"options", "text", "mixed"}:
             mode = "text" if str(info.get("args_hint") or "").strip() else None
@@ -394,7 +398,7 @@ def _catalog_skills(cat: _Catalog, skills: dict[str, dict]) -> None:
     """Append skill pairs and fill ``skills`` = ``{key: {usage, origin}}`` (every consumer ranks by them)."""
     usage, origin_of = _skill_usage_lookup()
     for k, info in sorted(_tools_mod("agent.skill_commands").scan_skill_commands().items()):
-        cat.pairs.append([k, str(info.get("description", "Skill"))])
+        cat.pairs.append([k, _clip(str(info.get("description", "Skill")))])
         name = str(info.get("name") or k.lstrip("/"))
         skills[k] = {"usage": usage(name), "origin": origin_of(name)}
 
@@ -662,6 +666,12 @@ def _cmd_steer(rid, params, session, name, arg):
     if agent and hasattr(agent, "steer"):
         with contextlib.suppress(Exception):
             if agent.steer(arg):
+                from tui_gateway.server import _emit
+                sid = str((params or {}).get("session_id") or (session or {}).get("session_key") or "")
+                _emit("turn.steer", sid, {"text": arg, "timestamp": time.time()})
+                writer = getattr(agent, "_live_stream_writer", None)
+                if writer and hasattr(writer, "steer"):
+                    writer.steer(arg)
                 shown = f"{arg[:80]}{'...' if len(arg) > 80 else ''}"
                 return _exec_out(rid, f"⏩ Steer queued — arrives after the next tool call: {shown}")
     return _ok(rid, {"type": "send", "message": arg})  # no active run: next-turn message
@@ -751,6 +761,74 @@ def _cmd_undo(rid, params, session, name, arg):
     return _ok(rid, {"type": "prefill", "message": target_text, "notice": notice})
 
 
+def _cmd_redo(rid, params, session, name, arg):
+    if not session:
+        return _err(rid, 4001, "no active session to redo")
+    if busy := _busy_error(rid, session, "redo"):
+        return busy
+    if not (session_key := session.get("session_key", "")):
+        return _err(rid, 4001, "no session key for redo")
+    arg_str = (arg or "").strip()
+    try:
+        n = max(int(arg_str.split()[0]), 1) if arg_str else 1
+    except (ValueError, IndexError):
+        return _err(rid, 4004, f"redo: invalid count {arg_str!r} — use /redo or /redo N")
+
+    with session["history_lock"]:
+        if busy := _busy_error(rid, session, "redo"):
+            return busy
+        with _session_db(session) as db:
+            if db is None:
+                return _err(rid, 5000, "session database unavailable")
+            try:
+                result = db.redo_turn(session_key, n)
+            except Exception as exc:
+                return _err(rid, 5008, f"redo: {exc}")
+
+        restored_turns = result.get("restored_turns", 0)
+        restored_messages = result.get("messages", [])
+        if restored_turns == 0 or not restored_messages:
+            return _ok(rid, {"type": "notice", "notice": "Nothing to redo."})
+
+        current_history = session.get("history", [])
+        current_history.extend(restored_messages)
+        session["history"] = current_history
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+        agent = session.get("agent")
+        if agent is not None:
+            agent._session_messages = current_history
+            if hasattr(agent, "_last_flushed_db_idx"):
+                with contextlib.suppress(Exception):
+                    agent._last_flushed_db_idx = len(current_history)
+            if hasattr(agent, "_db_flush_scan_prefix"):
+                with contextlib.suppress(Exception):
+                    agent._db_flush_scan_prefix = list(current_history)
+            if hasattr(agent, "_invalidate_system_prompt"):
+                with contextlib.suppress(Exception):
+                    agent._invalidate_system_prompt()
+            mm = getattr(agent, "_memory_manager", None)
+            if mm is not None:
+                with contextlib.suppress(Exception):
+                    mm.on_session_switch(
+                        session_key,
+                        parent_session_id="",
+                        reset=False,
+                        rewound=False,
+                    )
+
+    turn_word = "turn" if restored_turns == 1 else "turns"
+    notice = f"↷ Redid {restored_turns} {turn_word} ({len(restored_messages)} message(s))."
+    return _ok(
+        rid,
+        {
+            "type": "notice",
+            "notice": notice,
+            "restored_turns": restored_turns,
+            "restored_count": len(restored_messages),
+        },
+    )
+
+
 def _is_snapshot_restore(arg: str) -> bool:
     return (arg.split(maxsplit=1)[0].lower() if arg else "") in {"restore", "rewind"}
 
@@ -785,11 +863,25 @@ def _cmd_compress(rid, params, session, name, arg):
         return _err(rid, 5009, f"compress failed: {exc}")
 
 
+def _cmd_gs(rid, params, session, name, arg):
+    try:
+        from hermes_cli.auth import handle_gs_command
+        output = handle_gs_command(
+            session_id=params.get("session_id", ""),
+            arg=arg,
+            db=_get_db(),
+            agent=(session or {}).get("agent"),
+        )
+        return _ok(rid, {"type": "exec", "output": output})
+    except Exception as exc:
+        return _err(rid, 4018, f"gs failed: {exc}")
+
+
 _SLASH_BUILTINS = {
     "queue": _cmd_queue, "q": _cmd_queue, "learn": _cmd_learn, "plan": _cmd_plan, "init": _cmd_init,
     "moa": _cmd_moa, "focus": _cmd_focus, "retry": _cmd_retry, "steer": _cmd_steer, "goal": _cmd_goal,
-    "loop": _cmd_loop, "undo": _cmd_undo, "snapshot": _cmd_snapshot, "snap": _cmd_snapshot,
-    "compress": _cmd_compress, "compact": _cmd_compress}
+    "loop": _cmd_loop, "undo": _cmd_undo, "redo": _cmd_redo, "snapshot": _cmd_snapshot, "snap": _cmd_snapshot,
+    "compress": _cmd_compress, "compact": _cmd_compress, "gs": _cmd_gs}
 
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
@@ -980,23 +1072,6 @@ def _(rid, params: dict) -> dict:
 
 @_rpc("tools.configure", 5035)
 def _(rid, params: dict) -> dict:
-    sid = params.get("session_id", "")
-    session = None
-    if sid:
-        session, err = _sess_nowait(params, rid)
-        if err:
-            return err
-    # The client sends session_id, not profile; the live session is authoritative.
-    home = (session or {}).get("profile_home")
-    scopes = _bind_build_profile_scopes(home) if home else None
-    try:
-        return _configure_session_tools(rid, params, sid, session)
-    finally:
-        if scopes is not None:
-            _release_build_profile_scopes(scopes)
-
-
-def _configure_session_tools(rid, params: dict, sid: str, session) -> dict:
     action = str(params.get("action", "") or "").strip().lower()
     targets = [str(name).strip() for name in params.get("names", []) or [] if str(name).strip()]
     if action not in {"disable", "enable"}:
@@ -1013,6 +1088,8 @@ def _configure_session_tools(rid, params: dict, sid: str, session) -> dict:
         tc._apply_toolset_change(cfg, "cli", toolset_targets, action)
     missing_servers = tc._apply_mcp_change(cfg, mcp_targets, action) if mcp_targets else set()
     hc.save_config(cfg)
+    sid = params.get("session_id", "")
+    session = _sessions.get(sid)
     info = _reset_session_agent(sid, session) if session else None
     enabled = sorted(tc._get_platform_tools(hc.load_config(), "cli", include_default_mcp_servers=False))
     changed = [
@@ -1306,14 +1383,6 @@ def _(rid, params: dict) -> dict:
     """Poll a flow → ``{ok, status: pending|approved|error, ...}``; ``approved`` persists tokens per profile."""
     poll = _tools_mod("tui_gateway.mcp_oauth_sessions").poll_flow
     return _ok(rid, {"ok": True, **poll(_str_arg(params, "session_id"), _str_arg(params, "name"))})
-
-
-@_mcp_rpc("oauth.cancel", _NAME_SESSION)
-def _(rid, params: dict) -> dict:
-    """Cancel a flow owned by the resolved profile, waking its callback worker."""
-    home = str(_tools_mod("hermes_constants").get_hermes_home().expanduser().resolve(strict=False))
-    cancel = _tools_mod("tui_gateway.mcp_oauth_sessions").cancel_flow
-    return _ok(rid, cancel(_str_arg(params, "session_id"), _str_arg(params, "name"), home))
 
 
 @_mcp_rpc("oauth.callback", _NAME_SESSION)

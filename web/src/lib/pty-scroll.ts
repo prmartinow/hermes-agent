@@ -45,8 +45,9 @@ export function isViewportPinnedToBottom(
 export function shouldFollowPtyOutput(
 	resumeParam: string | null,
 	stickToBottom: boolean,
+	isReplaying = true,
 ): boolean {
-	return Boolean(resumeParam) && stickToBottom;
+	return Boolean(resumeParam) && stickToBottom && isReplaying;
 }
 
 /**

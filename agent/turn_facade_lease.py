@@ -16,8 +16,26 @@ from typing import Any, Dict, List, Optional
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
 
-LEASE_TTL_SECONDS = 300.0
+LEASE_TTL_SECONDS = 45.0
 LEASE_WAIT_SECONDS = 1800.0
+
+_PENDING_LEASE_CLEANUP: set[tuple[str, str]] = set()
+_PENDING_LEASE_CLEANUP_LOCK = threading.Lock()
+
+
+def _drain_pending_lease_cleanups(db: Any) -> None:
+    """Best-effort reclaim of turn leases stranded by transient DB lock contention."""
+    if not _PENDING_LEASE_CLEANUP or not callable(getattr(db, "release_session_turn_lease", None)):
+        return
+    with _PENDING_LEASE_CLEANUP_LOCK:
+        items = list(_PENDING_LEASE_CLEANUP)
+    for sid, h in items:
+        try:
+            db.release_session_turn_lease(sid, h)
+            with _PENDING_LEASE_CLEANUP_LOCK:
+                _PENDING_LEASE_CLEANUP.discard((sid, h))
+        except Exception:
+            pass
 
 
 class DurableTurnLease:
@@ -34,7 +52,7 @@ class DurableTurnLease:
         self.session_id = session_id  # id at admission; release always targets this row
         self.holder = holder
         self.stop = threading.Event()
-        self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
+        self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 15.0))
         self._lock = threading.Lock()
         self.turn_active = False
         self.interrupt_message: Optional[str] = None
@@ -100,6 +118,8 @@ class DurableTurnLease:
             self.db.release_session_turn_lease(self.session_id, self.holder)
         except Exception:
             logger.error("Failed to release session turn lease: %s", self.session_id, exc_info=True)
+            with _PENDING_LEASE_CLEANUP_LOCK:
+                _PENDING_LEASE_CLEANUP.add((self.session_id, self.holder))
         if getattr(agent, "_active_session_turn_lease_holder", None) == self.holder:
             agent._active_session_turn_lease_holder = None
             agent._active_session_turn_lease_ttl_seconds = None
@@ -253,9 +273,11 @@ def admit_durable_turn_lease(
         return admission
     # Row proven to exist — suppress the redundant create attempt.
     agent._session_db_created = True
+    _drain_pending_lease_cleanups(db)
     holder = (
         f"pid={os.getpid()}:turn={relay_turn_id}:platform={task_context['platform'] or 'unknown'}"
     )
+    _lease_ttl = float(getattr(agent, "_session_turn_lease_ttl_seconds", LEASE_TTL_SECONDS) or LEASE_TTL_SECONDS)
     waited = False
 
     def _on_wait(elapsed: float) -> None:
@@ -269,7 +291,7 @@ def admit_durable_turn_lease(
         )
 
     if not db.acquire_session_turn_lease(
-        session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
+        session_id, holder, ttl_seconds=_lease_ttl, wait_seconds=LEASE_WAIT_SECONDS,
         on_wait=_on_wait, should_abort=lambda: getattr(agent, "_interrupt_requested", False),
     ):
         admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
@@ -279,7 +301,7 @@ def admit_durable_turn_lease(
     # row; persist paths read the agent attr so a late flush is fenced in the same transaction.
     lease = DurableTurnLease(agent, db, session_id, holder)
     agent._active_session_turn_lease_holder = holder
-    agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
+    agent._active_session_turn_lease_ttl_seconds = _lease_ttl
     try:
         if waited:
             agent._emit_status("Session is free; loading the latest transcript...")

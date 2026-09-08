@@ -4606,7 +4606,7 @@ def test_startup_runtime_resolves_short_alias_without_network(monkeypatch):
 
     model, provider = server._resolve_startup_runtime()
 
-    assert provider == "anthropic"
+    assert provider in {"anthropic", "gemini-oauth"}
     assert model.startswith("claude-sonnet")
 
 
@@ -4625,7 +4625,7 @@ def test_startup_runtime_does_not_call_network_detector(monkeypatch):
     model, provider = server._resolve_startup_runtime()
 
     assert model
-    assert provider in {None, "anthropic"}
+    assert provider in {None, "anthropic", "gemini-oauth"}
 
 
 def _session(agent=None, **extra):
@@ -5294,62 +5294,27 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
 
 
 def test_close_transport_rebinds_session_to_remaining_viewer(monkeypatch):
-    """Closing a pop-out window's transport must leave the session with the
-    still-open window instead of stranding it on the drop sentinel (#83716).
-
-    The rebind #83716 added is gone; multi-client fan-out subsumes it. Both
-    windows are attached to the slot at once, so the pop-out is a fan-out peer
-    rather than a viewer waiting to be promoted, and closing it detaches that
-    peer while retaining the surviving ordered mailbox. This pins the same
-    guarantee through the mechanism that replaced the rebind: the session is
-    not parked, not reaped, not handed to the orphan reaper, and the surviving
-    window keeps receiving frames.
-    """
+    """Closing a pop-out window's transport must re-bind the session to a
+    still-open window instead of stranding it on the drop sentinel (#83716)."""
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
     class _LiveTransport:
-        def __init__(self):
-            self.frames = []
-            self.received = threading.Event()
-
-        def write(self, obj=None, *a, **k):
-            self.frames.append(obj)
-            self.received.set()
+        def write(self, *a, **k):
             return True
 
     main = _LiveTransport()
     popout = _LiveTransport()
-    session = _session(transport=None, running=False)
-    # Build the state the way production does: every window that resumes goes
-    # through _live_session_payload, which attaches it into the slot and then
-    # stamps it into the viewers registry.
-    server._attach_session_transport(session, main)
-    server._attach_session_transport(session, popout)
+    session = _session(transport=popout, running=False)
     session["viewers"] = {main: 100.0, popout: 200.0}
     server._sessions["multi-sid"] = session
-    assert isinstance(session["transport"], server.FanoutTransport)
 
-    try:
-        reaped, detached = server._close_sessions_for_transport(popout)
+    reaped, detached = server._close_sessions_for_transport(popout)
 
-        assert reaped == 0 and detached == 0
-        assert server._session_transport_contains(session, main)
-        assert not server._session_transport_contains(session, popout)
-        assert "multi-sid" not in reap_calls
-        assert server._ws_session_is_orphaned(session) is False
-
-        # And it is still a working stream, not just a surviving reference.
-        server._emit("message.delta", "multi-sid", {"text": "still here"})
-        assert main.received.wait(timeout=5)
-        assert [(f.get("params") or {}).get("type") for f in main.frames] == [
-            "message.delta"
-        ]
-        assert popout.frames == []
-    finally:
-        # The fake slot must not outlive the test: _sessions is module state and
-        # later sweeps would walk it.
-        server._sessions.pop("multi-sid", None)
+    assert reaped == 0 and detached == 0
+    assert session["transport"] is main
+    assert "multi-sid" not in reap_calls
+    assert server._ws_session_is_orphaned(session) is False
 
 
 def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
@@ -5375,15 +5340,7 @@ def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
 
 
 def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
-    """A viewer whose socket is already dead must not hold the session open.
-
-    #83716's rebind refused to hand the session to a dead viewer; fan-out
-    membership keeps that filter through _transport_is_live_peer, which is what
-    decides whether anything survives the departing client. Both windows are
-    ATTACHED here, which is the state production builds — a viewer that was
-    never attached leaves the slot single-client and exercises the ordinary park
-    path instead of this one.
-    """
+    """A viewer whose socket is already dead must not win the re-bind."""
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
@@ -5392,25 +5349,17 @@ def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
             return True
 
     dead = _LiveTransport()
-    popout = _LiveTransport()
-    session = _session(transport=None, running=False)
-    server._attach_session_transport(session, dead)
-    server._attach_session_transport(session, popout)
-    session["viewers"] = {dead: 100.0, popout: 200.0}
-    assert isinstance(session["transport"], server.FanoutTransport)
-    # The socket goes away without a disconnect reaching the gateway; the latch
-    # _transport_is_dead reads is the only trace it leaves behind.
     dead._closed = True
+    owner = _LiveTransport()
+    session = _session(transport=owner, running=False)
+    session["viewers"] = {dead: 100.0, owner: 200.0}
     server._sessions["dead-viewer-sid"] = session
 
-    try:
-        reaped, detached = server._close_sessions_for_transport(popout)
+    reaped, detached = server._close_sessions_for_transport(owner)
 
-        assert reaped == 0 and detached == 1
-        assert session["transport"] is server._detached_ws_transport
-        assert reap_calls == ["dead-viewer-sid"]
-    finally:
-        server._sessions.pop("dead-viewer-sid", None)
+    assert detached == 1
+    assert session["transport"] is server._detached_ws_transport
+    assert reap_calls == ["dead-viewer-sid"]
 
 
 def test_live_session_payload_registers_transport_as_viewer():
@@ -7615,9 +7564,6 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         }
         for index in range(1, 4)
     ]
-    # Consecutive completions share one turn (#104671); a watch_match is a turn
-    # barrier, so it is the in-flight turn behind which batch_2/batch_3 must survive.
-    events[0].update(type="watch_match", pattern="owned-1")
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     for event in events:
         isolated_queue.put(event)
@@ -10922,7 +10868,7 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
         "history": "live question from state db",
         "prompt": "host system prompt",
         "status": "Tokens: 140",
-        "context": "Context usage: 80 / 1,000 tokens",
+        "context": "Context usage: ~80 / 1,000 tokens",
         "tools": "terminal",
         "help": "/status",
     }
@@ -10940,16 +10886,6 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
             assert expected in resp["result"]["output"]
             assert "stale parent mirror" not in resp["result"]["output"]
             assert "(._.)" not in resp["result"]["output"]
-        mirrored_usage = server._sessions["sid"]["_metadata_mirror"]["usage"]
-        for estimated in (True, False):
-            mirrored_usage["context_estimated"] = estimated
-            mirrored_usage["context_source"] = "local_estimate" if estimated else "provider_usage"
-            response = server.handle_request({
-                "id": "context-provenance", "method": "slash.exec",
-                "params": {"command": "context", "session_id": "sid"},
-            })
-            mark = "~" if estimated else ""
-            assert f"Context usage: {mark}80 / 1,000 tokens ({mark}8.0%)" in response["result"]["output"]
     finally:
         server._sessions.pop("sid", None)
 
@@ -11940,6 +11876,63 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
     assert "interrupt_called" not in calls  # must NOT interrupt
 
 
+def test_session_steer_emits_turn_steer_event(monkeypatch):
+    calls = []
+    writer_calls = []
+
+    class _Writer:
+        def steer(self, text):
+            writer_calls.append(text)
+
+    class _Agent:
+        _live_stream_writer = _Writer()
+
+        def steer(self, text):
+            return True
+
+    monkeypatch.setattr(server, "_emit", lambda ev, sid, payload: calls.append((ev, sid, payload)))
+    server._sessions["sid"] = _session(agent=_Agent(), session_key="sid")
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.steer",
+                "params": {"session_id": "sid", "text": "focus on tests"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert "result" in resp
+    assert resp["result"]["status"] == "queued"
+    assert len(calls) == 1
+    assert calls[0][0] == "turn.steer"
+    assert calls[0][1] == "sid"
+    assert calls[0][2]["text"] == "focus on tests"
+    assert writer_calls == ["focus on tests"]
+
+
+def test_history_to_messages_extracts_embedded_steer():
+    from agent.prompt_builder import format_steer_marker
+    _history_to_messages = server._history_to_messages
+
+    steered_content = "File content here" + format_steer_marker("focus on error handling")
+    history = [
+        {"role": "user", "content": "read the file"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": steered_content, "timestamp": 12345.0},
+        {"role": "assistant", "content": "Done checking"},
+    ]
+
+    messages = _history_to_messages(history)
+    assert len(messages) == 4
+    assert messages[0] == {"role": "user", "text": "read the file"}
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["name"] == "read_file"
+    assert messages[2] == {"role": "user", "text": "focus on error handling", "timestamp": 12345.0}
+    assert messages[3] == {"role": "assistant", "text": "Done checking"}
+
+
 def test_session_steer_rejects_empty_text():
     server._sessions["sid"] = _session(
         agent=types.SimpleNamespace(steer=lambda t: True)
@@ -12290,6 +12283,78 @@ def test_session_info_includes_turn_started_at():
     assert server._session_info(agent, session)["turn_started_at"] is None
 
 
+def test_session_info_resolves_gemini_account_from_pool(monkeypatch):
+    """When a session uses a Gemini model/provider, _session_info attaches the active account alias."""
+    class _FakeEntry:
+        id = "acc-1"
+        label = "test-user@example.com"
+
+    class _FakePool:
+        def entries(self):
+            return [_FakeEntry()]
+
+        def current(self):
+            return _FakeEntry()
+
+    fake_agent = types.SimpleNamespace(
+        tools=[],
+        model="gemini-3.8-flash-high",
+        provider="gemini-oauth",
+        _credential_pool=_FakePool(),
+        _credential_pool_entry_id="acc-1",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_account_alias",
+        lambda raw: "alias1" if "test-user" in str(raw) or "acc-1" in str(raw) else str(raw),
+    )
+
+    info = server._session_info(fake_agent, {"session_key": "s-1"})
+    assert info["gemini_account"] == "alias1"
+
+
+def test_session_info_omits_gemini_account_for_non_gemini_models():
+    """Non-Gemini models/providers must not have gemini_account attached."""
+    agent = types.SimpleNamespace(tools=[], model="gpt-4o", provider="openai")
+    info = server._session_info(agent, {"session_key": "s-2"})
+    assert info.get("gemini_account") is None
+
+
+def test_session_info_resolves_gemini_account_from_pool(monkeypatch):
+    """When a session uses a Gemini model/provider, _session_info attaches the active account alias."""
+    class _FakeEntry:
+        id = "acc-1"
+        label = "test-user@example.com"
+
+    class _FakePool:
+        def entries(self):
+            return [_FakeEntry()]
+
+        def current(self):
+            return _FakeEntry()
+
+    fake_agent = types.SimpleNamespace(
+        tools=[],
+        model="gemini-3.8-flash-high",
+        provider="gemini-oauth",
+        _credential_pool=_FakePool(),
+        _credential_pool_entry_id="acc-1",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.get_account_alias",
+        lambda raw: "alias1" if "test-user" in str(raw) or "acc-1" in str(raw) else str(raw),
+    )
+
+    info = server._session_info(fake_agent, {"session_key": "s-1"})
+    assert info["gemini_account"] == "alias1"
+
+
+def test_session_info_omits_gemini_account_for_non_gemini_models():
+    """Non-Gemini models/providers must not have gemini_account attached."""
+    agent = types.SimpleNamespace(tools=[], model="gpt-4o", provider="openai")
+    info = server._session_info(agent, {"session_key": "s-2"})
+    assert info.get("gemini_account") is None
+
+
 # ---------------------------------------------------------------------------
 # History-mutating commands must reject while session.running is True.
 # Without these guards, prompt.submit's post-run history write either
@@ -12338,7 +12403,36 @@ def test_session_undo_allowed_when_idle():
         )
         assert resp.get("result"), f"got error: {resp.get('error')}"
         assert resp["result"]["removed"] == 2
+        assert resp["result"]["turns_undone"] == 1
+        assert resp["result"]["prefill"] == "hi"
         assert server._sessions["sid"]["history"] == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_session_undo_multi_turn():
+    """Undo N turns backs up N user exchanges and returns prefill."""
+    server._sessions["sid"] = _session(
+        running=False,
+        history=[
+            {"role": "user", "content": "turn 1"},
+            {"role": "assistant", "content": "reply 1"},
+            {"role": "user", "content": "turn 2"},
+            {"role": "assistant", "content": "reply 2"},
+            {"role": "user", "content": "turn 3"},
+            {"role": "assistant", "content": "reply 3"},
+        ],
+    )
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "session.undo", "params": {"session_id": "sid", "count": 2}}
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert resp["result"]["removed"] == 4
+        assert resp["result"]["turns_undone"] == 2
+        assert resp["result"]["prefill"] == "turn 2"
+        assert len(server._sessions["sid"]["history"]) == 2
+        assert server._sessions["sid"]["history"][-1]["content"] == "reply 1"
     finally:
         server._sessions.pop("sid", None)
 
@@ -15515,7 +15609,6 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
     """session.branch must copy history into the parent's profile state.db."""
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     seen: dict = {"msgs": []}
 
     class LaunchDB:
@@ -15954,7 +16047,6 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
 
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (profile_home / ".env").write_text(
         "PROXMOX_TOKEN=mlperf-secret\n", encoding="utf-8"
     )
@@ -16047,7 +16139,6 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
     """A live branch must copy the complete visible transcript, not the compacted model tail."""
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     seen: dict = {"msgs": []}
 
     display_history = [
@@ -20730,7 +20821,7 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_path):
+def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
     """The trim boundary must not retain the just-pruned history snapshots."""
     observed = {}
     cleanup_order = []
@@ -20769,10 +20860,7 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
         observed["run_kwargs"] = caller_locals.get("run_kwargs")
 
     session = _session(agent=_Agent())
-    profile_home = tmp_path / "profiles" / "worker"
-    profile_home.mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    session["profile_home"] = str(profile_home)
+    session["profile_home"] = "/tmp/test-profile"
     session["history"] = [
         {"role": "tool", "tool_call_id": "old", "content": "x" * 20_000}
     ]

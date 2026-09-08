@@ -2,7 +2,7 @@
   "name": "hermes",
   "productName": "Hermes",
   "private": true,
-  "version": "0.17.1",
+  "version": "0.17.0",
   "description": "Native desktop shell for Hermes Agent.",
   "author": "Nous Research",
   "repository": {
@@ -12,7 +12,7 @@
   "type": "module",
   "main": "dist/electron-main.mjs",
   "engines": {
-    "node": "^22.22.0 || ^24.11.0 || >=26.0.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "clean": "npm run clean:e2e && npm run clean:renderer && npm run clean:electron",

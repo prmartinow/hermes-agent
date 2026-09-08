@@ -520,30 +520,34 @@ export function Panel({ sections, t, title }: PanelProps) {
         </Text>
       </Box>
 
-      {sections.map((sec, si) => (
-        <Box flexDirection="column" key={si} marginTop={si > 0 ? 1 : 0}>
-          {sec.title && (
-            <Text bold color={t.color.accent}>
-              {sec.title}
-            </Text>
-          )}
+      {sections.map((sec, si) => {
+        const keyWidth = Math.max(20, ...(sec.rows?.map(([k]) => k.length + 2) ?? [20]))
 
-          {sec.rows?.map(([k, v], ri) => (
-            <Text key={ri} wrap="truncate">
-              <Text color={t.color.muted}>{k.padEnd(20)}</Text>
-              <Text color={t.color.text}>{v}</Text>
-            </Text>
-          ))}
+        return (
+          <Box flexDirection="column" key={si} marginTop={si > 0 ? 1 : 0}>
+            {sec.title && (
+              <Text bold color={t.color.accent}>
+                {sec.title}
+              </Text>
+            )}
 
-          {sec.items?.map((item, ii) => (
-            <Text color={t.color.text} key={ii} wrap="truncate">
-              {item}
-            </Text>
-          ))}
+            {sec.rows?.map(([k, v], ri) => (
+              <Text key={ri} wrap="truncate">
+                <Text color={t.color.muted}>{k.padEnd(keyWidth)}</Text>
+                <Text color={t.color.text}>{v}</Text>
+              </Text>
+            ))}
 
-          {sec.text && <Text color={t.color.muted}>{sec.text}</Text>}
-        </Box>
-      ))}
+            {sec.items?.map((item, ii) => (
+              <Text color={t.color.text} key={ii} wrap="truncate">
+                {item}
+              </Text>
+            ))}
+
+            {sec.text && <Text color={t.color.muted}>{sec.text}</Text>}
+          </Box>
+        )
+      })}
     </Box>
   )
 }

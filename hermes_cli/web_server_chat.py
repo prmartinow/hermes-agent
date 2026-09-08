@@ -343,10 +343,11 @@ def _resolve_chat_argv(
         _log.warning("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
     _apply_tui_python_env(env)
     env.setdefault("NODE_ENV", "production")
-    # Mouse tracking would swallow wheel events the browser needs for
-    # transcript scrolling; disable it for the dashboard PTY only.
-    env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
+    # Client-side wheel decoupling allows native browser scrolling while
+    # button mouse tracking (DEC 1000/1002/1006) preserves click interactivity.
+    env.pop("HERMES_TUI_DISABLE_MOUSE", None)
     env.setdefault("HERMES_TUI_INLINE", "1")
+    env.setdefault("HERMES_TUI_MOUSE_TRACKING", "buttons")
     # chalk in the child picks its color depth from the SERVER env; hosted
     # deploys have no COLORTERM, so hex colors would snap to the 256 palette.
     env.setdefault("COLORTERM", "truecolor")
@@ -357,6 +358,9 @@ def _resolve_chat_argv(
             requested if profile_dir is not None else None, read_only=True)
         try:
             latest_resume, _latest_path = _session_latest_descendant(resume, _resume_db)
+        except Exception:
+            _log.warning("Failed to resolve latest session descendant for %s", resume, exc_info=True)
+            latest_resume = None
         finally:
             _resume_db.close()
         if latest_resume:
@@ -440,6 +444,14 @@ async def _resolve_chat_argv_async(
 
     async with _get_chat_argv_lock(app):
         return await asyncio.to_thread(_resolve_chat_argv, **kwargs)
+
+
+def _default_pty_spawn():
+    from hermes_cli.pty import PtyBridge, PtyUnavailableError
+    if PtyBridge is None:
+        raise PtyUnavailableError("PTY bridge is not available on this platform")
+    argv, cwd, env = _resolve_chat_argv()
+    return PtyBridge.spawn(argv, cwd=cwd, env=env)
 
 
 def _active_session_file_for_channel(app: "FastAPI", channel: str) -> Path:

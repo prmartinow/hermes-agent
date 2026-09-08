@@ -745,8 +745,6 @@ export interface UsageStats {
   calls: number
   context_max?: number
   context_percent?: number
-  context_estimated?: boolean
-  context_source?: string
   context_used?: number
   cost_usd?: number
   input: number
@@ -806,8 +804,6 @@ export interface ContextBreakdown {
   categories: ContextUsageCategory[]
   context_max: number
   context_percent: number
-  context_estimated?: boolean
-  context_source?: string
   context_used: number
   estimated_total: number
   model?: string
@@ -1441,10 +1437,11 @@ export interface MoaConfigResponse {
       aggregator_temperature: number
       degraded_reference_policy: 'loud' | 'silent'
       enabled: boolean
-
+      max_tokens: number
       reference_models: MoaModelSlot[]
       reference_temperature: number
-
+      /** Optional advisor output cap — round-tripped, not edited here. */
+      reference_max_tokens?: number | null
       /** Fan-out cadence (user_turn default | per_iteration | every_n:N) — round-tripped. */
       fanout?: string
       reference_timeout: number | null
@@ -1454,7 +1451,7 @@ export interface MoaConfigResponse {
   aggregator_temperature: number
   degraded_reference_policy: 'loud' | 'silent'
   enabled: boolean
-
+  max_tokens: number
   reference_models: MoaModelSlot[]
   reference_temperature: number
   reference_timeout: number | null

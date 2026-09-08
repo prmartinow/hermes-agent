@@ -519,7 +519,7 @@ def _find_live_unpersisted(needle: str, home) -> str:
 
 def _resume_live_unpersisted(ctx: _Resume, live_sid: str, live: dict) -> dict:
     """Reattach a LIVE lazy session with no state.db row yet (every fresh Bot Chat; a 404 here killed messaging
-    for never-spoken bots). Attach the transport and cancel the armed orphan-reap Timer (a WS drop may have
+    for never-spoken bots). Rebind the transport and cancel the armed orphan-reap Timer (a WS drop may have
     sentinel-parked the record) or it fires against this client."""
     if ctx.owns_db:
         _release_db(ctx.db)
@@ -628,8 +628,7 @@ def _resume_guard(ctx: _Resume) -> dict | None:
 
 def _resume_reuse_live(ctx: _Resume, sid: str, session: dict) -> dict:
     """Reattach an already-live session under the resume lock (held across the client-gone check,
-    transport attach and reap cancel so grace expiry is atomic). _live_session_payload ATTACHES this
-    caller alongside the client(s) already streaming instead of taking the slot from them."""
+    transport rebind and reap cancel so grace expiry is atomic)."""
     with _session_resume_lock:
         return _resume_reuse_live_locked(ctx, sid, session)
 
@@ -1133,8 +1132,74 @@ def _(rid, params: dict) -> dict:
 @_session_method("session.usage")
 def _(rid, params: dict, session: dict) -> dict:
     usage: dict = _session_usage_snapshot(session)
-    if session.get("agent") is None and not usage:
+    agent = session.get("agent")
+    if agent is None and not usage:
         usage = {"calls": 0, "input": 0, "output": 0, "total": 0}
+
+    # Attach account info, Gemini quota, and provider limits
+    try:
+        from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+        info = _session_info(agent, session) if session else {}
+        provider = (
+            info.get("provider")
+            or _metadata_mirror(session).get("provider", getattr(agent, "provider", ""))
+            or ""
+        )
+        gemini_acc = info.get("gemini_account", "")
+        session_key = str(
+            (session or {}).get("session_key")
+            or getattr(agent, "session_id", "")
+            or params.get("session_id", "")
+            or ""
+        )
+        model = (
+            info.get("model")
+            or _metadata_mirror(session).get("model", getattr(agent, "model", ""))
+            or ""
+        )
+
+        snapshot = fetch_account_usage(
+            provider,
+            account=gemini_acc,
+            session_id=session_key,
+            model=model,
+        )
+        if snapshot:
+            lines = render_account_usage_lines(snapshot)
+            if lines:
+                usage["account_lines"] = lines
+            if "gemini" in str(provider).lower():
+                from hermes_cli.auth import get_gemini_oauth_auth_status, get_account_alias
+
+                acc_idx = 1
+                if gemini_acc:
+                    for idx in range(1, 6):
+                        try:
+                            st = get_gemini_oauth_auth_status(idx)
+                            if st.get("logged_in"):
+                                alias = st.get("alias") or get_account_alias(st.get("email", ""))
+                                if str(gemini_acc).strip().lower() in (
+                                    str(idx),
+                                    (st.get("email") or "").lower(),
+                                    alias.lower(),
+                                ):
+                                    acc_idx = idx
+                                    break
+                        except Exception:
+                            pass
+                st = get_gemini_oauth_auth_status(acc_idx)
+                if st.get("logged_in"):
+                    usage["gemini_account"] = (
+                        st.get("alias")
+                        or get_account_alias(st.get("email", ""))
+                        or f"Account {acc_idx}"
+                    )
+                    if st.get("quota"):
+                        usage["quota"] = st["quota"]
+    except Exception:
+        pass
+
     # Nous credits are agent-independent (portal fetch); fail-open when absent.
     with contextlib.suppress(Exception):
         from agent.account_usage import nous_credits_lines
@@ -1151,9 +1216,7 @@ def _(rid, params: dict, session: dict) -> dict:
             "categories": [], "context_max": usage.get("context_max", 0) or 0,
             "context_percent": usage.get("context_percent", 0) or 0,
             "context_used": usage.get("context_used", 0) or 0,
-            "estimated_total": 0,
-            "context_estimated": usage.get("context_estimated", False),
-            "context_source": usage.get("context_source", "provider_usage"),
+            "estimated_total": usage.get("context_used", 0) or usage.get("total", 0) or 0,
             "model": _metadata_mirror(session).get("model", "")})
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1648,19 +1711,76 @@ def _(rid, params: dict, session: dict) -> dict:
 
 @_session_method("session.history")
 def _(rid, params: dict, session: dict) -> dict:
-    history = list(session.get("history", []))
-    if session.get("session_key"):
-        with _session_db(session) as db:
-            if db is not None:
-                # include_row_ids: the durable row id is how clients address a persisted turn (reactions,
-                # truncation targets); _history_to_messages forwards it.
-                with contextlib.suppress(Exception):
-                    # The projection in _history_to_messages only forwards row_id when the row carries a
-                    # stamp, so an unstamped read here silently strips the one durable address clients can
-                    # use. See #87059.
-                    history = db.get_messages_as_conversation(
-                        session["session_key"], include_ancestors=True, include_row_ids=True)
-    return _ok(rid, {"count": len(history), "messages": _history_to_messages(history)})
+    before_index = params.get("before_index")
+    limit_param = params.get("limit")
+
+    if before_index is None and limit_param is None:
+        history = list(session.get("history", []))
+        if session.get("session_key"):
+            with _session_db(session) as db:
+                if db is not None:
+                    # include_row_ids: the durable row id is how clients address a persisted turn (reactions,
+                    # truncation targets); _history_to_messages forwards it.
+                    with contextlib.suppress(Exception):
+                        history = db.get_messages_as_conversation(
+                            session["session_key"],
+                            include_ancestors=True,
+                            include_compacted=True,
+                            include_row_ids=True,
+                        )
+        return _ok(rid, {"count": len(history), "messages": _history_to_messages(history)})
+
+    stored_id = str(session.get("session_key") or params.get("session_id") or "")
+    try:
+        before_index_val = int(before_index or 0)
+    except (TypeError, ValueError):
+        before_index_val = 0
+    try:
+        limit_val = min(max(int(limit_param or 50), 1), 100)
+    except (TypeError, ValueError):
+        limit_val = 50
+
+    with _session_db(session) as db:
+        if db is None:
+            return _err(rid, 5000, "database unavailable")
+
+        session_ids = (
+            [stored_id]
+            if db._is_explicit_branch_session(stored_id)
+            else db._session_lineage_root_to_tip(stored_id)
+        )
+        placeholders = ",".join("?" for _ in session_ids)
+        offset = max(0, before_index_val - limit_val)
+        fetch_count = before_index_val - offset
+
+        with db._read_ctx() as conn:
+            rows = conn.execute(
+                f"SELECT session_id, active, compacted, {db._CONVERSATION_ROW_COLUMNS} "
+                f"FROM messages WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1) "
+                f"ORDER BY id ASC LIMIT ? OFFSET ?",
+                tuple(session_ids) + (fetch_count, offset),
+            ).fetchall()
+
+        display_history = db._rows_to_conversation(
+            rows,
+            session_id=stored_id,
+            include_ancestors=True,
+            repair_alternation=False,
+            include_row_ids=True,
+        )
+        messages = _history_to_messages(display_history)
+
+        return _ok(
+            rid,
+            {
+                "session_id": str(params.get("session_id") or ""),
+                "messages": messages,
+                "start_index": offset,
+                "end_index": before_index_val,
+                "has_more_before": offset > 0,
+                "count": len(messages),
+            },
+        )
 
 
 @_session_method("session.undo", live=True)
@@ -1784,6 +1904,87 @@ def _compress_live(rid, sid: str, session: dict, focus_topic: str) -> dict:
     finally:
         # Always clear the pinned compressing status (success, no-op, or raise).
         _status_update(sid, "ready")
+
+
+@method("session.redo")
+def _(rid, params: dict) -> dict:
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    assert session is not None
+    if session.get("running"):
+        return _err(
+            rid, 4009, "session busy — /interrupt the current turn before /redo"
+        )
+    count = params.get("count", 1)
+    try:
+        n = max(1, int(count))
+    except (ValueError, TypeError):
+        n = 1
+
+    with session["history_lock"]:
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /redo"
+            )
+        session_key = str(session.get("session_key") or "").strip()
+        if not session_key:
+            return _err(rid, 4001, "no session key for redo")
+
+        with _session_db(session) as db:
+            if db is None:
+                return _err(rid, 5000, "session database unavailable")
+            try:
+                result = db.redo_turn(session_key, n)
+            except Exception as exc:
+                return _err(rid, 5008, f"redo: {exc}")
+
+        restored_turns = result.get("restored_turns", 0)
+        restored_messages = result.get("messages", [])
+        if restored_turns > 0 and restored_messages:
+            current_history = session.get("history", [])
+            current_history.extend(restored_messages)
+            session["history"] = current_history
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+            agent = session.get("agent")
+            if agent is not None:
+                agent._session_messages = current_history
+                if hasattr(agent, "_last_flushed_db_idx"):
+                    try:
+                        agent._last_flushed_db_idx = len(current_history)
+                    except Exception:
+                        pass
+                if hasattr(agent, "_db_flush_scan_prefix"):
+                    try:
+                        agent._db_flush_scan_prefix = list(current_history)
+                    except Exception:
+                        pass
+                if hasattr(agent, "_invalidate_system_prompt"):
+                    try:
+                        agent._invalidate_system_prompt()
+                    except Exception:
+                        pass
+                mm = getattr(agent, "_memory_manager", None)
+                if mm is not None:
+                    try:
+                        mm.on_session_switch(
+                            session_key,
+                            parent_session_id="",
+                            reset=False,
+                            rewound=False,
+                        )
+                    except Exception:
+                        pass
+
+    from tui_gateway.server import _history_to_messages
+    return _ok(
+        rid,
+        {
+            "restored_turns": restored_turns,
+            "restored_count": len(restored_messages),
+            "messages": _history_to_messages(restored_messages),
+        },
+    )
 
 
 @method("session.compress")
@@ -1967,7 +2168,7 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "interrupted"})
 
 
-def _apply_correction(rid, session: dict, verb: str, text: str, accepted_status: str) -> dict:
+def _apply_correction(rid, session: dict, verb: str, text: str, accepted_status: str, sid: str = "") -> dict:
     """``agent.<verb>(text)``; on acceptance record it on the live turn (mid-turn resume rebuilds the bubble)
     and purge queued self-copies so post-turn drain cannot re-fire the old prompt."""
     try:
@@ -1983,6 +2184,13 @@ def _apply_correction(rid, session: dict, verb: str, text: str, accepted_status:
             # restart the pre-correction prompt.
             _drop_queued_duplicates_of_inflight_user(session)
             session["last_active"] = time.time()
+        if verb == "steer":
+            from tui_gateway.server import _emit
+            target_sid = sid or _session_lookup_key(session, fallback=str(session.get("session_key") or ""))
+            _emit("turn.steer", target_sid, {"text": text, "timestamp": time.time()})
+            writer = getattr(session.get("agent"), "_live_stream_writer", None)
+            if writer and hasattr(writer, "steer"):
+                writer.steer(text)
     return _ok(rid, {"status": accepted_status if accepted else "rejected", "text": text})
 
 
@@ -2005,7 +2213,7 @@ def _correction_method(name: str, verb: str, accepted_status: str, supported, un
             return _ok(rid, {"status": "queued", "text": text})
         if not supported(agent):
             return _err(rid, 4010, unsupported)
-        return _apply_correction(rid, session, verb, text, accepted_status)
+        return _apply_correction(rid, session, verb, text, accepted_status, sid=str(params.get("session_id") or ""))
 
 
 # Inject text into the next tool result without interrupting (AIAgent.steer(): no new user turn, no role

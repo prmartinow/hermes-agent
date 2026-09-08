@@ -6,7 +6,7 @@ import {
   useCallback,
   useRef,
 } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate, Link } from "react-router";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -428,6 +428,65 @@ function MessageBubble({
   );
 }
 
+function CollapsibleToolGroup({
+  tools,
+  highlight,
+}: {
+  tools: SessionMessage[];
+  highlight?: string;
+}) {
+  const hasHit = Boolean(
+    highlight &&
+      tools.some((t) =>
+        t.content?.toLowerCase().includes(highlight.toLowerCase())
+      )
+  );
+  const [expanded, setExpanded] = useState(hasHit);
+
+  useEffect(() => {
+    if (hasHit) setExpanded(true);
+  }, [hasHit]);
+
+  if (tools.length === 1) {
+    return <MessageBubble msg={tools[0]} highlight={highlight} />;
+  }
+
+  const toolNames = Array.from(
+    new Set(tools.map((t) => t.tool_name).filter(Boolean))
+  );
+  const summary = toolNames.length
+    ? toolNames.slice(0, 3).join(", ") + (toolNames.length > 3 ? "…" : "")
+    : "tools";
+
+  return (
+    <div className="border border-border/60 rounded bg-midground/5 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setExpanded((prev) => !prev)}
+        className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-text-secondary hover:text-foreground hover:bg-midground/10 font-mono-ui cursor-pointer transition-colors"
+      >
+        <span className="flex items-center gap-2">
+          <span>{expanded ? "▾" : "▸"}</span>
+          <span className="font-semibold text-text-primary">
+            {tools.length} Tool Calls
+          </span>
+          <span className="text-text-tertiary">({summary})</span>
+        </span>
+        <span className="text-[0.6875rem] text-text-tertiary">
+          {expanded ? "Click to collapse" : "Click to expand"}
+        </span>
+      </button>
+      {expanded && (
+        <div className="flex flex-col gap-2 p-2 border-t border-border/40 bg-background/50">
+          {tools.map((msg, i) => (
+            <MessageBubble key={i} msg={msg} highlight={highlight} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Message list with auto-scroll to first search hit. */
 function MessageList({
   messages,
@@ -450,14 +509,36 @@ function MessageList({
     return () => clearTimeout(timer);
   }, [messages, highlight]);
 
+  const groupedItems: Array<{ type: "tool_group"; tools: SessionMessage[] } | { type: "msg"; msg: SessionMessage }> = [];
+  let currentTools: SessionMessage[] = [];
+
+  for (const msg of messages) {
+    if (msg.role === "tool") {
+      currentTools.push(msg);
+    } else {
+      if (currentTools.length > 0) {
+        groupedItems.push({ type: "tool_group", tools: currentTools });
+        currentTools = [];
+      }
+      groupedItems.push({ type: "msg", msg });
+    }
+  }
+  if (currentTools.length > 0) {
+    groupedItems.push({ type: "tool_group", tools: currentTools });
+  }
+
   return (
     <div
       ref={containerRef}
       className="flex flex-col gap-3 max-h-[600px] overflow-y-auto pr-2"
     >
-      {messages.map((msg, i) => (
-        <MessageBubble key={i} msg={msg} highlight={highlight} />
-      ))}
+      {groupedItems.map((item, i) =>
+        item.type === "tool_group" ? (
+          <CollapsibleToolGroup key={`tg-${i}`} tools={item.tools} highlight={highlight} />
+        ) : (
+          <MessageBubble key={`msg-${i}`} msg={item.msg} highlight={highlight} />
+        )
+      )}
     </div>
   );
 }
@@ -527,6 +608,12 @@ function SessionRow({
         <SourceIcon className={`mr-1 h-3 w-3 ${sourceInfo.color}`} />
         {session.source ? sourceLabel(session.source) : "local"}
       </Badge>
+
+      {session.account_alias && (
+        <Badge tone="secondary" className="text-xs font-mono-ui">
+          {session.account_alias}
+        </Badge>
+      )}
 
       {resumeInChatEnabled && (
         <Button
@@ -1009,14 +1096,23 @@ export default function SessionsPage() {
 
   useEffect(() => {
     setEnd(
-      <Button
-        outlined
-        size="sm"
-        onClick={() => setPruneOpen(true)}
-        prefix={<Archive />}
-      >
-        Prune old sessions
-      </Button>,
+      <div className="flex items-center gap-2">
+        <Link
+          to="/gemini/history"
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono font-bold bg-midground/10 hover:bg-midground/20 text-foreground border border-midground/30 rounded transition-colors"
+        >
+          <Clock className="w-3.5 h-3.5 text-midground" />
+          Account History
+        </Link>
+        <Button
+          outlined
+          size="sm"
+          onClick={() => setPruneOpen(true)}
+          prefix={<Archive />}
+        >
+          Prune old sessions
+        </Button>
+      </div>,
     );
     return () => {
       setEnd(null);
@@ -2181,6 +2277,15 @@ export default function SessionsPage() {
                       <Database className="mr-1 h-3 w-3" />
                       {s.source ? sourceLabel(s.source) : "local"}
                     </Badge>
+
+                    {s.account_alias && (
+                      <Badge
+                        tone="secondary"
+                        className="shrink-0 self-start text-xs font-mono-ui sm:self-center"
+                      >
+                        {s.account_alias}
+                      </Badge>
+                    )}
                   </div>
                 ))}
               </CardContent>

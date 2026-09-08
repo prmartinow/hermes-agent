@@ -12,6 +12,10 @@ interface VisualLine {
   start: number
 }
 
+const VISUAL_LINES_CACHE = new Map<string, VisualLine[]>()
+const MAX_VISUAL_LINES_CACHE = 256
+const ASCII_PRINTABLE_SUB_RE = /^[ -~]*$/
+
 const graphemes = (value: string) =>
   [...seg().segment(value)].map(({ segment, index }) => ({
     end: index + segment.length,
@@ -38,6 +42,16 @@ function visualLines(value: string, cols: number): VisualLine[] {
   }
 
   const width = Math.max(1, cols)
+  const cacheKey = `${width}:${value}`
+  const cached = VISUAL_LINES_CACHE.get(cacheKey)
+
+  if (cached) {
+    VISUAL_LINES_CACHE.delete(cacheKey)
+    VISUAL_LINES_CACHE.set(cacheKey, cached)
+
+    return cached
+  }
+
   const wrapped = wrapAnsi(value, width, { hard: true, trim: false })
   const lines: VisualLine[] = []
 
@@ -96,13 +110,31 @@ function visualLines(value: string, cols: number): VisualLine[] {
 
   // wrap-ansi collapses an empty input into [""] which we already handled
   // above; preserve the invariant that lines is never empty for any input.
-  return lines.length ? lines : [{ start: 0, end: 0 }]
+  const result = lines.length ? lines : [{ start: 0, end: 0 }]
+
+  if (VISUAL_LINES_CACHE.size >= MAX_VISUAL_LINES_CACHE) {
+    const oldestKey = VISUAL_LINES_CACHE.keys().next().value
+
+    if (oldestKey !== undefined) {
+      VISUAL_LINES_CACHE.delete(oldestKey)
+    }
+  }
+
+  VISUAL_LINES_CACHE.set(cacheKey, result)
+
+  return result
 }
 
 function widthBetween(value: string, start: number, end: number) {
+  const sub = value.slice(start, end)
+
+  if (ASCII_PRINTABLE_SUB_RE.test(sub)) {
+    return sub.length
+  }
+
   let width = 0
 
-  for (const part of graphemes(value.slice(start, end))) {
+  for (const part of graphemes(sub)) {
     width += part.width
   }
 
@@ -167,7 +199,7 @@ export function offsetFromPosition(value: string, row: number, col: number, cols
 }
 
 export function inputVisualHeight(value: string, columns: number) {
-  return cursorLayout(value, value.length, columns).line + 1
+  return visualLines(value, Math.max(1, columns)).length
 }
 
 export function composerPromptWidth(promptText: string) {

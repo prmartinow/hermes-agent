@@ -126,4 +126,30 @@ describe('virtual height estimates', () => {
     expect(rows).toBeLessThanOrEqual(800)
     expect(elapsed).toBeLessThan(50)
   })
+
+  it('accurately estimates intro banner and session panel heights across column tiers', () => {
+    const introMsg: Msg = {
+      kind: 'intro',
+      role: 'assistant',
+      text: '',
+      info: {
+        model: 'gemini-3.7-flash-high',
+        profile_name: 'default',
+        tools: { fs: ['read', 'write'], term: ['sh'] },
+        version: '0.20.6'
+      }
+    }
+
+    // Wide desktop tier (cols >= 68): full logo (12) + panel (10) = 22
+    expect(estimatedMsgHeight(introMsg, 120, { compact: false, details: false })).toBe(22)
+
+    // Compact tier (cols = 60, COMPACT_FROM = 58): compact banner (4) + panel (10) = 14
+    expect(estimatedMsgHeight(introMsg, 60, { compact: false, details: false })).toBe(14)
+
+    // Narrow text tier (cols = 40, HIDE_BELOW = 34): text banner (3) + panel (10) = 13
+    expect(estimatedMsgHeight(introMsg, 40, { compact: false, details: false })).toBe(13)
+
+    // Minimal hidden tier (cols = 30 < 34): hidden banner (0) + panel (10) = 10
+    expect(estimatedMsgHeight(introMsg, 30, { compact: false, details: false })).toBe(10)
+  })
 })
