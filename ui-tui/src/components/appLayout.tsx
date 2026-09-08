@@ -407,6 +407,7 @@ const ComposerPane = memo(function ComposerPane({
                 {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
                 <TextInput
                   accentColor={ui.theme.color.accent}
+                  busy={ui.busy}
                   color={ui.theme.color.text}
                   columns={inputColumns}
                   cursorSnapshotRef={cursorSnapshotRef}

@@ -1988,21 +1988,31 @@ export default class Ink {
     }
   }
 
+  private getScrollbackYOffset(): number {
+    if (this.altScreenActive) {
+      return 0
+    }
+    const screenHeight = this.frontFrame?.screen?.height ?? 0
+    const termRows = this.options.stdout?.rows ?? 24
+    return Math.max(0, screenHeight - termRows)
+  }
+
   /**
    * Hit-test the rendered DOM tree at (col, row) and bubble a ClickEvent
    * from the deepest hit node up through ancestors with onClick handlers.
-   * Returns true if a DOM handler consumed the click. Gated on
-   * altScreenActive — clicks only make sense with a fixed viewport where
-   * nodeCache rects map 1:1 to terminal cells (no scrollback offset).
+   * Returns true if a DOM handler consumed the click. Translates viewport-relative
+   * rows to virtual scrollback rows in inline mode so clicks match nodeCache coordinates.
    */
   dispatchClick(col: number, row: number): boolean {
     if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return false
     }
 
-    const blank = isEmptyCellAt(this.frontFrame.screen, col, row)
+    const yOffset = this.getScrollbackYOffset()
+    const virtualRow = row + yOffset
+    const blank = isEmptyCellAt(this.frontFrame.screen, col, virtualRow)
 
-    return dispatchClick(this.rootNode, col, row, blank)
+    return dispatchClick(this.rootNode, col, virtualRow, blank)
   }
   dispatchMouseDown(col: number, row: number, button: number): dom.DOMElement | undefined {
     if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
@@ -2010,14 +2020,16 @@ export default class Ink {
     }
 
     this.stopSelectionAutoScroll()
+    const yOffset = this.getScrollbackYOffset()
+    const virtualRow = row + yOffset
 
     return dispatchMouse(
       this.rootNode,
       col,
-      row,
+      virtualRow,
       'onMouseDown',
       button,
-      isEmptyCellAt(this.frontFrame.screen, col, row)
+      isEmptyCellAt(this.frontFrame.screen, col, virtualRow)
     )
   }
   dispatchMouseUp(target: dom.DOMElement, col: number, row: number, button: number): void {
@@ -2026,20 +2038,26 @@ export default class Ink {
     }
 
     this.stopSelectionAutoScroll()
-    dispatchMouse(this.rootNode, col, row, 'onMouseUp', button, isEmptyCellAt(this.frontFrame.screen, col, row), target)
+    const yOffset = this.getScrollbackYOffset()
+    const virtualRow = row + yOffset
+
+    dispatchMouse(this.rootNode, col, virtualRow, 'onMouseUp', button, isEmptyCellAt(this.frontFrame.screen, col, virtualRow), target)
   }
   dispatchMouseDrag(target: dom.DOMElement, col: number, row: number, button: number): void {
     if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return
     }
 
+    const yOffset = this.getScrollbackYOffset()
+    const virtualRow = row + yOffset
+
     dispatchMouse(
       this.rootNode,
       col,
-      row,
+      virtualRow,
       'onMouseDrag',
       button,
-      isEmptyCellAt(this.frontFrame.screen, col, row),
+      isEmptyCellAt(this.frontFrame.screen, col, virtualRow),
       target
     )
   }
