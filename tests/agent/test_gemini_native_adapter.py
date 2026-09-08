@@ -476,6 +476,59 @@ def test_provider_call_id_is_the_slot_identity():
     assert ids == ["c1", "c2", "c1"]
 
 
+def test_stream_event_translation_parallel_tool_calls_multi_event():
+    from agent.gemini_native_adapter import translate_stream_event
+
+    tool_call_indices = {}
+    event1 = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "skill_view", "args": {"name": "rpc-environment"}}}
+                    ]
+                }
+            }
+        ]
+    }
+    event2 = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"functionCall": {"name": "skill_view", "args": {"name": "github-ops"}}}
+                    ]
+                }
+            }
+        ]
+    }
+    event3_finish = {
+        "candidates": [
+            {
+                "finishReason": "STOP",
+            }
+        ]
+    }
+
+    c1 = translate_stream_event(event1, model="gemini-3.7-flash-high", tool_call_indices=tool_call_indices)
+    c2 = translate_stream_event(event2, model="gemini-3.7-flash-high", tool_call_indices=tool_call_indices)
+    c3 = translate_stream_event(event3_finish, model="gemini-3.7-flash-high", tool_call_indices=tool_call_indices)
+
+    assert len(c1) == 1
+    assert c1[0].choices[0].delta.tool_calls[0].index == 0
+    assert c1[0].choices[0].delta.tool_calls[0].function.name == "skill_view"
+    assert c1[0].choices[0].delta.tool_calls[0].function.arguments == '{"name": "rpc-environment"}'
+
+    assert len(c2) == 1
+    assert c2[0].choices[0].delta.tool_calls[0].index == 1
+    assert c2[0].choices[0].delta.tool_calls[0].function.name == "skill_view"
+    assert c2[0].choices[0].delta.tool_calls[0].function.arguments == '{"name": "github-ops"}'
+    assert c2[0].choices[0].delta.tool_calls[0].id != c1[0].choices[0].delta.tool_calls[0].id
+
+    assert len(c3) == 1
+    assert c3[0].choices[0].finish_reason == "tool_calls"
+
+
 def test_build_gemini_request_preserves_explicit_max_tokens_without_thinking():
     from agent.gemini_native_adapter import build_gemini_request
 
@@ -700,7 +753,12 @@ def test_gemini_3x_embeds_image_in_function_response_parts(model):
         tools=[],
         tool_choice=None,
     )
-    fr = request["contents"][1]["parts"][0]["functionResponse"]
+    fr = next(
+        part["functionResponse"]
+        for content in request["contents"]
+        for part in content["parts"]
+        if "functionResponse" in part
+    )
     assert "parts" in fr, "Gemini 3.x must embed image inlineData in functionResponse.parts"
     assert fr["parts"][0]["inlineData"]["mimeType"] == "image/png"
     assert fr["parts"][0]["inlineData"]["data"]
@@ -716,7 +774,12 @@ def test_gemini_2x_does_not_embed_image_parts():
         tools=[],
         tool_choice=None,
     )
-    fr = request["contents"][1]["parts"][0]["functionResponse"]
+    fr = next(
+        part["functionResponse"]
+        for content in request["contents"]
+        for part in content["parts"]
+        if "functionResponse" in part
+    )
     assert "parts" not in fr
 
 
@@ -749,7 +812,12 @@ def test_text_only_tool_result_has_no_parts():
         tools=[],
         tool_choice=None,
     )
-    fr = request["contents"][1]["parts"][0]["functionResponse"]
+    fr = next(
+        part["functionResponse"]
+        for content in request["contents"]
+        for part in content["parts"]
+        if "functionResponse" in part
+    )
     assert "parts" not in fr
 
 
@@ -787,3 +855,75 @@ def test_iter_sse_events_stops_at_done_and_ignores_trailing_frames():
 
     resp = _FakeStreamResponse(['data: {"candidates": [1]}\ndata: [DONE]'])
     assert list(_iter_sse_events(resp)) == [{"candidates": [1]}]
+
+
+@pytest.mark.parametrize("api_version", ["v1beta", "v1"])
+@pytest.mark.parametrize("operation", ["completion", "count_tokens"])
+def test_native_tools_keep_grounding_and_versioned_schemas(api_version, operation):
+    import copy
+    import httpx
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    schema = {"type": "object", "properties": {"value": {"anyOf": [
+        {"type": "string"}, {"type": "array", "items": {"type": "string"}},
+    ]}}}
+    tools = [
+        {"type": "function", "function": {"name": "z_tool", "parameters": schema}},
+        {"googleSearch": {}},
+        {"name": "a_tool", "parameters": schema},
+    ]
+    original = copy.deepcopy(tools)
+    requests = []
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"candidates": [], "totalTokens": 7})
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        with GeminiNativeClient(api_key="test", base_url=f"https://proxy.example/{api_version}", http_client=http) as client:
+            if operation == "count_tokens":
+                assert client.count_tokens("hello", tools=tools) == 7
+            else:
+                client.chat.completions.create(messages=[{"role": "user", "content": "hello"}], tools=tools)
+    wire_tools = requests[0]["tools"]
+    assert {"googleSearch": {}} in wire_tools
+    declarations = wire_tools[0]["functionDeclarations"]
+    assert [d["name"] for d in declarations] == ["a_tool", "z_tool"]
+    for declaration in declarations:
+        if api_version == "v1beta":
+            assert declaration["parametersJsonSchema"] == schema
+            assert "parameters" not in declaration
+        else:
+            assert "parameters" in declaration
+            assert "parametersJsonSchema" not in declaration
+    assert tools == original
+
+
+@pytest.mark.parametrize("retry_delay", [None, "2.5s"])
+def test_native_error_keeps_http_date_retry_and_rpc_details(monkeypatch, retry_delay):
+    import httpx
+    from agent.gemini_native_adapter import gemini_http_error
+
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr("time.time", lambda: 0.0)
+    monkeypatch.setattr(
+        "agent.retry_utils.datetime",
+        SimpleNamespace(now=lambda tz: datetime.fromtimestamp(0, timezone.utc)),
+    )
+    details = [
+        {"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "VALIDATION_REQUIRED"},
+        {"@type": "type.googleapis.com/google.rpc.Help", "links": [{"url": "https://example.com/verify"}]},
+    ]
+    if retry_delay:
+        details.append({"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": retry_delay})
+    response = httpx.Response(
+        403, headers={"Retry-After": "Thu, 01 Jan 1970 00:01:00 GMT"},
+        json={"error": {"message": "Verify account", "details": details}},
+        request=httpx.Request("POST", "https://example.com"),
+    )
+    error = gemini_http_error(response)
+    assert error.retry_after == (2.5 if retry_delay else 60.0)
+    assert error.details["reset_at"] == error.retry_after
+    assert error.details["challenge_url"] == "https://example.com/verify"
+    assert error.code == "gemini_validation_required"
