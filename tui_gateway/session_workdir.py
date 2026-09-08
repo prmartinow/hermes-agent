@@ -184,6 +184,26 @@ def _emit_settled_session_info(sid: str, session: dict, agent) -> None:
         _reconcile_session_cwd_from_terminal(session)
     except Exception:
         logger.debug("failed to reconcile settled session cwd", exc_info=True)
+    if agent and hasattr(agent, "_credential_pool_entry_id") and session:
+        try:
+            entry_id = getattr(agent, "_credential_pool_entry_id", None)
+            pool = getattr(agent, "_credential_pool", None)
+            entry = pool.get_entry(entry_id) if (pool and entry_id) else (pool.current() if pool else None)
+            raw_acc = getattr(entry, "label", None) or getattr(entry, "id", None) or entry_id
+            if raw_acc:
+                from hermes_cli.auth import get_account_alias
+                acc_alias = get_account_alias(raw_acc)
+                db = session.get("db")
+                if db and hasattr(db, "update_session_meta"):
+                    row = db.get_session(sid) if hasattr(db, "get_session") else None
+                    if row:
+                        m_cfg = row.get("model_config") or {}
+                        if isinstance(m_cfg, str):
+                            m_cfg = json.loads(m_cfg)
+                        m_cfg["gemini_account"] = raw_acc or acc_alias
+                        db.update_session_meta(sid, json.dumps(m_cfg), row.get("model"))
+        except Exception:
+            logger.debug("failed to persist rotated account into state.db", exc_info=True)
     _emit("session.info", sid, _session_info(agent, session))
 
 

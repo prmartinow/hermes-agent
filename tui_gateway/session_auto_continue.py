@@ -65,8 +65,6 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     home = _session_home(session)
     if (marker := read_turn_marker(home, session_key)) is None:
         return None
-    if not marker.get("auto_continue", True):
-        return None  # The mailbox owns recovery and receipt identity for imported turns.
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
     if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
@@ -217,7 +215,7 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
     threading.Thread(target=interrupt, daemon=True, name=f"busy-interrupt-{sid}").start()
 
 
-def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str) -> dict | None:
+def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: str, status: str, sid: str = "") -> dict | None:
     """Apply ``agent.<method>(plain_text)`` (steer/redirect); on acceptance record the correction, scrub stale
     self-duplicates so the live turn's original text is not re-fired after settle, and return the ``status`` reply.
     None → caller falls through to the queue path."""
@@ -230,6 +228,13 @@ def _ac_try_correction(rid, session: dict, agent: Any, method: str, plain_text: 
         _record_inflight_correction(session, plain_text)
         _drop_queued_duplicates_of_inflight_user(session)
         session["last_active"] = time.time()
+    if method == "steer":
+        from tui_gateway.server import _emit
+        target_sid = sid or str(session.get("session_key") or "")
+        _emit("turn.steer", target_sid, {"text": plain_text, "timestamp": time.time()})
+        writer = getattr(agent, "_live_stream_writer", None)
+        if writer and hasattr(writer, "steer"):
+            writer.steer(plain_text)
     return _ok(rid, {"status": status})
 
 
@@ -255,7 +260,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any,
             "interrupt": getattr(agent, "_supports_active_turn_redirect", False) is True and hasattr(agent, "redirect")}
         method, status = {"steer": ("steer", "steered"), "interrupt": ("redirect", "redirected")}.get(mode, (None, None))
         if (method and supported[mode]
-                and (resp := _ac_try_correction(rid, session, agent, method, plain_text, status)) is not None):
+                and (resp := _ac_try_correction(rid, session, agent, method, plain_text, status, sid=sid)) is not None):
             return resp
     # Queue before asking the live turn to stop. Never call a provider/compute-host method under history_lock: an
     # interrupt can wait behind the op it cancels.
@@ -287,13 +292,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         _ac_set_queue(session, session.get("queued_prompts") or [])
         session["running"] = True
-        queued_transport = queued.get("transport")
-        # The queuer's transport is pinned so the drained turn reaches the client that sent it — but
-        # ATTACHED, not rebound: a mid-turn prompt from a second client used to silence the first for the
-        # whole drained turn. A peer that disconnected while its prompt sat in the queue is skipped: the
-        # prompt still runs, only the dead pin is dropped.
-        if queued_transport is not None and not _transport_is_dead(queued_transport):
-            _attach_session_transport(session, queued_transport)
+        if queued.get("transport") is not None:
+            session["transport"] = queued["transport"]
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:

@@ -416,9 +416,8 @@ def _normalize_base_url(base_url: str) -> str:
     return (base_url or "").strip().rstrip("/")
 
 
-def _auth_headers(api_key: object = "") -> Dict[str, str]:
-    from agent.command_token_source import materialize_probe_api_key
-    token = materialize_probe_api_key(api_key)
+def _auth_headers(api_key: str = "") -> Dict[str, str]:
+    token = str(api_key or "").strip()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -920,7 +919,7 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
         return {}
     alternate = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized + "/v1"
     candidates = [normalized] + ([alternate] if alternate != normalized else [])
-    headers = _auth_headers(api_key)
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     verify = _resolve_requests_verify(normalized)
     last_error: Optional[Exception] = None
     if local:
@@ -1031,6 +1030,41 @@ def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
     return next((hit for hit in map(cache.get, (key, f"{model}@{base_url}", f"{key}/")) if hit is not None), None)
 
 
+def get_model_max_output_tokens(
+    model: str = "",
+    provider: str = "",
+    config_max_tokens: Optional[int] = None,
+) -> int:
+    """Resolve authoritative max output tokens for a model.
+
+    If an explicit positive ``config_max_tokens`` is provided, it is honored.
+    Otherwise, returns the native model output ceiling for known large-output
+    models (65536 for Gemini, 64000 for Claude 3.7 / 4.6+), catalog values
+    when known, or 0 when unspecified.
+    """
+    if config_max_tokens is not None and int(config_max_tokens) > 0:
+        return int(config_max_tokens)
+
+    norm_provider = (provider or "").strip().lower()
+    norm_model = (model or "").strip().lower()
+
+    if norm_provider in ("gemini", "gemini-oauth", "google") or "gemini" in norm_model:
+        return 65536
+    if "claude" in norm_model:
+        if "opus-4-6" in norm_model or "sonnet-4-6" in norm_model or "claude-3-7" in norm_model:
+            return 64000
+
+    try:
+        from agent.models_dev import get_model_capabilities
+
+        caps = get_model_capabilities(provider, model, allow_network=False)
+        if caps and caps.max_output_tokens:
+            return caps.max_output_tokens
+    except Exception:
+        pass
+    return 0
+
+
 def _invalidate_cached_context_length(model: str, base_url: str) -> None:
     """Drop a stale cache entry so it gets re-resolved on the next lookup."""
     key = _context_cache_key(model, base_url)
@@ -1075,6 +1109,27 @@ def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
         limit = int(match.group(1))
         if 1024 <= limit <= 10_000_000:  # sanity: must be a plausible window
             return limit
+    return None
+
+
+def get_model_max_output_tokens(
+    model: str = "",
+    provider: str = "",
+    config_max_tokens: Optional[int] = None,
+) -> Optional[int]:
+    """Return the authoritative native output token limit for a model, or None."""
+    if config_max_tokens is not None and config_max_tokens > 0:
+        return config_max_tokens
+    p_lower = (provider or "").strip().lower()
+    m_lower = (model or "").strip().lower()
+    if "gemini" in p_lower or "gemini" in m_lower:
+        return 65536
+    if "claude" in m_lower or "anthropic" in p_lower:
+        if "3-7" in m_lower or "3.7" in m_lower or "4-" in m_lower:
+            return 64000
+        return 8192
+    if "gpt-4o" in m_lower:
+        return 16384
     return None
 
 
@@ -1438,7 +1493,6 @@ def _query_anthropic_context_length(model: str, base_url: str, api_key: str) -> 
 # Codex OAuth `context_window` values (what Codex enforces — lower than the direct API for the same
 # slugs). Fallback when the live probe fails; longest-key-first. gpt-5.3-codex-spark is listed so "gpt-5.3-codex" doesn't win.
 _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
-    "gpt-6-astra": 272_000,
     "gpt-5.1-codex-max": 272_000, "gpt-5.1-codex-mini": 272_000, "gpt-5.3-codex": 272_000,
     "gpt-5.3-codex-spark": 128_000, "gpt-5.2-codex": 272_000, "gpt-5.4-mini": 272_000,
     "gpt-5.6-sol": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000, "gpt-daybreak-blue-latest": 272_000,
@@ -1450,16 +1504,13 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
 # The bump fires ONLY when the resolved value is exactly the stale 272,000. ``gpt-5.6`` is a FAMILY
 # PREFIX (``-pro`` slugs aren't routable on Codex); ``gpt-5.4`` is EXACT because gpt-5.4-mini enforces 272K.
 _CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_PREFIXES: Dict[str, int] = {"gpt-5.6": 900_000}  # sol / terra / luna
-_CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {
-    "gpt-5.4": 900_000, "gpt-daybreak-blue-latest": 900_000,
-    "gpt-6-astra": 900_000,  # advertised 272K; 920,043 input OK, 1,000,043 rejected (live 2026-09-04)
-}
+_CODEX_OAUTH_VERIFIED_ABOVE_ADVERTISED_EXACT: Dict[str, int] = {"gpt-5.4": 900_000, "gpt-daybreak-blue-latest": 900_000}
 _CODEX_OAUTH_STALE_ADVERTISED_CTX = 272_000  # the only advertised value the bump may override
 CODEX_CONTEXT_VARIANT_SUFFIX = "-900k"  # picker-only opt-in suffix; never sent on the wire
 # The ONLY bases eligible for ``-900k``: routable, live-verified. No family prefixing (it would synthesize
 # dead ``-pro`` variants); dated snapshots of the 5.6 bases are allowed. gpt-daybreak-blue-latest is a verified Sol alias.
 _CODEX_900K_SNAPSHOT_BASES = ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
-_CODEX_900K_ELIGIBLE_BASES = frozenset({*_CODEX_900K_SNAPSHOT_BASES, "gpt-5.4", "gpt-daybreak-blue-latest", "gpt-6-astra"})
+_CODEX_900K_ELIGIBLE_BASES = frozenset({*_CODEX_900K_SNAPSHOT_BASES, "gpt-5.4", "gpt-daybreak-blue-latest"})
 _CODEX_900K_SNAPSHOT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 

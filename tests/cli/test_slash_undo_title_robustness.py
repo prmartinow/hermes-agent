@@ -53,3 +53,15 @@ def test_title_too_long_prints_single_error(capsys):
     # The length error should fire; the contradictory "empty after cleanup"
     # message must NOT also appear.
     assert "empty after cleanup" not in out.lower()
+
+
+def test_redo_non_numeric_count_keeps_repl_alive():
+    cli = _make_cli()
+    result = cli.process_command("/redo abc")
+    assert result is True
+
+
+def test_redo_empty_session_reports_nothing_to_redo(capsys):
+    cli = _make_cli()
+    result = cli.process_command("/redo")
+    assert result is True

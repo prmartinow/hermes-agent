@@ -953,11 +953,32 @@ class SessionSessionsMixin:
                 {chain[-1] for chain in chain_by_root.values()}, compact_rows=compact_rows,
             ) if chain_by_root else {}
         )
+        # Batch fetch total cumulative visual message counts across all chains and standalone/in-place sessions
+        target_sids = set()
+        for s in sessions:
+            chain = chain_by_root.get(s["id"])
+            if chain:
+                target_sids.update(chain)
+            else:
+                target_sids.add(s["id"])
+
+        counts_by_sid: Dict[str, int] = {}
+        if target_sids:
+            all_target_sids = list(target_sids)
+            placeholders = ",".join("?" * len(all_target_sids))
+            with self._read_ctx() as conn:
+                cursor = conn.execute(
+                    f"SELECT session_id, COUNT(*) FROM messages WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1) GROUP BY session_id",
+                    all_target_sids,
+                )
+                counts_by_sid = dict(cursor.fetchall())
+
         projected = []
         for s in sessions:
             chain = chain_by_root.get(s["id"])
             tip_row = tip_rows.get(chain[-1]) if chain else None
             if not tip_row:
+                s["total_message_count"] = counts_by_sid.get(s["id"], s.get("message_count", 0))
                 projected.append(s)
                 continue
             merged = dict(s)
@@ -969,6 +990,7 @@ class SessionSessionsMixin:
                     merged[key] = tip_row[key]
             merged["_lineage_root_id"] = s["id"]
             merged["_lineage_ids"] = chain
+            merged["total_message_count"] = sum(counts_by_sid.get(sid, 0) for sid in chain)
             projected.append(merged)
         return projected
 

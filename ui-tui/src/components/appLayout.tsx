@@ -3,7 +3,7 @@ import '../sdk/apps/index.js'
 
 import { AlternateScreen, Box, NoSelect, ScrollBox, Text } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
-import { Fragment, memo, useEffect, useMemo, useRef } from 'react'
+import { memo, useEffect, useMemo, useRef } from 'react'
 
 import { useGateway } from '../app/gatewayContext.js'
 import type { AppLayoutProps } from '../app/interfaces.js'
@@ -137,10 +137,10 @@ const PromptPrefix = memo(function PromptPrefix({
 
 const TranscriptPane = memo(function TranscriptPane({
   actions,
-  composer,
+  cols,
   progress,
   transcript
-}: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'>) {
+}: Pick<AppLayoutProps, 'actions' | 'progress' | 'transcript'> & { cols: number }) {
   const ui = useStore($uiState)
   const petBox = useStore($petBox)
   const railCols = useAmbientRailWidth('left') + useAmbientRailWidth('right')
@@ -150,24 +150,11 @@ const TranscriptPane = memo(function TranscriptPane({
   //    (as long as enough width is left for comfortable reading);
   //  - narrow terminals: keep full width and reserve bottom rows instead, so
   //    the newest lines sit above the pet rather than getting cramped.
-  const useGutter = !!petBox && composer.cols - railCols - petBox.width >= MIN_GUTTER_BODY_COLS
-  const bodyCols = Math.max(28, (useGutter && petBox ? composer.cols - petBox.width : composer.cols) - railCols)
+  const useGutter = !!petBox && cols - railCols - petBox.width >= MIN_GUTTER_BODY_COLS
+  const bodyCols = Math.max(28, (useGutter && petBox ? cols - petBox.width : cols) - railCols)
   const petBandRows = petBox && !useGutter ? petBox.height : 0
 
-  // LiveTodoPanel rides as a child of the latest user-message row so it
-  // visually belongs to the prompt and follows it during scroll. -1 when
-  // empty → row.index === -1 is always false → no render.
-  const lastUserIdx = useMemo(() => {
-    const items = transcript.historyItems
 
-    for (let i = items.length - 1; i >= 0; i--) {
-      if (items[i].role === 'user') {
-        return i
-      }
-    }
-
-    return -1
-  }, [transcript.historyItems])
 
   // Index of the first user-role message; every later user message gets a
   // small dash above it so multi-turn transcripts visually segment by
@@ -205,15 +192,10 @@ const TranscriptPane = memo(function TranscriptPane({
 
               {row.msg.kind === 'intro' ? (
                 <Box flexDirection="column" paddingTop={1}>
-                  <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
+                  <Banner maxWidth={Math.max(1, cols - 2)} t={ui.theme} />
 
                   {row.msg.info && (
-                    <SessionPanel
-                      info={row.msg.info}
-                      maxWidth={Math.max(1, composer.cols - 2)}
-                      sid={ui.sid}
-                      t={ui.theme}
-                    />
+                    <SessionPanel info={row.msg.info} maxWidth={Math.max(1, cols - 2)} sid={ui.sid} t={ui.theme} />
                   )}
                 </Box>
               ) : row.msg.kind === 'panel' && row.msg.panelData ? (
@@ -236,7 +218,7 @@ const TranscriptPane = memo(function TranscriptPane({
                 />
               )}
 
-              {row.index === lastUserIdx && <LiveTodoPanel />}
+
             </Box>
           ))}
 
@@ -257,7 +239,7 @@ const TranscriptPane = memo(function TranscriptPane({
         </Box>
       </ScrollBox>
 
-      <NoSelect flexShrink={0} marginLeft={1}>
+      <NoSelect flexGrow={0} flexShrink={0} marginLeft={1} width={1}>
         <TranscriptScrollbar scrollRef={transcript.scrollRef} t={ui.theme} />
       </NoSelect>
 
@@ -363,7 +345,9 @@ const ComposerPane = memo(function ComposerPane({
         <Box height={1} onMouseDown={captureInputDrag} onMouseDrag={dragFromSpacer} onMouseUp={endInputDrag} />
       )}
 
-      <StatusRulePane at="top" composer={composer} status={status} />
+      <LiveTodoPanel />
+
+      <StatusRulePane at="top" cols={composer.cols} status={status} />
       <AmbientDock placement="dock-top" />
 
       <Box flexDirection="column" marginTop={ui.statusBar === 'top' ? 0 : 1} position="relative">
@@ -448,7 +432,7 @@ const ComposerPane = memo(function ComposerPane({
       {!composer.empty && !ui.sid && <Text color={ui.theme.color.muted}>⚕ {ui.status}</Text>}
 
       <AmbientDock placement="dock-bottom" />
-      <StatusRulePane at="bottom" composer={composer} status={status} />
+      <StatusRulePane at="bottom" cols={composer.cols} status={status} />
     </NoSelect>
   )
 })
@@ -477,9 +461,9 @@ const JourneyPane = memo(function JourneyPane() {
 
 const StatusRulePane = memo(function StatusRulePane({
   at,
-  composer,
+  cols,
   status
-}: Pick<AppLayoutProps, 'composer' | 'status'> & { at: 'bottom' | 'top' }) {
+}: Pick<AppLayoutProps, 'status'> & { at: 'bottom' | 'top'; cols: number }) {
   const ui = useStore($uiState)
 
   if (ui.statusBar !== at) {
@@ -492,7 +476,7 @@ const StatusRulePane = memo(function StatusRulePane({
         battery={ui.battery ? ui.batteryStatus : null}
         bgCount={ui.bgTasks.size}
         busy={ui.busy}
-        cols={composer.cols}
+        cols={cols}
         compacting={ui.compacting}
         cwdLabel={status.cwdLabel}
         focusView={ui.focusView}
@@ -500,6 +484,7 @@ const StatusRulePane = memo(function StatusRulePane({
         lastTurnEndedAt={status.lastTurnEndedAt}
         liveSessionCount={ui.liveSessionCount}
         model={ui.info?.model ?? ''}
+        modelAccount={ui.info?.gemini_account}
         modelFast={ui.info?.fast || ui.info?.service_tier === 'priority'}
         modelReasoningEffort={ui.info?.reasoning_effort}
         notice={ui.notice}
@@ -529,14 +514,11 @@ export const AppLayout = memo(function AppLayout({
   const overlay = useStore($overlayState)
   const ui = useStore($uiState)
 
-  // Inline mode skips AlternateScreen so the host terminal's native
-  // scrollback captures rows scrolled off the top; composer + progress
-  // stay anchored via normal flex-column flow.
-  const Shell = INLINE_MODE ? Fragment : AlternateScreen
-  const shellProps = INLINE_MODE ? {} : { mouseTracking }
-
+  // Inline mode runs without entering the alternate screen buffer so
+  // native scrollback works, while asserting DEC mouse tracking so click
+  // boxes remain interactive.
   return (
-    <Shell {...shellProps}>
+    <AlternateScreen inline={INLINE_MODE} mouseTracking={mouseTracking}>
       <Box flexDirection="column" flexGrow={1} position="relative">
         <Box flexDirection="row" flexGrow={1}>
           {!overlay.agents && !overlay.journey && <AmbientRail side="left" />}
@@ -550,7 +532,7 @@ export const AppLayout = memo(function AppLayout({
             </PerfPane>
           ) : (
             <PerfPane id="transcript">
-              <TranscriptPane actions={actions} composer={composer} progress={progress} transcript={transcript} />
+              <TranscriptPane actions={actions} cols={composer.cols} progress={progress} transcript={transcript} />
             </PerfPane>
           )}
           {!overlay.agents && !overlay.journey && <AmbientRail side="right" />}
@@ -585,7 +567,7 @@ export const AppLayout = memo(function AppLayout({
       </Box>
 
       <ActiveWidgetSlot />
-    </Shell>
+    </AlternateScreen>
   )
 })
 

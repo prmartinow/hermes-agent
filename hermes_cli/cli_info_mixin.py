@@ -524,7 +524,12 @@ class CLIInfoMixin:
                     print(f"    ○ {name:<12} Not configured ({env_var})")
 
             print()
-            print("  Conversations persist until /new or /reset.")
+            print("  Session Reset Policy:")
+            print("  " + "-" * 55)
+            policy = config.default_reset_policy
+            print(f"    Mode: {policy.mode}")
+            print(f"    Daily reset at: {policy.at_hour}:00")
+            print(f"    Idle timeout: {policy.idle_minutes} minutes")
             print()
             print("  To start the gateway:")
             print("    python cli.py --gateway")
@@ -713,23 +718,52 @@ class CLIInfoMixin:
         print(f"  API calls:                 {calls:>10,}")
         print(f"  Session duration:          {elapsed:>10}")
         print(f"  {'─' * 40}")
-        from agent.context_breakdown import context_display_source
-        mark = "~" if context_display_source(compressor) != "provider_usage" else ""
-        print(f"  Current context:  {mark}{last_prompt:,} / {ctx_len:,} ({mark}{pct:.0f}%)")
+        print(f"  Current context:  {last_prompt:,} / {ctx_len:,} ({pct:.0f}%)")
         print(f"  Messages:         {len(self.conversation_history)}")
         print(f"  Compressions:     {compressor.compression_count}")
 
         # Account limits — fetched off-thread with a hard timeout so slow provider APIs don't
         # hang the prompt. Lazy import: pulls the OpenAI SDK chain.
         provider = self._agent_or_self("provider")
+        pinned_acc = None
+        if str(provider or "").strip().lower() in {"gemini-oauth", "gemini_oauth", "gemini"} or (provider and str(provider).startswith("gemini-")):
+            try:
+                agent = getattr(self, "agent", None)
+                entry_id = getattr(agent, "_credential_pool_entry_id", None)
+                pool = getattr(agent, "_credential_pool", None)
+                if entry_id and pool:
+                    entries = pool.entries() if hasattr(pool, "entries") else []
+                    curr = next((e for e in entries if getattr(e, "id", None) == entry_id), None)
+                    if curr:
+                        pinned_acc = curr.label or curr.id
+                if not pinned_acc and pool:
+                    curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
+                    if curr:
+                        pinned_acc = curr.label or curr.id
+            except Exception:
+                pass
+
         from agent.account_usage import fetch_account_usage, render_account_usage_lines
         account_snapshot = None
         if provider:
+            fetch_kwargs = {}
+            if self._agent_or_self("base_url"):
+                fetch_kwargs["base_url"] = self._agent_or_self("base_url")
+            if self._agent_or_self("api_key"):
+                fetch_kwargs["api_key"] = self._agent_or_self("api_key")
+            if str(provider or "").strip().lower() in {"gemini-oauth", "gemini_oauth", "gemini"} or (provider and str(provider).startswith("gemini-")):
+                if pinned_acc:
+                    fetch_kwargs["account"] = pinned_acc
+                if getattr(self, "session_id", None):
+                    fetch_kwargs["session_id"] = getattr(self, "session_id", None)
+                if self._agent_or_self("model"):
+                    fetch_kwargs["model"] = self._agent_or_self("model")
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
                 try:
                     account_snapshot = _pool.submit(
-                        fetch_account_usage, provider, base_url=self._agent_or_self("base_url"),
-                        api_key=self._agent_or_self("api_key"),
+                        fetch_account_usage, provider,
+                        **fetch_kwargs,
                     ).result(timeout=10.0)
                 except (concurrent.futures.TimeoutError, Exception):
                     account_snapshot = None

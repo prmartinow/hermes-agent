@@ -227,6 +227,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
       }
 
       if (mode === 'steer' && live.sid) {
+        turnController.recordSteer(item.text)
+
         gw.request<SessionSteerResponse>('session.steer', { session_id: live.sid, text: item.text })
           .then(raw => {
             const r = asRpcResult<SessionSteerResponse>(raw)

@@ -9,6 +9,7 @@ import pytest
 from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
+    MessageEvent,
     SendResult,
     cache_audio_from_bytes,
     cache_image_from_bytes,
@@ -20,7 +21,6 @@ from gateway.platforms.base import (
     _prefix_within_utf16_limit,
     cache_audio_from_bytes,
 )
-from gateway.platforms.event import MessageEvent
 
 
 def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):

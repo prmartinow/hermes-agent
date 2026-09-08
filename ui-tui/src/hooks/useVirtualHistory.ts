@@ -1,3 +1,4 @@
+import { INLINE_MODE } from '../config/env.js'
 import type { ScrollBoxHandle } from '@hermes/ink'
 import {
   type RefObject,
@@ -148,7 +149,8 @@ export function useVirtualHistory(
     onHeightsChange,
     overscan = OVERSCAN,
     maxMounted = MAX_MOUNTED,
-    coldStartCount = COLD_START
+    coldStartCount = COLD_START,
+    inline = INLINE_MODE
   }: VirtualHistoryOptions = {}
 ) {
   const nodes = useRef(new Map<string, unknown>())
@@ -322,10 +324,15 @@ export function useVirtualHistory(
     return rangeTop <= visibleTop && rangeBottom >= visibleBottom ? frozenRangeCandidate : null
   })()
 
+  const isInline = inline
+
   let start = 0
   let end = n
 
-  if (frozenRange) {
+  if (isInline) {
+    start = 0
+    end = n
+  } else if (frozenRange) {
     start = frozenRange[0]
     end = Math.min(frozenRange[1], n)
   } else if (n > 0) {
@@ -663,12 +670,12 @@ export function useVirtualHistory(
   }, [effEnd, effStart, items, liveTailActive, measuredHeightVersion, n, offsets, scrollRef, sticky, top, total, vp])
 
   return {
-    bottomSpacer: Math.max(0, total - (offsets[effEnd] ?? total)),
-    end: effEnd,
+    bottomSpacer: isInline ? 0 : Math.max(0, total - (offsets[effEnd] ?? total)),
+    end: isInline ? n : effEnd,
     measureRef,
     offsets,
-    start: effStart,
-    topSpacer: offsets[effStart] ?? 0
+    start: isInline ? 0 : effStart,
+    topSpacer: isInline ? 0 : (offsets[effStart] ?? 0)
   }
 }
 
@@ -686,4 +693,5 @@ interface VirtualHistoryOptions {
   maxMounted?: number
   onHeightsChange?: (heights: ReadonlyMap<string, number>) => void
   overscan?: number
+  inline?: boolean
 }

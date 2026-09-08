@@ -438,7 +438,7 @@ _nous_caps_disk_checked = False
 _nous_caps_warm_started = False
 
 
-from agent.reasoning_effort import clamp_effort as _clamp_effort, is_astra_model
+from agent.reasoning_effort import clamp_effort as _clamp_effort
 
 
 def clamp_reasoning_effort_to_supported(
@@ -1203,11 +1203,7 @@ def _openai_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]
     curated = list(_PROVIDER_MODELS.get(normalized, []))
     # Curated order, only models the account has access to; an account serving none of them (rare)
     # falls back to curated so the picker still offers sane defaults.
-    discovered = [m for m in curated if m.lower() in live_lower]
-    # Astra is intentionally absent from offline/static catalogs: the official API's
-    # account-scoped /models response is the only source that may advertise it.
-    discovered.extend(m for m in live if is_astra_model(m))
-    return discovered or curated or live
+    return [m for m in curated if m.lower() in live_lower] or curated or live
 
 
 def _custom_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]:
@@ -1241,11 +1237,25 @@ def _opencode_free_catalog(normalized: str, force_refresh: bool) -> list[str]:
     return _fetch_opencode_free_models(force_refresh=force_refresh) or list(_PROVIDER_MODELS.get(normalized, []))
 
 
+def _gemini_oauth_catalog(normalized: str, force_refresh: bool) -> list[str]:
+    try:
+        from hermes_cli.auth import fetch_gemini_available_models
+        return fetch_gemini_available_models(account=normalized, force=force_refresh)
+    except Exception:
+        return []
+
+
 # Per-provider catalog sources tried before the generic profile fetch. A fetcher returning None
 # falls through to the profile/curated path; a list is returned as-is (even empty).
 _PROVIDER_CATALOG_FETCHERS: dict[str, Any] = {
     "openrouter": lambda normalized, force_refresh: model_ids(force_refresh=force_refresh),
     "openai-codex": _codex_catalog,
+    "gemini-oauth": _gemini_oauth_catalog,
+    "gemini-1": _gemini_oauth_catalog,
+    "gemini-2": _gemini_oauth_catalog,
+    "gemini-3": _gemini_oauth_catalog,
+    "gemini-4": _gemini_oauth_catalog,
+    "gemini-5": _gemini_oauth_catalog,
     "copilot": _copilot_catalog,
     "copilot-acp": _copilot_catalog,
     "nous": _nous_catalog,
@@ -1515,11 +1525,6 @@ def _normalized_cache_slug(provider: Optional[str]) -> str:
     return requested if requested == "ollama" else (normalize_provider(provider) or (provider or ""))
 
 
-def _model_requires_account_discovery(provider: Optional[str], model: str) -> bool:
-    """Astra names cannot confer API/OAuth entitlement through picker state."""
-    return _normalized_cache_slug(provider) in {"openai", "openai-api", "openai-codex"} and is_astra_model(model)
-
-
 def cached_provider_model_ids(
     provider: Optional[str], *, force_refresh: bool = False,
     ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL) -> list[str]:
@@ -1564,11 +1569,9 @@ def cached_provider_model_ids(
         if same_creds and isinstance(entry.get("models"), list) and entry["models"]:
             return list(entry["models"])
         return []
-    # Live returned nothing: a stale same-fingerprint entry beats an empty result — minus account-gated
-    # models, which only a successful discovery may advertise (the entry itself is untouched, so the
-    # next successful fetch restores them).
+    # Live returned nothing: a stale same-fingerprint entry beats an empty result.
     if _cache_entry_valid(entry, fp):
-        return [model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)]
+        return list(entry["models"])
     return []
 
 
@@ -2312,15 +2315,13 @@ def fetch_api_models(
 
 
 def _custom_endpoint_fingerprint(
-    api_key: Any, api_mode: Optional[str], headers: Optional[dict[str, str]]) -> str:
+    api_key: Optional[str], api_mode: Optional[str], headers: Optional[dict[str, str]]) -> str:
     """Custom endpoints have no ``PROVIDER_REGISTRY`` slug, so hash exactly what callers pass to
     :func:`fetch_api_models`: a rotated ``api_key``, changed ``api_mode`` or edited ``extra_headers``
     each bust the cache entry. blake2b for the same CodeQL rationale as ``_credential_fingerprint``."""
     import hashlib
 
-    from agent.command_token_source import CommandTokenSource
-    identity = api_key.cache_identity if isinstance(api_key, CommandTokenSource) else api_key
-    blob = "|".join((identity or "", api_mode or "", json.dumps(headers or {}, sort_keys=True)))
+    blob = "|".join((api_key or "", api_mode or "", json.dumps(headers or {}, sort_keys=True)))
     return hashlib.blake2b(blob.encode("utf-8", errors="replace"), digest_size=8).hexdigest()
 
 
@@ -2339,28 +2340,15 @@ def _cache_entry_valid(
 
 
 def cached_fetch_api_models(
-    api_key: Any, base_url: Optional[str], *, timeout: float = 5.0,
+    api_key: Optional[str], base_url: Optional[str], *, timeout: float = 5.0,
     api_mode: Optional[str] = None, headers: Optional[dict[str, str]] = None,
     force_refresh: bool = False, cache_only: bool = False,
-    fetch_models=None,
     ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL) -> Optional[list[str]]:
     """Disk-cached :func:`fetch_api_models` for custom endpoints. ``cache_only`` callers (GUI picker
     opens that must not block on a stopped local endpoint) still get a warm catalog instead of
-    collapsing to the config-declared subset. ``fetch_models`` supplies native-aware discovery
-    without minting a command token before cache admission."""
-    from hermes_cli.model_switch_providers import _NativePickerModelList
-
-    def _catalog(entry):
-        return (_NativePickerModelList if entry.get("native_catalog") else list)(entry["models"])
-
-    def _entry(live, at=None):
-        return {**_cache_entry(fp, live, at), "native_catalog": isinstance(live, _NativePickerModelList)}
-
+    collapsing to the config-declared subset."""
     def _live():
-        if fetch_models is not None:
-            return fetch_models()
-        from agent.command_token_source import materialize_probe_api_key
-        return fetch_api_models(materialize_probe_api_key(api_key), base_url, timeout=timeout, api_mode=api_mode, headers=headers)
+        return fetch_api_models(api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers)
 
     normalized_url = str(base_url or "").strip().rstrip("/").lower()
     if not normalized_url:  # nothing to key the cache on
@@ -2371,33 +2359,32 @@ def cached_fetch_api_models(
     cache = _load_provider_models_cache()
     entry = cache.get(cache_key)
     now = time.time()
-    valid = not force_refresh and _cache_entry_valid(entry, fp, allow_empty=isinstance(entry, dict) and entry.get("native_catalog") is True)
+    valid = not force_refresh and _cache_entry_valid(entry, fp)
 
     if cache_only:
         # Same trust window as the SWR tier below, minus the revalidation.
-        return _catalog(entry) if valid and now - entry["at"] < _PROVIDER_MODELS_STALE_SERVE_MAX else None
+        return list(entry["models"]) if valid and now - entry["at"] < _PROVIDER_MODELS_STALE_SERVE_MAX else None
 
     if valid:
         age = now - entry["at"]
         if age < ttl_seconds:
-            return _catalog(entry)
+            return list(entry["models"])
         if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
             # Stale-while-revalidate: serve now, refresh off-thread for the next open.
             def _refresh_custom():
                 live = _live()
-                return _entry(live) if live or isinstance(live, _NativePickerModelList) else None
+                return _cache_entry(fp, live) if live else None
 
             _spawn_swr_refresh(cache_key, _refresh_custom)
-            return _catalog(entry)
+            return list(entry["models"])
 
     live = _live()
-    if live or isinstance(live, _NativePickerModelList):
-        stored = _entry(live, now)
-        _store_cache_entry(cache_key, stored, cache)
-        return _catalog(stored)
+    if live:
+        _store_cache_entry(cache_key, _cache_entry(fp, live, now), cache)
+        return list(live)
     # Live returned nothing (offline, timeout, auth hiccup): a stale same-fingerprint entry beats it.
-    if _cache_entry_valid(entry, fp, allow_empty=isinstance(entry, dict) and entry.get("native_catalog") is True):
-        return _catalog(entry)
+    if _cache_entry_valid(entry, fp):
+        return list(entry["models"])
     return live
 
 

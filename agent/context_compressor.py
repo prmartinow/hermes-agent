@@ -22,7 +22,6 @@ from agent.auxiliary_client import (
     extract_content_or_reasoning,
 )
 from agent.context_engine import ContextEngine, sanitize_memory_context
-from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.micro_compaction import MicroCompactionMixin
 from agent.model_metadata import (
@@ -1638,7 +1637,7 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 }
 
 
-class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngine):
+class ContextCompressor(MicroCompactionMixin, ContextEngine):
     """Default context engine: prune tool results, protect head/tail, summarize the middle
     with an LLM, and iteratively update the previous summary on later compactions."""
 
@@ -1745,7 +1744,6 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             self._resolved_context_length = get_model_context_length(
                 self.model, base_url=self.base_url, api_key=self.api_key,
                 config_context_length=self._config_context_length, provider=self.provider,
-                custom_providers=self.custom_providers,
             )
             # Raise-only small-context floor; must run after context_length resolves and before threshold_tokens derives.
             self.threshold_percent = self._effective_threshold_percent(self._resolved_context_length, self._base_threshold_percent)
@@ -1774,7 +1772,13 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         if self._threshold_tokens is None:
             # Resolve the window first: it may floor threshold_percent as a side effect.
             _ctx = self.context_length
-            self._threshold_tokens = self._compute_threshold_tokens(_ctx, self.threshold_percent, self.max_tokens)
+            self._threshold_tokens = self._compute_threshold_tokens(
+                _ctx,
+                self.threshold_percent,
+                self.max_tokens,
+                model=getattr(self, "model", "") or "",
+                provider=getattr(self, "provider", "") or "",
+            )
             self._apply_threshold_tokens_cap()
         return self._threshold_tokens
 
@@ -2156,14 +2160,21 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
-        self.threshold_tokens = self._compute_threshold_tokens(context_length, self.threshold_percent, self.max_tokens)
+        self.threshold_tokens = self._compute_threshold_tokens(
+            context_length,
+            self.threshold_percent,
+            self.max_tokens,
+            model=model or getattr(self, "model", "") or "",
+            provider=getattr(self, "provider", "") or "",
+        )
         self._apply_threshold_tokens_cap()
         # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
         self._tail_token_budget = None
         _ = self.tail_token_budget  # eager recompute, same timing as before
         self.max_summary_tokens = min(int(context_length * 0.05), _SUMMARY_TOKENS_CEILING)
-        # Old usage cannot price a new model. Clear it without arming the post-compaction
-        # latch: the next response supplies usage or enables the usage-less fallback.
+        # Calibration state is only valid for the model that produced it: carried to a smaller window it would let
+        # should_defer_preflight_to_real_usage() suppress a compaction the new model needs. 0 (not the -1 sentinel)
+        # means "no real usage yet -> use the rough estimate" so post-response should_compress still fires.
         self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
         self._reset_real_usage_pairing()
         # Strikes were judged against the previous threshold; void them durably too.
@@ -2221,41 +2232,62 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     @staticmethod
     def _compute_threshold_tokens(
-        context_length: int, threshold_percent: float, max_tokens: int | None = None,
+        context_length: int,
+        threshold_percent: float,
+        max_tokens: int | None = None,
+        model: str = "",
+        provider: str = "",
     ) -> int:
         """Compute the compaction trigger in tokens from the effective input budget.
         Base is ``(context_length - max_tokens) * threshold_percent`` floored at MINIMUM_CONTEXT_LENGTH;
         when the floor binds it is capped at 85% of the budget so small windows can still fire.
 
-        The base value is ``effective_input_budget * threshold_percent``, floored at
-        ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress prematurely at 50%. BUT that floor
-        degenerates at small windows: for a model whose ``context_length`` is at/below the minimum (e.g. a
-        64K local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold equal the ENTIRE window —
-        auto-compression can never fire because the provider rejects the request before usage reaches 100%
-        (#14690).
-        The provider reserves ``max_tokens`` of output space out of the same window, so the usable INPUT
-        budget is ``context_length - max_tokens``. With a large ``max_tokens`` (e.g. 65536 on a custom
-        provider) the input budget is materially smaller than the raw window, and a threshold based on the
-        full window lets the session hit a provider 400 before compaction fires (#43547). The percentage and
-        the degenerate-window check below both operate on the effective input budget. ``max_tokens=None``
-        (provider default) conservatively assumes no reservation (full window).
-        """
-        effective_window = context_length - (max_tokens or 0)
-        if effective_window <= 0:
-            effective_window = context_length
-        pct_value = int(effective_window * threshold_percent)
-        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # The floor must not consume output headroom: cap at 85% when it is the binding term. Near-minimum windows
-        # otherwise trigger at ~98%, and providers that silently clip over-window prompts (ollama) never raise the
-        # overflow backstop, so the session wedges. An explicit threshold_percent above 85% is user intent; not capped.
-        trigger_cap = int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
-        if effective_window > 0 and floored > pct_value and floored > trigger_cap:
-            floored = max(pct_value, trigger_cap)
-        # A percentage at/above the window is unreachable; trigger at 85% instead.
-        if effective_window > 0 and floored >= effective_window:
-            return max(1, min(trigger_cap, effective_window - 1))
-        return floored
+        The base value is ``usable_input_budget * threshold_percent``, floored
+        at ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress
+        prematurely at 50%. BUT that floor degenerates at small windows: for a
+        model whose ``context_length`` is at/below the minimum (e.g. a 64K
+        local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold
+        equal the ENTIRE window — auto-compression can never fire because the
+        provider rejects the request before usage reaches 100% (#14690).
 
+        When the floor would meet or exceed the usable input budget, trigger at
+        ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the budget — high enough that a
+        small model uses most of its context before compacting, but below
+        100% so compaction fires before the provider rejects the request.
+
+        The provider reserves ``max_tokens`` of output space out of the same
+        window, so the usable INPUT budget is ``context_length - output_reservation``.
+        When ``max_tokens`` is None and model/provider are provided, we resolve
+        the authoritative native output ceiling via ``get_model_max_output_tokens``.
+        A hard invariant ceiling additionally preserves 1024 safety headroom for
+        system prompts and tool schemas.
+        """
+        if max_tokens is not None and max_tokens > 0:
+            output_reservation = max_tokens
+        elif model or provider:
+            from agent.model_metadata import get_model_max_output_tokens
+
+            output_reservation = get_model_max_output_tokens(
+                model=model, provider=provider, config_max_tokens=max_tokens
+            )
+        else:
+            output_reservation = 0
+
+        usable_input_budget = max(1, context_length - output_reservation)
+        pct_value = int(usable_input_budget * threshold_percent)
+        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
+        hard_input_cap = max(1, usable_input_budget - 1024)
+
+        if usable_input_budget > 0 and floored >= usable_input_budget:
+            return max(
+                1,
+                min(
+                    int(usable_input_budget * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
+                    hard_input_cap,
+                    usable_input_budget - 1,
+                ),
+            )
+        return min(floored, hard_input_cap)
     def __init__(
         self, model: str, threshold_percent: float = 0.50, protect_first_n: int = 3, protect_last_n: int = 20,
         summary_target_ratio: float = 0.20, quiet_mode: bool = False, summary_model_override: str = None,
@@ -2264,14 +2296,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
-        custom_providers: list | None = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "lean"
-        # Per-model context_length overrides live in custom_providers; without them deferred
-        # resolution falls back to the hardcoded family catalog (#83324).
-        self.custom_providers = custom_providers or None
         # Per-model overrides (longest substring match wins); floor applied on top.
         self.model_thresholds = model_thresholds or {}
         # Raw config value, before override/floor; fallback when switching to a model with no override.
@@ -2440,9 +2468,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             return False
         if self.awaiting_real_usage_after_compression:
             return True
-        # Estimate magnitude is not evidence of overflow, even past the full window.
-        # Let the provider adjudicate; its overflow error still triggers reactive recovery.
-        if self.last_real_prompt_tokens >= self.threshold_tokens:
+        # A real reading already at/over threshold needs no second opinion, and a rough figure past
+        # the whole window describes a request certain to fail — sending it only buys an overflow error.
+        if self.last_real_prompt_tokens >= self.threshold_tokens or rough_tokens >= self.context_length:
             return False
         return not self._provider_omits_usage
 
@@ -4673,6 +4701,23 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Phase 4: Assemble compressed message list
         compressed = self._assemble_compressed(messages, compress_start, compress_end, scan, summary)
         return self._finalize_compressed(compressed, messages, n_messages)
+
+    def _summarize_window(
+        self, messages: List[Dict[str, Any]], turns_to_summarize: List[Dict[str, Any]], scan: "_HandoffScan",
+        focus_topic: Optional[str], memory_context: str, bypass_cooldown: bool,
+    ) -> Optional[str]:
+        """Run the summary LLM; a cancellation rolls back the handoff scan's self-heal mutation first."""
+        # Focus-topic derivation scans user turns; only pay when a summary is generated.
+        try:
+            return self._generate_summary(
+                turns_to_summarize, focus_topic=focus_topic or self._derive_auto_focus_topic(messages),
+                memory_context=memory_context, bypass_cooldown=bypass_cooldown,
+            )
+        except AuxiliaryExplicitCancellation:
+            # Cancellation is a true no-op: restore the scan's mutation before the exception escapes.
+            self._previous_summary = scan.previous_summary_before
+            self._summary_has_user_turn = scan.has_user_turn_before
+            raise
 
     def _assemble_compressed(
         self, messages: List[Dict[str, Any]], compress_start: int, compress_end: int, scan: "_HandoffScan", summary: str,

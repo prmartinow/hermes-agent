@@ -13,6 +13,7 @@ act/
 .venv
 .vscode/
 .env
+.env.docker
 .op.env
 .env.local
 .env.development.local
@@ -27,6 +28,9 @@ act/
 .pip-cache/
 .uv-cache/
 compose.hermes.local.yml
+docker-compose.local.yml
+docker-compose.override.yml
+*.local.yml
 export*
 __pycache__/model_tools.cpython-310.pyc
 __pycache__/web_tools.cpython-310.pyc

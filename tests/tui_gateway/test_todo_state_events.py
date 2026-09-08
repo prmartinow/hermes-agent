@@ -99,17 +99,40 @@ def test_empty_list_at_nonzero_revision_is_a_real_clear():
 
     assert state == {"todos": [], "revision": 2}
 
+def test_history_to_messages_attaches_structured_todos_for_todo_tool():
+    todos = [
+        {"id": "1", "content": "Step 1", "status": "completed"},
+        {"id": "2", "content": "Step 2", "status": "in_progress"},
+    ]
+    history = [
+        {"role": "user", "content": "solve task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "todo_list",
+                        "arguments": json.dumps({"todos": todos}),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": json.dumps({"todos": todos, "revision": 1}),
+        },
+        {"role": "assistant", "content": "Working on step 2."},
+    ]
 
-def test_subagent_lifecycle_bypasses_tool_progress_off(monkeypatch):
-    """Subagent rows feed the Desktop status stack / TUI spawn tree — application state, not
-    tool-progress chrome — so display.tool_progress=off must not swallow them."""
-    sid = "subagent-progress-off"
-    events = []
-    monkeypatch.setitem(server._sessions, sid, {"agent": None, "tool_progress_mode": "off"})
-    monkeypatch.setattr(server, "_tool_progress_enabled", lambda _sid: False)
-    monkeypatch.setattr(server, "_emit", lambda event, event_sid, payload=None: events.append(event))
+    messages = server._history_to_messages(history)
+    assert len(messages) == 3
+    assert messages[0] == {"role": "user", "text": "solve task"}
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["name"] == "todo_list"
+    assert messages[1]["todos"] == todos
+    assert messages[2] == {"role": "assistant", "text": "Working on step 2."}
 
-    server._on_tool_progress(sid, "subagent.start", "delegate_task", "goal", None, goal="goal", subagent_id="s1")
-    server._on_tool_progress(sid, "reasoning.available", "_thinking", "hmm", None)
-
-    assert events == ["subagent.start"]

@@ -4,6 +4,7 @@ from __future__ import annotations
 from hermes_cli.cli_output import line_input
 
 import math
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ import uuid
 from agent.credential_pool import (
     AUTH_TYPE_API_KEY, AUTH_TYPE_OAUTH, CUSTOM_POOL_PREFIX, SOURCE_MANUAL,
     SOURCE_MANUAL_DEVICE_CODE, STATUS_EXHAUSTED, STRATEGY_FILL_FIRST, STRATEGY_ROUND_ROBIN,
-    STRATEGY_RANDOM, STRATEGY_LEAST_USED, PooledCredential, REFRESHABLE_OAUTH_PROVIDERS, _exhausted_until,
+    STRATEGY_RANDOM, STRATEGY_LEAST_USED, PooledCredential, _exhausted_until,
     _normalize_custom_pool_name, get_pool_strategy, label_from_token, list_custom_pool_providers,
     load_pool)
 import hermes_cli.auth as auth_mod
@@ -24,7 +25,10 @@ from hermes_cli.secret_prompt import masked_secret_prompt
 
 
 # Providers that support OAuth login in addition to API keys.
-_OAUTH_CAPABLE_PROVIDERS = {"anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth"}
+_OAUTH_CAPABLE_PROVIDERS = {
+    "anthropic", "nous", "openai-codex", "xai-oauth", "qwen-oauth", "minimax-oauth",
+    "gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5",
+}
 
 
 def _get_custom_provider_entries() -> list[dict]:
@@ -258,19 +262,18 @@ def _ask(prompt: str, reader: Callable[[str], str] | None = None) -> str | None:
         return None
 
 
-def _add_nous_oauth_credential(args, provider: str) -> PooledCredential:
+def _add_nous_oauth_credential(args, provider: str) -> None:
     """``hermes auth add nous --type oauth``: shared-credential import, else device-code login."""
     custom_label = (getattr(args, "label", None) or "").strip() or None
     timeout = getattr(args, "timeout", None) or 15.0
 
-    def _persist(creds: dict, what: str) -> PooledCredential:
+    def _persist(creds: dict, what: str) -> None:
         # `--label` is embedded into providers.nous so label_from_token doesn't overwrite it on every
         # subsequent load_pool("nous").
         entry = auth_mod.persist_nous_credentials(creds, label=custom_label)
         shown_label = entry.label if entry is not None else label_from_token(
             creds.get("access_token", ""), f"{provider}-oauth-1")
         print(f'{what} {provider} OAuth {"device-code " if what == "Saved" else ""}credentials: "{shown_label}"')
-        return entry
 
     # Codex-style auto-import: a shared Nous credential at <hermes-root>/shared/nous_auth.json
     # (written by any previous login) makes `hermes --profile <name> auth add nous --type oauth`
@@ -287,7 +290,8 @@ def _add_nous_oauth_credential(args, provider: str) -> PooledCredential:
             print("Rehydrating Nous session from shared credentials...")
             rehydrated = auth_mod._try_import_shared_nous_state(timeout_seconds=timeout)
             if rehydrated is not None:
-                return _persist(rehydrated, "Imported")
+                _persist(rehydrated, "Imported")
+                return
             # Expired refresh_token, portal down, etc. — fall through to device-code.
             print("Could not refresh shared credentials — falling back to device-code login.")
 
@@ -297,7 +301,7 @@ def _add_nous_oauth_credential(args, provider: str) -> PooledCredential:
         client_id=getattr(args, "client_id", None), scope=getattr(args, "scope", None),
         open_browser=not getattr(args, "no_browser", False), timeout_seconds=timeout,
         insecure=bool(getattr(args, "insecure", False)), ca_bundle=getattr(args, "ca_bundle", None))
-    return _persist(creds, "Saved")
+    _persist(creds, "Saved")
 
 
 def _unsuppress_provider_sources(provider: str) -> None:
@@ -312,7 +316,7 @@ def _unsuppress_provider_sources(provider: str) -> None:
         pass
 
 
-def _add_api_key_credential(args, provider: str, pool) -> PooledCredential:
+def _add_api_key_credential(args, provider: str, pool) -> None:
     token = ((getattr(args, "api_key", None) or "").strip()
              or masked_secret_prompt("Paste your API key: ").strip())
     if not token:
@@ -325,9 +329,8 @@ def _add_api_key_credential(args, provider: str, pool) -> PooledCredential:
     entry = PooledCredential(
         provider=provider, id=uuid.uuid4().hex[:6], label=label, auth_type=AUTH_TYPE_API_KEY,
         priority=0, source=SOURCE_MANUAL, access_token=token, base_url=_provider_base_url(provider))
-    entry = pool.add_entry(entry)
+    pool.add_entry(entry)
     print(f'Added {provider} credential #{len(pool.entries())}: "{label}"')
-    return entry
 
 
 def auth_add_command(args) -> None:
@@ -350,19 +353,42 @@ def auth_add_command(args) -> None:
     if not is_custom:
         _unsuppress_provider_sources(provider)
 
-    wanted_priority = getattr(args, "priority", None)
-    entry = _add_credential(args, provider, pool, requested_type)
-    if wanted_priority is not None:
-        placed_pool = load_pool(provider)
-        moved = placed_pool.move_entry(entry.id, int(wanted_priority))
-        _report_priority(provider, placed_pool, moved, int(wanted_priority), "Placed", "at")
-
-
-def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCredential:
     if requested_type == AUTH_TYPE_API_KEY:
-        return _add_api_key_credential(args, provider, pool)
+        _add_api_key_credential(args, provider, pool)
+        return
     if provider == "nous":
-        return _add_nous_oauth_credential(args, provider)
+        _add_nous_oauth_credential(args, provider)
+        return
+
+    if provider in {"gemini-oauth", "gemini_oauth"} or re.match(r"^gemini(?:-oauth)?-([1-5])$", provider):
+        m = re.match(r"^gemini(?:-oauth)?-([1-5])$", provider)
+        acc_idx = int(m.group(1)) if m else 1
+        try:
+            creds = auth_mod.resolve_gemini_oauth_runtime_credentials(account=acc_idx, refresh_if_expiring=False)
+        except Exception:
+            creds = auth_mod._gemini_oauth_pkce_login(account=acc_idx)
+        auth_mod._mark_gemini_oauth_active(creds, account=acc_idx)
+        label = (getattr(args, "label", None) or "").strip() or creds.get("email") or label_from_token(
+            creds["api_key"],
+            f"{provider}-oauth-{len(pool.entries()) + 1}",
+        )
+        entry = PooledCredential(
+            provider=provider,
+            id=uuid.uuid4().hex[:6],
+            label=label,
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=f"{SOURCE_MANUAL}:gemini_{acc_idx}",
+            access_token=creds["api_key"],
+            refresh_token=creds.get("refresh_token"),
+            base_url=creds.get("base_url"),
+        )
+        first_credential = not pool.entries()
+        pool.add_entry(entry)
+        if first_credential:
+            auth_mod.mark_provider_active_if_unset(provider)
+        print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
+        return
 
     spec = _OAUTH_ADD_SPECS.get(provider)
     if spec is None:
@@ -379,45 +405,12 @@ def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCre
         provider=provider, id=uuid.uuid4().hex[:6], label=label, auth_type=AUTH_TYPE_OAUTH, priority=0,
         source=spec.source, access_token=token, **spec.fields(creds, provider))
     first_credential = not pool.entries()
-    entry = pool.add_entry(entry)
+    pool.add_entry(entry)
     # The first Codex/xAI credential becomes the active provider (as the old singleton save path
     # did implicitly); subsequent adds leave the active provider as-is.
     if spec.activate_first and first_credential:
         auth_mod.mark_provider_active_if_unset(provider)
     print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
-    return entry
-
-
-def _report_priority(provider: str, pool, moved, requested: int, verb: str, prep: str) -> None:
-    """Print the effective priority and say why it differs from the request, if it does."""
-    print(f'{verb} {provider} credential "{moved.label}" {prep} priority {moved.priority} '
-          f"(#{moved.priority + 1} in `hermes auth list {provider}`)")
-    size = len(pool.entries())
-    if moved.priority != requested:
-        if requested < 0 or requested >= size:
-            reason = f"the pool has {size} credentials, so it was clamped"
-        else:
-            reason = "anthropic keeps manually added credentials ahead of seeded ones"
-        print(f"note: requested priority {requested}; effective priority is {moved.priority} "
-              f"because {reason}.", file=sys.stderr)
-    strategy = get_pool_strategy(provider)
-    if strategy != STRATEGY_FILL_FIRST:
-        print(f"note: {provider} uses the {strategy} strategy; priority only orders "
-              f"fill_first selection.", file=sys.stderr)
-
-
-def auth_priority_command(args) -> None:
-    """`hermes auth priority <provider> <target> <priority>`: reorder one pooled credential."""
-    provider = _normalize_provider(getattr(args, "provider", ""))
-    pool = load_pool(provider)
-    index, matched, error = pool.resolve_target(getattr(args, "target", None))
-    if matched is None or index is None:
-        raise SystemExit(f"{error} Provider: {provider}.")
-    requested = int(getattr(args, "priority"))
-    moved = pool.move_entry(matched.id, requested)
-    if moved is None:
-        raise SystemExit(f'No credential matching "{getattr(args, "target", None)}" for provider {provider}.')
-    _report_priority(provider, pool, moved, requested, "Set", "to")
 
 
 def auth_list_command(args) -> None:
@@ -441,11 +434,7 @@ def auth_list_command(args) -> None:
             marker = "← " if current is not None and entry.id == current.id else "  "
             status = _format_exhausted_status(entry)
             source = _display_source(entry.source)
-            row = (
-                f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} "
-                f"id={entry.id} priority={entry.priority} {source}{status} {marker}"
-            )
-            print(row.rstrip())
+            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
         print()
     _print_oauth_heal_notices()
 
@@ -487,71 +476,9 @@ def auth_remove_command(args) -> None:
 
 def auth_reset_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
-    target = getattr(args, "target", None)
     pool = load_pool(provider)
-    if target is None or not str(target).strip():
-        count = pool.reset_statuses()
-        print(f"Reset status on {count} {provider} credentials")
-        return
-    index, matched, error = pool.resolve_target(target)
-    if matched is None or index is None:
-        raise SystemExit(f"{error} Provider: {provider}.")
-    cleared = pool.reset_status(matched.id)
-    if cleared is None:
-        raise SystemExit(f'No credential matching "{target}" for provider {provider}.')
-    print(f"Reset status on {provider} credential #{index} ({cleared.label})")
-
-
-def auth_refresh_command(args) -> None:
-    """`hermes auth refresh <provider> [target]`: force one pooled OAuth entry to refresh.
-
-    A successful refresh rotates the stored tokens and clears the entry's local
-    exhaustion block, returning it to rotation before its persisted
-    ``last_error_reset_at`` elapses. It proves the grant is alive, not that the
-    provider's quota is back: if the account is still capped, the next request
-    429s and benches it again. Failure leaves the pool's own verdict in place.
-    """
-    provider = _normalize_provider(getattr(args, "provider", ""))
-    target = getattr(args, "target", None)
-    pool = load_pool(provider)
-    entries = pool.entries()
-    if not entries:
-        raise SystemExit(f"No {provider} credentials in the pool.")
-    if target is None or not str(target).strip():
-        if len(entries) != 1:
-            raise SystemExit(
-                f"{provider} has {len(entries)} credentials; pass an index, entry id, or exact "
-                f"label (see `hermes auth list {provider}`).")
-        index, matched = 1, entries[0]
-    else:
-        index, matched, error = pool.resolve_target(target)
-        if matched is None or index is None:
-            raise SystemExit(f"{error} Provider: {provider}.")
-    if (provider not in REFRESHABLE_OAUTH_PROVIDERS or matched.auth_type != AUTH_TYPE_OAUTH
-            or not matched.refresh_token):
-        raise SystemExit(
-            f"{provider} credential #{index} ({matched.label}) is not a refreshable OAuth "
-            f"credential.")
-    # Nous's resolver is singleton-bound, not an independent-account refresher.
-    if provider == "nous" and matched.source != "device_code":
-        raise SystemExit(
-            f"nous credential #{index} ({matched.label}) is not a refreshable OAuth "
-            "credential: only the device_code singleton supports refresh. "
-            "Reauthenticate with `hermes auth add nous --type oauth`.")
-    refreshed = pool.try_refresh_matching(credential_id=matched.id)
-    if refreshed is None:
-        after = next((e for e in pool.entries() if e.id == matched.id), None)
-        state = "removed from pool" if after is None else (after.last_status or "unknown")
-        raise SystemExit(
-            f"Refresh failed for {provider} credential #{index} ({matched.label}); "
-            f"status now: {state}.")
-    status = refreshed.last_status or "ok"
-    if status == "ok":
-        print(f"Refreshed {provider} credential #{index} ({refreshed.label}); status: ok")
-    else:
-        # A peer already rotated this grant and the pool adopted it without clearing status.
-        print(f"Adopted current tokens for {provider} credential #{index} ({refreshed.label}); "
-              f"status still: {status}")
+    count = pool.reset_statuses()
+    print(f"Reset status on {count} {provider} credentials")
 
 
 def auth_status_command(args) -> None:
@@ -567,10 +494,36 @@ def auth_status_command(args) -> None:
         print(f"{provider}: logged out" + (f" ({reason})" if reason else ""))
         return
     print(f"{provider}: logged in")
-    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url"):
+    if status.get("email"):
+        print(f"  Account: {status['email']}")
+    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url", "source", "auth_file"):
         value = status.get(key)
         if value:
             print(f"  {key}: {value}")
+
+    quota = status.get("quota")
+    if quota and isinstance(quota, dict):
+        print("  Rate Limits & Quota:")
+        if quota.get("gemini_5h_percent") is not None or quota.get("gemini_weekly_percent") is not None:
+            print("    Gemini Models (Flash, Pro):")
+            if quota.get("gemini_5h_percent") is not None:
+                countdown = quota.get("gemini_5h_countdown")
+                reset_txt = f" (resets in {countdown})" if countdown else ""
+                print(f"      5-Hour Limit:   {quota['gemini_5h_percent']}% remaining{reset_txt}")
+            if quota.get("gemini_weekly_percent") is not None:
+                countdown = quota.get("gemini_weekly_countdown")
+                reset_txt = f" (resets in {countdown})" if countdown else ""
+                print(f"      Weekly Limit:   {quota['gemini_weekly_percent']}% remaining{reset_txt}")
+        if quota.get("claude_5h_percent") is not None or quota.get("claude_weekly_percent") is not None:
+            print("    Claude & GPT Models (Opus, Sonnet):")
+            if quota.get("claude_5h_percent") is not None:
+                countdown = quota.get("claude_5h_countdown")
+                reset_txt = f" (resets in {countdown})" if countdown else ""
+                print(f"      5-Hour Limit:   {quota['claude_5h_percent']}% remaining{reset_txt}")
+            if quota.get("claude_weekly_percent") is not None:
+                countdown = quota.get("claude_weekly_countdown")
+                reset_txt = f" (resets in {countdown})" if countdown else ""
+                print(f"      Weekly Limit:   {quota['claude_weekly_percent']}% remaining{reset_txt}")
 
 
 def auth_logout_command(args) -> None:
@@ -758,9 +711,8 @@ def _interactive_strategy() -> None:
 
 _AUTH_ACTIONS = {
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
-    "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
-    "logout": auth_logout_command,
-    "spotify": auth_spotify_command}
+    "reset": auth_reset_command, "status": auth_status_command, "logout": auth_logout_command,
+    "spotify": auth_spotify_command, "prime": lambda args: auth_prime_command(args)}
 
 
 def auth_command(args) -> None:
@@ -769,3 +721,55 @@ def auth_command(args) -> None:
         handler(args)
     else:
         _interactive_auth()  # no subcommand
+
+
+def auth_prime_command(args=None) -> None:
+    """Kick-start sleeping quota reset timers across all authorized Gemini OAuth accounts."""
+    from hermes_cli.auth import (
+        prime_sleeping_gemini_account_timer,
+        get_gemini_oauth_auth_status,
+    )
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+    console.print("\n[bold cyan]⏳ Kick-starting sleeping quota reset timers across accounts...[/bold cyan]\n")
+
+    target_acc = getattr(args, "account", None)
+    target_group = getattr(args, "group", "all")
+    force = getattr(args, "force", False)
+
+    accounts = [target_acc] if target_acc else list(range(1, 6))
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Account", style="cyan", width=12)
+    table.add_column("Email", style="white", width=30)
+    table.add_column("Gemini 5h Status", style="green")
+    table.add_column("Claude/GPT 5h Status", style="yellow")
+
+    for acc in accounts:
+        status = get_gemini_oauth_auth_status(acc)
+        if not status.get("logged_in"):
+            table.add_row(f"Account {acc}", "[dim]Not logged in[/dim]", "[dim]-[/dim]", "[dim]-[/dim]")
+            continue
+
+        email = status.get("email", "")
+        r_gem = False
+        r_claude = False
+
+        if target_group in ("gemini", "all"):
+            r_gem = prime_sleeping_gemini_account_timer(acc, model_group="gemini", force=force)
+        if target_group in ("claude", "all"):
+            r_claude = prime_sleeping_gemini_account_timer(acc, model_group="claude/gpt", force=force)
+
+        st_after = get_gemini_oauth_auth_status(acc)
+        q = st_after.get("quota") or {}
+        g_cd = q.get("gemini_5h_countdown") or ("Active" if r_gem else "Idle")
+        c_cd = q.get("claude_5h_countdown") or ("Active" if r_claude else "Idle")
+
+        gem_status = f"[green]✅ Ticking ({g_cd})[/green]" if (r_gem or q.get("gemini_5h_countdown")) else "[dim]Idle[/dim]"
+        claude_status = f"[yellow]✅ Ticking ({c_cd})[/yellow]" if (r_claude or q.get("claude_5h_countdown")) else "[dim]Idle[/dim]"
+        table.add_row(f"Account {acc}", email, gem_status, claude_status)
+
+    console.print(table)
+    console.print("\n[bold green]✨ 5-hour rolling windows are now actively counting down![/bold green]\n")

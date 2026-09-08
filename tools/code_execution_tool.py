@@ -144,10 +144,8 @@ _TOOL_STUBS = {
 def _missing_hermes_tools_import_hint(m, enabled_tools) -> str:
     missing = m.group(1)
     if missing in {"json_parse", "shell_quote", "retry"}:
-        return (f"Import helpers with `from hermes_tools import {missing}`. "
-                "If that import failed, the generated module may be stale or another "
-                "hermes_tools may be first on sys.path. Check hermes_tools.__file__ "
-                "and retry with reset=true.")
+        return (f"{missing} is a BUILT-IN helper in the sandbox — no import "
+                f"needed. Remove it from the import line and call {missing}(...) directly.")
     available = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools or SANDBOX_ALLOWED_TOOLS))
     return (f"'{missing}' is not available inside the execute_code sandbox. "
             f"Importable tools here: {', '.join(available)}. For anything "
@@ -155,13 +153,13 @@ def _missing_hermes_tools_import_hint(m, enabled_tools) -> str:
 
 
 # (regex, formatter(match, enabled_tools)) — first match wins. Production mining (state.db) ranked
-# these as the top execute_code failure classes: hermes_tools import misuse, missing helper
-# imports, treating tool results as strings, importing third-party packages absent from the sandbox.
+# these as the top execute_code failure classes: hermes_tools import misuse, importing the built-in
+# helpers, treating tool results as strings, importing third-party packages absent from the sandbox.
 _FAILURE_HINT_RULES = (
     (r"cannot import name '(\w+)' from 'hermes_tools'", _missing_hermes_tools_import_hint),
     (r"NameError: name '(json_parse|shell_quote|retry)' is not defined",
-     lambda m, _: f"Import {m.group(1)} before calling it: "
-                  f"from hermes_tools import {m.group(1)}"),
+     lambda m, _: f"{m.group(1)} is built into the generated sandbox module — "
+                  "call it directly at module scope without importing it."),
     (r"ModuleNotFoundError: No module named '([\w.]+)'",
      lambda m, _: f"'{m.group(1)}' is not installed in the sandbox interpreter. "
                   "Use Python stdlib inside execute_code, or run the code via "
@@ -239,6 +237,39 @@ def retry(fn, max_attempts=3, delay=2):
             if attempt < max_attempts - 1:
                 time.sleep(delay * (2 ** attempt))
     raise last_err
+
+
+def share_to_session(session_id: str, content: str, source_label: str = "") -> dict:
+    """Safely deliver context/notes to another active Hermes session.
+    Uses the Dual Atomic Write pattern (SessionDB + LiveSessionStreamWriter)
+    to update the recipient transcript and live Web TUI screen without
+    causing SQLite lock contention or turn lease deadlocks.
+    """
+    try:
+        from hermes_state import SessionDB
+        from agent.live_session_stream import LiveSessionStreamWriter
+
+        header = ("[Shared Note from " + str(source_label) + "]\\n\\n") if source_label else "[Shared Note]\\n\\n"
+        formatted_content = f"{header}{content}"
+
+        db = SessionDB()
+        try:
+            msg_id = db.append_message(
+                session_id=session_id,
+                role="user",
+                content=formatted_content,
+            )
+        finally:
+            db.close()
+
+        writer = LiveSessionStreamWriter(session_id)
+        writer.write_event("message.complete", {
+            "role": "user",
+            "content": formatted_content,
+        })
+        return {"success": True, "message_id": msg_id, "session_id": session_id}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 '''
 
@@ -852,8 +883,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "Limits: 5-minute timeout, max 50 tool calls per call. Stdout over "
         "50KB shows head/tail inline; the FULL text is auto-saved to a file whose path rides in the result.\n\n"
         f"{cwd_note}\n\n"
-        "Helpers require imports: `from hermes_tools import json_parse, shell_quote, retry`. "
-        "json_parse(text) — tolerant "
+        "Built-in helpers (no import): json_parse(text) — tolerant "
         "json.loads for terminal() output; shell_quote(s) — shlex.quote for "
         "dynamic shell args; retry(fn, max_attempts=3, delay=2) — exponential backoff."
     )

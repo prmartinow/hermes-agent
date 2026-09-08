@@ -784,14 +784,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       case 'session.info': {
         const info = ev.payload
 
-        // A replayed snapshot can be the only terminal signal after reconnect.
-        // Missing running on older gateways must not clear a live turn.
-        if (info.running === false) {
-          turnController.clearStatusTimer()
-          turnController.idle()
-          setStatus('ready')
-        }
-
         patchUiState(state => ({
           ...state,
           info,
@@ -829,10 +821,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (text !== undefined) {
           const value = String(text)
           scheduleThinkingStatus(value || statusFromBusy())
-
-          if (value) {
-            turnController.recordReasoningDelta(value)
-          }
         }
 
         return
@@ -1241,6 +1229,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'todo.updated': {
+        if (ev.payload && 'todos' in ev.payload) {
+          turnController.recordTodos(ev.payload.todos)
+        }
+
+        return
+      }
+
       case 'clarify.request': {
         const batch = (ev.payload.questions ?? [])
           .filter(q => typeof q?.qid === 'string' && q.qid && typeof q?.question === 'string' && q.question.trim())
@@ -1451,6 +1447,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (typeof text === 'string' && text.trim()) {
           turnController.recordInterimMessage(text)
+        }
+
+        return
+      }
+
+      case 'turn.steer': {
+        const text = ev.payload?.text ?? ev.payload?.user_message
+
+        if (typeof text === 'string' && text.trim()) {
+          turnController.recordSteer(text.trim())
         }
 
         return
