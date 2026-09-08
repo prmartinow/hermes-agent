@@ -55,6 +55,7 @@ cmd_build() {
   echo ""
 
   DOCKER_BUILDKIT=1 docker build \
+    --progress=plain \
     --build-arg HERMES_VERSION="$version" \
     --build-arg HERMES_GIT_SHA="$git_sha" \
     --tag "hermes-agent:$version" \
