@@ -14,6 +14,7 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Version | Image ID | Git Commit | Build Date (UTC) | Core Changes & Fixes | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`v0.23`** | `b265a7472f3a` | `f80afa7a09` | 2026-09-08 14:40 | Candidate release v0.23: interactive trace inspector drawer, subagent credential inheritance, and runtime hardening | Built (Available) |
 | **`v0.22`** | `599cd168d76c` | `0609aabca1` | 2026-09-07 23:08 | Candidate release v0.22: interactive tool & thinking trace inspector drawer with drag-selection protection | **Active (Serving :9119)** |
 | **`v0.21`** (`stable`) | `f943c52f5879` | `f7176e33c1` | 2026-09-07 20:38 | Candidate release v0.21: latest Web TUI terminal hydration, privilege-drop shim, subagent account persistence | Available (`stable` / Fallback Target) |
 | **`v0.20`** (Pruned) | `e7a76204d565` | `9d030f0c3c` | 2026-09-07 18:35 | Release v0.20: universal privilege-drop shim (UID 1000), in-image provenance metadata, bootstrap hardening, Web TUI scrollbar stability | Pruned |
