@@ -14,7 +14,7 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Version | Image ID | Git Commit | Build Date (UTC) | Core Changes & Fixes | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`v0.24`** | `6b256639c1b7` | `9d46ed60cd` | 2026-09-08 17:29 | Candidate release v0.24: Playwright base layer caching, Jakarta Biznet mirror, 15MB uv image | Built (Available) |
+| **`v0.24`** | `439d47191613` | `9d46ed60cd` | 2026-09-08 17:29 | Candidate release v0.24: Playwright base layer caching, Jakarta Biznet mirror, 15MB uv image | Built (Available) |
 | **`v0.23`** | `4b4c90e11e8a` | `66ec0b0ecf` | 2026-09-08 15:35 | Rebuilt release v0.23: BuildKit cache mounts, fast dependency caching, and inspector drawer | **Active (Serving :9119)** |
 | **`v0.22`** | `599cd168d76c` | `0609aabca1` | 2026-09-07 23:08 | Candidate release v0.22: interactive tool & thinking trace inspector drawer with drag-selection protection | Available (Previous Serving) |
 | **`v0.21`** (`stable`) | `f943c52f5879` | `f7176e33c1` | 2026-09-07 20:38 | Candidate release v0.21: latest Web TUI terminal hydration, privilege-drop shim, subagent account persistence | Available (`stable` / Fallback Target) |
