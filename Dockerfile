@@ -6,7 +6,9 @@
 FROM debian:13.4 AS sqlite_build
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
-RUN apt-get -o Acquire::Retries=3 update && \
+RUN (sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+     sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list 2>/dev/null || true) && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         build-essential ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
@@ -41,7 +43,7 @@ RUN apt-get -o Acquire::Retries=3 update && \
     make -j"$(nproc)" && \
     make install
 
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
+FROM ghcr.io/astral-sh/uv:0.11.6 AS uv_source
 # Node 26 source stage. Debian trixie's bundled nodejs is pinned to 20.x
 # which reached EOL in April 2026 — we copy node + npm from the upstream
 # node:26 image instead (Hermes pins its toolchain to Node 26 everywhere).
@@ -69,7 +71,9 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
-RUN apt-get -o Acquire::Retries=3 update && \
+RUN (sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+     sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list 2>/dev/null || true) && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils \
     fonts-freefont-ttf fonts-ipafont-gothic fonts-liberation fonts-noto-color-emoji fonts-unifont \
@@ -153,7 +157,7 @@ COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
 
-COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+COPY --chmod=0755 --from=uv_source /uv /uvx /usr/local/bin/
 
 # Antigravity CLI (agy): package binary into image and ensure latest version at build time
 COPY --chmod=0755 bin/agy /usr/local/bin/agy
