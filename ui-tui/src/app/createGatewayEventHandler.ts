@@ -781,6 +781,19 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         return
+      case 'session.rewound':
+      case 'session.restored': {
+        const p = ev.payload
+        if (p?.notice) {
+          sys(p.notice)
+        }
+        if (live.sid) {
+          ctx.session.resumeById(live.sid)
+        }
+
+        return
+      }
+
       case 'session.info': {
         const info = ev.payload
 

@@ -1668,20 +1668,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // Keep-alive close-code contract (web_server.pty_ws + pty_session):
       //   4410 = the agent PROCESS exited (real end) → restart affordance.
       //   4409 = superseded by a newer tab attaching the same token → stay quiet.
-      if (ev.code === 4410) {
-        term.write(`\r\n\x1b[90m[session ended]\x1b[0m\r\n`);
-        setPtyState("ended");
-        return;
-      }
       if (ev.code === 4409) {
         setPtyState("closed");
         return;
       }
-      if (!ev.wasClean || ev.code === 1001 || ev.code === 1006) {
-        // Transient transport drop (refresh, sleep/wake, signal loss).
-        // Reconnect with backoff; the same ?attach= token reattaches to
-        // the still-living PTY, so the conversation continues in place.
+      if (!ev.wasClean || ev.code === 1001 || ev.code === 1006 || (resumeParam && ev.code === 4410)) {
+        // Transient transport drop or child worker exit in an active conversation:
+        // Reconnect with backoff so the conversation continues in place without stranding the user.
         scheduleReconnect(ev.code);
+        return;
+      }
+      if (ev.code === 4410) {
+        term.write(`\r\n\x1b[90m[session ended]\x1b[0m\r\n`);
+        setPtyState("ended");
         return;
       }
       // Normal/clean exit: the agent process ended (e.g. the user typed

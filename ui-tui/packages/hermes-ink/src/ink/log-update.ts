@@ -501,14 +501,17 @@ function fullResetSequence_CAUSES_FLICKER(
 ): Diff {
   // After clearTerminal (alt-screen) or clearScreen (inline), cursor is at (0, 0)
   const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
-  renderFrame(screen, frame, stylePool)
+  renderFrame(screen, frame, stylePool, altScreen)
 
   const patchType = altScreen ? 'clearTerminal' : 'clearScreen'
   return [{ type: patchType, reason, debug }, ...screen.diff]
 }
 
-function renderFrame(screen: VirtualScreen, frame: Frame, stylePool: StylePool): void {
-  renderFrameSlice(screen, frame, 0, frame.screen.height, stylePool)
+function renderFrame(screen: VirtualScreen, frame: Frame, stylePool: StylePool, altScreen = false): void {
+  // In inline mode, the cumulative transcript can be thousands of lines. Only render
+  // the active visible viewport slice to prevent pushing duplicate history into scrollback on reset/resize.
+  const startY = altScreen ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
+  renderFrameSlice(screen, frame, startY, frame.screen.height, stylePool)
 }
 
 /**
