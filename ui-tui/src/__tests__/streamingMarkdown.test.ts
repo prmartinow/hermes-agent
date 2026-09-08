@@ -44,6 +44,13 @@ const renderPlain = (node: React.ReactNode) => {
 }
 
 describe('findStableBoundary', () => {
+  it('settles headings and rules into frozen blocks without requiring blank line', () => {
+    const text = '---\n### Heading\ncontent line'
+    const idx = findStableBoundary(text)
+    expect(idx).toBeGreaterThan(0)
+    expect(text.slice(0, idx)).toContain('### Heading\n')
+  })
+
   it('returns -1 when no blank line exists yet', () => {
     expect(findStableBoundary('partial line with no newline yet')).toBe(-1)
   })

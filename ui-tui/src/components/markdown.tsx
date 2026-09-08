@@ -957,9 +957,10 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
 
       if (HR_RE.test(line)) {
         start('rule')
+        const ruleWidth = Math.max(12, cols ? cols - 2 : 60)
         nodes.push(
           <Text color={t.color.muted} key={key}>
-            {'─'.repeat(36)}
+            {'─'.repeat(ruleWidth)}
           </Text>
         )
         i++
