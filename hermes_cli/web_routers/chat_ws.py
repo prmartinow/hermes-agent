@@ -465,8 +465,9 @@ async def pty_ws(ws: WebSocket) -> None:
     if raw_resume and env:
         registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
     if registry_resume:
-        # Canonical shared key for resumed sessions: all devices viewing the same session share the PTY
-        attach_token = f"shared-resume\0{profile or ''}\0{registry_resume}"
+        # Key PTY per-session AND per-device so each surface has independent native screen geometry
+        device_token = ws.query_params.get("attach") or ""
+        attach_token = f"resume\0{profile or ''}\0{registry_resume}\0{device_token}"
     elif attach_token is not None and profile:
         attach_token = f"{attach_token}\0{profile}\0"
 

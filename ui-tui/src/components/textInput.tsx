@@ -790,6 +790,7 @@ const isPasteResultPromise = (
 ): value is Promise<PasteResult> => !!value && typeof (value as PromiseLike<PasteResult>).then === 'function'
 
 export function TextInput({
+  busy = false,
   columns = 80,
   value,
   onChange,
@@ -1535,7 +1536,7 @@ export function TextInput({
           const t = wordLeft(v, c)
           v = v.slice(0, t) + v.slice(c)
           c = t
-        } else if (canFastBackspace(v, c)) {
+        } else if (!busy && canFastBackspace(v, c)) {
           const effect = fastBackspaceEffect(v, c)
           v = effect.newValue
           c = effect.newCursor
@@ -1655,7 +1656,7 @@ export function TextInput({
             v = inserted.value
             c = inserted.cursor
           } else {
-            const simpleAppend = canFastAppend(v, c, text)
+            const simpleAppend = !busy && canFastAppend(v, c, text)
             const preInsertValue = v
             const preInsertCursor = c
 
@@ -1797,6 +1798,8 @@ export interface PasteEvent {
 interface TextInputProps {
   /** Hex/ansi256 tone for `/skill`, `@ref`, and `[[ token ]]` spans. */
   accentColor?: string
+  /** True when assistant is generating/streaming; disables direct stdout fast-echo to prevent ANSI collisions. */
+  busy?: boolean
   /** Hex color for typed text (theme text); terminal default when omitted. */
   color?: string
   columns?: number
