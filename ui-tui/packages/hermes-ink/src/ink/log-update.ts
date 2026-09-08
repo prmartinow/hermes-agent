@@ -225,7 +225,7 @@ export class LogUpdate {
         `Full reset (shrink->below): prevHeight=${prev.screen.height}, nextHeight=${next.screen.height}, viewport=${prev.viewport.height}`
       )
 
-      return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', stylePool)
+      return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', stylePool, undefined, altScreen)
     }
 
     if (
@@ -257,7 +257,7 @@ export class LogUpdate {
           triggerY: scrollbackChangeY,
           prevLine,
           nextLine
-        })
+        }, altScreen)
       }
     }
 
@@ -277,7 +277,7 @@ export class LogUpdate {
       // If we need to clear more lines than fit in the viewport, some are in
       // scrollback, so we need a full reset.
       if (linesToClear > prev.viewport.height) {
-        return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', this.options.stylePool)
+        return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', this.options.stylePool, undefined, altScreen)
       }
 
       // clear(N) moves cursor UP by N-1 lines and to column 0
@@ -388,7 +388,7 @@ export class LogUpdate {
         triggerY: resetTriggerY,
         prevLine: readLine(prev.screen, resetTriggerY),
         nextLine: readLine(next.screen, resetTriggerY)
-      })
+      }, altScreen)
     }
 
     // Reset styles before rendering new rows (they'll set their own styles)
