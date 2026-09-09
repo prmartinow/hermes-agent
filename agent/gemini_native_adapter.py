@@ -685,7 +685,7 @@ def _looks_like_json_schema(node: Any) -> bool:
     tool result that is itself a JSON Schema (e.g. ``tool_describe`` output) is forwarded as opaque text.
     False positives only lose the structured shape, never the content."""
     if isinstance(node, dict):
-        return any((k == "$ref" and isinstance(v, str) and v.startswith("#/")) or _looks_like_json_schema(v) for k, v in node.items())
+        return "$defs" in node or "$schema" in node or any((k == "$ref" and isinstance(v, str) and v.startswith("#/")) or _looks_like_json_schema(v) for k, v in node.items())
     return isinstance(node, list) and any(_looks_like_json_schema(item) for item in node)
 
 
