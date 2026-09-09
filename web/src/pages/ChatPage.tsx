@@ -1563,6 +1563,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     let pendingWriteChunks: string[] = [];
     let rafWriteHandle: number | null = null;
+    let isResizeReplaying = false;
+    let resizeReplaySettleTimer: ReturnType<typeof setTimeout> | null = null;
 
     const flushWrites = () => {
       if (pendingWriteChunks.length === 0) return;
@@ -1570,16 +1572,36 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       pendingWriteChunks = [];
       rafWriteHandle = null;
 
-      const followScroll = shouldFollowPtyOutput(
-        effectiveResume,
-        stickToBottomRef.current,
-        isReplayActive,
-      ) && !term.hasSelection()
+      const shouldFollow =
+        (isResizeReplaying ||
+          shouldFollowPtyOutput(
+            effectiveResume,
+            stickToBottomRef.current,
+            isReplayActive,
+          )) &&
+        !term.hasSelection();
+
+      const followScroll = shouldFollow
         ? () => termRef.current?.scrollToBottom()
         : undefined;
 
       term.write(batch, followScroll);
       noteResumePtyChunk(batch);
+
+      if (isResizeReplaying) {
+        if (resizeReplaySettleTimer) clearTimeout(resizeReplaySettleTimer);
+        resizeReplaySettleTimer = setTimeout(() => {
+          resizeReplaySettleTimer = null;
+          isResizeReplaying = false;
+          if (!term.hasSelection()) {
+            try {
+              term.scrollToBottom();
+            } catch {
+              /* ignore */
+            }
+          }
+        }, 150);
+      }
     };
 
     ws.onmessage = (ev) => {
@@ -1803,6 +1825,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         ptyResizeTimer = setTimeout(() => {
           ptyResizeTimer = null;
           if (ws.readyState === WebSocket.OPEN) {
+            isResizeReplaying = true;
+            stickToBottomRef.current = true;
             ws.send(`\x1b[RESIZE:${cols};${rows}]`);
           }
         }, 120);
