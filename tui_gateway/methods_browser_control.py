@@ -102,7 +102,7 @@ def _controller_method(
             session_id = str(params.get("session_id") or "")
             with _sessions_lock:
                 session = _sessions.get(session_id)
-                if session is None or session.get("transport") is not transport:
+                if session is None or not _session_transport_contains(session, transport):
                     return _err(rid, _ERR_FORBIDDEN, "session is not owned by this transport")
             broker = browser_control_broker.get_browser_control_broker()
             scope = None

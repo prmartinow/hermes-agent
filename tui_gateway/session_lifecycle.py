@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 
 from .method_ctx import bind_module
+from tui_gateway.transport import FanoutTransport
 
 
 def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> None:
@@ -465,7 +466,226 @@ def _reattach_refusal(rid, sid: str, session: dict) -> dict | None:
 
 def _rebind_live_transport(sid: str, session: dict, transport: Transport) -> None:
     """Point a live session at ``transport`` (caller holds ``history_lock``)."""
-    session["transport"] = transport
+    from .session_transports import _attach_session_transport
+    _attach_session_transport(session, transport)
+    # Every transport that showed this session (pop-outs resume the same sid); on disconnect the last
+    # viewer becomes the transport instead of the drop sentinel.
+    session.setdefault("viewers", {})[transport] = time.time()
+    # See #83716.
+    if transport is not _detached_ws_transport:
+        _cancel_ws_orphan_reap(sid)  # the client is back — a pending ws-orphan reap must not fire
+
+
+def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
+    """Whether a detached RUNNING turn's activity clock (``_touch_activity``) is still fresh — the reaper must NOT
+    interrupt healthy detached work (closed laptop). Conservative: disabled threshold, missing/opaque agent, unreadable
+    summary or never-stamped clock all report NOT fresh (eligible for interrupt-at-grace) to keep the wedged-turn net.
+
+    Reuses the agent's existing activity summary (``_touch_activity`` is stamped by API waits, stream
+    tokens, and tool heartbeats — the same clock the turn-liveness watchdog samples; see
+    agent/turn_liveness.py). See #100325, #98028.
+    Isolated turns mirror that clock from the child under a unique dispatch token;
+    their monotonic samples keep aging even if the child or its pipe stalls.
+    """
+    if _WS_ORPHAN_ACTIVITY_STALE_S <= 0:
+        return False
+    if session.get("_compute_host_turn_id"):
+        with session["history_lock"]:
+            stamp = session.get("_compute_host_activity_ns")
+            return (session.get("running", False) and isinstance(stamp, int)
+                    and 0 <= (time.perf_counter_ns() - stamp) / 1_000_000_000 < _WS_ORPHAN_ACTIVITY_STALE_S)
+    if not callable(summary_fn := getattr(session.get("agent"), "get_activity_summary", None)):
+        return False
+    try:
+        elapsed = summary_fn().get("seconds_since_activity")
+        return elapsed is not None and float(elapsed) < _WS_ORPHAN_ACTIVITY_STALE_S
+    except Exception:
+        return False
+
+
+def _schedule_ws_orphan_reap(
+    sid: str, *, delay_s: float | None = None, _expected_timer: threading.Timer | None = None,
+) -> None:
+    """After a grace window, reap session ``sid`` iff it's still orphaned. Called from the WS-disconnect path; a
+    reconnect or ``session.resume`` cancels the reap by re-binding a live transport. Disabled when grace is 0."""
+    if _WS_ORPHAN_REAP_GRACE_S <= 0:
+        return
+
+    def _reap() -> None:
+        # Serialize the re-check against session.resume (rebinds under _session_resume_lock). Claim teardown by popping
+        # under both locks, then release the resume lock before slow finalization. Order: resume_lock -> sessions_lock.
+        reschedule_delay = interrupt_session = session = None
+        with _session_resume_lock, _sessions_lock:
+            # Keep ownership through interrupt I/O and continuation registration. A cancelled
+            # callback may already be dispatched, but cannot act on a later detachment.
+            if _pending_ws_reaps.get(sid) is not timer:
+                return
+            current = _sessions.get(sid)
+            if current is None or not _ws_session_is_detached(current):
+                _pending_ws_reaps.pop(sid, None)
+                return
+            if _session_has_active_delegations(sid, current):
+                reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+            elif not current.get("running"):
+                session = _pop_session_by_id(sid)
+            elif not current.get("_client_gone_interrupt_requested") and _ws_orphan_turn_activity_is_fresh(current):
+                # Client-absent but producing: keep running detached (the sentinel buffers emits), re-check each grace.
+                logger.debug("client_gone sid=%s action=defer (turn activity fresh; stale threshold %.0fs)",
+                             sid, _WS_ORPHAN_ACTIVITY_STALE_S)
+                reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+            else:
+                # Mid-turn detached sessions must never drop the single Timer: interrupt once after grace, then poll
+                # until turn-finalization settles.
+                polls = current["_client_gone_interrupt_polls"] = int(current.get("_client_gone_interrupt_polls") or 0) + 1
+                # See #85578.
+                if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
+                    # Never settled inside the budget — force-reap rather than park forever.
+                    logger.error(
+                        "client_gone sid=%s: turn did not settle after %d interrupt polls (%.0fs) — force-reaping detached session",
+                        sid, polls - 1, (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S)
+                    session = _pop_session_by_id(sid)
+                else:
+                    if not current.get("_client_gone_interrupt_requested"):
+                        current["_client_gone_interrupt_requested"] = True
+                        interrupt_session = current
+                    reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
+            if reschedule_delay is None:
+                _pending_ws_reaps.pop(sid, None)
+        if interrupt_session is not None:
+            try:
+                isolated = _interrupt_session_turn(sid, interrupt_session, request_id=f"client-gone-{sid}")
+                logger.info("client_gone sid=%s action=interrupt turn_isolation=%s", sid, isolated)
+            except Exception:
+                logger.exception("client_gone interrupt failed sid=%s", sid)
+                with _sessions_lock:
+                    if (_sessions.get(sid) is interrupt_session
+                            and _pending_ws_reaps.get(sid) is timer):
+                        interrupt_session.pop("_client_gone_interrupt_requested", None)
+        if reschedule_delay is not None:
+            _schedule_ws_orphan_reap(sid, delay_s=reschedule_delay, _expected_timer=timer)
+            return
+        if session is not None and session.get("_client_gone_interrupt_requested"):
+            logger.info("client_gone sid=%s action=reap", sid)
+        _teardown_popped_session(session, end_reason="ws_orphan_reap")
+
+    with _sessions_lock:
+        if _expected_timer is not None and _pending_ws_reaps.get(sid) is not _expected_timer:
+            return
+        timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S if delay_s is None else max(0.0, delay_s), _reap)
+        timer.daemon = True
+        prior = _pending_ws_reaps.pop(sid, None)
+        _pending_ws_reaps[sid] = timer
+    if prior is not None:
+        with contextlib.suppress(Exception):
+            prior.cancel()
+    timer.start()
+
+
+def _ws_session_is_detached(session: dict | None) -> bool:
+    """True if a live session is still bound to the disconnected-WS sentinel."""
+    return bool(session and not session.get("_finalized") and session.get("transport") is _detached_ws_transport)
+
+
+def _ws_session_is_orphaned(session: dict | None) -> bool:
+    """True if a WS session sits on ``_detached_ws_transport`` (where ``handle_ws`` parks disconnected clients), idle."""
+    return bool(_ws_session_is_detached(session) and not session.get("running"))
+
+
+def _interrupt_session_turn(sid: str, session: dict, *, request_id: str | None = None) -> bool:
+    """Apply the shared ``session.interrupt`` contract to one claimed session; returns whether the compute-host control
+    channel was used. The WS orphan reaper reuses this so a dead client gets the same partial-history/queue semantics."""
+    use_compute_host = _session_uses_compute_host(session)
+    should_interrupt = bool(session.get("running"))
+    run_thread_alive = False
+    if use_compute_host:
+        # The host owns the live turn (parent `running` can lag a blocked tool), so let it decide. Gate on
+        # `_compute_host_active`: HostSupervisor.interrupt() calls start(), so a lazy session would spawn a child to interrupt.
+        if should_interrupt or session.get("_compute_host_active"):
+            _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
+    else:
+        run_thread_alive = (rt := session.get("_run_thread")) is not None and rt.is_alive()
+    with session["history_lock"]:
+        session["_turn_cancel_requested"] = True
+        session["queued_prompt"] = None
+        session.pop("queued_prompts", None)
+        session["_queued_prompt_generation"] = int(session.get("_queued_prompt_generation", 0)) + 1
+    if not use_compute_host:
+        if should_interrupt:
+            from agent.interrupt_compat import request_hard_interrupt
+            request_hard_interrupt(session.get("agent"))
+        if not run_thread_alive:
+            with session["history_lock"]:
+                if session.get("running"):
+                    session["running"] = False
+                    _clear_inflight_turn(session)
+    _clear_pending(sid)
+    with contextlib.suppress(Exception):
+        from tools.approval import resolve_gateway_approval
+        resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
+    return use_compute_host
+
+
+def _session_has_active_delegations(sid: str, session: dict | None = None) -> bool:
+    """True when UI session ``sid`` still owns live background work — by live UI sid AND, when the TUI owns the durable
+    lifecycle (never for gateway-viewer tabs), by session_key so a delegation from an earlier tab keeps it alive.
+
+    See #60609.
+    """
+    if session is None:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+    if not session:
+        return False
+    own_sid = _lifecycle_own_sid(session, sid)
+    owned_session_key = session_key = str(session.get("session_key") or "")
+    session_id = getattr(session.get("agent"), "session_id", None) or session_key
+    if session_id:
+        # Only when this session may end its durable row by key — never for gateway-originated sessions (TUI is a
+        # viewer there). Unknown DB state -> assume ownership.
+        with contextlib.suppress(Exception):
+            db = _get_db()
+            if db is not None and _is_gateway_owned_source((db.get_session(session_id) or {}).get("source", "")):
+                owned_session_key = ""
+    if not own_sid and not owned_session_key:
+        return False
+    try:
+        from tools.async_delegation import has_live_for_session
+        return has_live_for_session(session_key=owned_session_key, origin_ui_session_id=own_sid)
+    except Exception:
+        logger.debug("Failed to query active delegations for UI session %s", sid, exc_info=True)
+        return True  # a transient registry/import failure must not become destructive cleanup
+
+
+# One pending WS-orphan reap Timer per live sid; guarded by _sessions_lock. Cancelled by _cancel_ws_orphan_reap from
+# every resume/reuse/transport-rebind path — else a reap on a reattached session triggers a reap->broadcast->resume storm.
+_pending_ws_reaps: dict[str, threading.Timer] = {}
+
+
+def _cancel_ws_orphan_reap(sid: str) -> None:
+    """Cancel a pending WS-orphan reap for ``sid`` (client came back). Called from every path that re-binds a live
+    transport; closes the fired-but-not-run Timer race and stops dead Timers accumulating on flappy clients."""
+    with _sessions_lock:
+        timer = _pending_ws_reaps.pop(sid, None)
+    if timer is not None:
+        with contextlib.suppress(Exception):
+            timer.cancel()
+
+
+def _reattach_refusal(rid, sid: str, session: dict) -> dict | None:
+    """Under ``_session_resume_lock``: why a reattaching RPC (resume/activate/prompt.submit) must NOT rebind
+    ``session`` — it is stale, or a client-gone interrupt is still settling and the reap Timer must keep
+    polling. None when the reattach may proceed."""
+    if _sessions.get(sid) is not session:
+        return _err(rid, 4007, "session no longer live; retry resume")
+    if session.get("_client_gone_interrupt_requested"):
+        return _err(rid, 4009, "session disconnect interrupt settling")
+    return None
+
+
+def _rebind_live_transport(sid: str, session: dict, transport: Transport) -> None:
+    """Point a live session at ``transport`` (caller holds ``history_lock``)."""
+    from .session_transports import _attach_session_transport
+    _attach_session_transport(session, transport)
     # Every transport that showed this session (pop-outs resume the same sid); on disconnect the last
     # viewer becomes the transport instead of the drop sentinel.
     session.setdefault("viewers", {})[transport] = time.time()
@@ -584,7 +804,10 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
     re-point the rest at the detached transport (later emits miss the dead socket) for the grace-windowed WS-orphan
     reaper. Returns ``(reaped, detached)`` counts."""
     with _sessions_lock:
-        owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
+        owned = [(sid, s) for sid, s in _sessions.items()
+                 if s.get("transport") is transport
+                 or (isinstance(s.get("transport"), FanoutTransport) and s.get("transport").contains(transport))
+                 or transport in (s.get("viewers") or {})]
     reaped = detached = 0
     for sid, session in owned:
         claimed_for_teardown = None
@@ -595,8 +818,13 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
             current = _sessions.get(sid)
             if current is not session:
                 continue
-            if current.get("transport") is not transport:
-                # The reconnect owns this session now; drop only the old viewer registration.
+            if isinstance(current.get("transport"), FanoutTransport):
+                current.get("transport").detach(transport)
+                (current.get("viewers") or {}).pop(transport, None)
+                remaining = current.get("transport").transports()
+                if remaining:
+                    continue
+            elif current.get("transport") is not transport:
                 (current.get("viewers") or {}).pop(transport, None)
                 continue
             if current.get("close_on_disconnect"):
