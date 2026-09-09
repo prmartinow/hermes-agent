@@ -2,6 +2,7 @@
 export { default as useStderr } from './src/hooks/use-stderr.ts'
 export type { StderrHandle } from './src/hooks/use-stderr.ts'
 export { default as useStdout } from './src/hooks/use-stdout.ts'
+export { logForDebugging } from './src/utils/debug.ts'
 export type { StdoutHandle } from './src/hooks/use-stdout.ts'
 export { Ansi } from './src/ink/Ansi.tsx'
 export { evictInkCaches } from './src/ink/cache-eviction.ts'

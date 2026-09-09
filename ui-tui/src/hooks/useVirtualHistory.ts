@@ -220,19 +220,21 @@ export function useVirtualHistory(
 
     prevColumns.current = columns
 
-    for (const [k, h] of heights.current) {
-      const scaled = Math.round(h * ratio)
+    if (!inline) {
+      for (const [k, h] of heights.current) {
+        const scaled = Math.round(h * ratio)
 
-      if (validVirtualItemHeight(scaled)) {
-        heights.current.set(k, scaled)
-      } else {
-        heights.current.delete(k)
+        if (validVirtualItemHeight(scaled)) {
+          heights.current.set(k, scaled)
+        } else {
+          heights.current.delete(k)
+        }
       }
-    }
 
-    offsetVersion.current++
-    skipMeasurement.current = true
-    freezeRenders.current = FREEZE_RENDERS
+      offsetVersion.current++
+      skipMeasurement.current = true
+      freezeRenders.current = FREEZE_RENDERS
+    }
   }
 
   useLayoutEffect(() => {

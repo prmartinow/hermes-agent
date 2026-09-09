@@ -669,7 +669,7 @@ function MdInline({ color, t, text }: { color?: string; t: Theme; text: string }
 // Cross-instance parsed-children cache: useMemo's per-instance cache dies
 // on remount, so virtualization re-parses every row that scrolls back into
 // view. Theme-keyed WeakMap drops stale palettes; inner Map is LRU-bounded.
-const MD_CACHE_LIMIT = 512
+const MD_CACHE_LIMIT = 10000
 const mdCache = new WeakMap<Theme, Map<string, ReactNode[]>>()
 
 const cacheBucket = (t: Theme) => {
@@ -707,7 +707,8 @@ const cacheSet = (b: Map<string, ReactNode[]>, key: string, v: ReactNode[]) => {
 function MdImpl({ cols, compact, t, text }: MdProps) {
   const nodes = useMemo(() => {
     const bucket = cacheBucket(t)
-    const cacheKey = `${compact ? '1' : '0'}|${cols ?? ''}|${text}`
+    const needsCols = text.includes('|') || text.includes('---') || text.includes('***')
+    const cacheKey = `${compact ? '1' : '0'}|${needsCols ? (cols ?? '') : ''}|${text}`
     const cached = cacheGet(bucket, cacheKey)
 
     if (cached) {

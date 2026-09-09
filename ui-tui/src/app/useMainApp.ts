@@ -1,5 +1,6 @@
 import {
   forceRedraw,
+  logForDebugging,
   type ScrollBoxHandle,
   setDimFallbackColor,
   useApp,
@@ -163,6 +164,7 @@ export function useMainApp(gw: GatewayClient) {
     // collapse to at most one reflow per RESIZE_COALESCE_MS, and the trailing
     // edge always applies the final width so the settled layout is exact.
     const coalescer = createResizeCoalescer(() => {
+      logForDebugging(`[tui-perf] resize coalesced: cols=${stdout.columns ?? 80}`)
       setCols(stdout.columns ?? 80)
     }, RESIZE_COALESCE_MS)
     const sync = () => coalescer.schedule()
@@ -349,7 +351,7 @@ export function useMainApp(gw: GatewayClient) {
   // off live geometry. Cost: per-row local state (e.g. systemOpen toggles)
   // resets on resize; small UX hit for a hard correctness win.
   const virtualRows = useMemo<TranscriptRow[]>(
-    () => historyItems.map((msg, index) => ({ index, key: `${messageId(msg)}:c${cols}`, msg })),
+    () => historyItems.map((msg, index) => ({ index, key: INLINE_MODE ? messageId(msg) : `${messageId(msg)}:c${cols}`, msg })),
     [cols, historyItems, messageId]
   )
 
