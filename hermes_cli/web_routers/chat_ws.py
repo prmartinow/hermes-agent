@@ -465,9 +465,8 @@ async def pty_ws(ws: WebSocket) -> None:
     if raw_resume and env:
         registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
     if registry_resume:
-        # Key PTY per-session AND per-device so each surface has independent native screen geometry
-        device_token = ws.query_params.get("attach") or ""
-        attach_token = f"resume\0{profile or ''}\0{registry_resume}\0{device_token}"
+        # Key PTY per-session so all connected surfaces (Mac, mobile, RPC node) share the same live PTY instance
+        attach_token = f"resume\0{profile or ''}\0{registry_resume}"
     elif attach_token is not None and profile:
         attach_token = f"{attach_token}\0{profile}\0"
 
