@@ -46,7 +46,7 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 # A positive sleep lets other coroutines run and keeps dashboard idle CPU low (#42627).
 _PTY_IDLE_BACKOFF = 0.05
 PTY_REGISTRY = PtySessionRegistry(
-    ttl=30 * 60, max_sessions=16, buffer_cap=32 * 1024 * 1024, read_timeout=_PTY_READ_CHUNK_TIMEOUT)
+    ttl=3 * 60, max_sessions=16, buffer_cap=32 * 1024 * 1024, read_timeout=_PTY_READ_CHUNK_TIMEOUT)
 
 
 async def _close_stalled_pty_input(ws: "WebSocket", *, path: str) -> None:

@@ -18,6 +18,7 @@ import type {
 } from '../gatewayTypes.js'
 import { billingDialogCopy } from '../lib/billingDialog.js'
 import { isTodoDone } from '../lib/liveProgress.js'
+import { appendTranscriptMessage } from '../lib/messages.js'
 import { openExternalUrl } from '../lib/openExternalUrl.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
@@ -864,6 +865,26 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (text !== undefined) {
           const value = String(text)
           scheduleThinkingStatus(value || statusFromBusy())
+        }
+
+        return
+      }
+
+      case 'prompt.submitted': {
+        const p = ev.payload
+        const live = getUiState()
+
+        if (p?.session_id === live.sid && p.text) {
+          setHistoryItems(prev => {
+            const last = prev[prev.length - 1]
+
+            if (last && last.role === 'user' && last.text === p.text) {
+              return prev
+            }
+
+            return appendTranscriptMessage(prev, { role: 'user', text: p.text })
+          })
+          patchUiState({ busy: true, status: 'running…' })
         }
 
         return
