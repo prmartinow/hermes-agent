@@ -1257,6 +1257,10 @@ export default class Ink {
 
     const writeMs = performance.now() - tWrite
 
+    if (diff.some(p => p.type === 'clearTerminal' || p.type === 'clearScreen')) {
+      logForDebugging(`[tui-perf] frame paint: optimizeMs=${optimizeMs.toFixed(1)}ms, writeMs=${writeMs.toFixed(1)}ms, patches=${optimized.length}`)
+    }
+
     // Update blit safety for the NEXT frame. The frame just rendered
     // becomes frontFrame (= next frame's prevScreen). If we applied the
     // selection overlay, that buffer has inverted cells. selActive/hlActive

@@ -500,6 +500,7 @@ function fullResetSequence_CAUSES_FLICKER(
   altScreen = false
 ): Diff {
   const isResize = reason === 'resize'
+  const t0 = performance.now()
   // On resize in inline mode, render from line 0 so full history reflows cleanly at the new column width
   const startY = (altScreen || isResize) ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
   const screen = new VirtualScreen({ x: 0, y: startY }, frame.viewport.width)
@@ -512,7 +513,11 @@ function fullResetSequence_CAUSES_FLICKER(
 
   // Clear scrollback on resize to prevent duplicate history snapshots
   const patchType = (altScreen || isResize) ? 'clearTerminal' : 'clearScreen'
-  return [{ type: patchType, reason, debug }, ...screen.diff]
+  const diff: Diff = [{ type: patchType, reason, debug }, ...screen.diff]
+  if (isResize) {
+    logForDebugging(`[tui-perf] fullResetSequence: resize complete in ${(performance.now() - t0).toFixed(1)}ms: rows=${frame.screen.height}, cols=${frame.viewport.width}, patches=${diff.length}`)
+  }
+  return diff
 }
 
 function renderFrame(
