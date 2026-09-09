@@ -499,24 +499,30 @@ function fullResetSequence_CAUSES_FLICKER(
   debug?: { triggerY: number; prevLine: string; nextLine: string },
   altScreen = false
 ): Diff {
-  const startY = altScreen ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
-  // Virtual cursor origin must match startY so rowsToAdvance doesn't emit thousands of spurious LFs in inline mode
+  const isResize = reason === 'resize'
+  // On resize, render from row 0 so the entire history reloads cleanly from top to bottom at the new width
+  const startY = (altScreen || isResize) ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
   const screen = new VirtualScreen({ x: 0, y: startY }, frame.viewport.width)
-  renderFrame(screen, frame, stylePool, altScreen)
+  renderFrame(screen, frame, stylePool, altScreen, isResize)
 
   // Restore cursor to frame's target cursor position so typing does NOT overwrite the status bar!
   if (!altScreen && frame.cursor) {
     moveCursorTo(screen, frame.cursor.x, frame.cursor.y)
   }
 
-  const patchType = altScreen ? 'clearTerminal' : 'clearScreen'
+  // Use clearTerminal on resize or altScreen to wipe stale buffer and prevent duplicate history
+  const patchType = (altScreen || isResize) ? 'clearTerminal' : 'clearScreen'
   return [{ type: patchType, reason, debug }, ...screen.diff]
 }
 
-function renderFrame(screen: VirtualScreen, frame: Frame, stylePool: StylePool, altScreen = false): void {
-  // In inline mode, the cumulative transcript can be thousands of lines. Only render
-  // the active visible viewport slice to prevent pushing duplicate history into scrollback on reset/resize.
-  const startY = altScreen ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
+function renderFrame(
+  screen: VirtualScreen,
+  frame: Frame,
+  stylePool: StylePool,
+  altScreen = false,
+  fullHistory = false
+): void {
+  const startY = (altScreen || fullHistory) ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
   renderFrameSlice(screen, frame, startY, frame.screen.height, stylePool)
 }
 

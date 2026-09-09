@@ -334,11 +334,10 @@ export function useVirtualHistory(
   // freezes Yoga layout and React reconciliation for 15+ seconds on resize without displaying
   // any of those unmounted historical rows.
   // Bound the mounted slice to the visible tail window (maxMounted).
-  const maxInline = Math.max(coldStartCount, 120)
-  const inlineStart = isInline ? Math.max(0, n - maxInline) : 0
-
   if (isInline) {
-    start = inlineStart
+    // In inline mode, mount all history items so full history from line 0
+    // (Hermes intro banner through all conversation turns) is preserved and reflows on resize.
+    start = 0
     end = n
   } else if (frozenRange) {
     start = frozenRange[0]
@@ -682,7 +681,7 @@ export function useVirtualHistory(
     end: isInline ? n : effEnd,
     measureRef,
     offsets,
-    start: isInline ? inlineStart : effStart,
+    start: isInline ? 0 : effStart,
     topSpacer: isInline ? 0 : (offsets[effStart] ?? 0)
   }
 }
