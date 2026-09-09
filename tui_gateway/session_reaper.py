@@ -133,7 +133,10 @@ def install_exit_flush_signal_handlers() -> bool:
 def _transport_is_dead(transport) -> bool:
     # _detached_ws_transport is the post-disconnect drop sentinel. _stdio_transport is the REAL transport for
     # standalone `hermes --tui` and must NOT count as dead.
-    return transport is _detached_ws_transport or getattr(transport, "_closed", None) is True
+    from tui_gateway.transport import _DropTransport, FanoutTransport
+    if isinstance(transport, FanoutTransport):
+        return all(_transport_is_dead(p) for p in transport.transports())
+    return isinstance(transport, _DropTransport) or getattr(transport, "_closed", None) is True
 
 
 def _session_is_lru_evictable(sid: str, session: dict) -> bool:

@@ -34,7 +34,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: 
 from tui_gateway import git_probe
 from tui_gateway._env import env_float, env_int
 from tui_gateway.turn_marker import clear_turn_marker, read_turn_marker, record_turn_start  # noqa: F401
-from tui_gateway.transport import (StdioTransport, Transport, bind_transport, current_transport, reset_transport)
+from tui_gateway.transport import (FanoutTransport, StdioTransport, Transport, bind_transport, current_transport, reset_transport)
 
 logger = logging.getLogger(__name__)
 
@@ -566,17 +566,6 @@ def write_json(obj: dict) -> bool:
         params = obj.get("params")
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
         if sid and (sess := _sessions.get(sid)):
-            viewers = sess.get("viewers")
-            if viewers:
-                delivered = False
-                for t in list(viewers.keys()):
-                    try:
-                        if t.write(obj):
-                            delivered = True
-                    except Exception:
-                        pass
-                if delivered:
-                    return True
             if (t := sess.get("transport")) is not None:
                 return t.write(obj)
     return (current_transport() or _stdio_transport).write(obj)
@@ -762,7 +751,7 @@ def _current_session_steer_authority(session_id: str) -> tuple[Transport | None,
     with _sessions_lock:
         session = _sessions.get(session_id)
         if (session is None or (expected_session is not None and session is not expected_session)
-                or session.get("transport") is not transport):
+                or not _session_transport_contains(session, transport)):
             return None, None
         return transport, session
 
@@ -3265,7 +3254,7 @@ from . import (  # noqa: E402
     tool_progress as _tool_progress, change_watcher as _change_watcher,
     session_compression as _session_compression, model_switch as _model_switch,
     compute_host_bridge as _compute_host_bridge, session_workdir as _session_workdir,
-    session_lifecycle as _session_lifecycle, session_reaper as _session_reaper,
+    session_lifecycle as _session_lifecycle, session_reaper as _session_reaper, session_transports as _session_transports,
     methods_browser_control as _methods_browser_control, methods_bot_relay as _methods_bot_relay,
     methods_complete as _methods_complete, methods_config as _methods_config,
     methods_config_set as _methods_config_set, methods_images as _methods_images,
@@ -3275,7 +3264,7 @@ from . import (  # noqa: E402
     methods_session_control as _methods_session_control)
 
 for _m in (
-    _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
+    _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
     _session_compression, _change_watcher, _tool_progress, _session_notifications,
     _prompt_attachments, _session_history, _agent_callbacks, _session_auto_continue,
     _methods_complete_helpers, _methods_slash, _methods_voice, _methods_browser,
