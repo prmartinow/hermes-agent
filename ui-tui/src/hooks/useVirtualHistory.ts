@@ -617,8 +617,10 @@ export function useVirtualHistory(
 
     if (skipMeasurement.current) {
       skipMeasurement.current = false
-      bumpMeasuredHeightVersion(n => n + 1)
-    } else {
+      if (!isInline) {
+        bumpMeasuredHeightVersion(n => n + 1)
+      }
+    } else if (!isInline) {
       for (let i = effStart; i < effEnd; i++) {
         const k = items[i]?.key
 

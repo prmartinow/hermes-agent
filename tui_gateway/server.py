@@ -614,17 +614,6 @@ def write_json(obj: dict) -> bool:
         project_room_member_activity(obj, _sessions)
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
         if sid and (sess := _sessions.get(sid)):
-            viewers = sess.get("viewers")
-            if viewers:
-                delivered = False
-                for t in list(viewers.keys()):
-                    try:
-                        if t.write(obj):
-                            delivered = True
-                    except Exception:
-                        pass
-                if delivered:
-                    return True
             if (t := sess.get("transport")) is not None:
                 return t.write(obj)
     return (current_transport() or _stdio_transport).write(obj)

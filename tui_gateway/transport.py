@@ -8,6 +8,8 @@ A :class:`Transport` forwards a JSON-serialisable dict to its peer, so one dispa
 """
 
 from __future__ import annotations
+from collections import deque
+from dataclasses import dataclass, field
 
 from collections import deque
 from dataclasses import dataclass, field
@@ -78,6 +80,14 @@ def _raise_unless_peer_gone(exc: Exception, what: str) -> None:
     if not isinstance(exc, OSError) or exc.errno not in _PEER_GONE_ERRNOS:
         raise exc
     logger.debug("StdioTransport %s peer gone: %s", what, exc)
+
+
+class _DropTransport:
+    """Detached WS sink: keep sessions resumable without writing stale frames."""
+    def write(self, obj: dict) -> bool:
+        return False
+    def close(self) -> None:
+        pass
 
 
 class StdioTransport:
