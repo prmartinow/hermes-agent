@@ -38,7 +38,7 @@ function Harness({
   )
 }
 
-describe('useVirtualHistory inline mode for native browser scrollbar', () => {
+describe('useVirtualHistory inline mode for full history reflow', () => {
   it('mounts 100% of items from start to end with 0 spacers when inline is true', () => {
     const items: Item[] = Array.from({ length: 50 }, (_, i) => ({
       key: `item-${i}`,
@@ -90,33 +90,5 @@ describe('useVirtualHistory inline mode for native browser scrollbar', () => {
     )
 
     expect(result.end - result.start).toBeLessThan(50)
-  })
-
-  it('bounds mounted items in inline mode when history exceeds 120 items to prevent resize freeze', () => {
-    const items: Item[] = Array.from({ length: 500 }, (_, i) => ({
-      key: `item-${i}`,
-      text: `Message ${i}`,
-    }))
-
-    let result!: ReturnType<typeof useVirtualHistory>
-
-    const stdout = new PassThrough()
-    Object.assign(stdout, { columns: 80, isTTY: false, rows: 20 })
-
-    renderSync(
-      <Harness
-        items={items}
-        inline={true}
-        onResult={res => {
-          result = res
-        }}
-      />,
-      { stdout }
-    )
-
-    expect(result.start).toBe(500 - 120)
-    expect(result.end).toBe(500)
-    expect(result.topSpacer).toBe(0)
-    expect(result.bottomSpacer).toBe(0)
   })
 })
