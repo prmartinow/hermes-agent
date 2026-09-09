@@ -656,10 +656,34 @@ def _translate_tool_call_to_gemini(
     return part
 
 
+def _has_schema_defs(val: Any) -> bool:
+    """Check if a tool result contains JSON Schema $defs, $schema, or JSON pointer $ref ('#/...').
+
+    Gemini 3 resolves ``$ref``/``$defs`` pointers inside functionResponse.response
+    and rejects unknown schema references with HTTP 400 INVALID_ARGUMENT
+    ("The referenced name ... does not match to a display_name").
+    """
+    if isinstance(val, dict):
+        if "$defs" in val or "$schema" in val:
+            return True
+        ref = val.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/"):
+            return True
+        for v in val.values():
+            if _has_schema_defs(v):
+                return True
+    elif isinstance(val, list):
+        for item in val:
+            if _has_schema_defs(item):
+                return True
+    return False
+
+
 def _translate_tool_result_to_gemini(
     message: Dict[str, Any],
     tool_name_by_call_id: Optional[Dict[str, str]] = None,
     include_ids: bool = False,
+    model: str = "",
 ) -> Dict[str, Any]:
     tool_name_by_call_id = tool_name_by_call_id or {}
     tool_call_id = str(message.get("tool_call_id") or "")
@@ -678,11 +702,16 @@ def _translate_tool_result_to_gemini(
             if isinstance(content_raw, str)
             else content_raw
         )
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, TypeError):
         content_val = content_raw
     response_payload: Dict[str, Any]
     if isinstance(content_val, dict):
-        response_payload = content_val
+        if _has_schema_defs(content_val):
+            response_payload = {
+                "output": content_raw if isinstance(content_raw, str) else json.dumps(content_val)
+            }
+        else:
+            response_payload = content_val
     else:
         response_payload = {"output": content_val}
     part: Dict[str, Any] = {
@@ -693,6 +722,15 @@ def _translate_tool_result_to_gemini(
     }
     if include_ids and tool_call_id:
         part["functionResponse"]["id"] = tool_call_id
+
+    # Gemini 3.x+ multimodal tool results embed image inlineData inside functionResponse.parts
+    if model and (_gemini_major_version(model) or 0) >= 3:
+        if isinstance(content_raw, (list, tuple)):
+            mm_parts = _extract_multimodal_parts(content_raw)
+            img_parts = [p for p in mm_parts if isinstance(p, dict) and "inlineData" in p]
+            if img_parts:
+                part["functionResponse"]["parts"] = img_parts
+
     return part
 
 
@@ -723,6 +761,7 @@ def _build_gemini_contents(
                             msg,
                             tool_name_by_call_id=tool_name_by_call_id,
                             include_ids=include_tool_call_ids,
+                            model=model,
                         )
                     ],
                 }

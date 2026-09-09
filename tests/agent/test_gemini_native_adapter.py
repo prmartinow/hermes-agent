@@ -677,7 +677,7 @@ def test_gemini_3x_embeds_image_in_function_response_parts(model):
         tools=[],
         tool_choice=None,
     )
-    fr = request["contents"][1]["parts"][0]["functionResponse"]
+    fr = request["contents"][-1]["parts"][0]["functionResponse"]
     assert "parts" in fr, "Gemini 3.x must embed image inlineData in functionResponse.parts"
     assert fr["parts"][0]["inlineData"]["mimeType"] == "image/png"
     assert fr["parts"][0]["inlineData"]["data"]
@@ -693,7 +693,7 @@ def test_gemini_2x_does_not_embed_image_parts():
         tools=[],
         tool_choice=None,
     )
-    fr = request["contents"][1]["parts"][0]["functionResponse"]
+    fr = request["contents"][-1]["parts"][0]["functionResponse"]
     assert "parts" not in fr
 
 
@@ -726,5 +726,5 @@ def test_text_only_tool_result_has_no_parts():
         tools=[],
         tool_choice=None,
     )
-    fr = request["contents"][1]["parts"][0]["functionResponse"]
+    fr = request["contents"][-1]["parts"][0]["functionResponse"]
     assert "parts" not in fr
