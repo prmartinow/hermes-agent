@@ -3,7 +3,7 @@ import { LogUpdate } from './log-update.js'
 import { StylePool } from './screen.js'
 
 describe('Inline Resize Invariants (Hermes Web TUI)', () => {
-  it('VALIDATION 1: Inline resize emits clearScreen and bounds viewport rendering to active rows', () => {
+  it('VALIDATION 1: Inline resize emits clearTerminal to wipe stale scrollback before reload', () => {
     const stylePool = new StylePool()
     const width = 80
     const height = 100
@@ -31,8 +31,7 @@ describe('Inline Resize Invariants (Hermes Web TUI)', () => {
     const log = new LogUpdate({ isTTY: true, stylePool })
     const diff = log.render(prevFrame, frame, false, false) // altScreen = false
 
-    // Assert clearScreen in inline mode so live viewport repaints without blowing scrollback
-    expect(diff.some(p => p.type === 'clearScreen')).toBe(true)
-    expect(diff.some(p => p.type === 'clearTerminal')).toBe(false)
+    // Assert clearTerminal in inline mode so stale scrollback is erased before reload
+    expect(diff.some(p => p.type === 'clearTerminal')).toBe(true)
   })
 })

@@ -334,14 +334,10 @@ export function useVirtualHistory(
   // freezes Yoga layout and React reconciliation for 15+ seconds on resize without displaying
   // any of those unmounted historical rows.
   // Bound the mounted slice to the visible tail window (maxMounted).
-  // In inline mode, the active React tree ONLY mounts the visible tail (~60 items).
-  // Mounting 3,800+ historical messages forces Yoga to layout 55,000 nodes and
-  // forces log-update to loop over 4.8 million cells on Node's single thread,
-  // freezing resize for 12 seconds!
-  // Full static history is formatted in parallel across 24 worker threads.
-  const maxInlineMounted = Math.max(coldStartCount, 60)
   if (isInline) {
-    start = Math.max(0, n - maxInlineMounted)
+    // In inline mode, mount all history items so full history from line 0
+    // (Hermes intro banner through all conversation turns) is preserved and reflows on resize.
+    start = 0
     end = n
   } else if (frozenRange) {
     start = frozenRange[0]
@@ -685,7 +681,7 @@ export function useVirtualHistory(
     end: isInline ? n : effEnd,
     measureRef,
     offsets,
-    start: isInline ? Math.max(0, n - maxInlineMounted) : effStart,
+    start: isInline ? 0 : effStart,
     topSpacer: isInline ? 0 : (offsets[effStart] ?? 0)
   }
 }
