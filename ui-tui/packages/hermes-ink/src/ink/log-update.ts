@@ -220,7 +220,7 @@ export class LogUpdate {
     // bring scrollback content into view, so we need a full reset.
     // Use <= (not <) because even when next height equals viewport height, the
     // scrollback depth from the previous render differs from a fresh render.
-    if (prevHadScrollback && nextFitsViewport && isShrinking) {
+    if (altScreen && prevHadScrollback && nextFitsViewport && isShrinking) {
       logForDebugging(
         `Full reset (shrink->below): prevHeight=${prev.screen.height}, nextHeight=${next.screen.height}, viewport=${prev.viewport.height}`
       )
@@ -276,7 +276,7 @@ export class LogUpdate {
       // eraseLines only works within the viewport - it can't clear scrollback.
       // If we need to clear more lines than fit in the viewport, some are in
       // scrollback, so we need a full reset.
-      if (linesToClear > prev.viewport.height) {
+      if (altScreen && linesToClear > prev.viewport.height) {
         return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', this.options.stylePool, undefined, altScreen)
       }
 
@@ -501,10 +501,9 @@ function fullResetSequence_CAUSES_FLICKER(
 ): Diff {
   const isResize = reason === 'resize'
   const t0 = performance.now()
-  // On resize in inline mode, render from line 0 so full history reflows cleanly at the new column width
-  const startY = (altScreen || isResize) ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
-  const screen = new VirtualScreen({ x: 0, y: startY }, frame.viewport.width)
-  renderFrame(screen, frame, stylePool, altScreen, isResize)
+  // A full reset sequence clears the terminal and redraws cleanly from row 0:
+  const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
+  renderFrame(screen, frame, stylePool, altScreen, true)
 
   // Restore cursor to frame's target cursor position so typing does NOT overwrite the status bar!
   if (!altScreen && frame.cursor) {
@@ -527,7 +526,7 @@ function renderFrame(
   altScreen = false,
   fullHistory = false
 ): void {
-  const startY = (altScreen || fullHistory) ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
+  const startY = fullHistory ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
   renderFrameSlice(screen, frame, startY, frame.screen.height, stylePool)
 }
 
