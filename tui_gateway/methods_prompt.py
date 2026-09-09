@@ -634,6 +634,7 @@ def _(rid, params: dict) -> dict:
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
     run_thread.start()
+    _broadcast_global_event("prompt.submitted", {"session_id": sid, "text": text})
     return _ok(rid, {"status": "streaming", **survivor_fields})
 
 
