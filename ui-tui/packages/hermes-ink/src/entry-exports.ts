@@ -1,5 +1,6 @@
 export { default as useStderr } from './hooks/use-stderr.js'
 export { default as useStdout } from './hooks/use-stdout.js'
+export { logForDebugging } from './utils/debug.js'
 export { Ansi } from './ink/Ansi.js'
 export { evictInkCaches, type EvictLevel, type InkCacheSizes } from './ink/cache-eviction.js'
 export { colorize } from './ink/colorize.js'

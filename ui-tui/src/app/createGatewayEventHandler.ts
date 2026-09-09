@@ -787,8 +787,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (p?.notice) {
           sys(p.notice)
         }
-        if (live.sid) {
-          ctx.session.resumeById(live.sid)
+        const sid = (p as any)?.session_id || ctx.session.activeSid
+        if (sid) {
+          ctx.session.resumeById(sid)
         }
 
         return
