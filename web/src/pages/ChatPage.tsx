@@ -975,40 +975,55 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         this._enabled = false;
       };
 
-      const origShouldForce = selService.shouldForceSelection.bind(selService);
-      selService.shouldForceSelection = (e: MouseEvent) => {
-        // Explicit modifier keys (Shift, or Option on macOS) always force selection
-        if (origShouldForce(e)) return true;
+      // Natural text selection is enabled everywhere by default (including prompt input field and prose).
+      // Single clicks without drag are forwarded to PTY via mouseup listener below.
+      selService.shouldForceSelection = () => true;
 
-        const rect = term.element?.getBoundingClientRect();
-        const dims = (term as any)._core?._renderService?.dimensions?.css?.cell;
-        if (!rect || !dims) return true;
-
-        const row = Math.floor((e.clientY - rect.top) / dims.height);
-
-        // 1. Any click on the bottom half of the terminal (composer, status bar, prompt).
-        // Composer can expand up to half the screen when writing large multi-line prompts.
-        if (row >= Math.floor(term.rows / 2)) return false;
-
-        // 2. Interactive controls, confirmation modals, approval dialogs across the viewport
-        const line = term.buffer.active.getLine(term.buffer.active.viewportY + row);
-        if (line) {
-          const lineText = line.translateToString(true);
-          const isInteractive =
-            /\[(Allow|Deny|Yes|No|Confirm|Cancel|Retry|Select|\s*\d+\s*)\]/i.test(lineText) ||
-            /Allow\s+this|Deny|Confirm|Cancel|Permission/i.test(lineText) ||
-            /[┌┐└┘├┤─│▸▾❯›]/.test(lineText) ||
-            lineText.trim().startsWith("❯") ||
-            lineText.trim().startsWith("?");
-
-          if (isInteractive) {
-            return false;
+      // Track mousedown coordinates to cleanly differentiate single clicks from drag-selection
+      let clickStartPos: { x: number; y: number; time: number } | null = null;
+      term.element?.addEventListener(
+        "mousedown",
+        (e: MouseEvent) => {
+          if (e.button === 0) {
+            clickStartPos = { x: e.clientX, y: e.clientY, time: Date.now() };
           }
-        }
+        },
+        { capture: true },
+      );
 
-        // Everywhere else across normal transcript prose: force selection naturally
-        return true;
-      };
+      term.element?.addEventListener(
+        "mouseup",
+        (e: MouseEvent) => {
+          if (!clickStartPos || e.button !== 0) return;
+          const dist = Math.hypot(e.clientX - clickStartPos.x, e.clientY - clickStartPos.y);
+          const elapsed = Date.now() - clickStartPos.time;
+          clickStartPos = null;
+
+          // If user dragged (> 3px) or took longer than 700ms or text is selected, respect selection!
+          if (dist > 3 || elapsed > 700 || term.hasSelection()) {
+            return;
+          }
+
+          // Single click detected: forward SGR mouse click sequence to PTY so interactive
+          // elements (modals, [Allow]/[Deny], status bar, textInput positioning) respond
+          const rect = term.element?.getBoundingClientRect();
+          const dims = (term as any)._core?._renderService?.dimensions?.css?.cell;
+          if (!rect || !dims) return;
+
+          const col = Math.floor((e.clientX - rect.left) / dims.width);
+          const row = Math.floor((e.clientY - rect.top) / dims.height);
+
+          if (col >= 0 && col < term.cols && row >= 0 && row < term.rows) {
+            // SGR DEC 1006 format: \x1b[<0;col+1;row+1M (press) and \x1b[<0;col+1;row+1m (release)
+            const press = `\x1b[<0;${col + 1};${row + 1}M`;
+            const release = `\x1b[<0;${col + 1};${row + 1}m`;
+            if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+              wsRef.current.send(press + release);
+            }
+          }
+        },
+        { capture: true },
+      );
 
       // Disarm auto-follow to bottom the moment a selection is created or modified
       term.onSelectionChange(() => {
