@@ -351,7 +351,7 @@ export function useMainApp(gw: GatewayClient) {
   // off live geometry. Cost: per-row local state (e.g. systemOpen toggles)
   // resets on resize; small UX hit for a hard correctness win.
   const virtualRows = useMemo<TranscriptRow[]>(
-    () => historyItems.map((msg, index) => ({ index, key: INLINE_MODE ? messageId(msg) : `${messageId(msg)}:c${cols}`, msg })),
+    () => historyItems.map((msg, index) => ({ index, key: `${messageId(msg)}:c${cols}`, msg })),
     [cols, historyItems, messageId]
   )
 

@@ -707,8 +707,7 @@ const cacheSet = (b: Map<string, ReactNode[]>, key: string, v: ReactNode[]) => {
 function MdImpl({ cols, compact, t, text }: MdProps) {
   const nodes = useMemo(() => {
     const bucket = cacheBucket(t)
-    const needsCols = text.includes('|') || text.includes('---') || text.includes('***')
-    const cacheKey = `${compact ? '1' : '0'}|${needsCols ? (cols ?? '') : ''}|${text}`
+    const cacheKey = `${compact ? '1' : '0'}|${cols ?? ''}|${text}`
     const cached = cacheGet(bucket, cacheKey)
 
     if (cached) {
