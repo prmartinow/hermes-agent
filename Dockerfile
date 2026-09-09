@@ -159,10 +159,9 @@ RUN useradd -u 10000 -m -d /opt/data hermes
 
 COPY --chmod=0755 --from=uv_source /uv /uvx /usr/local/bin/
 
-# Antigravity CLI (agy): package binary into image and ensure latest version at build time
+# Antigravity CLI (agy): package binary into image
 COPY --chmod=0755 bin/agy /usr/local/bin/agy
-RUN /usr/local/bin/agy update || true && \
-    mkdir -p /opt/hermes/bin && \
+RUN mkdir -p /opt/hermes/bin && \
     ln -sf /usr/local/bin/agy /opt/hermes/bin/agy
 
 # Node 26: copy the node binary plus the bundled npm JS install from the
