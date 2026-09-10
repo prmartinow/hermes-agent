@@ -1,4 +1,4 @@
-import { Ansi, Box, NoSelect, Text } from '@hermes/ink'
+import { Ansi, Box, NoSelect, RawAnsi, Text, wrapAnsi } from '@hermes/ink'
 import { memo, useState } from 'react'
 
 import { TERMUX_TUI_MODE } from '../config/env.js'
@@ -201,7 +201,12 @@ export const MessageLine = memo(function MessageLine({
     }
 
     if (msg.role !== 'user' && hasAnsi(msg.text)) {
-      return <Ansi>{sanitizeAnsiForRender(msg.text)}</Ansi>
+      const bodyWidth = transcriptBodyWidth(cols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)
+      const sanitized = sanitizeAnsiForRender(msg.text)
+      const wrapped = wrapAnsi(sanitized, bodyWidth, { hard: true, trim: false })
+      const lines = wrapped.split('\n')
+
+      return <RawAnsi lines={lines} width={bodyWidth} />
     }
 
     if (msg.role === 'assistant') {
