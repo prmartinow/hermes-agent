@@ -6,7 +6,7 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Container Name | Target Port | Active Image Tag | Compose Configuration | Role |
 | :--- | :---: | :--- | :--- | :--- |
-| **`hermes-agent-serving`** | `9119` | `hermes-agent:v0.23` (`v0.23`, `local`) | `docker-compose.local.yml` | Active production serving & leader lease holder |
+| **`hermes-agent-serving`** | `9119` | `hermes-agent:v0.25` (`v0.25`, `local`) | `docker-compose.local.yml` | Active production serving & leader lease holder |
 
 ---
 
@@ -14,8 +14,9 @@ Authoritative version and build ledger for containerized Hermes Agent deployment
 
 | Version | Image ID | Git Commit | Build Date (UTC) | Core Changes & Fixes | Status |
 | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`v0.25`** | `221df005f90e` | `df91609331` | 2026-09-09 09:30 | Release v0.25: Hindsight prefer_observations, document_id, include_chunks, universal FanoutTransport | **Active (Serving :9119)** |
 | **`v0.24`** | `439d47191613` | `9d46ed60cd` | 2026-09-08 17:29 | Candidate release v0.24: Playwright base layer caching, Jakarta Biznet mirror, 15MB uv image | Built (Available) |
-| **`v0.23`** | `4b4c90e11e8a` | `66ec0b0ecf` | 2026-09-08 15:35 | Rebuilt release v0.23: BuildKit cache mounts, fast dependency caching, and inspector drawer | **Active (Serving :9119)** |
+| **`v0.23`** | `4b4c90e11e8a` | `66ec0b0ecf` | 2026-09-08 15:35 | Rebuilt release v0.23: BuildKit cache mounts, fast dependency caching, and inspector drawer | Available (Previous Serving) |
 | **`v0.22`** | `599cd168d76c` | `0609aabca1` | 2026-09-07 23:08 | Candidate release v0.22: interactive tool & thinking trace inspector drawer with drag-selection protection | Available (Previous Serving) |
 | **`v0.21`** (`stable`) | `f943c52f5879` | `f7176e33c1` | 2026-09-07 20:38 | Candidate release v0.21: latest Web TUI terminal hydration, privilege-drop shim, subagent account persistence | Available (`stable` / Fallback Target) |
 | **`v0.20`** (Pruned) | `e7a76204d565` | `9d030f0c3c` | 2026-09-07 18:35 | Release v0.20: universal privilege-drop shim (UID 1000), in-image provenance metadata, bootstrap hardening, Web TUI scrollbar stability | Pruned |
