@@ -990,11 +990,21 @@ export default class Ink {
     // Selection/highlight overlays write via setCellStyleId which doesn't
     // track damage. prevFrameContaminated covers the cleanup frame.
     if (didLayoutShift() || selActive || hlActive || this.prevFrameContaminated) {
-      frame.screen.damage = {
-        x: 0,
-        y: 0,
-        width: frame.screen.width,
-        height: frame.screen.height
+      if (this.altScreenActive) {
+        frame.screen.damage = {
+          x: 0,
+          y: 0,
+          width: frame.screen.width,
+          height: frame.screen.height
+        }
+      } else {
+        const vpY = Math.max(0, frame.screen.height - frame.viewport.height)
+        frame.screen.damage = {
+          x: 0,
+          y: vpY,
+          width: frame.screen.width,
+          height: frame.screen.height - vpY
+        }
       }
     }
 

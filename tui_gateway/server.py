@@ -2443,9 +2443,25 @@ def _resolve_checkpoint_hash(mgr, cwd: str, ref: str) -> str:
 
 def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "", profile: str | None = None) -> dict:
     """session.info for a not-yet-built session (session.create's shape); tools/skills land with the deferred build."""
+    skills = {}
+    with contextlib.suppress(Exception):
+        from hermes_cli.banner import get_available_skills
+        skills = get_available_skills()
+    tools = {}
+    with contextlib.suppress(Exception):
+        from toolsets import get_all_toolsets, get_toolset_info
+        for name in sorted(get_all_toolsets().keys()):
+            if info := get_toolset_info(name):
+                resolved = info.get("resolved_tools", [])
+                if resolved:
+                    tools[name] = resolved
+    mcp_servers = []
+    with contextlib.suppress(Exception):
+        from tools.mcp_tool_discovery import get_mcp_status
+        mcp_servers = get_mcp_status()
     return {
         "cwd": cwd, "branch": git_probe.branch(cwd), "project": _project_info_for_cwd(cwd),
-        "model": model or _resolve_model(), "tools": {}, "skills": {}, "lazy": True,
+        "model": model or _resolve_model(), "tools": tools, "skills": skills, "mcp_servers": mcp_servers, "lazy": False,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT, "profile_name": _response_profile_name(profile),
         **({"provider": provider} if provider else {}),
     }
@@ -2688,18 +2704,28 @@ def _find_live_session_by_key(session_key: str, profile_home=_ANY_PROFILE) -> tu
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent)
-    # The SESSION's own workspace, not the launch dir (wrong project in the desktop Files pane). `branch` is
-    # always emitted ("" outside git) so a stale label clears; `desktop_contract` missing reads as "out of date".
-    # Reporting `_default_session_cwd()` here told a lazily-resumed session's client that its workspace was
-    # wherever the gateway process happened to start, so the desktop Files pane painted the wrong project
-    # even after the renderer rebound correctly (#71254). `branch` is always emitted ("" outside a git repo)
-    # so a client can clear a stale label instead of retaining it — the same contract `_lazy_session_info`
-    # above already follows.
+        return _session_info(agent, session)
     cwd = _session_cwd(session)
+    skills = {}
+    with contextlib.suppress(Exception):
+        from hermes_cli.banner import get_available_skills
+        skills = get_available_skills()
+    tools = {}
+    with contextlib.suppress(Exception):
+        from toolsets import get_all_toolsets, get_toolset_info
+        for name in sorted(get_all_toolsets().keys()):
+            if info := get_toolset_info(name):
+                resolved = info.get("resolved_tools", [])
+                if resolved:
+                    tools[name] = resolved
+    mcp_servers = []
+    with contextlib.suppress(Exception):
+        from tools.mcp_tool_discovery import get_mcp_status
+        mcp_servers = get_mcp_status()
     return {
-        "cwd": cwd, "branch": git_probe.branch(cwd), "project": _project_info_for_cwd(cwd), "lazy": True,
-        "model": _resolve_model(), "skills": {}, "tools": {}, "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "cwd": cwd, "branch": git_probe.branch(cwd), "project": _project_info_for_cwd(cwd), "lazy": False,
+        "model": _resolve_model(), "skills": skills, "tools": tools, "mcp_servers": mcp_servers,
+        "desktop_contract": DESKTOP_BACKEND_CONTRACT,
     }
 
 
