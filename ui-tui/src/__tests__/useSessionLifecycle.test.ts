@@ -77,6 +77,13 @@ describe('live session activation in-flight state', () => {
     expect(turnController.bufRef).toBe('')
     expect(getTurnState().streaming).toBe('')
   })
+
+  it('does not duplicate in-flight user prompt if already present in messages', () => {
+    const inflight = { assistant: 'partial answer', streaming: true, user: 'write a long answer' }
+    const existing = [{ role: 'user' as const, text: 'write a long answer' }]
+
+    expect(liveSessionInflightMessages(inflight, existing)).toEqual([])
+  })
 })
 
 describe('resume scroll settle', () => {

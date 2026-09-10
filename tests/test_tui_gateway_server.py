@@ -2862,6 +2862,29 @@ def test_history_to_messages_ships_full_tool_args():
     assert "args" not in argless[0]
 
 
+def test_history_to_messages_parses_json_string_tool_calls():
+    history = [
+        {"role": "user", "content": "run it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": json.dumps([
+                {
+                    "id": "call_sqlite_1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "src/main.ts"}),
+                    },
+                }
+            ]),
+        },
+        {"role": "tool", "content": "file text", "tool_call_id": "call_sqlite_1", "tool_name": "read_file"},
+    ]
+    rows = server._history_to_messages(history)
+    assert rows[1]["args"] == {"path": "src/main.ts"}
+    assert rows[1]["context"] == "main.ts" 
+
+
 def test_tool_start_ships_full_args(monkeypatch):
     # The desktop rebuilds the expanded row's `$` transcript from args. When
     # only the 80-char `context` preview shipped, the expanded command was
