@@ -57,10 +57,23 @@ export const writeActiveSessionFile = (sessionId: null | string, file = process.
   }
 }
 
-export const liveSessionInflightMessages = (inflight?: null | SessionInflightTurn): Msg[] => {
+export const liveSessionInflightMessages = (
+  inflight?: null | SessionInflightTurn,
+  existingMessages?: Msg[]
+): Msg[] => {
   const user = String(inflight?.user ?? '').trim()
+  if (!user) {
+    return []
+  }
 
-  return user ? [{ role: 'user', text: user }] : []
+  if (existingMessages && existingMessages.length > 0) {
+    const lastUser = [...existingMessages].reverse().find(m => m.role === 'user')
+    if (lastUser && lastUser.text.trim() === user) {
+      return []
+    }
+  }
+
+  return [{ role: 'user', text: user }]
 }
 
 export const hydrateLiveSessionInflight = (inflight?: null | SessionInflightTurn) => {
@@ -338,7 +351,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
           resetSession()
           setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
-          const transcript = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
+          const transcriptMsgs = toTranscriptMessages(r.messages)
+          const transcript = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
           setHistoryItems(info ? [introMsg(info), ...transcript] : transcript)
           writeActiveSessionFile(r.session_key ?? r.session_id)
           patchUiState({
@@ -437,7 +451,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             resetSession()
             setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
-            const resumed = [...toTranscriptMessages(r.messages), ...liveSessionInflightMessages(r.inflight)]
+            const transcriptMsgs = toTranscriptMessages(r.messages)
+            const resumed = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
 
             setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
             setViewportMeta(r.viewport ?? null)
