@@ -500,18 +500,26 @@ function fullResetSequence_CAUSES_FLICKER(
   altScreen = false
 ): Diff {
   const isResize = reason === 'resize'
+  const isInit = reason === 'init'
   const t0 = performance.now()
-  // A full reset sequence clears the terminal and redraws cleanly from row 0:
+  
+  // Static History / Dynamic Active Split:
+  // In inline mode, completed turns reside in the terminal emulator's native scrollback,
+  // which the terminal automatically and hardware-reflows on window resize.
+  // Only the initial session hydration (isInit) renders fullHistory from line 0.
+  // Resizes and offscreen recoveries only redraw the visible active viewport slice.
+  const fullHistory = altScreen ? true : isInit
   const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
-  renderFrame(screen, frame, stylePool, altScreen, true)
+  renderFrame(screen, frame, stylePool, altScreen, fullHistory)
 
   // Restore cursor to frame's target cursor position so typing does NOT overwrite the status bar!
   if (!altScreen && frame.cursor) {
     moveCursorTo(screen, frame.cursor.x, frame.cursor.y)
   }
 
-  // Clear scrollback on resize to prevent duplicate history snapshots
-  const patchType = (altScreen || isResize || !altScreen) ? 'clearTerminal' : 'clearScreen'
+  // clearTerminal wipes scrollback (only on initial hydration / altScreen).
+  // clearScreen clears visible screen rows without duplicating or wiping scrollback.
+  const patchType = (altScreen || (isInit && !altScreen)) ? 'clearTerminal' : 'clearScreen'
   const diff: Diff = [{ type: patchType, reason, debug }, ...screen.diff]
   if (isResize) {
     logForDebugging(`[tui-perf] fullResetSequence: resize complete in ${(performance.now() - t0).toFixed(1)}ms: rows=${frame.screen.height}, cols=${frame.viewport.width}, patches=${diff.length}`)
