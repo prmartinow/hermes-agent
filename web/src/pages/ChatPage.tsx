@@ -1553,6 +1553,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       setPtyState("open");
       blockedInputNoticeRef.current = false;
       term.reset();
+      term.clear();
       // Connected — cancel any pending reconnect from a prior transient drop.
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
@@ -1601,6 +1602,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       stickToBottomRef.current = true;
       try {
         term.reset();
+        term.clear();
       } catch {
         /* ignore */
       }

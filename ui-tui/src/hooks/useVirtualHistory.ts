@@ -376,7 +376,7 @@ export function useVirtualHistory(
     }
   }
 
-  if (end - start > maxMounted) {
+  if (!isInline && end - start > maxMounted) {
     sticky ? (start = Math.max(0, end - maxMounted)) : (end = Math.min(n, start + maxMounted))
   }
 
@@ -384,7 +384,7 @@ export function useVirtualHistory(
   // viewportH + 2*overscan so the viewport is physically covered even when
   // items are tiny. Pessimistic because uncached items use a floor of 1 —
   // over-mounts when items are large, never leaves blank spacer showing.
-  if (n > 0 && vp > 0 && !frozenRange) {
+  if (!isInline && n > 0 && vp > 0 && !frozenRange) {
     const needed = vp + 2 * overscan
     let coverage = 0
 
@@ -416,7 +416,7 @@ export function useVirtualHistory(
   // PageUp skips this; the clamp holds the viewport at the mounted edge
   // during catch-up so there's no blank screen. Only caps range GROWTH;
   // shrinking is unbounded.
-  if (!frozenRange && prevRange.current && vp > 0) {
+  if (!isInline && !frozenRange && prevRange.current && vp > 0) {
     const velocity = Math.abs(top - lastScrollTopRef.current) + Math.abs(pendingDelta)
 
     if (velocity > vp * 2) {
@@ -476,7 +476,7 @@ export function useVirtualHistory(
   // wider than either bound alone. Trim the far edge by viewport position
   // (not pendingDelta direction — that flips mid-settle under concurrent
   // scheduling and yanks scrollTop).
-  if (effEnd - effStart > maxMounted && vp > 0) {
+  if (!isInline && effEnd - effStart > maxMounted && vp > 0) {
     const mid = (offsets[effStart]! + offsets[effEnd]!) / 2
 
     if (top < mid) {
