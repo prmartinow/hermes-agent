@@ -1,4 +1,4 @@
-import { Box, Link, stringWidth, Text } from '@hermes/ink'
+import { Box, colorize, Link, RawAnsi, stringWidth, Text } from '@hermes/ink'
 import { Fragment, memo, type ReactNode, useMemo } from 'react'
 
 import { ensureEmojiPresentation } from '../lib/emoji.js'
@@ -809,42 +809,29 @@ function MdImpl({ cols, compact, t, text }: MdProps) {
         const isDiff = lang === 'diff'
         const highlighted = !isDiff && isHighlightable(lang)
 
+        const ansiLines = block.map(l => {
+          if (highlighted) {
+            return highlightLine(l, lang, t)
+              .map(([color, text]) => (color ? colorize(text, color, 'foreground') : text))
+              .join('')
+          }
+
+          const add = isDiff && l.startsWith('+')
+          const del = isDiff && l.startsWith('-')
+          const hunk = isDiff && l.startsWith('@@')
+          const fg = add ? t.color.diffAddedWord : del ? t.color.diffRemovedWord : hunk ? t.color.muted : undefined
+          const bg = add ? t.color.diffAdded : del ? t.color.diffRemoved : undefined
+
+          let res = l
+          if (fg) res = colorize(res, fg, 'foreground')
+          if (bg) res = colorize(res, bg, 'background')
+          return res
+        })
+
         nodes.push(
           <Box flexDirection="column" key={key} paddingLeft={2}>
             {lang && !isDiff && <Text color={t.color.muted}>{'─ ' + lang}</Text>}
-
-            {block.map((l, j) => {
-              if (highlighted) {
-                return (
-                  <Text key={j}>
-                    {highlightLine(l, lang, t).map(([color, text], kk) =>
-                      color ? (
-                        <Text color={color} key={kk}>
-                          {text}
-                        </Text>
-                      ) : (
-                        <Text key={kk}>{text}</Text>
-                      )
-                    )}
-                  </Text>
-                )
-              }
-
-              const add = isDiff && l.startsWith('+')
-              const del = isDiff && l.startsWith('-')
-              const hunk = isDiff && l.startsWith('@@')
-
-              return (
-                <Text
-                  backgroundColor={add ? t.color.diffAdded : del ? t.color.diffRemoved : undefined}
-                  color={add ? t.color.diffAddedWord : del ? t.color.diffRemovedWord : hunk ? t.color.muted : undefined}
-                  dimColor={isDiff && !add && !del && !hunk && l.startsWith(' ')}
-                  key={j}
-                >
-                  {l}
-                </Text>
-              )
-            })}
+            <RawAnsi lines={ansiLines} width={Math.max(1, (cols ?? 80) - 2)} />
           </Box>
         )
 
