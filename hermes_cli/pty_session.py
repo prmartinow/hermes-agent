@@ -24,6 +24,14 @@ class RingBuffer:
         self.truncated = False
 
     def append(self, data: bytes) -> None:
+        # If the incoming stream clears the terminal scrollback (\x1b[3J),
+        # discard all buffered bytes prior to that clear. Keeping wiped
+        # scrollback causes reconnected viewers to replay duplicate transcripts.
+        clear_idx = data.rfind(b"\x1b[3J")
+        if clear_idx != -1:
+            self._buf.clear()
+            self.truncated = False
+            data = data[clear_idx:]
         self._buf.extend(data)
         overflow = len(self._buf) - self._cap
         if overflow > 0:
@@ -56,6 +64,10 @@ class PtySession:
         self._attach_generation = 0
         self._drain_task: Optional[asyncio.Task] = None
         self._write_lock = asyncio.Lock()
+
+    @property
+    def _ws(self) -> Any:
+        return self._leader_ws
 
     def is_leader(self, ws: Any) -> bool:
         return self._leader_ws is None or self._leader_ws is ws
@@ -115,15 +127,17 @@ class PtySession:
     async def attach(self, ws: Any, *, force_redraw: bool = False) -> bool:
         """Attach a browser terminal viewer and replay buffered PTY output without kicking out peers."""
         self._viewers.add(ws)
-        if self._leader_ws is None:
-            self._leader_ws = ws
+        self._leader_ws = ws
         self._attach_generation += 1
         self.attached = True
         self.last_detached_at = None
         if snap := self.buffer.snapshot():
             await ws.send_bytes(snap)
         if force_redraw:
-            return await self.bridge.write(TUI_FORCE_REDRAW)
+            delivered = await self.bridge.write(TUI_FORCE_REDRAW)
+            if not delivered and self.is_leader(ws):
+                self.alive = False
+            return delivered
         return True
 
     def detach(self, ws: Any) -> None:

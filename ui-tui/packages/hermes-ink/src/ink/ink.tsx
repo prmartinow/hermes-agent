@@ -27,6 +27,7 @@ import { emptyFrame, type Frame, type FrameEvent } from './frame.js'
 import { dispatchClick, dispatchHover, dispatchMouse } from './hit-test.js'
 import { applyHyperlinkHoverHighlight } from './hyperlinkHover.js'
 import instances from './instances.js'
+import { clearTerminal } from './clearTerminal.js'
 import { LogUpdate } from './log-update.js'
 import { nodeCache } from './node-cache.js'
 import { optimize } from './optimizer.js'
@@ -1378,11 +1379,11 @@ export default class Ink {
       return
     }
 
-    this.options.stdout.write(ERASE_SCREEN + CURSOR_HOME)
-
     if (this.altScreenActive) {
+      this.options.stdout.write(ERASE_SCREEN + CURSOR_HOME)
       this.resetFramesForAltScreen()
     } else {
+      this.options.stdout.write(clearTerminal)
       this.repaint()
       // repaint() resets frontFrame to 0×0. Without this flag the next
       // frame's blit optimization copies from that empty screen and the
