@@ -51,6 +51,66 @@ _LOCAL_MODES = {"local", "local_embedded"}
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 
+
+def _patch_client_recall_extensions() -> None:
+    try:
+        from hindsight_client import Hindsight
+        from hindsight_client_api.models import recall_request
+        from pydantic.fields import FieldInfo
+
+        if "prefer_observations" not in recall_request.RecallRequest.model_fields:
+            recall_request.RecallRequest.model_fields["prefer_observations"] = FieldInfo(
+                annotation=Optional[bool], default=None
+            )
+            recall_request.RecallRequest.model_fields["temporal_window"] = FieldInfo(
+                annotation=Optional[dict], default=None
+            )
+            recall_request.RecallRequest.model_rebuild(force=True)
+
+        orig_arecall = Hindsight.arecall
+        if getattr(orig_arecall, "_extended", False):
+            return
+
+        async def arecall_extended(self, bank_id, query, *args, prefer_observations=None, temporal_window=None, **kwargs):
+            if not hasattr(self, "_memory_api") or (prefer_observations is None and temporal_window is None):
+                return await orig_arecall(self, bank_id, query, *args, **kwargs)
+
+            types = kwargs.get("types")
+            budget = kwargs.get("budget", "mid")
+            max_tokens = kwargs.get("max_tokens", 4096)
+            trace = kwargs.get("trace", False)
+            query_timestamp = kwargs.get("query_timestamp")
+            include_chunks = kwargs.get("include_chunks", False)
+            max_chunk_tokens = kwargs.get("max_chunk_tokens", 8192)
+            tags = kwargs.get("tags")
+            tags_match = kwargs.get("tags_match", "any")
+
+            from hindsight_client_api.models import chunk_include_options, include_options
+
+            include_opts = include_options.IncludeOptions(
+                chunks=chunk_include_options.ChunkIncludeOptions(max_tokens=max_chunk_tokens) if include_chunks else None
+            )
+
+            req_obj = recall_request.RecallRequest(
+                query=query,
+                types=types,
+                budget=budget,
+                max_tokens=max_tokens,
+                trace=trace,
+                query_timestamp=query_timestamp,
+                include=include_opts,
+                tags=tags,
+                tags_match=tags_match,
+                prefer_observations=prefer_observations,
+                temporal_window=temporal_window,
+            )
+            return await self._memory_api.recall_memories(bank_id, req_obj, _request_timeout=self._timeout)
+
+        arecall_extended._extended = True
+        Hindsight.arecall = arecall_extended
+    except Exception as exc:
+        logger.debug("Could not patch Hindsight.arecall: %s", exc)
+
 def _ensure_client_dependency() -> None:
     """Lazily install the Hindsight client (``tools.lazy_deps``) before importing it."""
     try:
@@ -200,6 +260,11 @@ RETAIN_SCHEMA = {
             "context": {"type": "string", "description": "Short label (e.g. 'user preference', 'project decision')."},
             "tags": {"type": "array", "items": {"type": "string"},
                      "description": "Optional per-call tags to merge with configured default retain tags."},
+            "document_id": {"type": "string", "description": (
+                "Optional stable document identifier (e.g. 'skill:gemini-bridge', 'file:CLAUDE.md'). "
+                "Enables SHA-256 chunk delta hashing: re-retaining with the same document_id automatically "
+                "replaces modified chunks and prunes outdated facts without full re-extraction."
+            )},
             "occurred_at": {"type": "string", "description": (
                 "When the remembered event actually happened, as an ISO-8601 date "
                 "or datetime (e.g. '2026-08-20' or '2026-08-20T14:30:00+02:00'). "
@@ -218,10 +283,26 @@ RECALL_SCHEMA = {
         "Search long-term memory. Returns memories ranked by relevance using "
         "semantic search, keyword matching, entity graph traversal, and reranking."
     ),
-    "parameters": {"type": "object", "required": ["query"],
-                   "properties": {"query": {"type": "string", "description": "What to search for."}}},
+    "parameters": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+            "query": {"type": "string", "description": "What to search for."},
+            "include_chunks": {
+                "type": "boolean",
+                "description": "If true, returns verbatim raw text chunks and logs alongside extracted facts.",
+            },
+            "start_date": {
+                "type": "string",
+                "description": "Optional ISO-8601 start date to steer search to memories within a temporal window (e.g. '2026-09-01').",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Optional ISO-8601 end date to steer search to memories within a temporal window (e.g. '2026-09-05').",
+            },
+        },
+    },
 }
-
 REFLECT_SCHEMA = {
     "name": "hindsight_reflect",
     "description": (
@@ -803,6 +884,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
             self._recall_types = list([] if configured_types is None else configured_types) or ["observation"]
+        self._prefer_observations = bool(cfg.get("prefer_observations", True))
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
 
@@ -869,15 +951,34 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: skipped (%s)", why)
         return why is not None
 
-    def _recall(self, query: str) -> list:
-        kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
+    def _recall(self, query: str, *, include_chunks: bool = False,
+                start_date: str | None = None, end_date: str | None = None) -> tuple[list, dict]:
+        kwargs: dict = {
+            "bank_id": self._bank_id,
+            "query": query,
+            "budget": self._budget,
+            "max_tokens": self._recall_max_tokens,
+        }
+        if self._prefer_observations:
+            kwargs["prefer_observations"] = True
         if self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
-        resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
-        return resp.results or []
+        if include_chunks:
+            kwargs["include_chunks"] = True
+            kwargs["max_chunk_tokens"] = 2048
+        if start_date or end_date:
+            window = {}
+            if start_date:
+                window["start"] = start_date
+            if end_date:
+                window["end"] = end_date
+            kwargs["temporal_window"] = window
 
+        resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
+        chunks_dict = getattr(resp, "chunks", None) or {}
+        return resp.results or [], chunks_dict
     def _reflect(self, query: str) -> str | None:
         resp = self._run_hindsight_operation(
             lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget)
@@ -895,7 +996,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 return self._reflect(query) or "", 0
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
-            results = self._recall(query)
+            results, _ = self._recall(query)
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
@@ -1084,21 +1185,38 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _tool_retain(self, args: dict) -> str:
         content, context = args["content"], args.get("context")
+        doc_id = args.get("document_id")
         item = self._build_retain_kwargs(content, context=context, tags=args.get("tags"),
                                          occurred_at=args.get("occurred_at"))
-        logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
-                     self._bank_id, len(content), context)
-        self._retain_batch(item, bank_id=self._bank_id, retain_async=self._retain_async)
+        logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s, doc_id=%s",
+                     self._bank_id, len(content), context, doc_id)
+        self._retain_batch(item, bank_id=self._bank_id, document_id=doc_id, retain_async=self._retain_async)
         logger.debug("Tool hindsight_retain: success")
-        return "Memory stored successfully."
+        msg = f" (document: {doc_id})" if doc_id else ""
+        return f"Memory stored successfully{msg}."
 
     def _tool_recall(self, args: dict) -> str:
         query = args["query"]
-        logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                     self._bank_id, len(query), self._budget)
-        results = self._recall(query)
-        logger.debug("Tool hindsight_recall: %d results", len(results))
-        return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        include_chunks = bool(args.get("include_chunks", False))
+        start_date = args.get("start_date")
+        end_date = args.get("end_date")
+        logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s, chunks=%s, window=%s..%s",
+                     self._bank_id, len(query), self._budget, include_chunks, start_date, end_date)
+        results, chunks = self._recall(query, include_chunks=include_chunks, start_date=start_date, end_date=end_date)
+        logger.debug("Tool hindsight_recall: %d results, %d chunks", len(results), len(chunks))
+        facts_text = chr(10).join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        if not chunks:
+            return facts_text
+        chunks_lines = [chr(10) + chr(10) + "--- Source Chunks ---"]
+        if isinstance(chunks, dict):
+            for cid, chunk in chunks.items():
+                txt = getattr(chunk, "text", str(chunk))
+                chunks_lines.append(f"{chr(10)}[Chunk {cid}]:{chr(10)}{txt}")
+        elif isinstance(chunks, list):
+            for i, chunk in enumerate(chunks, 1):
+                txt = getattr(chunk, "text", str(chunk))
+                chunks_lines.append(f"{chr(10)}[Chunk {i}]:{chr(10)}{txt}")
+        return facts_text + "".join(chunks_lines)
 
     def _tool_reflect(self, args: dict) -> str:
         query = args["query"]
