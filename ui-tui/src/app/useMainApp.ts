@@ -197,7 +197,9 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [stdout])
 
-  const [historyItems, setHistoryItemsState] = useState<Msg[]>(() => [{ kind: 'intro', role: 'system', text: '' }])
+  const [historyItems, setHistoryItemsState] = useState<Msg[]>(() =>
+    STARTUP_RESUME_ID ? [] : [{ kind: 'intro', role: 'system', text: '' }]
+  )
   const [historyGeneration, setHistoryGeneration] = useState(0)
 
   const setHistoryItems = useCallback<StateSetter<Msg[]>>(value => {

@@ -57,7 +57,6 @@ import {
 import {
   PTY_RESUME_LOADING_MAX_MS,
   PTY_RESUME_LOADING_MESSAGE,
-  shouldFinishResumeHydrationOnChunk,
   shouldShowResumeLoadingOverlay,
 } from "@/lib/pty-resume-loading";
 import {
@@ -1382,14 +1381,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         eraseSuppressionTimer = null;
       }
     };
+    let isReplayActive = Boolean(resumeParam);
+    let resumeHydrationFinished = false;
+    let resumeSettleTimer: ReturnType<typeof setTimeout> | null = null;
+    const PTY_RESUME_SETTLE_MS = 600;
+
     const clearResumeLoadingTimers = () => {
       if (resumeMaxTimer) {
         clearTimeout(resumeMaxTimer);
         resumeMaxTimer = null;
       }
+      if (resumeSettleTimer) {
+        clearTimeout(resumeSettleTimer);
+        resumeSettleTimer = null;
+      }
     };
-    let isReplayActive = Boolean(resumeParam);
-    let resumeHydrationFinished = false;
+
     const finishResumeHydration = () => {
       if (resumeHydrationFinished) return;
       resumeHydrationFinished = true;
@@ -1407,12 +1414,17 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     };
     const noteResumePtyChunk = (chunkText: string) => {
-      if (!effectiveResume || unmounting) {
+      if (!effectiveResume || unmounting || resumeHydrationFinished) {
         return;
       }
-      if (shouldFinishResumeHydrationOnChunk(chunkText)) {
-        finishResumeHydration();
+      // Keep replay active while stream chunks are landing.
+      // Settle after 600ms of quiet following the last received chunk,
+      // or fast-settle if the ready prompt/status bar is detected.
+      if (resumeSettleTimer) {
+        clearTimeout(resumeSettleTimer);
       }
+      const hasPrompt = chunkText.includes("❯ ") || chunkText.includes("─ ready │");
+      resumeSettleTimer = setTimeout(finishResumeHydration, hasPrompt ? 150 : PTY_RESUME_SETTLE_MS);
     };
     if (resumeParam) {
       setResumeHydrating(true);
@@ -1600,6 +1612,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     const sanitizer = new PtyResumeSanitizer();
     const beginResumeReplay = () => {
       isReplayActive = true;
+      resumeHydrationFinished = false;
       stickToBottomRef.current = true;
       try {
         term.reset();
