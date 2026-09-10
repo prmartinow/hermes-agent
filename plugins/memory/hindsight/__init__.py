@@ -111,6 +111,10 @@ def _patch_client_recall_extensions() -> None:
     except Exception as exc:
         logger.debug("Could not patch Hindsight.arecall: %s", exc)
 
+
+# Auto-apply extensions on import
+_patch_client_recall_extensions()
+
 def _ensure_client_dependency() -> None:
     """Lazily install the Hindsight client (``tools.lazy_deps``) before importing it."""
     try:
@@ -120,6 +124,7 @@ def _ensure_client_dependency() -> None:
         pass
     except Exception as exc:
         raise ImportError(str(exc)) from exc
+    _patch_client_recall_extensions()
 
 
 def _cloud_api_key(config: dict) -> str:
@@ -761,6 +766,7 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- lifecycle ---------------------------------------------------------------
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        _patch_client_recall_extensions()
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
         # Status channel for the retain indicator (recall reports via recall_status()).
