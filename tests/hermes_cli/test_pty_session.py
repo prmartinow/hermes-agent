@@ -21,6 +21,17 @@ def test_ringbuffer_drops_oldest_over_capacity():
     assert rb.truncated is True
 
 
+def test_ringbuffer_clears_prior_bytes_on_scrollback_wipe():
+    rb = RingBuffer(1024)
+    rb.append(b"Stale run line 1\nStale run line 2\n")
+    assert b"Stale run" in rb.snapshot()
+    # Emitting clearTerminal (\x1b[3J) must discard stale runs
+    rb.append(b"\x1b[2J\x1b[3J\x1b[HFresh run line 1\n")
+    snap = rb.snapshot()
+    assert b"Stale run" not in snap
+    assert b"Fresh run" in snap
+
+
 
 
 class FakeBridge:

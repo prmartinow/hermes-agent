@@ -511,7 +511,7 @@ function fullResetSequence_CAUSES_FLICKER(
   }
 
   // Clear scrollback on resize to prevent duplicate history snapshots
-  const patchType = (altScreen || isResize) ? 'clearTerminal' : 'clearScreen'
+  const patchType = (altScreen || isResize || !altScreen) ? 'clearTerminal' : 'clearScreen'
   const diff: Diff = [{ type: patchType, reason, debug }, ...screen.diff]
   if (isResize) {
     logForDebugging(`[tui-perf] fullResetSequence: resize complete in ${(performance.now() - t0).toFixed(1)}ms: rows=${frame.screen.height}, cols=${frame.viewport.width}, patches=${diff.length}`)
