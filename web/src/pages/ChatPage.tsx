@@ -619,6 +619,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       theme: terminalTheme,
     });
     termRef.current = term;
+    (window as any).__hermes_term = term;
 
     // Wheel events scroll the terminal locally in the browser buffer and
     // update the native scrollbar without sending SGR wheel sequences to PTY.
@@ -1924,6 +1925,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       host.removeEventListener("keydown", _imeCompositionGuard, true);
       term.dispose();
       termRef.current = null;
+      delete (window as any).__hermes_term;
       fitRef.current = null;
       if (copyResetRef.current) {
         clearTimeout(copyResetRef.current);
