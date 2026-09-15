@@ -2717,6 +2717,9 @@ OPTIONAL_ENV_VARS = {
     "HONCHO_BASE_URL": _tool("Base URL for self-hosted Honcho instances (no API key needed)",
         "Honcho base URL (e.g. http://localhost:8000)", password=None),
     # ── Hindsight ──
+    "HERMES_HINDSIGHT_WEBHOOK_SECRET": _tool(
+        "Shared signing secret for POST /api/webhooks/hindsight (not the API key)",
+        "Hindsight webhook signing secret", "https://hindsight.vectorize.io", password=True, advanced=True),
     "HINDSIGHT_API_KEY": _tool("Hindsight API key for graph-aware persistent memory",
         "Hindsight API key", "https://hindsight.vectorize.io", tools=["hindsight_recall"]),
     "HINDSIGHT_API_URL": _tool(
