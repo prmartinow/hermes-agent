@@ -2240,44 +2240,24 @@ def _gemini_oauth_pkce_login(account: Any = 1, timeout_seconds: float = 120.0) -
 def _save_antigravity_tokens(tokens: Dict[str, Any], account: Any = 1) -> Path:
     acc_idx = _normalize_gemini_account_id(account)
     auth_path = _antigravity_token_path(acc_idx)
-    auth_path.parent.mkdir(parents=True, exist_ok=True)
-    secure_parent_dir(auth_path)
-    tmp_path = auth_path.with_name(f"{auth_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    fd = os.open(
-        str(tmp_path),
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        stat.S_IRUSR | stat.S_IWUSR,
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            raw = tokens.get("raw")
-            if isinstance(raw, dict):
-                raw["token"]["access_token"] = tokens.get("access_token", "")
-                if tokens.get("refresh_token"):
-                    raw["token"]["refresh_token"] = tokens["refresh_token"]
-                if tokens.get("expiry"):
-                    raw["token"]["expiry"] = tokens["expiry"]
-                fh.write(json.dumps(raw, indent=2, sort_keys=True) + "\n")
-            else:
-                agy_format = {
-                    "token": {
-                        "access_token": tokens.get("access_token", ""),
-                        "refresh_token": tokens.get("refresh_token", ""),
-                        "token_type": tokens.get("token_type", "Bearer"),
-                        "expiry": tokens.get("expiry", ""),
-                    },
-                    "auth_method": "consumer",
-                }
-                fh.write(json.dumps(agy_format, indent=2, sort_keys=True) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        atomic_replace(tmp_path, auth_path)
-    finally:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
+    raw = tokens.get("raw")
+    if isinstance(raw, dict):
+        raw["token"]["access_token"] = tokens.get("access_token", "")
+        if tokens.get("refresh_token"):
+            raw["token"]["refresh_token"] = tokens["refresh_token"]
+        if tokens.get("expiry"):
+            raw["token"]["expiry"] = tokens["expiry"]
+    else:
+        raw = {
+            "token": {
+                "access_token": tokens.get("access_token", ""),
+                "refresh_token": tokens.get("refresh_token", ""),
+                "token_type": tokens.get("token_type", "Bearer"),
+                "expiry": tokens.get("expiry", ""),
+            },
+            "auth_method": "consumer",
+        }
+    _save_private_json(auth_path, raw, indent=2, sort_keys=True)
     return auth_path
 
 

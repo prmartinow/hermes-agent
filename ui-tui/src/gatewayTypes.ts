@@ -17,6 +17,8 @@ export type GatewaySkin = HermesSkin
 /** Distributive form of the shared `GatewayEvent<K>` so `switch (ev.type)`
  *  narrows `ev.payload` per case (the generic-defaulted interface does not). */
 export type AnyGatewayEvent = { [K in GatewayEventName]: GatewayEvent<K> }[GatewayEventName] | { payload?: { text?: string; timestamp?: number; user_message?: string }; session_id?: string; type: 'turn.steer' }
+  | { payload?: { notice?: string; session_id?: string }; session_id?: string; type: 'session.rewound' | 'session.restored' }
+  | { payload?: { session_id: string; text: string }; session_id?: string; type: 'prompt.submitted' }
 
 export interface SessionViewportMeta { end_index: number; has_more_before: boolean; start_index: number; total: number }
 export interface SessionHistoryResponse { count?: number; end_index?: number; has_more_before?: boolean; messages: TranscriptMessage[]; session_id?: string; start_index?: number }

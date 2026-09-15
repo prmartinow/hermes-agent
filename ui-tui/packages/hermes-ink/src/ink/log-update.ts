@@ -150,7 +150,9 @@ export class LogUpdate {
       next.viewport.height !== prev.viewport.height ||
       (prev.viewport.width !== 0 && next.viewport.width !== prev.viewport.width)
     ) {
-      return fullResetSequence_CAUSES_FLICKER(next, 'resize', stylePool, undefined, altScreen)
+      return fullResetSequence_CAUSES_FLICKER(
+        next, prev.viewport.width === 0 ? 'init' : 'resize', stylePool, undefined, altScreen
+      )
     }
 
     // DECSTBM scroll optimization: when a ScrollBox's scrollTop changed,

@@ -28,7 +28,7 @@ describe('turnController.recordSteer — live mid-turn steer prompt ordering', (
 
   it('places steer prompt chronologically after preceding completed tool', () => {
     turnController.recordToolStart('call_1', 'read_file', 'path: config.json')
-    turnController.recordToolComplete('call_1', 'read_file', undefined, 'read 50 lines')
+    turnController.recordToolComplete('call_1', 'read_file', 'read 50 lines')
 
     turnController.recordSteer('now inspect database.py')
 
@@ -50,14 +50,14 @@ describe('turnController.recordSteer — live mid-turn steer prompt ordering', (
   it('appends subsequent tool calls after the steer prompt without backward merging', () => {
     // 1. Tool 1 completes
     turnController.recordToolStart('call_1', 'read_file', 'path: a.txt')
-    turnController.recordToolComplete('call_1', 'read_file', undefined, 'ok')
+    turnController.recordToolComplete('call_1', 'read_file', 'ok')
 
     // 2. User steers
     turnController.recordSteer('focus on b.txt')
 
     // 3. Tool 2 starts and completes
     turnController.recordToolStart('call_2', 'read_file', 'path: b.txt')
-    turnController.recordToolComplete('call_2', 'read_file', undefined, 'ok')
+    turnController.recordToolComplete('call_2', 'read_file', 'ok')
 
     const segments = getTurnState().streamSegments
     expect(segments).toHaveLength(3)
@@ -71,7 +71,7 @@ describe('turnController.recordSteer — live mid-turn steer prompt ordering', (
 
   it('preserves the steer prompt in finalMessages upon message.complete', () => {
     turnController.recordToolStart('call_1', 'read_file', 'path: a.txt')
-    turnController.recordToolComplete('call_1', 'read_file', undefined, 'ok')
+    turnController.recordToolComplete('call_1', 'read_file', 'ok')
 
     turnController.recordSteer('focus on b.txt')
 

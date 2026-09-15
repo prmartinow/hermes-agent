@@ -805,9 +805,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (p?.notice) {
           sys(p.notice)
         }
-        const sid = (p as any)?.session_id || ctx.session.activeSid
-        if (sid) {
-          ctx.session.resumeById(sid)
+        const restoredSid = p?.session_id || sid
+        if (restoredSid) {
+          ctx.session.resumeById(restoredSid)
         }
 
         return

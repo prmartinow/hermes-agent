@@ -12,7 +12,7 @@ import { patchUiState, resetUiState } from '../app/uiStore.js'
 import { AppLayout } from '../components/appLayout.js'
 import { toTranscriptMessages } from '../domain/messages.js'
 import type { GatewayClient } from '../gatewayTypes.js'
-import { stripAnsi } from '../lib/text.js'
+import { stripAnsi } from '@hermes/shared/ansi'
 import { DEFAULT_THEME } from '../theme.js'
 import type { TodoItem } from '../types.js'
 

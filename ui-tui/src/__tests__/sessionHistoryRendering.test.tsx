@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import { Banner, SessionPanel } from "../components/branding.js";
 import { MessageLine } from "../components/messageLine.js";
-import { stripAnsi } from "../lib/text.js";
+import { stripAnsi } from "@hermes/shared/ansi";
 import { DEFAULT_THEME } from "../theme.js";
 
 const makeStreams = (cols = 120, rows = 42) => {

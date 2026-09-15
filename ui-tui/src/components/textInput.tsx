@@ -1478,7 +1478,7 @@ export function TextInput({
         return swap(undo, redo)
       }
 
-      if ((mod && inp === 'y') || (mod && k.shift && inp === 'z')) {
+      if ((mod && inp === 'y') || (mod && k.shift && inp.toLowerCase() === 'z')) {
         return swap(redo, undo)
       }
 

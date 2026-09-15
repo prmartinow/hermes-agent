@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, Request
 
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_server_oauth import (
-    _external_process_cli_command, _minimax_poller, _nous_poller, _oauth_profile_name, _oauth_session_profile, _oauth_sessions, _oauth_sessions_lock, _truncate_token, _xai_device_poller,
+    _external_process_cli_command, _oauth_profile_name, _oauth_session_profile, _oauth_sessions, _oauth_sessions_lock, _truncate_token,
 )
 from hermes_cli.web_models import OAuthSubmitBody
 from hermes_cli.web_routers._common import scoped_to_thread

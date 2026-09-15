@@ -1526,14 +1526,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           url = await api.buildWsUrl("/api/pty", params);
         } catch (err) {
           if (unmounting || ticketSuperseded) return;
-          console.warn(`[chat] PTY ticket request failed: ${err}`);
+          console.warn(`[chat] PTY ticket request failed: ${errorMessage(err)}`);
           failTicketAttempt();
           return;
         }
         if (unmounting || ticketSuperseded) return;
-        console.warn(`[chat] PTY ticket request failed: ${errorMessage(err)}`);
-        failTicketAttempt();
-        return;
+        clearTicketTimer();
       }
 
       const ws = new WebSocket(url);

@@ -381,12 +381,13 @@ describe('createGatewayEventHandler', () => {
       type: 'message.complete'
     } as any)
 
-    expect(appended).toHaveLength(2)
+    expect(appended).toHaveLength(3)
     expect(appended[0]).toMatchObject({ kind: 'trail', role: 'system', text: '', thinking: 'mapped the page' })
-    expect(appended[0]?.tools).toHaveLength(1)
-    expect(appended[0]?.tools?.[0]).toContain('home page')
-    expect(appended[0]?.toolTokens).toBeGreaterThan(0)
-    expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
+    expect(appended[1]).toMatchObject({ kind: 'trail', role: 'system', text: '' })
+    expect(appended[1]?.tools).toHaveLength(1)
+    expect(appended[1]?.tools?.[0]).toContain('home page')
+    expect(appended[1]?.toolTokens).toBeGreaterThan(0)
+    expect(appended[2]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
   it('groups sequential completed tools into one trail when the turn completes', () => {
