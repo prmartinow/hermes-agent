@@ -52,6 +52,70 @@ _LOCAL_MODES = {"local", "local_embedded"}
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
 
 
+
+def _patch_client_recall_extensions() -> None:
+    try:
+        from hindsight_client import Hindsight
+        from hindsight_client_api.models import recall_request
+        from pydantic.fields import FieldInfo
+
+        if "prefer_observations" not in recall_request.RecallRequest.model_fields:
+            recall_request.RecallRequest.model_fields["prefer_observations"] = FieldInfo(
+                annotation=Optional[bool], default=None
+            )
+            recall_request.RecallRequest.model_fields["temporal_window"] = FieldInfo(
+                annotation=Optional[dict], default=None
+            )
+            recall_request.RecallRequest.model_rebuild(force=True)
+
+        orig_arecall = Hindsight.arecall
+        if getattr(orig_arecall, "_extended", False):
+            return
+
+        async def arecall_extended(self, bank_id, query, *args, prefer_observations=None, temporal_window=None, **kwargs):
+            if not hasattr(self, "_memory_api") or (prefer_observations is None and temporal_window is None):
+                return await orig_arecall(self, bank_id, query, *args, **kwargs)
+
+            types = kwargs.get("types")
+            budget = kwargs.get("budget", "mid")
+            max_tokens = kwargs.get("max_tokens", 4096)
+            trace = kwargs.get("trace", False)
+            query_timestamp = kwargs.get("query_timestamp")
+            include_chunks = kwargs.get("include_chunks", False)
+            max_chunk_tokens = kwargs.get("max_chunk_tokens", 8192)
+            tags = kwargs.get("tags")
+            tags_match = kwargs.get("tags_match", "any")
+
+            from hindsight_client_api.models import chunk_include_options, include_options
+
+            include_opts = include_options.IncludeOptions(
+                chunks=chunk_include_options.ChunkIncludeOptions(max_tokens=max_chunk_tokens) if include_chunks else None
+            )
+
+            req_obj = recall_request.RecallRequest(
+                query=query,
+                types=types,
+                budget=budget,
+                max_tokens=max_tokens,
+                trace=trace,
+                query_timestamp=query_timestamp,
+                include=include_opts,
+                tags=tags,
+                tags_match=tags_match,
+                prefer_observations=prefer_observations,
+                temporal_window=temporal_window,
+            )
+            return await self._memory_api.recall_memories(bank_id, req_obj, _request_timeout=self._timeout)
+
+        arecall_extended._extended = True
+        Hindsight.arecall = arecall_extended
+    except Exception as exc:
+        logger.debug("Could not patch Hindsight.arecall: %s", exc)
+
+
+# Auto-apply extensions on import
+_patch_client_recall_extensions()
+
 def _ensure_client_dependency() -> None:
     """Lazily install the Hindsight client (``tools.lazy_deps``) before importing it."""
     try:
@@ -61,6 +125,7 @@ def _ensure_client_dependency() -> None:
         pass
     except Exception as exc:
         raise ImportError(str(exc)) from exc
+    _patch_client_recall_extensions()
 
 
 def _scoped_setting(name: str, default: str = "") -> str:
@@ -222,6 +287,11 @@ RETAIN_SCHEMA = {
             "context": {"type": "string", "description": "Short label (e.g. 'user preference', 'project decision')."},
             "tags": {"type": "array", "items": {"type": "string"},
                      "description": "Optional per-call tags to merge with configured default retain tags."},
+            "document_id": {"type": "string", "description": (
+                "Optional stable document identifier (e.g. 'skill:gemini-bridge', 'file:CLAUDE.md'). "
+                "Enables SHA-256 chunk delta hashing: re-retaining with the same document_id automatically "
+                "replaces modified chunks and prunes outdated facts without full re-extraction."
+            )},
             "occurred_at": {"type": "string", "description": (
                 "When the remembered event actually happened, as an ISO-8601 date "
                 "or datetime (e.g. '2026-08-20' or '2026-08-20T14:30:00+02:00'). "
@@ -240,10 +310,26 @@ RECALL_SCHEMA = {
         "Search long-term memory. Returns memories ranked by relevance using "
         "semantic search, keyword matching, entity graph traversal, and reranking."
     ),
-    "parameters": {"type": "object", "required": ["query"],
-                   "properties": {"query": {"type": "string", "description": "What to search for."}}},
+    "parameters": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+            "query": {"type": "string", "description": "What to search for."},
+            "include_chunks": {
+                "type": "boolean",
+                "description": "If true, returns verbatim raw text chunks and logs alongside extracted facts.",
+            },
+            "start_date": {
+                "type": "string",
+                "description": "Optional ISO-8601 start date to steer search to memories within a temporal window (e.g. '2026-09-01').",
+            },
+            "end_date": {
+                "type": "string",
+                "description": "Optional ISO-8601 end date to steer search to memories within a temporal window (e.g. '2026-09-05').",
+            },
+        },
+    },
 }
-
 REFLECT_SCHEMA = {
     "name": "hindsight_reflect",
     "description": (
@@ -252,6 +338,34 @@ REFLECT_SCHEMA = {
     ),
     "parameters": {"type": "object", "required": ["query"],
                    "properties": {"query": {"type": "string", "description": "The question to reflect on."}}},
+}
+
+RETHINK_SCHEMA = {
+    "name": "rethink_memory",
+    "description": (
+        "Create, update, or delete standing repository procedural rules, coding "
+        "standards, formatting conventions, or architectural policies in procedural memory "
+        "with Git version tracking and automatic directive synchronization."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "rule_name": {
+                "type": "string",
+                "description": "Name/identifier of the procedural rule (without .md).",
+            },
+            "content": {
+                "type": "string",
+                "description": "Markdown content or text of the procedural rule.",
+            },
+            "action": {
+                "type": "string",
+                "enum": ["update", "insert", "delete"],
+                "description": "Action to perform: 'update', 'insert', or 'delete'. Defaults to 'update'.",
+            },
+        },
+        "required": ["rule_name", "content"],
+    },
 }
 
 
@@ -449,7 +563,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_every_n_turns", "description": "Retain every N turns (1 = every turn)", "default": 1},
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
             {"key": "prefetch_waits_for_retain", "description": "Have the background next-turn prefetch wait for the just-completed retain to become recall-visible on the server (local queue drain + async operation completion) before recalling, so recall includes the just-completed turn (runs off the reply path, adds no response latency)", "default": True},
-            {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
+            {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 100.0},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
@@ -671,6 +785,7 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- lifecycle ---------------------------------------------------------------
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        _patch_client_recall_extensions()
         self._session_id = str(session_id or "").strip()
         self._parent_session_id = str(kwargs.get("parent_session_id", "") or "").strip()
         # Status channel for the retain indicator (recall reports via recall_status()).
@@ -777,7 +892,7 @@ class HindsightMemoryProvider(MemoryProvider):
         # recall-visible; when True it first waits (bounded, off the reply path)
         # for the queue to drain AND the server-side op(s) to complete.
         self._prefetch_waits_for_retain = cfg.get("prefetch_waits_for_retain", True)
-        self._prefetch_retain_drain_timeout = float(cfg.get("prefetch_retain_drain_timeout", 10.0))
+        self._prefetch_retain_drain_timeout = float(cfg.get("prefetch_retain_drain_timeout", 100.0))
 
     def _apply_recall_settings(self, cfg: dict) -> None:
         """Recall knobs are pure config too (``{}`` yields the defaults)."""
@@ -796,6 +911,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = [t.strip() for t in configured_types.split(",") if t.strip()]
         else:
             self._recall_types = list([] if configured_types is None else configured_types) or ["observation"]
+        self._prefer_observations = bool(cfg.get("prefer_observations", True))
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
 
@@ -875,15 +991,34 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Prefetch: skipped (%s)", why)
         return why is not None
 
-    def _recall(self, query: str) -> list:
-        kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget, "max_tokens": self._recall_max_tokens}
+    def _recall(self, query: str, *, include_chunks: bool = False,
+                start_date: str | None = None, end_date: str | None = None) -> tuple[list, dict]:
+        kwargs: dict = {
+            "bank_id": self._bank_id,
+            "query": query,
+            "budget": self._budget,
+            "max_tokens": self._recall_max_tokens,
+        }
+        if self._prefer_observations:
+            kwargs["prefer_observations"] = True
         if self._recall_tags:
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
-        resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
-        return resp.results or []
+        if include_chunks:
+            kwargs["include_chunks"] = True
+            kwargs["max_chunk_tokens"] = 2048
+        if start_date or end_date:
+            window = {}
+            if start_date:
+                window["start"] = start_date
+            if end_date:
+                window["end"] = end_date
+            kwargs["temporal_window"] = window
 
+        resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
+        chunks_dict = getattr(resp, "chunks", None) or {}
+        return resp.results or [], chunks_dict
     def _reflect(self, query: str) -> str | None:
         resp = self._run_hindsight_operation(
             lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget)
@@ -901,7 +1036,7 @@ class HindsightMemoryProvider(MemoryProvider):
                 return self._reflect(query) or "", 0
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
-            results = self._recall(query)
+            results, _ = self._recall(query)
             logger.debug("Recall: returned %d results", len(results))
             return "\n".join(f"- {r.text}" for r in results if r.text), len(results)
         except Exception as e:
@@ -1086,25 +1221,42 @@ class HindsightMemoryProvider(MemoryProvider):
     # -- tools -------------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        return [] if self._memory_mode == "context" else [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA, RETHINK_SCHEMA]
 
     def _tool_retain(self, args: dict) -> str:
         content, context = args["content"], args.get("context")
+        doc_id = args.get("document_id")
         item = self._build_retain_kwargs(content, context=context, tags=args.get("tags"),
                                          occurred_at=args.get("occurred_at"))
-        logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s",
-                     self._bank_id, len(content), context)
-        self._retain_batch(item, bank_id=self._bank_id)
+        logger.debug("Tool hindsight_retain: bank=%s, content_len=%d, context=%s, doc_id=%s",
+                     self._bank_id, len(content), context, doc_id)
+        self._retain_batch(item, bank_id=self._bank_id, document_id=doc_id, retain_async=self._retain_async)
         logger.debug("Tool hindsight_retain: success")
-        return "Memory stored successfully."
+        msg = f" (document: {doc_id})" if doc_id else ""
+        return f"Memory stored successfully{msg}."
 
     def _tool_recall(self, args: dict) -> str:
         query = args["query"]
-        logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                     self._bank_id, len(query), self._budget)
-        results = self._recall(query)
-        logger.debug("Tool hindsight_recall: %d results", len(results))
-        return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        include_chunks = bool(args.get("include_chunks", False))
+        start_date = args.get("start_date")
+        end_date = args.get("end_date")
+        logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s, chunks=%s, window=%s..%s",
+                     self._bank_id, len(query), self._budget, include_chunks, start_date, end_date)
+        results, chunks = self._recall(query, include_chunks=include_chunks, start_date=start_date, end_date=end_date)
+        logger.debug("Tool hindsight_recall: %d results, %d chunks", len(results), len(chunks))
+        facts_text = chr(10).join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        if not chunks:
+            return facts_text
+        chunks_lines = [chr(10) + chr(10) + "--- Source Chunks ---"]
+        if isinstance(chunks, dict):
+            for cid, chunk in chunks.items():
+                txt = getattr(chunk, "text", str(chunk))
+                chunks_lines.append(f"{chr(10)}[Chunk {cid}]:{chr(10)}{txt}")
+        elif isinstance(chunks, list):
+            for i, chunk in enumerate(chunks, 1):
+                txt = getattr(chunk, "text", str(chunk))
+                chunks_lines.append(f"{chr(10)}[Chunk {i}]:{chr(10)}{txt}")
+        return facts_text + "".join(chunks_lines)
 
     def _tool_reflect(self, args: dict) -> str:
         query = args["query"]
@@ -1114,11 +1266,37 @@ class HindsightMemoryProvider(MemoryProvider):
         logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
         return text or "No relevant memories found."
 
+    def _tool_rethink(self, args: dict, session_id: str = "") -> Any:
+        rule_name = args["rule_name"]
+        content = args.get("content", "")
+        action = args.get("action", "update")
+        sess = self._session_id or session_id or "hindsight-rethink"
+        from hermes_constants import get_hermes_home
+        _agent_db_path = os.getenv("AGENT_MEMORY_DB_PATH", str(get_hermes_home() / "agent-memory" / "db"))
+        if _agent_db_path not in sys.path and os.path.isdir(_agent_db_path):
+            sys.path.insert(0, _agent_db_path)
+        from rule_mutator import mutate_rule  # type: ignore[import-not-found] # pyright: ignore[reportMissingImports]
+
+        logger.debug(
+            "Tool rethink_memory: rule_name=%s, action=%s, session=%s",
+            rule_name, action, sess,
+        )
+        res = mutate_rule(
+            rule_name=rule_name,
+            content=content,
+            action=action,
+            session_id=sess,
+            tool_caller="hindsight_plugin",
+        )
+        logger.debug("Tool rethink_memory: success: %s", res)
+        return res
+
     # tool name -> (required arg, handler, user-facing failure prefix)
     _TOOL_HANDLERS = {
         "hindsight_retain": ("content", _tool_retain, "Failed to store memory"),
         "hindsight_recall": ("query", _tool_recall, "Failed to search memory"),
         "hindsight_reflect": ("query", _tool_reflect, "Failed to reflect"),
+        "rethink_memory": ("rule_name", _tool_rethink, "Failed to rethink memory"),
     }
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -1128,6 +1306,9 @@ class HindsightMemoryProvider(MemoryProvider):
         if not args.get(required, ""):
             return tool_error(f"Missing required parameter: {required}")
         try:
+            if tool_name == "rethink_memory":
+                sess_id = self._session_id or kwargs.get("session_id") or "hindsight-rethink"
+                return json.dumps({"result": handler(self, args, session_id=sess_id)})
             return json.dumps({"result": handler(self, args)})
         except Exception as e:
             logger.warning("%s failed: %s", tool_name, e, exc_info=True)

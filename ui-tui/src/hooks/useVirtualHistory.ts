@@ -1,3 +1,4 @@
+import { INLINE_MODE } from '../config/env.js'
 import type { ScrollBoxHandle } from '@hermes/ink'
 import {
   type RefObject,
@@ -148,7 +149,8 @@ export function useVirtualHistory(
     onHeightsChange,
     overscan = OVERSCAN,
     maxMounted = MAX_MOUNTED,
-    coldStartCount = COLD_START
+    coldStartCount = COLD_START,
+    inline = INLINE_MODE
   }: VirtualHistoryOptions = {}
 ) {
   const nodes = useRef(new Map<string, unknown>())
@@ -218,19 +220,21 @@ export function useVirtualHistory(
 
     prevColumns.current = columns
 
-    for (const [k, h] of heights.current) {
-      const scaled = Math.round(h * ratio)
+    if (!inline) {
+      for (const [k, h] of heights.current) {
+        const scaled = Math.round(h * ratio)
 
-      if (validVirtualItemHeight(scaled)) {
-        heights.current.set(k, scaled)
-      } else {
-        heights.current.delete(k)
+        if (validVirtualItemHeight(scaled)) {
+          heights.current.set(k, scaled)
+        } else {
+          heights.current.delete(k)
+        }
       }
-    }
 
-    offsetVersion.current++
-    skipMeasurement.current = true
-    freezeRenders.current = FREEZE_RENDERS
+      offsetVersion.current++
+      skipMeasurement.current = true
+      freezeRenders.current = FREEZE_RENDERS
+    }
   }
 
   useLayoutEffect(() => {
@@ -322,10 +326,22 @@ export function useVirtualHistory(
     return rangeTop <= visibleTop && rangeBottom >= visibleBottom ? frozenRangeCandidate : null
   })()
 
+  const isInline = inline
+
   let start = 0
   let end = n
 
-  if (frozenRange) {
+  // In inline mode, the terminal renderer only draws the active visible viewport slice
+  // (see renderFrame in log-update.ts). Mounting the entire transcript (e.g. 3,800+ messages)
+  // freezes Yoga layout and React reconciliation for 15+ seconds on resize without displaying
+  // any of those unmounted historical rows.
+  // Bound the mounted slice to the visible tail window (maxMounted).
+  if (isInline) {
+    // In inline mode, mount all history items so full history from line 0
+    // (Hermes intro banner through all conversation turns) is preserved and reflows on resize.
+    start = 0
+    end = n
+  } else if (frozenRange) {
     start = frozenRange[0]
     end = Math.min(frozenRange[1], n)
   } else if (n > 0) {
@@ -360,7 +376,7 @@ export function useVirtualHistory(
     }
   }
 
-  if (end - start > maxMounted) {
+  if (!isInline && end - start > maxMounted) {
     sticky ? (start = Math.max(0, end - maxMounted)) : (end = Math.min(n, start + maxMounted))
   }
 
@@ -368,7 +384,7 @@ export function useVirtualHistory(
   // viewportH + 2*overscan so the viewport is physically covered even when
   // items are tiny. Pessimistic because uncached items use a floor of 1 —
   // over-mounts when items are large, never leaves blank spacer showing.
-  if (n > 0 && vp > 0 && !frozenRange) {
+  if (!isInline && n > 0 && vp > 0 && !frozenRange) {
     const needed = vp + 2 * overscan
     let coverage = 0
 
@@ -400,7 +416,7 @@ export function useVirtualHistory(
   // PageUp skips this; the clamp holds the viewport at the mounted edge
   // during catch-up so there's no blank screen. Only caps range GROWTH;
   // shrinking is unbounded.
-  if (!frozenRange && prevRange.current && vp > 0) {
+  if (!isInline && !frozenRange && prevRange.current && vp > 0) {
     const velocity = Math.abs(top - lastScrollTopRef.current) + Math.abs(pendingDelta)
 
     if (velocity > vp * 2) {
@@ -460,7 +476,7 @@ export function useVirtualHistory(
   // wider than either bound alone. Trim the far edge by viewport position
   // (not pendingDelta direction — that flips mid-settle under concurrent
   // scheduling and yanks scrollTop).
-  if (effEnd - effStart > maxMounted && vp > 0) {
+  if (!isInline && effEnd - effStart > maxMounted && vp > 0) {
     const mid = (offsets[effStart]! + offsets[effEnd]!) / 2
 
     if (top < mid) {
@@ -601,8 +617,10 @@ export function useVirtualHistory(
 
     if (skipMeasurement.current) {
       skipMeasurement.current = false
-      bumpMeasuredHeightVersion(n => n + 1)
-    } else {
+      if (!isInline) {
+        bumpMeasuredHeightVersion(n => n + 1)
+      }
+    } else if (!isInline) {
       for (let i = effStart; i < effEnd; i++) {
         const k = items[i]?.key
 
@@ -663,12 +681,12 @@ export function useVirtualHistory(
   }, [effEnd, effStart, items, liveTailActive, measuredHeightVersion, n, offsets, scrollRef, sticky, top, total, vp])
 
   return {
-    bottomSpacer: Math.max(0, total - (offsets[effEnd] ?? total)),
-    end: effEnd,
+    bottomSpacer: isInline ? 0 : Math.max(0, total - (offsets[effEnd] ?? total)),
+    end: isInline ? n : effEnd,
     measureRef,
     offsets,
-    start: effStart,
-    topSpacer: offsets[effStart] ?? 0
+    start: isInline ? 0 : effStart,
+    topSpacer: isInline ? 0 : (offsets[effStart] ?? 0)
   }
 }
 
@@ -686,4 +704,5 @@ interface VirtualHistoryOptions {
   maxMounted?: number
   onHeightsChange?: (heights: ReadonlyMap<string, number>) => void
   overscan?: number
+  inline?: boolean
 }

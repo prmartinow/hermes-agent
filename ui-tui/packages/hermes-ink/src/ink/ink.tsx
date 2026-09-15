@@ -27,6 +27,7 @@ import { emptyFrame, type Frame, type FrameEvent } from './frame.js'
 import { dispatchClick, dispatchHover, dispatchMouse } from './hit-test.js'
 import { applyHyperlinkHoverHighlight } from './hyperlinkHover.js'
 import instances from './instances.js'
+import { clearTerminal } from './clearTerminal.js'
 import { LogUpdate } from './log-update.js'
 import { nodeCache } from './node-cache.js'
 import { optimize } from './optimizer.js'
@@ -280,6 +281,7 @@ export default class Ink {
   // tracking, and tmux users routinely opt into the hover-free 'wheel'
   // subset to silence prompt-row clipboard probes).
   private altScreenMouseTracking: MouseTrackingMode = 'off'
+  private inlineMouseTracking: MouseTrackingMode = 'off'
   // True when the previous frame's screen buffer cannot be trusted for
   // blit — selection overlay mutated it, resetFramesForAltScreen()
   // replaced it with blanks, or forceRedraw() reset it to 0×0. Forces
@@ -610,10 +612,19 @@ export default class Ink {
     }, 160)
   }
 
+  private pendingTerminalFocusIn = false
+
   private handleTerminalFocusChange(isFocused: boolean): void {
-    if (!isFocused || !this.options.stdout.isTTY) {
+    if (!this.options.stdout.isTTY) {
       return
     }
+
+    if (!isFocused) {
+      this.pendingTerminalFocusIn = false
+      return
+    }
+
+    this.pendingTerminalFocusIn = true
 
     // Focus-in means the terminal emulator has just made this tab/pane
     // visible again. Some emulators throttle or coalesce hidden-tab output;
@@ -641,9 +652,11 @@ export default class Ink {
     // OS app-switch. Re-assert modes and stop; the focus report still reaches
     // TerminalFocusProvider.
     queueMicrotask(() => {
-      if (this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
+      if (!this.pendingTerminalFocusIn || this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
         return
       }
+
+      this.pendingTerminalFocusIn = false
 
       this.reassertTerminalModes(false)
 
@@ -978,11 +991,21 @@ export default class Ink {
     // Selection/highlight overlays write via setCellStyleId which doesn't
     // track damage. prevFrameContaminated covers the cleanup frame.
     if (didLayoutShift() || selActive || hlActive || this.prevFrameContaminated) {
-      frame.screen.damage = {
-        x: 0,
-        y: 0,
-        width: frame.screen.width,
-        height: frame.screen.height
+      if (this.altScreenActive) {
+        frame.screen.damage = {
+          x: 0,
+          y: 0,
+          width: frame.screen.width,
+          height: frame.screen.height
+        }
+      } else {
+        const vpY = Math.max(0, frame.screen.height - frame.viewport.height)
+        frame.screen.damage = {
+          x: 0,
+          y: vpY,
+          width: frame.screen.width,
+          height: frame.screen.height - vpY
+        }
       }
     }
 
@@ -1034,7 +1057,7 @@ export default class Ink {
     const flickers: FrameEvent['flickers'] = []
 
     for (const patch of diff) {
-      if (patch.type === 'clearTerminal') {
+      if (patch.type === 'clearTerminal' || patch.type === 'clearScreen') {
         flickers.push({
           desiredHeight: frame.screen.height,
           availableHeight: frame.viewport.height,
@@ -1245,6 +1268,10 @@ export default class Ink {
 
     const writeMs = performance.now() - tWrite
 
+    if (diff.some(p => p.type === 'clearTerminal' || p.type === 'clearScreen')) {
+      logForDebugging(`[tui-perf] frame paint: optimizeMs=${optimizeMs.toFixed(1)}ms, writeMs=${writeMs.toFixed(1)}ms, patches=${optimized.length}`)
+    }
+
     // Update blit safety for the NEXT frame. The frame just rendered
     // becomes frontFrame (= next frame's prevScreen). If we applied the
     // selection overlay, that buffer has inverted cells. selActive/hlActive
@@ -1352,11 +1379,11 @@ export default class Ink {
       return
     }
 
-    this.options.stdout.write(ERASE_SCREEN + CURSOR_HOME)
-
     if (this.altScreenActive) {
+      this.options.stdout.write(ERASE_SCREEN + CURSOR_HOME)
       this.resetFramesForAltScreen()
     } else {
+      this.options.stdout.write(clearTerminal)
       this.repaint()
       // repaint() resets frontFrame to 0×0. Without this flag the next
       // frame's blit optimization copies from that empty screen and the
@@ -1433,6 +1460,13 @@ export default class Ink {
       this.options.stdout.write(DISABLE_MOUSE_TRACKING + enableMouseTrackingFor(mode))
     }
   }
+  setInlineMouseTracking(mode: MouseTrackingMode): void {
+    if (this.inlineMouseTracking === mode) {
+      return
+    }
+    this.inlineMouseTracking = mode
+  }
+
   get isAltScreenActive(): boolean {
     return this.altScreenActive
   }
@@ -1446,7 +1480,8 @@ export default class Ink {
    * session), or after unmount.
    */
   get expectsMouseTracking(): boolean {
-    return this.altScreenActive && !this.isPaused && !this.isUnmounted && this.altScreenMouseTracking !== 'off'
+    const active = this.altScreenActive || this.inlineMouseTracking !== 'off'
+    return active && !this.isPaused && !this.isUnmounted && (this.altScreenMouseTracking !== 'off' || this.inlineMouseTracking !== 'off')
   }
 
   /**
@@ -1492,7 +1527,7 @@ export default class Ink {
       )
     }
 
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return
     }
 
@@ -1500,7 +1535,8 @@ export default class Ink {
     // DISABLE first so we land in the exact preset state even if an
     // external app or tmux left DEC 1003 hover asserted out from under us
     // since the last assertion.
-    this.options.stdout.write(DISABLE_MOUSE_TRACKING + enableMouseTrackingFor(this.altScreenMouseTracking))
+    const mode = this.altScreenActive ? this.altScreenMouseTracking : this.inlineMouseTracking
+    this.options.stdout.write(DISABLE_MOUSE_TRACKING + enableMouseTrackingFor(mode))
 
     // Alt-screen re-entry — destructive (ERASE_SCREEN). Only for callers that
     // have a strong signal the terminal actually dropped mode 1049.
@@ -1967,58 +2003,76 @@ export default class Ink {
     }
   }
 
+  private getScrollbackYOffset(): number {
+    if (this.altScreenActive) {
+      return 0
+    }
+    const screenHeight = this.frontFrame?.screen?.height ?? 0
+    const termRows = this.options.stdout?.rows ?? 24
+    return Math.max(0, screenHeight - termRows)
+  }
+
   /**
    * Hit-test the rendered DOM tree at (col, row) and bubble a ClickEvent
    * from the deepest hit node up through ancestors with onClick handlers.
-   * Returns true if a DOM handler consumed the click. Gated on
-   * altScreenActive — clicks only make sense with a fixed viewport where
-   * nodeCache rects map 1:1 to terminal cells (no scrollback offset).
+   * Returns true if a DOM handler consumed the click. Translates viewport-relative
+   * rows to virtual scrollback rows in inline mode so clicks match nodeCache coordinates.
    */
   dispatchClick(col: number, row: number): boolean {
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return false
     }
 
-    const blank = isEmptyCellAt(this.frontFrame.screen, col, row)
+    const yOffset = this.getScrollbackYOffset()
+    const virtualRow = row + yOffset
+    const blank = isEmptyCellAt(this.frontFrame.screen, col, virtualRow)
 
-    return dispatchClick(this.rootNode, col, row, blank)
+    return dispatchClick(this.rootNode, col, virtualRow, blank)
   }
   dispatchMouseDown(col: number, row: number, button: number): dom.DOMElement | undefined {
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return undefined
     }
 
     this.stopSelectionAutoScroll()
+    const yOffset = this.getScrollbackYOffset()
+    const virtualRow = row + yOffset
 
     return dispatchMouse(
       this.rootNode,
       col,
-      row,
+      virtualRow,
       'onMouseDown',
       button,
-      isEmptyCellAt(this.frontFrame.screen, col, row)
+      isEmptyCellAt(this.frontFrame.screen, col, virtualRow)
     )
   }
   dispatchMouseUp(target: dom.DOMElement, col: number, row: number, button: number): void {
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return
     }
 
     this.stopSelectionAutoScroll()
-    dispatchMouse(this.rootNode, col, row, 'onMouseUp', button, isEmptyCellAt(this.frontFrame.screen, col, row), target)
+    const yOffset = this.getScrollbackYOffset()
+    const virtualRow = row + yOffset
+
+    dispatchMouse(this.rootNode, col, virtualRow, 'onMouseUp', button, isEmptyCellAt(this.frontFrame.screen, col, virtualRow), target)
   }
   dispatchMouseDrag(target: dom.DOMElement, col: number, row: number, button: number): void {
-    if (!this.altScreenActive) {
+    if (!this.altScreenActive && this.inlineMouseTracking === 'off') {
       return
     }
+
+    const yOffset = this.getScrollbackYOffset()
+    const virtualRow = row + yOffset
 
     dispatchMouse(
       this.rootNode,
       col,
-      row,
+      virtualRow,
       'onMouseDrag',
       button,
-      isEmptyCellAt(this.frontFrame.screen, col, row),
+      isEmptyCellAt(this.frontFrame.screen, col, virtualRow),
       target
     )
   }

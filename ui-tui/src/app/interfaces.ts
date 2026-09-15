@@ -554,7 +554,7 @@ export interface SlashHandlerContext {
     send: (text: string, showUserMessage?: boolean, displayText?: string) => void
     setHistoryItems: StateSetter<Msg[]>
     sys: (text: string) => void
-    trimLastExchange: (items: Msg[]) => Msg[]
+    trimLastExchange: (items: Msg[], turns?: number) => Msg[]
   }
   voice: {
     setVoiceEnabled: StateSetter<boolean>

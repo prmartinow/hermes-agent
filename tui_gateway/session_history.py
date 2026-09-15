@@ -194,25 +194,75 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         content_text = _coerce_message_text(m.get("content"))
         if _is_display_hidden_marker(role, content_text):
             continue
-        if role == "assistant" and m.get("tool_calls"):
-            for tc in m["tool_calls"]:
-                fn, tc_id = tc.get("function", {}), tc.get("id", "")
-                if tc_id and fn.get("name"):
-                    try:
-                        args = json.loads(fn.get("arguments", "{}"))
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                    tool_call_args[tc_id] = (fn["name"], args)
+        if role == "assistant":
+            raw_tcs = m.get("tool_calls")
+            if isinstance(raw_tcs, str):
+                try:
+                    raw_tcs = json.loads(raw_tcs)
+                except (json.JSONDecodeError, TypeError):
+                    raw_tcs = None
+            if raw_tcs and isinstance(raw_tcs, list):
+                for tc in raw_tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    fn, tc_id = tc.get("function", {}), tc.get("id", "") or tc.get("call_id", "")
+                    if tc_id and isinstance(fn, dict) and fn.get("name"):
+                        raw_args = fn.get("arguments", "{}")
+                        try:
+                            args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                        except (json.JSONDecodeError, TypeError):
+                            args = {}
+                        tool_call_args[tc_id] = (fn["name"], args)
+                        tool_call_args[fn["name"]] = (fn["name"], args)
         if role == "user" and m.get("display_kind") == STEER_DISPLAY_KIND:
             # Mid-turn /steer: show the user's own words, not the model-facing marker wrapper.
             from agent.conversation_compression import _extract_steer_text_from_message
             content_text = _extract_steer_text_from_message(m) or content_text
         if role == "tool":
-            tc_name, tc_args = tool_call_args.get(m.get("tool_call_id") or "", (None, None))
+            tc_id = m.get("tool_call_id") or ""
+            tc_name, tc_args = tool_call_args.get(tc_id, (None, None))
+            if tc_name is None and m.get("tool_name") in tool_call_args:
+                tc_name, tc_args = tool_call_args[m.get("tool_name")]
             name = tc_name or m.get("tool_name") or "tool"
             args = tc_args or {}
+            if not args and m.get("args"):
+                raw_args = m.get("args")
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                elif isinstance(raw_args, dict):
+                    args = raw_args
             # `context` is an 80-char preview; ship args so a full-call renderer isn't truncated.
-            messages.append({"role": "tool", "name": name, "context": _tool_ctx(name, args), **({"args": args} if args else {})})
+            tool_msg = {"role": "tool", "name": name, "context": _tool_ctx(name, args), **({"args": args} if args else {})}
+            if name in ("todo_list", "todo"):
+                if content_text and '"todos"' in content_text:
+                    try:
+                        parsed = json.loads(content_text)
+                        if isinstance(parsed, dict) and "todos" in parsed and isinstance(parsed["todos"], list):
+                            tool_msg["todos"] = parsed["todos"]
+                    except Exception:
+                        pass
+                if "todos" not in tool_msg and isinstance(args.get("todos"), list):
+                    tool_msg["todos"] = args["todos"]
+            messages.append(tool_msg)
+            if content_text:
+                from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
+                if STEER_MARKER_OPEN in content_text:
+                    remaining = content_text
+                    while STEER_MARKER_OPEN in remaining:
+                        _, after_open = remaining.split(STEER_MARKER_OPEN, 1)
+                        if STEER_MARKER_CLOSE not in after_open:
+                            break
+                        steer_body, remaining = after_open.split(STEER_MARKER_CLOSE, 1)
+                        steer_text = steer_body.strip()
+                        if steer_text:
+                            steer_msg = {"role": "user", "text": steer_text}
+                            ts = m.get("timestamp")
+                            if isinstance(ts, (int, float)) and ts > 0:
+                                steer_msg["timestamp"] = float(ts)
+                            messages.append(steer_msg)
             continue
         # Assistant detail sidecars can carry the only visible reply or reasoning after resume/reload.
         has_assistant_detail = role == "assistant" and any(m.get(key) for key in _HISTORY_ASSISTANT_DETAIL_KEYS)

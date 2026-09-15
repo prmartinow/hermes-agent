@@ -1,4 +1,4 @@
-import { Ansi, Box, NoSelect, Text } from '@hermes/ink'
+import { Ansi, Box, NoSelect, RawAnsi, Text, wrapAnsi } from '@hermes/ink'
 import { hasAnsi, sanitizeAnsiForRender, stripAnsi } from '@hermes/shared/ansi'
 import { memo, useState } from 'react'
 
@@ -105,6 +105,7 @@ export const MessageLine = memo(function MessageLine({
           reasoningTokens={msg.thinkingTokens}
           sections={sections}
           t={t}
+          thinkingTitle={msg.thinkingTitle}
           tools={tools}
           toolTokens={msg.toolTokens}
           trail={msg.tools ?? []}
@@ -194,7 +195,12 @@ export const MessageLine = memo(function MessageLine({
     }
 
     if (msg.role !== 'user' && hasAnsi(msg.text)) {
-      return <Ansi>{sanitizeAnsiForRender(msg.text)}</Ansi>
+      const bodyWidth = transcriptBodyWidth(cols, msg.role, t.brand.prompt, TERMUX_TUI_MODE)
+      const sanitized = sanitizeAnsiForRender(msg.text)
+      const wrapped = wrapAnsi(sanitized, bodyWidth, { hard: true, trim: false })
+      const lines = wrapped.split('\n')
+
+      return <RawAnsi lines={lines} width={bodyWidth} />
     }
 
     if (msg.role === 'assistant') {
@@ -276,6 +282,7 @@ export const MessageLine = memo(function MessageLine({
             reasoningTokens={msg.thinkingTokens}
             sections={sections}
             t={t}
+            thinkingTitle={msg.thinkingTitle}
             toolTokens={msg.toolTokens}
             trail={msg.tools}
           />

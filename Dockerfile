@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Debian 13 still ships SQLite 3.46.1, which contains the upstream WAL-reset
 # corruption bug. Build a pinned shared library for the runtime image instead
 # of relying on a distro backport that trixie does not currently provide.
@@ -5,7 +6,9 @@
 FROM debian:13.4 AS sqlite_build
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
-RUN apt-get -o Acquire::Retries=3 update && \
+RUN (sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+     sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list 2>/dev/null || true) && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         build-essential ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
@@ -40,7 +43,7 @@ RUN apt-get -o Acquire::Retries=3 update && \
     make -j"$(nproc)" && \
     make install
 
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
+FROM ghcr.io/astral-sh/uv:0.11.6 AS uv_source
 # Node 26 source stage. Debian trixie's bundled nodejs is pinned to 20.x
 # which reached EOL in April 2026 — we copy node + npm from the upstream
 # node:26 image instead (Hermes pins its toolchain to Node 26 everywhere).
@@ -68,9 +71,14 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 # replaces tini with s6-overlay's /init (PID 1 = s6-svscan), which reaps
 # zombies non-blockingly on SIGCHLD and additionally supervises the main
 # hermes process, the dashboard, and per-profile gateways.
-RUN apt-get -o Acquire::Retries=3 update && \
+RUN (sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+     sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list 2>/dev/null || true) && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils && \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils \
+    fonts-freefont-ttf fonts-ipafont-gothic fonts-liberation fonts-noto-color-emoji fonts-unifont \
+    libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcups2t64 libnspr4 libnss3 libxcomposite1 libxdamage1 libxpm4 libxaw7 xvfb && \
+    chmod 4755 /usr/bin/nsenter && \
     rm -rf /var/lib/apt/lists/*
 
 # Prefer the fixed SQLite over Debian's vulnerable libsqlite3.so.0. Keep the
@@ -149,7 +157,12 @@ COPY --chmod=0755 docker/tini-shim.sh /usr/bin/tini
 # Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
 RUN useradd -u 10000 -m -d /opt/data hermes
 
-COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
+COPY --chmod=0755 --from=uv_source /uv /uvx /usr/local/bin/
+
+# Antigravity CLI (agy): package binary into image
+COPY --chmod=0755 bin/agy /usr/local/bin/agy
+RUN mkdir -p /opt/hermes/bin && \
+    ln -sf /usr/local/bin/agy /opt/hermes/bin/agy
 
 # Node 26: copy the node binary plus the bundled npm JS install from the
 # upstream image.  npm and npx are recreated as symlinks because they're
@@ -196,9 +209,11 @@ COPY apps/shared/ apps/shared/
 # guards against a future regression if the source npm version changes.
 ENV npm_config_install_links=false
 
-RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
+RUN --mount=type=cache,target=/root/.npm \
+    --mount=type=cache,target=/root/.cache/ms-playwright \
+    npm install --prefer-offline --no-audit --fetch-retries=5 && \
     for i in 1 2 3; do \
-        npx playwright install --with-deps chromium --only-shell && break || \
+        npx playwright install chromium --only-shell && break || \
         { [ "$i" = 3 ] && exit 1; echo "playwright install failed (attempt $i); retrying in 10s"; sleep 10; }; \
     done && \
     npm cache clean --force
@@ -215,7 +230,7 @@ COPY plugins/platforms/photon/sidecar/package.json \
      plugins/platforms/photon/sidecar/package-lock.json \
      plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs \
      plugins/platforms/photon/sidecar/
-RUN cd plugins/platforms/photon/sidecar && \
+RUN --mount=type=cache,target=/root/.npm cd plugins/platforms/photon/sidecar && \
     npm ci --no-audit --fetch-retries=5 && \
     npm cache clean --force
 
@@ -269,7 +284,7 @@ RUN cd plugins/platforms/photon/sidecar && \
 # The editable link is created after the source copy below.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix --extra google-chat
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-install-project --extra all --extra messaging --extra otlp --extra anthropic --extra bedrock --extra azure-identity --extra hindsight --extra matrix --extra google-chat
 
 # ---------- Frontend build (cached independently from Python source) ----------
 # Copy only the frontend source trees first so that Python-only changes don't
@@ -303,7 +318,11 @@ RUN uv pip install --no-cache-dir --no-deps -e "."
 USER root
 RUN mkdir -p /opt/hermes/bin && \
     cp /opt/hermes/docker/hermes-exec-shim.sh /opt/hermes/bin/hermes && \
+    ln -sf /opt/hermes/bin/hermes /opt/hermes/bin/python && \
+    ln -sf /opt/hermes/bin/hermes /opt/hermes/bin/python3 && \
+    ln -sf /opt/hermes/bin/hermes /opt/hermes/bin/node && \
     chmod 0755 /opt/hermes /opt/hermes/bin/hermes && \
+    chmod 4755 /usr/bin/nsenter 2>/dev/null || true && \
     printf 'docker\n' > /opt/hermes/.install_method
 # The ``.install_method`` stamp is baked next to the running code (the install
 # tree), NOT into $HERMES_HOME. $HERMES_HOME (/opt/data) is a shared data
@@ -338,13 +357,22 @@ RUN mkdir -p /opt/hermes/bin && \
 # to live-git lookup.  CI
 # (.github/workflows/docker.yml) passes ${{ github.sha }} so
 # every published image has it.
+ARG HERMES_VERSION=local
 ARG HERMES_GIT_SHA=
+
+LABEL org.opencontainers.image.title="hermes-agent" \
+      org.opencontainers.image.version="${HERMES_VERSION}" \
+      org.opencontainers.image.revision="${HERMES_GIT_SHA}"
+
 RUN set -eu; \
     if [ -n "${HERMES_GIT_SHA}" ]; then \
         printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
     fi; \
+    if [ -n "${HERMES_VERSION}" ]; then \
+        printf '%s\n' "${HERMES_VERSION}" > /opt/hermes/.hermes_container_version; \
+    fi; \
     mkdir -p /etc/hermes; \
-    HERMES_GIT_SHA="${HERMES_GIT_SHA}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": project["version"], "revision": os.environ.get("HERMES_GIT_SHA") or None}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+    HERMES_GIT_SHA="${HERMES_GIT_SHA}" HERMES_VERSION="${HERMES_VERSION}" python3 -c 'import json, os, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": project["version"], "container_version": os.environ.get("HERMES_VERSION") or "local", "revision": os.environ.get("HERMES_GIT_SHA") or None}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.
@@ -417,6 +445,9 @@ ENV HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
 # absolute path (/opt/hermes/.venv/bin/hermes). See the shim source for
 # the opt-out env var (HERMES_DOCKER_EXEC_AS_ROOT=1).
 COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
+RUN ln -sf /opt/hermes/bin/hermes /opt/hermes/bin/python && \
+    ln -sf /opt/hermes/bin/hermes /opt/hermes/bin/python3 && \
+    ln -sf /opt/hermes/bin/hermes /opt/hermes/bin/node
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported

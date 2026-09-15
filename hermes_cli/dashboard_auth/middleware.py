@@ -154,6 +154,10 @@ async def gated_auth_middleware(
         return await call_next(request)
     # Already authenticated by the token-auth seam (service caller on a registered token
     # route): not a cookie session, must not bounce to /login.
+    from hermes_cli.hindsight_webhook import is_authenticated_hindsight_webhook
+
+    if is_authenticated_hindsight_webhook(request):
+        return await call_next(request)
     if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
         return await call_next(request)
     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow

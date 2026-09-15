@@ -12,6 +12,7 @@ import {
   liveSessionInflightMessages,
   scheduleResumeScrollToBottom,
   signalFreshSessionBoundary,
+  trimTail,
   writeActiveSessionFile
 } from '../app/useSessionLifecycle.js'
 
@@ -75,6 +76,13 @@ describe('live session activation in-flight state', () => {
 
     expect(turnController.bufRef).toBe('')
     expect(getTurnState().streaming).toBe('')
+  })
+
+  it('does not duplicate in-flight user prompt if already present in messages', () => {
+    const inflight = { assistant: 'partial answer', streaming: true, user: 'write a long answer' }
+    const existing = [{ role: 'user' as const, text: 'write a long answer' }]
+
+    expect(liveSessionInflightMessages(inflight, existing)).toEqual([])
   })
 })
 
@@ -159,5 +167,43 @@ describe('resume scroll settle', () => {
 
     sticky = true
     cancel()
+  })
+})
+
+describe('trimTail', () => {
+  it('trims the last exchange even when trailing slash and system messages are present', () => {
+    const items = [
+      { role: 'user', text: 'turn 1' },
+      { role: 'assistant', text: 'reply 1' },
+      { role: 'user', text: 'turn 2' },
+      { role: 'assistant', text: 'reply 2' },
+      { kind: 'slash', role: 'system', text: '/undo' }
+    ] as any
+
+    const trimmed = trimTail(items, 1)
+    expect(trimmed).toEqual([
+      { role: 'user', text: 'turn 1' },
+      { role: 'assistant', text: 'reply 1' }
+    ])
+  })
+
+  it('supports multi-turn undo', () => {
+    const items = [
+      { role: 'user', text: 'turn 1' },
+      { role: 'assistant', text: 'reply 1' },
+      { role: 'user', text: 'turn 2' },
+      { role: 'assistant', text: 'reply 2' },
+      { role: 'user', text: 'turn 3' },
+      { kind: 'trail', role: 'assistant', text: 'thinking' },
+      { kind: 'diff', role: 'assistant', text: 'diff' },
+      { role: 'assistant', text: 'reply 3' },
+      { kind: 'slash', role: 'system', text: '/undo 2' }
+    ] as any
+
+    const trimmed = trimTail(items, 2)
+    expect(trimmed).toEqual([
+      { role: 'user', text: 'turn 1' },
+      { role: 'assistant', text: 'reply 1' }
+    ])
   })
 })

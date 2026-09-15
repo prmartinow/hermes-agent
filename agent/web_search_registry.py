@@ -57,13 +57,13 @@ def _configured_backend(capability: str) -> Optional[str]:
 
 # Paid providers first so existing paid setups don't get downgraded to a free
 # tier on upgrade; filtered by ``is_available()`` at walk time.
-_LEGACY_PREFERENCE = ("firecrawl", "parallel", "tavily", "perplexity", "exa", "searxng", "brave-free", "ddgs")
+_LEGACY_PREFERENCE = ("gemini-grounding", "firecrawl", "parallel", "tavily", "perplexity", "exa", "searxng", "brave-free", "ddgs")
 
 # Anonymous public free tiers (see plugins/web/keyless_mcp.py); strictly last
 # resort, i.e. zero web credentials and no importable ddgs. Unpinned keyless
 # traffic round-robins across the ring per request; an explicit `hermes tools`
 # pick bypasses this walk. Disable with ``web.keyless_fallback: false``.
-_KEYLESS_PREFERENCE = ("exa", "parallel", "firecrawl", "keenable")
+_KEYLESS_PREFERENCE = ("gemini-grounding", "exa", "parallel", "firecrawl", "keenable")
 
 
 def _keyless_preference() -> tuple:

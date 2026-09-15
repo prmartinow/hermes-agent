@@ -324,9 +324,11 @@ class TestPreflightDeferral:
         for rough in (compressor.context_length, 150_000, 10_000_000):
             assert compressor.should_defer_preflight_to_real_usage(rough) is True
         compressor.note_usage_less_response()
-        assert compressor.should_defer_preflight_to_real_usage(95_000) is False
+        for rough in (95_000, compressor.context_length, 150_000, 10_000_000):
+            assert compressor.should_defer_preflight_to_real_usage(rough) is False
         compressor.update_from_response({"prompt_tokens": 50_000})
-        assert compressor.should_defer_preflight_to_real_usage(95_000) is True
+        for rough in (95_000, compressor.context_length, 150_000, 10_000_000):
+            assert compressor.should_defer_preflight_to_real_usage(rough) is True
 
     def test_defers_immediately_after_compaction_with_stale_real_prompt(self, compressor):
         """#36718: right after a compaction, last_real_prompt_tokens still holds
@@ -3700,3 +3702,39 @@ class TestSanitizeToolPairsWhitespace:
         tool_call_ids = [m.get("tool_call_id") for m in out if m.get("role") == "tool"]
         assert "call_orphan" not in tool_call_ids, "genuinely orphaned result must be removed"
         assert " call_orphan " not in tool_call_ids, "original whitespace form must also be gone"
+
+
+    def test_compute_threshold_tokens_astra_and_unknown_models_safe(self):
+        """Model switch to gpt-6-astra or models with unspecified output reservation
+        must compute threshold_tokens without TypeError or NoneType subtraction."""
+        from agent.context_compressor import ContextCompressor
+
+        # gpt-6-astra on openai has 128K output reservation from builtin metadata
+        t_astra = ContextCompressor._compute_threshold_tokens(
+            context_length=1_050_000,
+            threshold_percent=0.50,
+            max_tokens=None,
+            model="gpt-6-astra",
+            provider="openai",
+        )
+        assert t_astra == (1_050_000 - 128_000) * 0.50 == 461_000
+
+        # gpt-6-astra-900k variant on codex preserves 128K output reservation
+        t_astra_900k = ContextCompressor._compute_threshold_tokens(
+            context_length=900_000,
+            threshold_percent=0.90,
+            max_tokens=None,
+            model="gpt-6-astra-900k",
+            provider="openai-codex",
+        )
+        assert t_astra_900k == int((900_000 - 128_000) * 0.90) == 694_800
+
+        # Unspecified/bare model falls back to 0 output reservation and does not raise
+        t_bare = ContextCompressor._compute_threshold_tokens(
+            context_length=128_000,
+            threshold_percent=0.50,
+            max_tokens=None,
+            model="custom-unknown-model",
+            provider="custom",
+        )
+        assert t_bare == 64_000

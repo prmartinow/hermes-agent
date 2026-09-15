@@ -1,6 +1,7 @@
 import type { MouseTrackingMode } from '@hermes/ink'
 import { useEffect, useRef } from 'react'
 
+import { TERMUX_TUI_MODE } from '../config/env.js'
 import { resolveDetailsMode, resolveSections } from '../domain/details.js'
 import type { GatewayClient } from '../gatewayClient.js'
 import type { ConfigFullResponse, ConfigMtimeResponse, ReloadMcpResponse } from '../gatewayTypes.js'
@@ -96,8 +97,12 @@ export const normalizeMouseTracking = (display: {
     return 'off'
   }
 
-  if (raw === true || raw === undefined || raw === null) {
+  if (raw === true) {
     return 'all'
+  }
+
+  if (raw === undefined || raw === null) {
+    return TERMUX_TUI_MODE ? 'off' : 'all'
   }
 
   if (typeof raw === 'number') {

@@ -150,7 +150,9 @@ export class LogUpdate {
       next.viewport.height !== prev.viewport.height ||
       (prev.viewport.width !== 0 && next.viewport.width !== prev.viewport.width)
     ) {
-      return fullResetSequence_CAUSES_FLICKER(next, 'resize', stylePool)
+      return fullResetSequence_CAUSES_FLICKER(
+        next, prev.viewport.width === 0 ? 'init' : 'resize', stylePool, undefined, altScreen
+      )
     }
 
     // DECSTBM scroll optimization: when a ScrollBox's scrollTop changed,
@@ -220,12 +222,12 @@ export class LogUpdate {
     // bring scrollback content into view, so we need a full reset.
     // Use <= (not <) because even when next height equals viewport height, the
     // scrollback depth from the previous render differs from a fresh render.
-    if (prevHadScrollback && nextFitsViewport && isShrinking) {
+    if (altScreen && prevHadScrollback && nextFitsViewport && isShrinking) {
       logForDebugging(
         `Full reset (shrink->below): prevHeight=${prev.screen.height}, nextHeight=${next.screen.height}, viewport=${prev.viewport.height}`
       )
 
-      return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', stylePool)
+      return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', stylePool, undefined, altScreen)
     }
 
     if (
@@ -257,7 +259,7 @@ export class LogUpdate {
           triggerY: scrollbackChangeY,
           prevLine,
           nextLine
-        })
+        }, altScreen)
       }
     }
 
@@ -276,8 +278,8 @@ export class LogUpdate {
       // eraseLines only works within the viewport - it can't clear scrollback.
       // If we need to clear more lines than fit in the viewport, some are in
       // scrollback, so we need a full reset.
-      if (linesToClear > prev.viewport.height) {
-        return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', this.options.stylePool)
+      if (altScreen && linesToClear > prev.viewport.height) {
+        return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', this.options.stylePool, undefined, altScreen)
       }
 
       // clear(N) moves cursor UP by N-1 lines and to column 0
@@ -388,7 +390,7 @@ export class LogUpdate {
         triggerY: resetTriggerY,
         prevLine: readLine(prev.screen, resetTriggerY),
         nextLine: readLine(next.screen, resetTriggerY)
-      })
+      }, altScreen)
     }
 
     // Reset styles before rendering new rows (they'll set their own styles)
@@ -496,17 +498,46 @@ function fullResetSequence_CAUSES_FLICKER(
   frame: Frame,
   reason: FlickerReason,
   stylePool: StylePool,
-  debug?: { triggerY: number; prevLine: string; nextLine: string }
+  debug?: { triggerY: number; prevLine: string; nextLine: string },
+  altScreen = false
 ): Diff {
-  // After clearTerminal, cursor is at (0, 0)
+  const isResize = reason === 'resize'
+  const isInit = reason === 'init'
+  const t0 = performance.now()
+  
+  // Static History / Dynamic Active Split:
+  // In inline mode, completed turns reside in the terminal emulator's native scrollback,
+  // which the terminal automatically and hardware-reflows on window resize.
+  // Only the initial session hydration (isInit) renders fullHistory from line 0.
+  // Resizes and offscreen recoveries only redraw the visible active viewport slice.
+  const fullHistory = altScreen ? true : isInit
   const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
-  renderFrame(screen, frame, stylePool)
+  renderFrame(screen, frame, stylePool, altScreen, fullHistory)
 
-  return [{ type: 'clearTerminal', reason, debug }, ...screen.diff]
+  // Restore cursor to frame's target cursor position so typing does NOT overwrite the status bar!
+  if (!altScreen && frame.cursor) {
+    moveCursorTo(screen, frame.cursor.x, frame.cursor.y)
+  }
+
+  // clearTerminal wipes scrollback (only on initial hydration / altScreen).
+  // clearScreen clears visible screen rows without duplicating or wiping scrollback.
+  const patchType = (altScreen || (isInit && !altScreen)) ? 'clearTerminal' : 'clearScreen'
+  const diff: Diff = [{ type: patchType, reason, debug }, ...screen.diff]
+  if (isResize) {
+    logForDebugging(`[tui-perf] fullResetSequence: resize complete in ${(performance.now() - t0).toFixed(1)}ms: rows=${frame.screen.height}, cols=${frame.viewport.width}, patches=${diff.length}`)
+  }
+  return diff
 }
 
-function renderFrame(screen: VirtualScreen, frame: Frame, stylePool: StylePool): void {
-  renderFrameSlice(screen, frame, 0, frame.screen.height, stylePool)
+function renderFrame(
+  screen: VirtualScreen,
+  frame: Frame,
+  stylePool: StylePool,
+  altScreen = false,
+  fullHistory = false
+): void {
+  const startY = fullHistory ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
+  renderFrameSlice(screen, frame, startY, frame.screen.height, stylePool)
 }
 
 /**

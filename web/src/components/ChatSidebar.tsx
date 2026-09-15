@@ -58,6 +58,7 @@ interface SessionInfo {
   cwd?: string
   model?: string
   provider?: string
+  gemini_account?: string
   credential_warning?: string
   title?: string
 }
@@ -85,6 +86,7 @@ interface ChatSidebarProps {
   className?: string
   onDashboardNewSessionRequest?: () => void
   onSessionTitleChange?: (title: string | null) => void
+  onAccountAliasChange?: (alias: string | null) => void
 }
 
 /** Build the ``session.create`` params for the sidecar session.
@@ -107,7 +109,8 @@ export function ChatSidebar({
   profile,
   className,
   onDashboardNewSessionRequest,
-  onSessionTitleChange
+  onSessionTitleChange,
+  onAccountAliasChange,
 }: ChatSidebarProps) {
   const navigate = useNavigate()
   // `version` bumps on reconnect (manual button, profile/channel switch) and
@@ -193,6 +196,9 @@ export function ChatSidebar({
 
       if (payload) {
         setInfo(prev => ({ ...prev, ...payload }))
+        if (payload.gemini_account !== undefined) {
+          onAccountAliasChange?.(payload.gemini_account || null)
+        }
       }
     })
 

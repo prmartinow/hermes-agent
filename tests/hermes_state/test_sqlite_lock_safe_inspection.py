@@ -329,3 +329,37 @@ def test_file_length_check_never_reports_truncated_db_as_healthy(tmp_path):
         assert file_length_matches_header(conn) is not True
     finally:
         conn.close()
+
+
+def test_apply_database_pragmas_sets_default_busy_timeout(tmp_path, monkeypatch):
+    """apply_database_pragmas must set busy_timeout=15000 by default for multi-container safety."""
+    from hermes_state import apply_database_pragmas
+
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+    db = tmp_path / "test_busy.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        apply_database_pragmas(conn, db_label="test_busy.db")
+        timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert timeout == 15000
+    finally:
+        conn.close()
+
+
+def test_apply_database_pragmas_honors_configured_busy_timeout(tmp_path, monkeypatch):
+    """apply_database_pragmas must honor explicit database.busy_timeout from config.yaml."""
+    from hermes_state import apply_database_pragmas
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"database": {"busy_timeout": 30000}},
+    )
+    db = tmp_path / "test_busy_custom.db"
+    conn = sqlite3.connect(str(db))
+    try:
+        apply_database_pragmas(conn, db_label="test_busy_custom.db")
+        timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert timeout == 30000
+    finally:
+        conn.close()
+

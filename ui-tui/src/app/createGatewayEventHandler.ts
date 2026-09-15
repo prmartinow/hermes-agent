@@ -18,6 +18,7 @@ import type {
 } from '../gatewayTypes.js'
 import { billingDialogCopy } from '../lib/billingDialog.js'
 import { isTodoDone } from '../lib/liveProgress.js'
+import { appendTranscriptMessage } from '../lib/messages.js'
 import { openExternalUrl } from '../lib/openExternalUrl.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
@@ -798,6 +799,20 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         return
+      case 'session.rewound':
+      case 'session.restored': {
+        const p = ev.payload
+        if (p?.notice) {
+          sys(p.notice)
+        }
+        const restoredSid = p?.session_id || sid
+        if (restoredSid) {
+          ctx.session.resumeById(restoredSid)
+        }
+
+        return
+      }
+
       case 'session.info': {
         const info = ev.payload as SessionInfo | undefined
 
@@ -850,10 +865,26 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (text !== undefined) {
           const value = String(text)
           scheduleThinkingStatus(value || statusFromBusy())
+        }
 
-          if (value) {
-            turnController.recordReasoningDelta(value)
-          }
+        return
+      }
+
+      case 'prompt.submitted': {
+        const p = ev.payload
+        const live = getUiState()
+
+        if (p?.session_id === live.sid && p.text) {
+          setHistoryItems(prev => {
+            const last = prev[prev.length - 1]
+
+            if (last && last.role === 'user' && last.text === p.text) {
+              return prev
+            }
+
+            return appendTranscriptMessage(prev, { role: 'user', text: p.text })
+          })
+          patchUiState({ busy: true, status: 'running…' })
         }
 
         return
@@ -1278,6 +1309,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'todo.updated': {
+        if (ev.payload && 'todos' in ev.payload) {
+          turnController.recordTodos(ev.payload.todos)
+        }
+
+        return
+      }
+
       case 'request.cancel': {
         // The backend withdrew a server→client request (timeout / interrupt /
         // session close): tear down whichever card carries that id. A clarify
@@ -1483,6 +1522,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (typeof text === 'string' && text.trim()) {
           turnController.recordInterimMessage(text)
+        }
+
+        return
+      }
+
+      case 'turn.steer': {
+        const text = ev.payload?.text ?? ev.payload?.user_message
+
+        if (typeof text === 'string' && text.trim()) {
+          turnController.recordSteer(text.trim())
         }
 
         return

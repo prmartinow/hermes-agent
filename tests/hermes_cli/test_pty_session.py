@@ -21,6 +21,17 @@ def test_ringbuffer_drops_oldest_over_capacity():
     assert rb.truncated is True
 
 
+def test_ringbuffer_clears_prior_bytes_on_scrollback_wipe():
+    rb = RingBuffer(1024)
+    rb.append(b"Stale run line 1\nStale run line 2\n")
+    assert b"Stale run" in rb.snapshot()
+    # Emitting clearTerminal (\x1b[3J) must discard stale runs
+    rb.append(b"\x1b[2J\x1b[3J\x1b[HFresh run line 1\n")
+    snap = rb.snapshot()
+    assert b"Stale run" not in snap
+    assert b"Fresh run" in snap
+
+
 
 
 class FakeBridge:
@@ -139,7 +150,7 @@ async def test_drain_send_failure_detaches_current_socket_but_not_a_replacement(
     stale.release.set()
     await asyncio.sleep(0.05)
     assert s.attached is True
-    assert s._ws is replacement
+    assert replacement in s._viewers
     assert s.last_detached_at is None
     await s.close()
 
@@ -244,10 +255,10 @@ async def test_superseded_failed_write_does_not_kill_replacement_session():
     await bridge.old_write_started.wait()
     new_attach = asyncio.create_task(s.attach(new_ws, force_redraw=True))
     for _ in range(10):
-        if s._ws is new_ws:
+        if new_ws in s._viewers:
             break
         await asyncio.sleep(0)
-    assert s._ws is new_ws
+    assert new_ws in s._viewers
 
     bridge.release_old_write.set()
     assert await old_write is False
@@ -277,7 +288,7 @@ async def test_detach_keeps_draining_into_buffer():
     await s.close()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_eof_marks_dead_and_closes_socket_4410():
     from hermes_cli.pty_session import PtySession
     bridge = FakeBridge([b"bye", None])
@@ -299,7 +310,7 @@ def make_registry(ttl=1800.0, max_sessions=16):
                               buffer_cap=1024, read_timeout=0.01)
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_same_key_reattaches_same_session():
     reg = make_registry()
     b1 = FakeBridge([b"", b"", b""])
@@ -313,7 +324,7 @@ async def test_same_key_reattaches_same_session():
 
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_new_key_at_capacity_raises_when_none_reapable():
     reg = make_registry(max_sessions=1)
     b = FakeBridge([b"", b""])
@@ -324,7 +335,7 @@ async def test_new_key_at_capacity_raises_when_none_reapable():
     await reg.close_all()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_reaper_loop_invokes_reap(monkeypatch):
     from hermes_cli.pty_session import run_reaper
     reg = make_registry()

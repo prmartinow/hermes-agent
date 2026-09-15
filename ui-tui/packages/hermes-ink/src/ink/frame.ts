@@ -29,7 +29,7 @@ export function emptyFrame(
   }
 }
 
-export type FlickerReason = 'resize' | 'offscreen' | 'clear'
+export type FlickerReason = 'resize' | 'offscreen' | 'clear' | 'init'
 
 export type FrameEvent = {
   durationMs: number
@@ -81,6 +81,11 @@ export type Patch =
       type: 'clearTerminal'
       reason: FlickerReason
       // Populated by log-update when a scrollback diff triggers the reset.
+      debug?: { triggerY: number; prevLine: string; nextLine: string }
+    }
+  | {
+      type: 'clearScreen'
+      reason: FlickerReason
       debug?: { triggerY: number; prevLine: string; nextLine: string }
     }
   | { type: 'cursorHide' }

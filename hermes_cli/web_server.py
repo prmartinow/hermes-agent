@@ -220,6 +220,10 @@ async def _lifespan(app: "FastAPI"):
 
     # Reap idle/dead keep-alive PTY sessions (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
+    from hermes_cli.web_server_chat import _default_pty_spawn
+    PTY_REGISTRY.configure_standby_spawn(_default_pty_spawn)
+    asyncio.create_task(PTY_REGISTRY.ensure_standby())
+
     # Periodic authenticated self-test feeding the ``dashboard`` component on /api/status.
     selftest_task = asyncio.create_task(_dashboard_selftest_loop())
     # Live auto-archive timer, independent of list requests.
@@ -248,9 +252,21 @@ async def _lifespan(app: "FastAPI"):
 
     start_background_bootstrap()
 
+    # 24/7 Gemini Quota Watcher Daemon — automatically ignites sleeping/expired quota windows
+    try:
+        from hermes_cli.auth import start_gemini_quota_watcher_daemon
+        start_gemini_quota_watcher_daemon(interval_seconds=60.0)
+    except Exception:
+        pass
+
     try:
         yield
     finally:
+        try:
+            from hermes_cli.auth import stop_gemini_quota_watcher_daemon
+            stop_gemini_quota_watcher_daemon()
+        except Exception:
+            pass
         hosted_room_start_cancel.set()
         _hosted_groups.stop_hosted_room_service(timeout=5.0)
         hosted_room_start_thread.join(timeout=1.0)
@@ -382,6 +398,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from hermes_cli.hindsight_webhook import PATH as _HINDSIGHT_WEBHOOK_PATH, receive as _receive_hindsight_webhook
+
+app.add_api_route(_HINDSIGHT_WEBHOOK_PATH, _receive_hindsight_webhook, methods=["POST"])
 
 # Endpoints that do NOT require the session token; everything else under /api/
 # is gated below. Shared with the OAuth gate so the two allowlists cannot
@@ -641,6 +661,14 @@ async def auth_middleware(request: Request, call_next):
     (``token_authenticated``) and when the OAuth gate is active — cookie auth is
     then authoritative and the loopback-only token path must not override it.
     """
+    from hermes_cli.hindsight_webhook import authenticate, is_hindsight_webhook
+
+    if is_hindsight_webhook(request):
+        try:
+            await authenticate(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return await call_next(request)
     path = request.url.path
     if (
         not getattr(request.state, "token_authenticated", False)
@@ -947,6 +975,7 @@ from hermes_cli.web_routers import (  # noqa: E402
     analytics as _analytics_routes,
     chat_ws as _chat_ws_routes,
     dashboard_ui as _dashboard_ui_routes,
+    gemini as _gemini_routes,
 )
 
 app.include_router(_files_routes.router)
@@ -977,6 +1006,7 @@ app.include_router(_tools_routes.router)
 app.include_router(_analytics_routes.router)
 app.include_router(_chat_ws_routes.router)
 app.include_router(_dashboard_ui_routes.router)
+app.include_router(_gemini_routes.router)
 
 # Plugin API routes and the dashboard auth routes (/login, /auth/*, /api/auth/*)
 # mount before the SPA catch-all so /{full_path:path} doesn't swallow them. Auth

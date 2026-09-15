@@ -613,8 +613,9 @@ def write_json(obj: dict) -> bool:
         # die at stdio below.
         project_room_member_activity(obj, _sessions)
         sid = ((params or {}).get("session_id")) if isinstance(params, dict) else ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+        if sid and (sess := _sessions.get(sid)):
+            if (t := sess.get("transport")) is not None:
+                return t.write(obj)
     return (current_transport() or _stdio_transport).write(obj)
 
 
@@ -2149,6 +2150,54 @@ def _session_info(agent, session: dict | None = None) -> dict:
         info["update_command"] = recommended_update_command()
     if live_agent and (warn := _probe_credentials(agent)):
         info["credential_warning"] = warn
+    model_str = str(info.get("model") or getattr(agent, "model", "") or mirror.get("model", "")).lower()
+    provider_str = str(info.get("provider") or getattr(agent, "provider", "") or mirror.get("provider", "")).lower()
+    if "gemini" in model_str or "gemini" in provider_str:
+        gemini_acc = None
+        # 1. Active agent credential pool entry IF explicitly bound
+        entry_id = getattr(agent, "_credential_pool_entry_id", None)
+        if entry_id:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import get_account_alias
+                pool = getattr(agent, "_credential_pool", None)
+                _all = pool.entries() if hasattr(pool, "entries") else getattr(pool, "_entries", [])
+                curr = next((e for e in _all if getattr(e, "id", None) == entry_id), None)
+                raw_lbl = (curr.label or curr.id) if curr else entry_id
+                if raw_lbl:
+                    gemini_acc = get_account_alias(raw_lbl)
+
+        # 2. Session model_config / mirror (saved session state takes precedence over unbound pool cursor)
+        if not gemini_acc:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import get_account_alias
+                cfg = sess.get("model_config") or mirror.get("model_config") or {}
+                if isinstance(cfg, str):
+                    import json
+                    cfg = json.loads(cfg)
+                if isinstance(cfg, dict) and cfg.get("gemini_account"):
+                    gemini_acc = get_account_alias(cfg["gemini_account"])
+
+        # 3. Fallback to pool current/peek only when session has no saved account
+        if not gemini_acc:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import get_account_alias
+                pool = getattr(agent, "_credential_pool", None)
+                if pool:
+                    curr = pool.current() or (pool.peek() if hasattr(pool, "peek") else None)
+                    raw_lbl = (curr.label or curr.id) if curr else None
+                    if raw_lbl:
+                        gemini_acc = get_account_alias(raw_lbl)
+
+        # 3. Fallback to state.db / last-used resolver
+        if not gemini_acc and session_key:
+            with contextlib.suppress(Exception):
+                from hermes_cli.auth import resolve_session_last_used_account, get_account_alias
+                raw_acc = resolve_session_last_used_account(session_key, db=_get_db())
+                if raw_acc:
+                    gemini_acc = get_account_alias(raw_acc)
+
+        if gemini_acc:
+            info["gemini_account"] = gemini_acc
     return info
 
 
@@ -2467,9 +2516,25 @@ def _resolve_checkpoint_hash(mgr, cwd: str, ref: str) -> str:
 
 def _lazy_resume_info(cwd: str, *, model: str = "", provider: str = "", profile: str | None = None) -> dict:
     """session.info for a not-yet-built session (session.create's shape); tools/skills land with the deferred build."""
+    skills = {}
+    with contextlib.suppress(Exception):
+        from hermes_cli.banner import get_available_skills
+        skills = get_available_skills()
+    tools = {}
+    with contextlib.suppress(Exception):
+        from toolsets import get_all_toolsets, get_toolset_info
+        for name in sorted(get_all_toolsets().keys()):
+            if info := get_toolset_info(name):
+                resolved = info.get("resolved_tools", [])
+                if resolved:
+                    tools[name] = resolved
+    mcp_servers = []
+    with contextlib.suppress(Exception):
+        from tools.mcp_tool_discovery import get_mcp_status
+        mcp_servers = get_mcp_status()
     return {
         "cwd": cwd, "branch": git_probe.branch(cwd), "project": _project_info_for_cwd(cwd),
-        "model": model or _resolve_model(), "tools": {}, "skills": {}, "lazy": True,
+        "model": model or _resolve_model(), "tools": tools, "skills": skills, "mcp_servers": mcp_servers, "lazy": False,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT, "profile_name": _response_profile_name(profile),
         **({"provider": provider} if provider else {}),
     }
@@ -2720,18 +2785,28 @@ def _find_live_session_by_key(session_key: str, profile_home=_ANY_PROFILE) -> tu
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent)
-    # The SESSION's own workspace, not the launch dir (wrong project in the desktop Files pane). `branch` is
-    # always emitted ("" outside git) so a stale label clears; `desktop_contract` missing reads as "out of date".
-    # Reporting `_default_session_cwd()` here told a lazily-resumed session's client that its workspace was
-    # wherever the gateway process happened to start, so the desktop Files pane painted the wrong project
-    # even after the renderer rebound correctly (#71254). `branch` is always emitted ("" outside a git repo)
-    # so a client can clear a stale label instead of retaining it — the same contract `_lazy_session_info`
-    # above already follows.
+        return _session_info(agent, session)
     cwd = _session_cwd(session)
+    skills = {}
+    with contextlib.suppress(Exception):
+        from hermes_cli.banner import get_available_skills
+        skills = get_available_skills()
+    tools = {}
+    with contextlib.suppress(Exception):
+        from toolsets import get_all_toolsets, get_toolset_info
+        for name in sorted(get_all_toolsets().keys()):
+            if info := get_toolset_info(name):
+                resolved = info.get("resolved_tools", [])
+                if resolved:
+                    tools[name] = resolved
+    mcp_servers = []
+    with contextlib.suppress(Exception):
+        from tools.mcp_tool_discovery import get_mcp_status
+        mcp_servers = get_mcp_status()
     return {
-        "cwd": cwd, "branch": git_probe.branch(cwd), "project": _project_info_for_cwd(cwd), "lazy": True,
-        "model": _resolve_model(), "skills": {}, "tools": {}, "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "cwd": cwd, "branch": git_probe.branch(cwd), "project": _project_info_for_cwd(cwd), "lazy": False,
+        "model": _resolve_model(), "skills": skills, "tools": tools, "mcp_servers": mcp_servers,
+        "desktop_contract": DESKTOP_BACKEND_CONTRACT,
     }
 
 
@@ -3176,7 +3251,7 @@ _TUI_EXTRA: list[tuple[str, str, str]] = [
 # Commands that queue onto _pending_input in the CLI; the slash worker has no reader for that queue, so
 # slash.exec routes them to command.dispatch instead.
 _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset({
-    "retry", "queue", "q", "steer", "plan", "goal", "loop", "proactive", "moa", "undo", "learn",
+    "retry", "queue", "q", "steer", "plan", "goal", "loop", "proactive", "moa", "undo", "redo", "learn",
     "init", "compress", "compact",
 })
 
