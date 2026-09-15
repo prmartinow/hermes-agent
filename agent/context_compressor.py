@@ -2306,20 +2306,23 @@ class ContextCompressor(MicroCompactionMixin, ContextEngine):
 
             output_reservation = get_model_max_output_tokens(
                 model=model, provider=provider, config_max_tokens=max_tokens
-            )
+            ) or 0
         else:
             output_reservation = 0
 
         usable_input_budget = max(1, context_length - output_reservation)
         pct_value = int(usable_input_budget * threshold_percent)
         floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
+        trigger_cap = int(usable_input_budget * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
+        if usable_input_budget > 0 and floored > pct_value and floored > trigger_cap:
+            floored = max(pct_value, trigger_cap)
         hard_input_cap = max(1, usable_input_budget - 1024)
 
         if usable_input_budget > 0 and floored >= usable_input_budget:
             return max(
                 1,
                 min(
-                    int(usable_input_budget * ContextCompressor._MIN_CTX_TRIGGER_RATIO),
+                    trigger_cap,
                     hard_input_cap,
                     usable_input_budget - 1,
                 ),

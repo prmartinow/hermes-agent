@@ -3700,3 +3700,29 @@ class TestSanitizeToolPairsWhitespace:
         tool_call_ids = [m.get("tool_call_id") for m in out if m.get("role") == "tool"]
         assert "call_orphan" not in tool_call_ids, "genuinely orphaned result must be removed"
         assert " call_orphan " not in tool_call_ids, "original whitespace form must also be gone"
+
+
+    def test_compute_threshold_tokens_astra_and_unknown_models_safe(self):
+        """Model switch to gpt-6-astra or models with unspecified output reservation
+        must compute threshold_tokens without TypeError or NoneType subtraction."""
+        from agent.context_compressor import ContextCompressor
+
+        # gpt-6-astra on openai has 128K output reservation from builtin metadata
+        t_astra = ContextCompressor._compute_threshold_tokens(
+            context_length=1_050_000,
+            threshold_percent=0.50,
+            max_tokens=None,
+            model="gpt-6-astra",
+            provider="openai",
+        )
+        assert t_astra == (1_050_000 - 128_000) * 0.50 == 461_000
+
+        # Unspecified/bare model falls back to 0 output reservation and does not raise
+        t_bare = ContextCompressor._compute_threshold_tokens(
+            context_length=128_000,
+            threshold_percent=0.50,
+            max_tokens=None,
+            model="custom-unknown-model",
+            provider="custom",
+        )
+        assert t_bare == 64_000
