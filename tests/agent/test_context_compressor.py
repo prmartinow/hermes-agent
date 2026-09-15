@@ -3717,6 +3717,16 @@ class TestSanitizeToolPairsWhitespace:
         )
         assert t_astra == (1_050_000 - 128_000) * 0.50 == 461_000
 
+        # gpt-6-astra-900k variant on codex preserves 128K output reservation
+        t_astra_900k = ContextCompressor._compute_threshold_tokens(
+            context_length=900_000,
+            threshold_percent=0.90,
+            max_tokens=None,
+            model="gpt-6-astra-900k",
+            provider="openai-codex",
+        )
+        assert t_astra_900k == int((900_000 - 128_000) * 0.90) == 694_800
+
         # Unspecified/bare model falls back to 0 output reservation and does not raise
         t_bare = ContextCompressor._compute_threshold_tokens(
             context_length=128_000,
