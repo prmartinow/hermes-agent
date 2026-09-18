@@ -26,7 +26,7 @@ class FakeTerminal {
   rows = 24;
   cols = 80;
   parser = {
-    registerOscHandler: vi.fn(),
+    registerOscHandler: vi.fn(() => ({ dispose() {} })),
   };
   unicode = { activeVersion: "" };
   scrollLines = vi.fn();
@@ -47,6 +47,10 @@ class FakeTerminal {
   });
 
   clearSelection() {}
+  reset() {}
+  clear() {}
+
+  hasSelection() { return false; }
 
   dispose() {}
 
@@ -58,7 +62,9 @@ class FakeTerminal {
 
   loadAddon() {}
 
-  onData() {
+  dataHandler?: (data: string) => void;
+  onData(handler: (data: string) => void) {
+    this.dataHandler = handler;
     return { dispose() {} };
   }
 
@@ -296,6 +302,34 @@ afterEach(async () => {
 });
 
 describe("ChatPage", () => {
+  it("keeps Enter distinct from coalesced typing without altering bracketed paste", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
+    const socket=FakeWebSocket.instances.at(-1)!;
+    await act(async()=>{socket.onopen?.();});
+    const send=vi.spyOn(socket,"send");
+    const terminal=FakeTerminal.instances.at(-1)!;
+    await act(async()=>{
+      terminal.dataHandler?.("/model");terminal.dataHandler?.("\r");
+      terminal.dataHandler?.("\x1b[200~pasted\rtext\x1b[201~");
+    });
+    expect(send).toHaveBeenCalledWith("/model");
+    expect(send).toHaveBeenCalledWith("\x1b[13u");
+    expect(send).toHaveBeenCalledWith("\x1b[200~pasted\rtext\x1b[201~");
+  });
+
+  it("preserves legitimate ANSI erase and positioning bytes during resume", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(<MemoryRouter initialEntries={["/chat?resume=fixture"]}><ChatPage isActive /></MemoryRouter>);
+    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
+    const terminal = FakeTerminal.instances.at(-1)!;
+    const write = vi.spyOn(terminal, "write");
+    const payload = "ABC\r\x1b[2KX" + "\r\n".repeat(60) + "z".repeat(8500);
+    await act(async () => { FakeWebSocket.instances.at(-1)!.onmessage?.({ data: payload }); });
+    expect(write.mock.calls.some(call => (call as unknown[])[0] === payload)).toBe(true);
+  });
+
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
     const { default: ChatPage } = await import("./ChatPage");
 

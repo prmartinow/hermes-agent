@@ -59,3 +59,7 @@ export function sendPtyShortcutSequence(
 
   return true;
 }
+
+// A browser keydown is unambiguously a key, unlike an unbracketed text paste.
+// CSI-u keeps Enter distinct when the PTY coalesces adjacent keyboard writes.
+export const PTY_EXPLICIT_ENTER = "\x1b[13u";

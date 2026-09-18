@@ -15,6 +15,11 @@ export type Frame = {
   readonly absoluteOverlayMoved?: boolean
 }
 
+/** The final cursor may occupy a trailing row beyond the painted content. */
+export function inlineViewportOrigin(frame: Frame, rows = frame.viewport.height): number {
+  return Math.max(0, Math.max(frame.screen.height, frame.cursor.y + 1) - rows)
+}
+
 export function emptyFrame(
   rows: number,
   columns: number,

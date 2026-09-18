@@ -824,6 +824,7 @@ export function TextInput({
   const editVersionRef = useRef(0)
   const parentChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingParentValue = useRef<string | null>(null)
+  const pendingParentEchoes = useRef<string[]>([])
   const localRenderTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // True for one keystroke after a commit took the full Ink render path
   // (syncParent). Ink repaints the whole input line, so the terminal cursor
@@ -846,6 +847,13 @@ export function TextInput({
   cbChange.current = onChange
   cbSubmit.current = onSubmit
   cbPaste.current = onPaste
+
+  const notifyParentChange = (next: string) => {
+    pendingParentEchoes.current.push(next)
+    self.current = true
+    cbChange.current(next)
+  }
+
 
   const raw = self.current ? vRef.current : value
   const display = mask ? raw.replace(/[^\n]/g, mask[0] ?? '*') : raw
@@ -939,11 +947,27 @@ export function TextInput({
   }, [accentOpen, cur, display, focus, highlights, nativeCursor, placeholder, placeholderColor, selected])
 
   useEffect(() => {
-    const ownEcho = self.current && value === vRef.current
-    self.current = false
-
-    if (ownEcho || value === vRef.current) {
+    // React can commit an older onChange echo after a newer keystroke has
+    // already advanced vRef. A boolean ownership flag mistakes that echo
+    // for an external replacement and drops the newer characters.
+    const echo = pendingParentEchoes.current.lastIndexOf(value)
+    if (echo >= 0) {
+      pendingParentEchoes.current.splice(0, echo + 1)
+      self.current = value !== vRef.current
       return
+    }
+    self.current = false
+    if (value === vRef.current) return
+    // A genuine external replacement supersedes queued local notifications.
+    pendingParentEchoes.current = []
+    pendingParentValue.current = null
+    if (parentChangeTimer.current) {
+      clearTimeout(parentChangeTimer.current)
+      parentChangeTimer.current = null
+    }
+    if (keyBurstTimer.current) {
+      clearTimeout(keyBurstTimer.current)
+      keyBurstTimer.current = null
     }
 
     setCur(value.length)
@@ -1060,8 +1084,7 @@ export function TextInput({
     pendingParentValue.current = null
 
     if (next !== null) {
-      self.current = true
-      cbChange.current(next)
+      notifyParentChange(next)
     }
   }
 
@@ -1151,10 +1174,10 @@ export function TextInput({
       nextLineWidth ?? stringWidth(next.includes('\n') ? next.slice(next.lastIndexOf('\n') + 1) : next)
 
     if (next !== prev) {
+      self.current = true
       if (syncParent) {
         flushParentChange()
-        self.current = true
-        cbChange.current(next)
+        notifyParentChange(next)
         // A full Ink repaint just happened. Mark it so any fast-echo backspace
         // later in this IME recompose burst is suppressed (it would write
         // "\b \b" against a baseline Ink just invalidated, stranding the U+202F

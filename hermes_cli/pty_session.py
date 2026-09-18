@@ -21,17 +21,22 @@ class RingBuffer:
     def __init__(self, capacity: int) -> None:
         self._cap = capacity
         self._buf = bytearray()
+        self._escape_tail = b""
         self.truncated = False
 
     def append(self, data: bytes) -> None:
         # If the incoming stream clears the terminal scrollback (\x1b[3J),
         # discard all buffered bytes prior to that clear. Keeping wiped
         # scrollback causes reconnected viewers to replay duplicate transcripts.
-        clear_idx = data.rfind(b"\x1b[3J")
+        # PTY read boundaries can split CSI 3 J at any byte. Inspect the
+        # retained suffix too, without duplicating it when no clear is found.
+        candidate = self._escape_tail + data
+        self._escape_tail = candidate[-3:]
+        clear_idx = candidate.rfind(b"\x1b[3J")
         if clear_idx != -1:
             self._buf.clear()
             self.truncated = False
-            data = data[clear_idx:]
+            data = candidate[clear_idx:]
         self._buf.extend(data)
         overflow = len(self._buf) - self._cap
         if overflow > 0:

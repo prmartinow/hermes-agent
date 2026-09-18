@@ -34,6 +34,24 @@ def test_ringbuffer_clears_prior_bytes_on_scrollback_wipe():
 
 
 
+@pytest.mark.parametrize("split", range(1, 4))
+def test_scrollback_wipe_survives_every_read_boundary(split):
+    rb = RingBuffer(128)
+    rb.append(b"old-history")
+    marker = b"\x1b[3J"
+    rb.append(marker[:split])
+    rb.append(marker[split:] + b"new-history")
+    assert rb.snapshot() == marker + b"new-history"
+    assert not rb.truncated
+
+
+def test_split_wipe_does_not_duplicate_partial_sequences():
+    rb = RingBuffer(128)
+    for chunk in [b"old", b"\x1b", b"[", b"3", b"J", b"new", b"\x1b[", b"2J"]:
+        rb.append(chunk)
+    assert rb.snapshot() == b"\x1b[3Jnew\x1b[2J"
+
+
 class FakeBridge:
     """Implements the bridge contract PtySession depends on."""
 

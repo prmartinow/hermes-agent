@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 from hermes_cli.model_switch import ModelSwitchResult
 
@@ -171,3 +173,49 @@ def test_custom_provider_context_avoids_false_shrink_warning(monkeypatch):
     assert "shrinks" in result3.warning_message
     # Must not honor the unused 1M custom override when no providers were passed.
     assert "1,048,576" not in result3.warning_message
+
+
+@pytest.mark.parametrize(
+    "source,model,provider,window,max_tokens,cap",
+    [
+        ("big-model", "gpt-6-astra", "openai-codex", 272_000, None, None),
+        ("big-model", "gpt-6-astra-900k", "openai-codex", 900_000, None, None),
+        ("big-model", "gpt-6-astra", "openai", 1_050_000, None, None),
+        ("gpt-6-astra-900k", "unknown-model", "openrouter", 900_000, None, None),
+        ("big-model", "unknown-model", "openrouter", 32_000, 4096, None),
+        ("big-model", "gpt-6-astra-900k", "openai-codex", 900_000, 8192, 300_000),
+    ],
+)
+def test_warning_matches_destination_compressor(
+    monkeypatch, tmp_path, source, model, provider, window, max_tokens, cap,
+):
+    from agent.context_compressor import ContextCompressor
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.context_switch_guard.resolve_display_context_length",
+        lambda *a, **k: window,
+    )
+    cc = ContextCompressor(
+        model=source, provider="openai-codex", config_context_length=1_048_576,
+        threshold_percent=0.5, quiet_mode=True, max_tokens=max_tokens,
+        model_thresholds={"gpt-6-astra": 0.8, "openai-codex:gpt-6-astra": 0.9},
+        threshold_tokens_cap=cap,
+    )
+    agent = SimpleNamespace(context_compressor=cc, compression_enabled=True)
+    # Compare the warning to the real post-switch budget, not a second test formula.
+    before = (cc.model, cc.provider, cc.context_length, cc.threshold_percent, cc.threshold_tokens)
+    expected = cc.preview_model_threshold(model, window, provider)
+    for estimate, should_warn in [(expected - 1, False), (expected, True)]:
+        monkeypatch.setattr(
+            "hermes_cli.context_switch_guard._estimate_tokens", lambda *a, **k: estimate,
+        )
+        result = _result(model=model)
+        result.target_provider = provider
+        merge_preflight_compression_warning(result, agent=agent)
+        assert bool(result.warning_message) == should_warn
+        if should_warn:
+            assert f"auto-compress at ~{expected:,}" in result.warning_message
+        assert (cc.model, cc.provider, cc.context_length, cc.threshold_percent, cc.threshold_tokens) == before
+    cc.update_model(model, window, provider=provider)
+    assert cc.threshold_tokens == expected

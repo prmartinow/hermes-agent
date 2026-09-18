@@ -139,6 +139,24 @@ describe('GatewayClient websocket attach mode', () => {
     }
   })
 
+  it('ignores queued events from a replaced gateway socket', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws'
+    delete process.env.HERMES_TUI_SIDECAR_URL
+    const gw = new GatewayClient()
+    const events: string[] = []
+    gw.on('event', ev => events.push(ev.type + ':' + (ev.payload?.text ?? '')))
+    try {
+      gw.start(); const oldSocket = FakeWebSocket.instances[0]!; oldSocket.open()
+      gw.drain(); await Promise.resolve()
+      gw.start(); const newSocket = FakeWebSocket.instances.at(-1)!; newSocket.open()
+      oldSocket.message(JSON.stringify({jsonrpc:'2.0',method:'event',params:{type:'message.delta',session_id:'fixture',payload:{text:'stale'}}}))
+      newSocket.message(JSON.stringify({jsonrpc:'2.0',method:'event',params:{type:'message.delta',session_id:'fixture',payload:{text:'fresh'}}}))
+      gw.drain()
+      await vi.waitFor(() => expect(events.some(e => e.startsWith('message.delta:'))).toBe(true))
+      expect(events.filter(e => e.startsWith('message.delta:'))).toEqual(['message.delta:fresh'])
+    } finally { gw.kill() }
+  })
+
   it('waits for websocket open and resolves RPC requests', async () => {
     process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
     const gw = new GatewayClient()
