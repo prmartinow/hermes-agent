@@ -1,3 +1,5 @@
+import { inlineViewportOrigin } from './frame.js'
+import { takeRenderBoundary } from './render-boundary.js'
 import { closeSync, constants as fsConstants, openSync, readSync, writeSync } from 'fs'
 import { format } from 'util'
 
@@ -282,6 +284,7 @@ export default class Ink {
   // subset to silence prompt-row clipboard probes).
   private altScreenMouseTracking: MouseTrackingMode = 'off'
   private inlineMouseTracking: MouseTrackingMode = 'off'
+  private inlineViewportOriginY = 0
   // True when the previous frame's screen buffer cannot be trusted for
   // blit — selection overlay mutated it, resetFramesForAltScreen()
   // replaced it with blanks, or forceRedraw() reset it to 0×0. Forces
@@ -1223,6 +1226,18 @@ export default class Ink {
       }
     }
 
+    // Shrinking the live frame does not remove terminal scrollback. Keep
+    // the emitted viewport origin until a reset deliberately remaps it.
+    if (!this.altScreenActive) {
+      const origin = inlineViewportOrigin(frame, terminalRows)
+      this.inlineViewportOriginY = diff.some(p => p.type === 'clearScreen' || p.type === 'clearTerminal')
+        ? origin : Math.max(this.inlineViewportOriginY, origin)
+    }
+
+    // Completion markers must follow this frame's bytes, including when a
+    // previous render was deferred by stdout backpressure.
+    const boundary = takeRenderBoundary(this.options.stdout)
+    if (boundary) optimized.push({ type: 'stdout', content: boundary })
     const tWrite = performance.now()
 
     // Capture any stale pending write BEFORE starting this frame's write —
@@ -2007,9 +2022,7 @@ export default class Ink {
     if (this.altScreenActive) {
       return 0
     }
-    const screenHeight = this.frontFrame?.screen?.height ?? 0
-    const termRows = this.options.stdout?.rows ?? 24
-    return Math.max(0, screenHeight - termRows)
+    return this.inlineViewportOriginY
   }
 
   /**

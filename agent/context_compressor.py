@@ -2199,14 +2199,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
         if max_tokens is not None:
             self.max_tokens = self._coerce_max_tokens(max_tokens)
-        self.threshold_tokens = self._compute_threshold_tokens(
-            context_length,
-            self.threshold_percent,
-            self.max_tokens,
-            model=model or getattr(self, "model", "") or "",
-            provider=getattr(self, "provider", "") or "",
-        )
-        self._apply_threshold_tokens_cap()
+        self.threshold_tokens = self.preview_model_threshold(model, context_length, provider)
         # Reset to None so the property recomputes via the mode-aware path (not the legacy formula).
         self._tail_token_budget = None
         _ = self.tail_token_budget  # eager recompute, same timing as before
@@ -2227,6 +2220,18 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # Runway was computed against the previous model's trigger; clear the durable copy too.
         self._reset_proactive_prune_rearm()
         self._clear_durable_proactive_prune_rearm()
+
+    def preview_model_threshold(self, model: str, context_length: int, provider: str = "") -> int:
+        """Resolve a switch's trigger without mutating live compression state."""
+        config_percent = getattr(self, "_config_threshold_percent", self.threshold_percent)
+        percent = resolve_model_threshold(model, self.model_thresholds, config_percent, provider)
+        percent = self._effective_threshold_percent(context_length, percent)
+        tokens = self._compute_threshold_tokens(
+            context_length, percent, self.max_tokens, model=model, provider=provider,
+        )
+        if self.threshold_tokens_cap is not None and self.threshold_tokens_cap > 0:
+            tokens = min(tokens, self.threshold_tokens_cap, context_length)
+        return tokens
 
     # When the MINIMUM_CONTEXT_LENGTH floor binds on a small window, trigger near the top instead.
     _MIN_CTX_TRIGGER_RATIO = 0.85

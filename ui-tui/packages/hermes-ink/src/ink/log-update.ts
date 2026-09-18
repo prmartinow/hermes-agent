@@ -1,3 +1,4 @@
+import { inlineViewportOrigin } from './frame.js'
 import { type AnsiCode, ansiCodesToString } from '@alcalzone/ansi-tokenize'
 
 import { logForDebugging } from '../utils/debug.js'
@@ -512,11 +513,14 @@ function fullResetSequence_CAUSES_FLICKER(
   // Resizes and offscreen recoveries only redraw the visible active viewport slice.
   const fullHistory = altScreen ? true : isInit
   const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
-  renderFrame(screen, frame, stylePool, altScreen, fullHistory)
+  // The terminal was homed by the clear patch: its cursor uses viewport,
+  // not transcript, coordinates. Include a cursor-only trailing row too.
+  const originY = fullHistory ? 0 : inlineViewportOrigin(frame)
+  renderFrameSlice(screen, frame, originY, frame.screen.height, stylePool, originY, !fullHistory)
 
   // Restore cursor to frame's target cursor position so typing does NOT overwrite the status bar!
   if (!altScreen && frame.cursor) {
-    moveCursorTo(screen, frame.cursor.x, frame.cursor.y)
+    moveCursorTo(screen, frame.cursor.x, fullHistory ? frame.cursor.y : Math.max(0, Math.min(frame.viewport.height - 1, frame.cursor.y - originY)))
   }
 
   // clearTerminal wipes scrollback (only on initial hydration / altScreen).
@@ -529,17 +533,6 @@ function fullResetSequence_CAUSES_FLICKER(
   return diff
 }
 
-function renderFrame(
-  screen: VirtualScreen,
-  frame: Frame,
-  stylePool: StylePool,
-  altScreen = false,
-  fullHistory = false
-): void {
-  const startY = fullHistory ? 0 : Math.max(0, frame.screen.height - frame.viewport.height)
-  renderFrameSlice(screen, frame, startY, frame.screen.height, stylePool)
-}
-
 /**
  * Render a slice of rows from the frame's screen.
  * Each row is rendered followed by a newline. Cursor ends at (0, endY).
@@ -549,7 +542,9 @@ function renderFrameSlice(
   frame: Frame,
   startY: number,
   endY: number,
-  stylePool: StylePool
+  stylePool: StylePool,
+  originY = 0,
+  viewportOnly = false
 ): VirtualScreen {
   let currentStyleId = stylePool.none
   let currentHyperlink: Hyperlink = undefined
@@ -568,8 +563,9 @@ function renderFrameSlice(
     // when the cursor is at the viewport bottom, moveCursorTo's
     // cursor-down silently fails, creating a permanent off-by-one
     // between the virtual cursor and the real terminal cursor.
-    if (screen.cursor.y < y) {
-      const rowsToAdvance = y - screen.cursor.y
+    const targetY = y - originY
+    if (screen.cursor.y < targetY) {
+      const rowsToAdvance = targetY - screen.cursor.y
       screen.txn(prev => {
         const patches: Diff = new Array<Diff[number]>(1 + rowsToAdvance)
         patches[0] = CARRIAGE_RETURN
@@ -596,7 +592,7 @@ function renderFrameSlice(
         continue
       }
 
-      moveCursorTo(screen, x, y)
+      moveCursorTo(screen, x, targetY)
 
       // Handle hyperlink
       const targetHyperlink = cell.hyperlink
@@ -620,7 +616,11 @@ function renderFrameSlice(
     // CR+LF at end of row — \r resets to column 0, \n moves to next line.
     // Without \r, the terminal cursor stays at whatever column content ended
     // (since we skip trailing spaces, this can be mid-row).
-    screen.txn(prev => [[CARRIAGE_RETURN, NEWLINE], { dx: -prev.x, dy: 1 }])
+    // LF on the bottom viewport row scrolls preserved history. A bounded
+    // repaint leaves the final row in place; cursor restoration follows.
+    if (!viewportOnly || targetY + 1 < frame.viewport.height) {
+      screen.txn(prev => [[CARRIAGE_RETURN, NEWLINE], { dx: -prev.x, dy: 1 }])
+    }
   }
 
   // Reset any open style/hyperlink at end of slice

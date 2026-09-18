@@ -1,9 +1,12 @@
+import { randomUUID } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
 
 import type { ScrollBoxHandle } from '@hermes/ink'
-import { evictInkCaches } from '@hermes/ink'
+import { evictInkCaches, writeAfterRender } from '@hermes/ink'
 import type { InflightTurn, SessionResumeResult, Usage } from '@hermes/shared/gateway-events'
-import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+
+import { INLINE_MODE, DASHBOARD_TUI_MODE } from '../config/env.js'
 
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
 import { introMsg, toTranscriptMessages } from '../domain/messages.js'
@@ -182,6 +185,14 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       targetSid ? rpc<SessionCloseResponse>('session.close', { session_id: targetSid }) : Promise.resolve(null),
     [rpc]
   )
+
+  const replayGeneration = useRef<string | null>(null)
+  const [replayCommitted, setReplayCommitted] = useState<string | null>(null)
+  useLayoutEffect(() => {
+    if (replayCommitted && replayCommitted === replayGeneration.current) {
+      writeAfterRender(`\x1b]777;hermes-replay;end;${replayCommitted}\x07`, process.stdout, true)
+    }
+  }, [replayCommitted])
 
   const cancelResumeScrollRef = useRef<null | (() => void)>(null)
   const [viewportMeta, setViewportMeta] = useState<SessionViewportMeta | null>(null)
@@ -421,9 +432,19 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     (id: string) => {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
+      const generation = INLINE_MODE && DASHBOARD_TUI_MODE ? randomUUID() : null
+      replayGeneration.current = generation
+      if (generation) process.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
+      const abortReplay = () => {
+        if (generation && replayGeneration.current === generation) {
+          process.stdout.write(`\x1b]777;hermes-replay;abort;${generation}\x07`)
+        }
+      }
 
       rpc<SetupStatusResponse>('setup.status', {}).then(setup => {
+        if (replayGeneration.current !== generation) return
         if (setup?.provider_configured === false) {
+          abortReplay()
           panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections())
           patchUiState({ status: 'setup required' })
 
@@ -432,11 +453,13 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
         const previousSid = getUiState().sid
 
-        gw.request<SessionResumeResult & { viewport?: SessionViewportMeta }>('session.resume', { cols: colsRef.current, session_id: id })
+        return gw.request<SessionResumeResult & { viewport?: SessionViewportMeta }>('session.resume', { cols: colsRef.current, session_id: id })
           .then(raw => {
+            if (replayGeneration.current !== generation) return
             const r = asRpcResult<SessionResumeResult & { viewport?: SessionViewportMeta }>(raw)
 
             if (!r) {
+              abortReplay()
               sys('error: invalid response: session.resume')
 
               return patchUiState({ status: 'ready' })
@@ -462,6 +485,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               usage: usageFrom(info)
             })
             hydrateLiveSessionInflight(r.inflight)
+            setReplayCommitted(generation)
             cancelResumeScrollRef.current?.()
             cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
 
@@ -469,10 +493,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               void closeSession(previousSid)
             }
           })
-          .catch((e: Error) => {
-            sys(`error: ${e.message}`)
-            patchUiState({ status: 'ready' })
-          })
+      }).catch((e: Error) => {
+        if (replayGeneration.current !== generation) return
+        abortReplay()
+        sys(`error: ${e.message}`)
+        patchUiState({ status: 'ready' })
       })
     },
     [closeSession, colsRef, gw, panel, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, sys]

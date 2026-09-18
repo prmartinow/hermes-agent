@@ -1,3 +1,5 @@
+import { filterPtyMouseData, ptyClickCell } from "@/lib/pty-click";
+import { ReplayBoundaryGate, REPLAY_STALLED_MESSAGE } from "@/lib/pty-replay-boundary";
 /**
  * ChatPage — embeds `hermes --tui` inside the dashboard.
  *
@@ -41,13 +43,11 @@ import { withPreservedTerminalContext } from "@/lib/terminal-state";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { createPtyCompositionForwarder } from "@/lib/pty-composition";
 import { shouldRestoreTerminalFocus } from "@/lib/pty-focus";
-import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
   PTY_CONNECTING_TIMEOUT_MS,
   PTY_RECONNECT_INPUT_MESSAGE,
   PTY_RECONNECT_MAX_ATTEMPTS,
   PTY_RESUME_RECONNECT_THROTTLE_MS,
-  PTY_RESUME_SANITIZE_WINDOW_MS,
   PTY_TICKET_TIMEOUT_MS,
   type PtyConnectionState,
   ptyReconnectDelayMs,
@@ -66,6 +66,7 @@ import {
 } from "@/lib/pty-mobile-input";
 import { computeKeyboardInset, keyboardRevealScrollDelta } from "@/lib/keyboard-inset";
 import {
+  PTY_EXPLICIT_ENTER,
   resolvePtyKeyboardShortcut,
   sendPtyShortcutSequence,
 } from "@/lib/pty-keyboard-shortcuts";
@@ -1020,12 +1021,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       selService.shouldForceSelection = () => true;
 
       // Track mousedown coordinates to cleanly differentiate single clicks from drag-selection
-      let clickStartPos: { x: number; y: number; time: number } | null = null;
+      let clickStartPos: { x: number; y: number } | null = null;
       term.element?.addEventListener(
         "mousedown",
         (e: MouseEvent) => {
           if (e.button === 0) {
-            clickStartPos = { x: e.clientX, y: e.clientY, time: Date.now() };
+            clickStartPos = { x: e.clientX, y: e.clientY };
           }
         },
         { capture: true },
@@ -1036,24 +1037,21 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         (e: MouseEvent) => {
           if (!clickStartPos || e.button !== 0) return;
           const dist = Math.hypot(e.clientX - clickStartPos.x, e.clientY - clickStartPos.y);
-          const elapsed = Date.now() - clickStartPos.time;
           clickStartPos = null;
 
-          // If user dragged (> 3px) or took longer than 700ms or text is selected, respect selection!
-          if (dist > 3 || elapsed > 700 || term.hasSelection()) {
+          // Dragging and selected text are never forwarded as button clicks.
+          if (dist > 3 || term.hasSelection()) {
             return;
           }
 
           // Single click detected: forward SGR mouse click sequence to PTY so interactive
           // elements (modals, [Allow]/[Deny], status bar, textInput positioning) respond
-          const rect = term.element?.getBoundingClientRect();
-          const dims = (term as any)._core?._renderService?.dimensions?.css?.cell;
-          if (!rect || !dims) return;
-
-          const col = Math.floor((e.clientX - rect.left) / dims.width);
-          const row = Math.floor((e.clientY - rect.top) / dims.height);
-
-          if (col >= 0 && col < term.cols && row >= 0 && row < term.rows) {
+          const rect = term.element?.querySelector('.xterm-screen')?.getBoundingClientRect();
+          if (!rect) return;
+          const cell = ptyClickCell(e.clientX, e.clientY, rect, term.cols, term.rows,
+            term.buffer.active.viewportY, term.buffer.active.baseY);
+          if (cell) {
+            const { col, row } = cell;
             // SGR DEC 1006 format: \x1b[<0;col+1;row+1M (press) and \x1b[<0;col+1;row+1m (release)
             const press = `\x1b[<0;${col + 1};${row + 1}M`;
             const release = `\x1b[<0;${col + 1};${row + 1}m`;
@@ -1373,33 +1371,22 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     let onDataDisposable: { dispose(): void } | null = null;
     let onResizeDisposable: { dispose(): void } | null = null;
     let onScrollDisposable: { dispose(): void } | null = null;
-    let eraseSuppressionTimer: ReturnType<typeof setTimeout> | null = null;
     let resumeMaxTimer: ReturnType<typeof setTimeout> | null = null;
-    const clearEraseSuppressionTimer = () => {
-      if (eraseSuppressionTimer) {
-        clearTimeout(eraseSuppressionTimer);
-        eraseSuppressionTimer = null;
-      }
-    };
     let isReplayActive = Boolean(resumeParam);
     let resumeHydrationFinished = false;
-    let resumeSettleTimer: ReturnType<typeof setTimeout> | null = null;
-    const PTY_RESUME_SETTLE_MS = 600;
+    const replayGate = new ReplayBoundaryGate();
 
     const clearResumeLoadingTimers = () => {
       if (resumeMaxTimer) {
         clearTimeout(resumeMaxTimer);
         resumeMaxTimer = null;
       }
-      if (resumeSettleTimer) {
-        clearTimeout(resumeSettleTimer);
-        resumeSettleTimer = null;
-      }
     };
 
     const finishResumeHydration = () => {
       if (resumeHydrationFinished) return;
       resumeHydrationFinished = true;
+      setBanner(previous => previous === REPLAY_STALLED_MESSAGE ? null : previous);
       clearResumeLoadingTimers();
       isReplayActive = false;
       if (!unmounting) {
@@ -1413,23 +1400,37 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         }
       }
     };
-    const noteResumePtyChunk = (chunkText: string) => {
-      if (!effectiveResume || unmounting || resumeHydrationFinished) {
-        return;
-      }
-      // Keep replay active while stream chunks are landing.
-      // Settle after 600ms of quiet following the last received chunk,
-      // or fast-settle if the ready prompt/status bar is detected.
-      if (resumeSettleTimer) {
-        clearTimeout(resumeSettleTimer);
-      }
-      const hasPrompt = chunkText.includes("❯ ") || chunkText.includes("─ ready │");
-      resumeSettleTimer = setTimeout(finishResumeHydration, hasPrompt ? 150 : PTY_RESUME_SETTLE_MS);
+    const replayTimedOut = () => {
+      resumeMaxTimer = null;
+      if (!unmounting && !resumeHydrationFinished) setBanner(REPLAY_STALLED_MESSAGE);
     };
+    const replayBoundaryDisposable = term.parser.registerOscHandler(777, data => {
+      const boundary = replayGate.receive(data);
+      if (!boundary) return false;
+      if (boundary.phase === "begin") {
+        isReplayActive = true;
+        resumeHydrationFinished = false;
+        clearResumeLoadingTimers();
+        setResumeHydrating(true);
+        resumeMaxTimer = setTimeout(replayTimedOut, PTY_RESUME_LOADING_MAX_MS);
+      } else if (boundary.phase === "end") {
+        // The callback follows all preceding parsed bytes; stale generations
+        // cannot finish a newer replay that started while the write queued.
+        term.write("", () => {
+          if (!unmounting && replayGate.complete(boundary.generation)) finishResumeHydration();
+        });
+      } else if (replayGate.complete(boundary.generation)) {
+        clearResumeLoadingTimers();
+        isReplayActive = false;
+        setResumeHydrating(false);
+        setBanner("Conversation replay failed. Reconnect to retry.");
+      }
+      return true;
+    });
     if (resumeParam) {
       setResumeHydrating(true);
       resumeMaxTimer = setTimeout(
-        finishResumeHydration,
+        replayTimedOut,
         PTY_RESUME_LOADING_MAX_MS,
       );
     } else {
@@ -1602,15 +1603,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     };
 
-    // Session resume: Ink's two-pass virtual scroll floods the PTY with
-    // erase codes and blank-line bursts while replaying a long session.
-    // Suppress them for a bounded window after connect, then let ordinary
-    // in-place redraws through untouched. See pty-resume-sanitizer.ts.
+    // ANSI is an ordered stateful protocol. xterm owns its parser; deleting
+    // erase commands or blank lines here changes the meaning of later bytes.
     const decoder = new TextDecoder();
-    const sanitizer = new PtyResumeSanitizer();
     const beginResumeReplay = () => {
       isReplayActive = true;
       resumeHydrationFinished = false;
+      replayGate.reset();
+      clearResumeLoadingTimers();
       stickToBottomRef.current = true;
       try {
         term.reset();
@@ -1618,16 +1618,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       } catch {
         /* ignore */
       }
-      if (!eraseSuppressionTimer) {
-        eraseSuppressionTimer = setTimeout(() => {
-          eraseSuppressionTimer = null;
-          sanitizer.endEraseSuppression();
-        }, PTY_RESUME_SANITIZE_WINDOW_MS);
-      }
       if (!resumeMaxTimer) {
         setResumeHydrating(true);
         resumeMaxTimer = setTimeout(
-          finishResumeHydration,
+          replayTimedOut,
           PTY_RESUME_LOADING_MAX_MS,
         );
       }
@@ -1657,18 +1651,21 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         !term.hasSelection();
 
       const followScroll = shouldFollow
-        ? () => termRef.current?.scrollToBottom()
+        ? () => {
+            // Parsing is async. A wheel event since this write was queued
+            // must win over the earlier follow decision.
+            if (stickToBottomRef.current && !term.hasSelection()) term.scrollToBottom();
+          }
         : undefined;
 
       term.write(batch, followScroll);
-      noteResumePtyChunk(batch);
 
       if (isResizeReplaying) {
         if (resizeReplaySettleTimer) clearTimeout(resizeReplaySettleTimer);
         resizeReplaySettleTimer = setTimeout(() => {
           resizeReplaySettleTimer = null;
           isResizeReplaying = false;
-          if (!term.hasSelection()) {
+          if (stickToBottomRef.current && !term.hasSelection()) {
             try {
               term.scrollToBottom();
             } catch {
@@ -1694,7 +1691,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           : decoder.decode(new Uint8Array(ev.data as ArrayBuffer), {
               stream: true,
             });
-      const rendered = effectiveResume ? sanitizer.next(text) : text;
+      const rendered = text;
       if (!rendered) return;
 
       pendingWriteChunks.push(rendered);
@@ -1715,17 +1712,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         rafWriteHandle = null;
       }
       flushWrites();
-      // Drain buffered sanitizer state. A buffered partial escape is dropped
-      // (writing an unterminated CSI would wedge xterm's parser); a buffered
-      // newline run is emitted collapsed.
-      if (effectiveResume) {
-        clearEraseSuppressionTimer();
-        try {
-          term.write(sanitizer.flush());
-        } catch {
-          /* ignore */
-        }
-      }
+      const decoderTail = decoder.decode();
+      if (decoderTail) term.write(decoderTail);
       wsRef.current = null;
       connectInFlightRef.current = false;
       clearConnectingTimer();
@@ -1789,20 +1777,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       setPtyState("ended");
     };
 
-    // Keystrokes → PTY.
-    //
-    // IMPORTANT:
-    // The embedded web chat has occasionally surfaced stray letters/digits
-    // in the input line after a turn completes. The most likely culprit is
-    // browser-side terminal control traffic being forwarded back into the
-    // PTY as if it were user text. SGR mouse tracking is the highest-risk
-    // path here: xterm.js emits raw CSI reports (`\x1b[<...`) that look like
-    // ordinary bytes to the backend.
-    //
-    // For the browser embed we prefer input stability over terminal-style
-    // mouse reporting, so we drop SGR mouse reports entirely instead of
-    // forwarding them into Hermes. Keyboard input, paste, and resize still
-    // behave normally.
+    // Keyboard/paste bytes go to the PTY once. Native wheel/drag belongs to
+    // xterm; retain button reports and any ordinary text batched after them.
       // eslint-disable-next-line no-control-regex -- intentional ESC byte in xterm SGR mouse report parser
       const SGR_MOUSE_RE = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/;
       const forwardPtyData = (data: string, useMobileReplacement = true) => {
@@ -1819,24 +1795,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           return;
         }
 
-        if (data.startsWith("\x1b[<")) {
-          // Extract SGR mouse reports (handles single and concatenated/batched clicks)
-          const matches = [...data.matchAll(/\x1b\[<(\d+);(\d+);(\d+)([Mm])/g)];
-          if (matches.length > 0) {
-            for (const m of matches) {
-              const btn = parseInt(m[1], 10);
-              // Forward button clicks (press/release button 0), drop drag/motion (32)
-              if (btn === 0) {
-                try {
-                  ws.send(m[0]);
-                } catch {
-                  /* socket closed */
-                }
-              }
-            }
-            return;
-          }
-        }
+        data = filterPtyMouseData(data);
+        if (!data) return;
 
         if (
           !data.startsWith("\x1b[<") &&
@@ -1858,7 +1818,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         if (normalized.normalized) {
           mobileReplacementInputUntilRef.current = 0;
         }
-        ws.send(normalized.data);
+        // xterm emits Enter separately; encode that key before the PTY can
+        // merge it into a preceding printable run. Bracketed pastes remain
+        // untouched, as do LF/Shift+Enter and IME-composed text.
+        ws.send(normalized.data === "\r" ? PTY_EXPLICIT_ENTER : normalized.data);
       };
       // The deferred composition fallback is already committed text, so it
       // must not consume the mobile replacement window intended for xterm's
@@ -1898,12 +1861,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       unmounting = true;
       imageUploadDisposed = true;
       syncMetricsRef.current = null;
-      clearEraseSuppressionTimer();
       clearResumeLoadingTimers();
       setResumeHydrating(false);
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
       onScrollDisposable?.dispose();
+      replayBoundaryDisposable.dispose();
       mobileInputCleanup?.();
       compositionForwarder.dispose();
       host.removeEventListener("paste", handleBrowserPaste, true);

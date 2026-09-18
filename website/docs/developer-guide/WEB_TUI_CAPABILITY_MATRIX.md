@@ -1,6 +1,8 @@
 # Hermes Web TUI Capability & Invariants Matrix
 
 ## Overview
+> **Historical implementation notes, not current proof.** The evidence audit below supersedes stale implementation claims and fixed test counts. Unverified capabilities must not be reported as passing.
+
 This document formalizes the architectural contracts, user-facing capabilities, failure classes overcome, and regression-guarding invariants for the Hermes Web TUI across all surfaces (Desktop, Web, Mobile, RPC Displays).
 
 ---
@@ -73,3 +75,32 @@ Every merge and release must pass these automated verification gates:
 4. `cd web && npm test` (324/324 passed)
 5. `cd ui-tui && npx vitest run packages/hermes-ink/src/ink/log-update.test.ts` (8/8 passed)
 6. Pre-commit security check: 0 host paths, 0 private IPs, 0 secrets.
+
+## Current evidence audit
+
+| ID | Evidence status | Required interpretation / next test |
+| :--- | :--- | :--- |
+| 1.1 | browser fixture passed | Native mouse drag through real ChatPage; no modifier; both displays required. |
+| 1.2 | browser fixture passed | Selection remains unchanged while deterministic active output advances. |
+| 1.3 | existing unit coverage only | Real HTTP clipboard behavior requires a consented clipboard test. |
+| 1.4 | reproduced and fixed | Model picker had no handlers; pointer offsets drifted after shrink. Real SGR and browser provider/model/effort clicks now exercised. |
+| 1.5 | reproduced and fixed | Older controlled-value echoes dropped newer characters (abc became ac). Explicit Enter prevents PTY-coalesced keys becoming pasted newlines. |
+| 2.1 | architecture claim requires revalidation | xterm only reflows soft-wrapped rows; Ink-emitted hard CRLF rows do not gain semantic paragraph reflow automatically. |
+| 2.2 | source reviewed; latency target unverified | Measure resize gesture to final frame; debounce alone is not a latency guarantee. |
+| 2.3 | contract needs qualification | Automatic follow must not override a user scroll during asynchronous output parsing. |
+| 2.4 | partial browser coverage | Early-scroll replay captures exist; repeat during live turn, resize and reconnect. |
+| 2.5 | component coverage improved | Real xterm checks repaint cursor and live-input placement; full device matrix remains. |
+| 3.1 | claimed guarantee not implemented | A finite 32 MB ring buffer can truncate; test overflow and recovery instead of promising unlimited history. |
+| 3.2 | old mechanism obsolete | Viewport repaint must not emit transcript-sized newlines. Explicit replacement replay owns a scrollback clear; resize is not always a full replay. |
+| 3.3 | old invariant overbroad | Full-history hydration and bounded viewport repair have different origins. Verify source-to-buffer content, not one global startY rule. |
+| 3.4 | reproduced and fixed | Keep emitted viewport origin stable when content shrinks; pure frame-height inference misroutes subsequent clicks. |
+| 3.5 | source retained; partial rendering tests | Native MessageLine/Md formatting remains. Full color/style golden comparison still required. |
+| 3.6 | source reviewed | Column-key remounts force all history to remount; profile before retaining/removing, and test gaps. |
+| 3.7 | source reviewed; target not proof | A larger cache trades memory for reuse; measure hit rate and retained bytes rather than assuming 10000 is optimal. |
+| 4.1 | unit coverage; reconnect defect found | Replaced gateway socket could still deliver queued events. Generation guard added; live multi-device soak still required. |
+| 4.2 | not revalidated end-to-end in this audit | Test exactly-once prompt broadcast between distinct device identities during active output. |
+| 4.3 | isolation exercised | Test tabs use unique attachment identities without overwriting shared localStorage. Native per-device geometry remains required. |
+| 4.4 | source reviewed; soak pending | Verify actual detached-PID disappearance and RSS reclamation, not only TTL configuration. |
+| 5.1 | partially addressed; startup still open | Inline deferred ranges disabled; explicit replay boundary added. Count actual commits/frames on cold live-session resume. |
+| 5.2 | old description numerically wrong | 287 ms and 313 ms are not sub-millisecond. Separate state acknowledgement, parsed display, paint, layout and transport timings. |
+| 5.3 | claim contradicted by current code | RawAnsi is used for code blocks and ANSI messages, not the entire completed transcript; no history worker-thread pool found in current TUI source. |

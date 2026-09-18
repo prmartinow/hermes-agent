@@ -577,7 +577,11 @@ export class GatewayClient extends EventEmitter {
       connectPromise.catch(() => {})
       this.wsConnectPromise = connectPromise
 
-      ws.addEventListener('message', ev => this.handleWebSocketFrame(ev.data))
+      ws.addEventListener('message', ev => {
+        // Old sockets can still have queued events after replacement. Never
+        // deliver their ready/delta notifications into the new connection.
+        if (this.ws === ws) this.handleWebSocketFrame(ev.data)
+      })
       ws.addEventListener('close', ev => {
         // Skip close events from sockets that have already been
         // replaced — start() / closeGatewaySocket() can swap `this.ws`
@@ -590,7 +594,7 @@ export class GatewayClient extends EventEmitter {
           return
         }
 
-        this.pushLog(`[lifecycle] websocket close code=${ev.code}`)
+        this.lifecycle(`[lifecycle] websocket close code=${ev.code} clean=${ev.wasClean} ready=${this.ready}`)
         this.ws = null
         this.wsConnectPromise = null
         this.handleTransportExit(ev.code, `gateway websocket closed${ev.code ? ` (${ev.code})` : ''}`)

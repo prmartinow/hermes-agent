@@ -457,7 +457,7 @@ export function useVirtualHistory(
   // Inverted range (large jump with deferred value lagging) or sticky snap
   // (scrollToBottom needs the tail mounted NOW so maxScroll lands on content,
   // not bottomSpacer) — skip deferral.
-  if (effStart > effEnd || sticky) {
+  if (isInline || effStart > effEnd || sticky) {
     effStart = start
     effEnd = end
   }
