@@ -166,3 +166,68 @@ def test_child_eof_closes_socket_and_bridge(pty_client, monkeypatch):
     while not bridges[0].closed and time.monotonic() < deadline:
         time.sleep(0.01)
     assert bridges[0].closed is True
+
+
+def test_warm_attach_sends_replay_control_before_snapshot_and_matching_request(pty_client, monkeypatch):
+    """Warm attach to an existing keep-alive PTY must send an out-of-band JSON
+    replay-start control frame carrying the replay generation BEFORE the binary
+    snapshot, and write the matching private OSC 777 redraw request to the bridge
+    instead of sending Ctrl+L (b"\x0c").
+    """
+    ws, client, token = pty_client
+    channel = "warm-chan"
+
+    bridge_instance = None
+
+    class _WarmBridge(_OneFrameBridge):
+        def __init__(self):
+            super().__init__()
+            nonlocal bridge_instance
+            self.written = []
+            bridge_instance = self
+
+        @classmethod
+        def spawn(cls, *args, **kwargs):
+            return cls()
+
+        def read(self, timeout):
+            if not self._sent:
+                self._sent = True
+                return b"ready"
+            return b""
+
+        async def write(self, raw):
+            self.written.append(bytes(raw) if isinstance(raw, (bytes, bytearray)) else raw.encode("utf-8"))
+            return True
+
+    monkeypatch.setattr(_web_server_chat.PtyBridge, "spawn", _WarmBridge.spawn)
+    monkeypatch.setattr(
+        _web_server_chat, "_resolve_chat_argv", lambda **kw: (["fake-hermes-tui"], None, None)
+    )
+
+    attach_id = "warm-test-device"
+    # First connection: fresh PTY is spawned
+    with client.websocket_connect(_url(token, channel=channel, attach=attach_id)) as conn1:
+        # First frame is raw output, no replay-start control
+        assert conn1.receive_bytes() == b"ready"
+
+    assert bridge_instance is not None
+    bridge_instance.written.clear()
+
+    # Second connection: warm attach to existing PTY without ?resume=
+    with client.websocket_connect(_url(token, channel=channel, attach=attach_id)) as conn2:
+        # 1. Control frame MUST arrive BEFORE binary snapshot
+        ctrl = conn2.receive_json()
+        assert ctrl["type"] == "replay-start"
+        assert "generation" in ctrl
+        gen = ctrl["generation"]
+
+        # 2. Binary snapshot arrives next
+        snap = conn2.receive_bytes()
+        assert snap == b"ready"
+
+        # 3. Matching private replay request sent to bridge instead of Ctrl+L
+        expected_payload = f"\x1b]777;hermes-replay;request;{gen}\x07".encode("ascii")
+        written_combined = b"".join(bridge_instance.written)
+        assert expected_payload in written_combined
+        assert b"\x0c" not in written_combined

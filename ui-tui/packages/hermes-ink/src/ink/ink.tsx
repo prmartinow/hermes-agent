@@ -1,5 +1,5 @@
 import { inlineViewportOrigin } from './frame.js'
-import { takeRenderBoundary } from './render-boundary.js'
+import { enqueueRenderBoundary, takeRenderBoundary } from './render-boundary.js'
 import { closeSync, constants as fsConstants, openSync, readSync, writeSync } from 'fs'
 import { format } from 'util'
 
@@ -1405,6 +1405,26 @@ export default class Ink {
       // diff sees no content. onRender resets the flag at frame end.
       this.prevFrameContaminated = true
     }
+
+    this.onRender()
+  }
+
+  requestRedraw(generation: string): void {
+    if (this.isUnmounted || this.isPaused) {
+      return
+    }
+
+    if (this.altScreenActive) {
+      this.options.stdout.write(ERASE_SCREEN + CURSOR_HOME)
+      this.resetFramesForAltScreen()
+    } else {
+      this.options.stdout.write(clearTerminal)
+      this.repaint()
+      this.prevFrameContaminated = true
+    }
+
+    this.options.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
+    enqueueRenderBoundary(this.options.stdout, `\x1b]777;hermes-replay;end;${generation}\x07`)
 
     this.onRender()
   }

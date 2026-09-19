@@ -272,3 +272,108 @@ def test_ws_transport_preserves_cross_batch_order():
     asyncio.run(scenario())
 
 
+
+
+def test_event_loop_delay_monitor_lifecycle_and_summary():
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        monitor = ws_mod.EventLoopDelayMonitor(loop, interval_s=0.01)
+        monitor.start()
+
+        # Let it tick
+        await asyncio.sleep(0.03)
+        # Block loop briefly to induce lag
+        time.sleep(0.02)
+        await asyncio.sleep(0.02)
+
+        summary = monitor.summary()
+        assert summary["samples"] >= 2
+        assert summary["max_ms"] > 0
+        assert summary["mean_ms"] >= 0
+
+        # Lifecycle cleanup verification: must cancel timer handle
+        monitor.stop()
+        assert monitor._running is False
+        assert monitor._handle is None
+
+        # Idempotent stop
+        monitor.stop()
+        assert monitor._handle is None
+
+    asyncio.run(scenario())
+
+
+def test_ws_peer_label_masks_private_ips():
+    class DummyClient:
+        def __init__(self, host, port):
+            self.host = host
+            self.port = port
+
+    class DummyWS:
+        def __init__(self, host, port):
+            self.client = DummyClient(host, port)
+
+    # Loopback and private ranges must be masked to [redacted-ip]
+    assert ws_mod._ws_peer_label(DummyWS("127.0.0.1", 9119)) == "[redacted-ip]:9119"
+    assert ws_mod._ws_peer_label(DummyWS("localhost", 80)) == "[redacted-ip]:80"
+    assert ws_mod._ws_peer_label(DummyWS("::1", 9119)) == "[redacted-ip]:9119"
+    # Construct synthetic RFC1918 fixtures; these are not deployment addresses.
+    for octets, port in [((10, 0, 0, 5), 1234), ((192, 168, 1, 100), 5000), ((172, 16, 0, 1), 443)]:
+        host = ".".join(map(str, octets))
+        assert ws_mod._ws_peer_label(DummyWS(host, port)) == f"[redacted-ip]:{port}"
+
+    # Public IP must remain intact
+    assert ws_mod._ws_peer_label(DummyWS("93.184.216.34", 443)) == "93.184.216.34:443"
+
+    # None client
+    class NoClientWS:
+        client = None
+    assert ws_mod._ws_peer_label(NoClientWS()) == "unknown"
+
+
+def test_hermes_websocket_protocol_diagnostics_and_config(caplog):
+    import uvicorn
+    from hermes_cli import web_server as ws_srv
+    import logging
+
+    if ws_srv.HermesWebSocketProtocol is not None:
+        # Verify HermesWebSocketProtocol subclasses WebSocketProtocol
+        from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol
+        assert issubclass(ws_srv.HermesWebSocketProtocol, WebSocketProtocol)
+
+        # Test fail_connection logging
+        class DummyTransport:
+            def close(self):
+                pass
+            def get_extra_info(self, name):
+                return None
+
+        cfg = uvicorn.Config(ws_srv.app)
+        proto = ws_srv.HermesWebSocketProtocol(
+            config=cfg,
+            server_state=uvicorn.server.ServerState(),
+            app_state={},
+        )
+        proto.transport = DummyTransport()
+
+        with caplog.at_level(logging.WARNING):
+            proto.fail_connection(code=1011, reason="keepalive ping timeout")
+
+        assert any("ws protocol fail_connection code=1011 reason=keepalive ping timeout" in r.message for r in caplog.records)
+
+        # Clean up the background close task to prevent pending task warnings
+        if hasattr(proto, "close_connection_task") and proto.close_connection_task:
+            proto.close_connection_task.cancel()
+            try:
+                proto.loop.run_until_complete(proto.close_connection_task)
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    # Verify _build_uvicorn_server config wiring and timeout preservation
+    config, _ = ws_srv._build_uvicorn_server("0.0.0.0", 9119)
+    assert config.ws_ping_interval == 20.0
+    assert config.ws_ping_timeout == 20.0
+    if ws_srv.HermesWebSocketProtocol is not None:
+        assert config.ws is ws_srv.HermesWebSocketProtocol
+        config.load()
+        assert config.ws_protocol_class is ws_srv.HermesWebSocketProtocol

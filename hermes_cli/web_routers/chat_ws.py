@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -520,9 +521,18 @@ async def pty_ws(ws: WebSocket) -> None:
         await _pty_fail(ws, exc)
         return
 
+    replay_generation: Optional[str] = None
+    if not _created:
+        replay_generation = str(uuid.uuid4())
+        try:
+            await ws.send_json({"type": "replay-start", "generation": replay_generation})
+        except Exception:
+            PTY_REGISTRY.detach(attach_token, ws)
+            return
+
     # A fresh xterm can't rebuild the TUI from an arbitrary tail of alternate-
     # screen differential output; reused PTYs emit a full frame after replay.
-    if not await session.attach(ws, force_redraw=not _created):
+    if not await session.attach(ws, force_redraw=False, generation=replay_generation):
         # attach() detaches itself when the client dropped mid-replay, and a socket
         # superseded during replay is already closed by its replacement; only a
         # stalled redraw write leaves THIS socket attached and worth closing.

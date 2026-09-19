@@ -1157,6 +1157,36 @@ def _configure_auth_gate(
         )
 
 
+try:
+    from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol as _UvicornWebSocketProtocol
+except ImportError:
+    _UvicornWebSocketProtocol = None
+
+
+_ALLOWED_WS_FAIL_REASONS = frozenset({
+    "keepalive ping timeout",
+})
+
+
+if _UvicornWebSocketProtocol is not None:
+    class HermesWebSocketProtocol(_UvicornWebSocketProtocol):
+        """Narrow supported subclass of Uvicorn's WebSocketProtocol.
+
+        Captures keepalive ping timeouts and protocol failure reasons at WARNING level
+        without enabling global websocket DEBUG logging (which could leak payloads/credentials)
+        or monkeypatching globals. Completely content-free: logs only code and reason.
+        """
+        def fail_connection(self, code: int = 1006, reason: str = "") -> None:
+            safe_reason = reason if reason in _ALLOWED_WS_FAIL_REASONS else ""
+            if safe_reason:
+                _log.warning("ws protocol fail_connection code=%s reason=%s", code, safe_reason)
+            else:
+                _log.warning("ws protocol fail_connection code=%s", code)
+            super().fail_connection(code, reason)
+else:
+    HermesWebSocketProtocol = None  # Telemetry limitation: non-websockets_impl protocol in use
+
+
 def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
     """Build the uvicorn ``Config`` + ``Server`` for this bind (reads ``app.state.auth_required``).
 
@@ -1202,18 +1232,20 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
         served_app = wrap_asgi_with_ws_tracking(app, app.state.ssh_isolated_clients)
         ping_interval, ping_timeout = TUNNEL_WS_PING_INTERVAL_S, TUNNEL_WS_PING_TIMEOUT_S
 
+    ws_protocol = HermesWebSocketProtocol if HermesWebSocketProtocol is not None else "auto"
     config = uvicorn.Config(
         served_app, host=host, port=port, log_level="warning",
         # Off by default so _ws_client_is_allowed sees the real peer, not
         # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
         # X-Forwarded-Proto for cookie Secure flags.
-        proxy_headers=bool(app.state.auth_required),
+        proxy_headers=bool(getattr(app.state, "auth_required", False)),
         # Loopback-only unless the operator trusts a bounded upstream proxy, so
         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
         forwarded_allow_ips=_dashboard_forwarded_allow_ips(_dash_cfg),
         ws_ping_interval=ping_interval,
         ws_ping_timeout=ping_timeout,
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
+        ws=ws_protocol,
     )
     return config, uvicorn.Server(config)
 

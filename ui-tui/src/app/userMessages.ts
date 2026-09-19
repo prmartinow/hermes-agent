@@ -55,6 +55,44 @@ export const backendGaveUp = (code: null | number, lastLine?: string): string =>
 
 export const BACKEND_GAVE_UP_ACTIVITY = 'Hermes stopped · /logs for details'
 
+// ── Transport loss recovery ────────────────────────────────────────────────
+
+export const TRANSPORT_RECONNECTING =
+  'Connection lost — reconnecting and restoring your chat…'
+
+export const TRANSPORT_RECONNECTING_ACTIVITY = 'Connection lost · reconnecting…'
+
+export const transportGaveUp = (code: null | number, lastLine?: string): string => {
+  const close = code === null ? '' : ` (code ${code})`
+  const detail = detailLine(lastLine)
+
+  return [
+    `Connection to Hermes was lost${close}. Your chat is saved.`,
+    detail,
+    'Hermes keeps trying to reconnect in the background and reopens this chat when it succeeds; if it does not, type /resume.',
+    'Type /logs for the full log, or check network and gateway status.'
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+export const TRANSPORT_GAVE_UP_ACTIVITY = 'Connection lost · /logs for details'
+
+export const recoveryRestartingMessage = (source?: 'process' | 'websocket'): string =>
+  source === 'websocket' ? TRANSPORT_RECONNECTING : BACKEND_RESTARTING
+
+export const recoveryRestartingActivity = (source?: 'process' | 'websocket'): string =>
+  source === 'websocket' ? TRANSPORT_RECONNECTING_ACTIVITY : BACKEND_RESTARTING_ACTIVITY
+
+export const recoveryGaveUpMessage = (
+  source: 'process' | 'websocket' | undefined,
+  code: null | number,
+  lastLine?: string
+): string => (source === 'websocket' ? transportGaveUp(code, lastLine) : backendGaveUp(code, lastLine))
+
+export const recoveryGaveUpActivity = (source?: 'process' | 'websocket'): string =>
+  source === 'websocket' ? TRANSPORT_GAVE_UP_ACTIVITY : BACKEND_GAVE_UP_ACTIVITY
+
 /** Last line of the backend log tail that is not our own [lifecycle]/[startup] bookkeeping. */
 export const lastStderrLine = (tail: string): string | undefined =>
   tail

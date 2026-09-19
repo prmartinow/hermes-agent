@@ -115,6 +115,18 @@ export const forceRedraw = (stdout: NodeJS.WriteStream = process.stdout): boolea
   return true
 }
 
+export const requestRedraw = (generation: string, stdout: NodeJS.WriteStream = process.stdout): boolean => {
+  const instance = instances.get(stdout)
+
+  if (!instance) {
+    return false
+  }
+
+  instance.requestRedraw(generation)
+
+  return true
+}
+
 /**
  * Mount a component and render the output.
  */

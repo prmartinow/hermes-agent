@@ -13,7 +13,7 @@ import { JSON_RPC_METHOD_NOT_FOUND, type ServerRequest } from '@hermes/shared/js
 import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { DASHBOARD_TUI_MODE, INLINE_MODE, STARTUP_RESUME_ID } from '../config/env.js'
+import { DASHBOARD_TUI_MODE, STARTUP_RESUME_ID } from '../config/env.js'
 import { WHEEL_SCROLL_STEP } from '../config/limits.js'
 import { RESIZE_COALESCE_MS } from '../config/timing.js'
 import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
@@ -53,7 +53,7 @@ import { applyAgentSnapshot } from './agentRoster.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createServerRequestHandler } from './createServerRequestHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
-import { planGatewayRecovery } from './gatewayRecovery.js'
+import { createGatewayExitHandler } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type StateSetter, type TranscriptRow } from './interfaces.js'
 import { $overlayState, patchOverlayState } from './overlayStore.js'
@@ -68,13 +68,6 @@ import { useComposerState } from './useComposerState.js'
 import { useConfigSync } from './useConfigSync.js'
 import { shouldDetachEditedHistoryInput, useInputHandlers } from './useInputHandlers.js'
 import { useLongRunToolCharms } from './useLongRunToolCharms.js'
-import {
-  BACKEND_GAVE_UP_ACTIVITY,
-  BACKEND_RESTARTING,
-  BACKEND_RESTARTING_ACTIVITY,
-  backendGaveUp,
-  lastStderrLine
-} from './userMessages.js'
 import { useSessionLifecycle } from './useSessionLifecycle.js'
 import { useSubmission } from './useSubmission.js'
 
@@ -179,6 +172,7 @@ export function useMainApp(gw: GatewayClient) {
       logForDebugging(`[tui-perf] resize coalesced: cols=${stdout.columns ?? 80}`)
       setCols(stdout.columns ?? 80)
     }, RESIZE_COALESCE_MS)
+
     const sync = () => coalescer.schedule()
 
     stdout.on('resize', sync)
@@ -200,6 +194,7 @@ export function useMainApp(gw: GatewayClient) {
   const [historyItems, setHistoryItemsState] = useState<Msg[]>(() =>
     STARTUP_RESUME_ID ? [] : [{ kind: 'intro', role: 'system', text: '' }]
   )
+
   const [historyGeneration, setHistoryGeneration] = useState(0)
 
   const setHistoryItems = useCallback<StateSetter<Msg[]>>(value => {
@@ -966,49 +961,13 @@ export function useMainApp(gw: GatewayClient) {
       }
     }
 
-    const exitHandler = (code: null | number) => {
-      turnController.reset()
-
-      // A still-owned child dying while the TUI is alive is an *unexpected*
-      // death — a user /quit exits Node before this fires, and a replaced child
-      // is identity-skipped in GatewayClient. Rather than stranding a long
-      // session (the user's complaint), respawn the gateway and resume the
-      // persisted session via the next gateway.ready, so a single crash / OOM /
-      // signal doesn't lose their work. planGatewayRecovery bounds the attempts
-      // so a gateway that crash-loops on startup can't spawn-storm, and falls
-      // back to recoverSidRef when sid was already cleared by a prior exit.
-      const plan = planGatewayRecovery(getUiState().sid, recoverSidRef.current, recoveryAtRef.current, Date.now())
-
-      // Clear sid immediately: while the gateway is down, sid-guarded effects
-      // (session.active_list poll, queue drain) would otherwise fire RPCs at a
-      // dead/respawning gateway. recoverSidRef carries the session forward, and
-      // resumeById restores sid once the fresh gateway is ready.
-      recoveryAtRef.current = plan.attempts
-      patchUiState({ busy: false, compacting: false, sid: null, status: 'restarting…' })
-
-      if (plan.recover && plan.sid) {
-        recoverSidRef.current = plan.sid
-        turnController.pushActivity(BACKEND_RESTARTING_ACTIVITY, 'warn')
-        sys(BACKEND_RESTARTING)
-        gw.start()
-
-        return
-      }
-
-      // Budget spent (crash loop) or nothing to recover: GatewayClient keeps
-      // retrying on its backoff — say so ONCE, with the exit code and the last
-      // stderr line, rather than repeating "gateway exited" every tick. Keep the
-      // recovery target: when that background reconnect eventually succeeds,
-      // gateway.ready must reopen the SAME chat instead of forging a new one.
-      recoverSidRef.current = plan.sid
-      patchUiState({ status: 'stopped' })
-
-      if (!gaveUpRef.current) {
-        gaveUpRef.current = true
-        turnController.pushActivity(BACKEND_GAVE_UP_ACTIVITY, 'error')
-        sys(`error: ${backendGaveUp(code, lastStderrLine(gw.getLogTail(20)))}`)
-      }
-    }
+    const exitHandler = createGatewayExitHandler({
+      gaveUpRef,
+      gw,
+      recoverSidRef,
+      recoveryAtRef,
+      sys
+    })
 
     gw.on('event', handler)
     gw.on('request', requestHandler)

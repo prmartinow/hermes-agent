@@ -1490,8 +1490,13 @@ export function TextInput({
       const range = selRange()
       const delFwd = k.delete || fwdDel.current
 
+      const isUnhandledControl =
+        !event.keypress.isPasted && ((k.ctrl && !k.meta) || Boolean(k.super))
+
       const isPrintableInput =
-        (event.keypress.isPasted || inp.length > 0) && PRINTABLE.test(inp.replace(BRACKET_PASTE, ''))
+        (event.keypress.isPasted || inp.length > 0) &&
+        !isUnhandledControl &&
+        PRINTABLE.test(inp.replace(BRACKET_PASTE, ''))
 
       if (!isPrintableInput) {
         flushKeyBurst()
@@ -1628,9 +1633,11 @@ export function TextInput({
         } else {
           ;({ cursor: c, value: v } = killToLineEnd(v, c))
         }
+      } else if (isUnhandledControl) {
+        return
       } else if (event.keypress.isPasted || inp.length > 0) {
-        // Discard unhandled ANSI escape sequences (e.g. mouse reports, cursor reports, focus reports)
-        if (!event.keypress.isPasted && eventRaw && (eventRaw.startsWith('\x1b') || eventRaw.includes('\x1b['))) {
+        // Discard unhandled ANSI escape sequences (e.g. mouse reports, cursor reports, focus reports, OSC)
+        if (!event.keypress.isPasted && eventRaw && (eventRaw.startsWith('\x1b') || eventRaw.includes('\x1b'))) {
           return
         }
 

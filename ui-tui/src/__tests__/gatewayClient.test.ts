@@ -61,13 +61,13 @@ const { FakeWebSocket } = vi.hoisted(() => {
       this.sent.push(payload)
     }
 
-    close(code = 1000) {
+    close(code = 1000, wasClean = false, reason = '') {
       if (this.readyState === FakeWebSocket.CLOSED) {
         return
       }
 
       this.readyState = FakeWebSocket.CLOSED
-      this.emit('close', { code })
+      this.emit('close', { code, wasClean, reason })
     }
 
     open() {
@@ -102,7 +102,8 @@ import {
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
   WS_HEARTBEAT_DEAD_MS,
-  WS_HEARTBEAT_INTERVAL_MS
+  WS_HEARTBEAT_INTERVAL_MS,
+  redactUrl
 } from '../gatewayClient.js'
 
 describe('GatewayClient websocket attach mode', () => {
@@ -349,6 +350,87 @@ describe('GatewayClient websocket attach mode', () => {
     expect(exits).toEqual([1011])
     expect(gw.getLogTail(20)).toContain('[lifecycle] websocket close code=1011')
     expect(gw.getLogTail(20)).toContain('[lifecycle] transport exit code=1011')
+  })
+
+  it('emits exit with websocket context, close code, and initiator on socket 1006 drop', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://127.0.0.1:9119/api/ws?token=secret123'
+    const gw = new GatewayClient()
+    const exitEvents: Array<{ code: null | number; context?: any }> = []
+
+    gw.on('exit', (code, context) => exitEvents.push({ code, context }))
+    gw.start()
+
+    const gatewaySocket = FakeWebSocket.instances[0]!
+    gatewaySocket.open()
+    gw.drain()
+    await Promise.resolve()
+
+    expect(gw.isAttached()).toBe(true)
+
+    // Simulate abnormal transport close 1006 from network/server side
+    gatewaySocket.close(1006, false, '')
+
+    expect(exitEvents).toHaveLength(1)
+    expect(exitEvents[0].code).toBe(1006)
+    expect(exitEvents[0].context).toEqual({
+      code: 1006,
+      source: 'websocket',
+      reason: 'gateway websocket closed (1006)',
+      clean: false,
+      initiator: 'remote_or_network'
+    })
+
+    const logTail = gw.getLogTail(20)
+    expect(logTail).toContain('[lifecycle] websocket close code=1006 clean=false ready=false initiator=remote_or_network')
+    expect(logTail).toContain('[lifecycle] transport exit code=1006 reason=gateway websocket closed (1006) source=websocket')
+    expect(logTail).toContain('[lifecycle] event-loop delay')
+    // Verify private IP and token are not leaked in log tail
+    expect(logTail).not.toContain('secret123')
+    expect(logTail).not.toContain('127.0.0.1')
+    expect(redactUrl('ws://127.0.0.1:9119/api/ws?token=secret123')).toBe('ws://[redacted-ip]:9119/api/ws?***')
+    expect(redactUrl('ws://localhost:9119/api/ws?token=secret123')).toBe('ws://[redacted-ip]:9119/api/ws?***')
+    const privateHost = [192, 168, 1, 50].join('.')
+    expect(redactUrl(`wss://${privateHost}:8000/api/ws`)).toBe('wss://[redacted-ip]:8000/api/ws')
+
+    gw.kill()
+  })
+
+  it('records heartbeat_timeout initiator when heartbeat failure forces close', async () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    const contexts: any[] = []
+    gw.on('exit', (_code, context) => contexts.push(context))
+    gw.start()
+
+    const gatewaySocket = FakeWebSocket.instances[0]!
+    gatewaySocket.open()
+    gw.drain()
+    await Promise.resolve()
+
+    // Trigger onHeartbeatFailure directly
+    ;(gw as any).onHeartbeatFailure()
+
+    expect(contexts).toHaveLength(1)
+    expect(contexts[0].source).toBe('websocket')
+    expect(contexts[0].initiator).toBe('heartbeat_timeout')
+    expect(gw.getLogTail(20)).toContain('initiator=heartbeat_timeout')
+
+    gw.kill()
+  })
+
+  it('initializes and cleans up event loop delay monitor without leaking', () => {
+    process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+    const gw = new GatewayClient()
+    gw.start()
+
+    const summary = gw.getLoopDelaySummary()
+    expect(summary).not.toBeNull()
+    expect(summary).toHaveProperty('meanMs')
+    expect(summary).toHaveProperty('maxMs')
+    expect(summary).toHaveProperty('p99Ms')
+
+    gw.kill()
+    expect(gw.getLoopDelaySummary()).toBeNull()
   })
 
   it('rejects pending RPCs with websocket wording when the attached socket closes', async () => {
