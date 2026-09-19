@@ -1,5 +1,5 @@
 import { filterPtyMouseData, ptyClickCell } from "@/lib/pty-click";
-import { ReplayBoundaryGate, REPLAY_STALLED_MESSAGE } from "@/lib/pty-replay-boundary";
+import { ReplayBoundaryGate, REPLAY_STALLED_MESSAGE, parseReplayStartControlMessage } from "@/lib/pty-replay-boundary";
 /**
  * ChatPage — embeds `hermes --tui` inside the dashboard.
  *
@@ -1606,34 +1606,54 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // ANSI is an ordered stateful protocol. xterm owns its parser; deleting
     // erase commands or blank lines here changes the meaning of later bytes.
     const decoder = new TextDecoder();
+    let pendingWriteChunks: string[] = [];
+    let rafWriteHandle: number | null = null;
+    let isResizeReplaying = false;
+    let resizeReplaySettleTimer: ReturnType<typeof setTimeout> | null = null;
+
     const beginResumeReplay = () => {
       isReplayActive = true;
       resumeHydrationFinished = false;
-      replayGate.reset();
+      if (!replayGate.isPinned()) {
+        replayGate.reset();
+      }
       clearResumeLoadingTimers();
       stickToBottomRef.current = true;
+      if (rafWriteHandle !== null) {
+        cancelAnimationFrame(rafWriteHandle);
+        rafWriteHandle = null;
+      }
+      pendingWriteChunks = [];
       try {
         term.reset();
         term.clear();
       } catch {
         /* ignore */
       }
-      if (!resumeMaxTimer) {
-        setResumeHydrating(true);
-        resumeMaxTimer = setTimeout(
-          replayTimedOut,
-          PTY_RESUME_LOADING_MAX_MS,
-        );
-      }
+      setResumeHydrating(true);
+      resumeMaxTimer = setTimeout(
+        replayTimedOut,
+        PTY_RESUME_LOADING_MAX_MS,
+      );
     };
+
+    const handleReplayStart = (generation: string) => {
+      effectiveResume = effectiveResume || generation;
+      isReplayActive = true;
+      resumeHydrationFinished = false;
+      replayGate.pin(generation);
+      clearResumeLoadingTimers();
+      stickToBottomRef.current = true;
+      setResumeHydrating(true);
+      resumeMaxTimer = setTimeout(
+        replayTimedOut,
+        PTY_RESUME_LOADING_MAX_MS,
+      );
+    };
+
     if (resumeParam) {
       beginResumeReplay();
     }
-
-    let pendingWriteChunks: string[] = [];
-    let rafWriteHandle: number | null = null;
-    let isResizeReplaying = false;
-    let resizeReplaySettleTimer: ReturnType<typeof setTimeout> | null = null;
 
     const flushWrites = () => {
       if (pendingWriteChunks.length === 0) return;
@@ -1678,6 +1698,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") {
+        const replayStart = parseReplayStartControlMessage(ev.data);
+        if (replayStart) {
+          handleReplayStart(replayStart.generation);
+          return;
+        }
         const resumeId = parseResumeControlMessage(ev.data);
         if (resumeId) {
           effectiveResume = resumeId;

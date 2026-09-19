@@ -432,3 +432,16 @@ async def test_close_all_survives_key_popped_by_concurrent_reap():
 
     assert not reg._sessions
     assert all(b.closed for b in bridges)
+
+
+@pytest.mark.asyncio
+async def test_attach_with_generation_emits_private_replay_request():
+    from hermes_cli.pty_session import PtySession, make_replay_request
+    bridge = FakeBridge([b""])
+    s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    await s.start()
+    ws = FakeWS()
+    gen = "11111111-1111-1111-1111-111111111111"
+    assert await s.attach(ws, generation=gen) is True
+    assert bytes(bridge.written) == f"\x1b]777;hermes-replay;request;{gen}\x07".encode("ascii")
+    await s.close()

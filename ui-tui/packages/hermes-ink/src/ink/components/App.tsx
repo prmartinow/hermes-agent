@@ -759,6 +759,18 @@ function processKeysInBatch(app: App, items: ParsedInput[], _unused1: undefined,
     // Terminal responses (DECRPM, DA1, OSC replies, etc.) are not user
     // input — route them to the querier to resolve pending promises.
     if (item.kind === 'response') {
+      if (item.response.type === 'osc' && item.response.code === 777) {
+        const match = /^hermes-replay;request;([a-f0-9-]{36})$/.exec(item.response.data)
+        if (match) {
+          const generation = match[1]!
+          const ink = instances.get(app.props.stdout)
+          if (ink) {
+            ink.requestRedraw(generation)
+          }
+          continue
+        }
+      }
+
       app.querier.onResponse(item.response)
 
       continue

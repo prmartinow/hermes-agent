@@ -723,9 +723,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       })
     }
 
-    if (isAction(key, ch, 'l')) {
+    if (isAction(key, ch, 'l') || isCtrl(key, ch, 'l')) {
       clearSelection()
       forceRedraw(terminal.stdout ?? process.stdout)
+      event.stopImmediatePropagation()
 
       return
     }

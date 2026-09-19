@@ -8,11 +8,19 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from typing import Any, Callable, Dict, Optional, Set, Tuple, Union
 
 WS_CLOSE_PROCESS_EXITED = 4410
 WS_CLOSE_SUPERSEDED = 4409
 TUI_FORCE_REDRAW = b"\x0c"
+
+
+def make_replay_request(generation: Optional[str] = None) -> tuple[str, bytes]:
+    """Format a private OSC 777 redraw request for Ink TUI that does not insert text."""
+    if not generation:
+        generation = str(uuid.uuid4())
+    return generation, f"\x1b]777;hermes-replay;request;{generation}\x07".encode("ascii")
 
 
 class RingBuffer:
@@ -121,7 +129,7 @@ class PtySession:
                 self.alive = False
             return delivered
 
-    async def attach(self, ws: Any, *, force_redraw: bool = False) -> bool:
+    async def attach(self, ws: Any, *, force_redraw: bool = False, generation: Optional[str] = None) -> bool:
         """Attach a browser terminal viewer and replay buffered PTY output without kicking out peers."""
         self._viewers.add(ws)
         self._leader_ws = ws
@@ -136,6 +144,9 @@ class PtySession:
                 # attach here or reap_idle() can never reclaim this PTY (#110849).
                 self.detach(ws)
                 return False
+        if generation is not None:
+            _, payload = make_replay_request(generation)
+            return await self.write(ws, payload)
         if force_redraw:
             return await self.write(ws, TUI_FORCE_REDRAW)
         return True

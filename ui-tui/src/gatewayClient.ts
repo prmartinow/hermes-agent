@@ -2,6 +2,7 @@ import { type ChildProcess, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
 import { delimiter, resolve } from 'node:path'
+import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks'
 import { createInterface } from 'node:readline'
 
 import type { GatewayEvent } from '@hermes/shared/gateway-events'
@@ -94,11 +95,14 @@ const resolvePython = (root: string) => {
 // scrubbed from log lines even when the URL is unparseable.
 const _USERINFO_FALLBACK_RE = /^([a-z][a-z0-9+.-]*:\/\/)[^/?#@]*@/i
 
+const isPrivateHost = (hostname: string): boolean =>
+  /^(?:127\.|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.|\[?::1\]?|localhost\b)/i.test(hostname)
+
 // Connection URLs (gateway, sidecar) often carry bearer tokens in the query
 // string. We surface them in user-facing log lines and the
 // `gateway.start_timeout` payload, so always strip the query string and any
 // embedded user-info before logging.
-const redactUrl = (raw: string): string => {
+export const redactUrl = (raw: string): string => {
   if (!raw) {
     return raw
   }
@@ -107,17 +111,32 @@ const redactUrl = (raw: string): string => {
     const url = new URL(raw)
     const userInfo = url.username || url.password ? '***@' : ''
     const query = url.search ? '?***' : ''
+    const host = isPrivateHost(url.hostname) ? `[redacted-ip]${url.port ? `:${url.port}` : ''}` : url.host
 
-    return `${url.protocol}//${userInfo}${url.host}${url.pathname}${query}`
+    return `${url.protocol}//${userInfo}${host}${url.pathname}${query}`
   } catch {
     // WHATWG URL rejected the input. Best-effort: strip an embedded
     // `user:pass@` segment AND the query string so a malformed token
     // bearer can never escape into the log tail.
     const noUserInfo = raw.replace(_USERINFO_FALLBACK_RE, '$1***@')
     const queryIdx = noUserInfo.indexOf('?')
+    const queryStripped = queryIdx >= 0 ? `${noUserInfo.slice(0, queryIdx)}?***` : noUserInfo
 
-    return queryIdx >= 0 ? `${noUserInfo.slice(0, queryIdx)}?***` : noUserInfo
+    return queryStripped.replace(
+      /^(https?|wss?):\/\/([^/?#@]*@)?(?:127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|localhost|\[?::1\]?)(?::\d+)?/i,
+      '$1://$2[redacted-ip]'
+    )
   }
+}
+
+export type GatewayExitSource = 'process' | 'websocket'
+
+export interface GatewayExitContext {
+  code: null | number
+  source: GatewayExitSource
+  reason?: string
+  clean?: boolean
+  initiator?: string
 }
 
 export class GatewayClient extends EventEmitter {
@@ -144,7 +163,7 @@ export class GatewayClient extends EventEmitter {
   // mount-order contract as events: an attached session mid-turn can send one
   // the instant the socket opens, before the Ink handler is registered.
   private bufferedRequests: ServerRequest[] = []
-  private pendingExit: number | null | undefined
+  private pendingExit: { code: null | number; context: GatewayExitContext } | undefined
   private ready = false
   private readyTimer: ReturnType<typeof setTimeout> | null = null
   private subscribed = false
@@ -155,6 +174,8 @@ export class GatewayClient extends EventEmitter {
   private reconnectAttempts = 0
   // Set on kill() so we never auto-reconnect after an intentional shutdown.
   private disposed = false
+  private loopDelayMonitor: IntervalHistogram | null = null
+  private closeInitiator: 'heartbeat_timeout' | 'client_kill' | 'client_stop' | null = null
 
   constructor() {
     super()
@@ -198,6 +219,48 @@ export class GatewayClient extends EventEmitter {
     }
   }
 
+  private initLoopDelayMonitor() {
+    this.cleanupLoopDelayMonitor()
+    try {
+      this.loopDelayMonitor = monitorEventLoopDelay({ resolution: 20 })
+      this.loopDelayMonitor.enable()
+    } catch {
+      this.loopDelayMonitor = null
+    }
+  }
+
+  private cleanupLoopDelayMonitor() {
+    if (this.loopDelayMonitor) {
+      try {
+        this.loopDelayMonitor.disable()
+      } catch {
+        // best effort
+      }
+      this.loopDelayMonitor = null
+    }
+  }
+
+  getLoopDelaySummary(): { meanMs: number; maxMs: number; p99Ms: number } | null {
+    if (!this.loopDelayMonitor) {
+      return null
+    }
+
+    try {
+      const mean = Number.isNaN(this.loopDelayMonitor.mean) ? 0 : this.loopDelayMonitor.mean
+      const meanMs = Number((mean / 1e6).toFixed(2))
+      const maxMs = Number((this.loopDelayMonitor.max / 1e6).toFixed(2))
+      const p99Ms = Number((this.loopDelayMonitor.percentile(99) / 1e6).toFixed(2))
+
+      return { meanMs, maxMs, p99Ms }
+    } catch {
+      return null
+    }
+  }
+
+  isAttached(): boolean {
+    return Boolean(this.attachUrl)
+  }
+
   private closeSidecarSocket() {
     try {
       this.sidecarWs?.close()
@@ -220,6 +283,10 @@ export class GatewayClient extends EventEmitter {
     this.ws = null
     this.wsConnectPromise = null
 
+    if (ws && !this.closeInitiator) {
+      this.closeInitiator = 'client_stop'
+    }
+
     try {
       ws?.close()
     } catch {
@@ -236,6 +303,7 @@ export class GatewayClient extends EventEmitter {
       return
     }
 
+    this.closeInitiator = 'heartbeat_timeout'
     this.lifecycle('[lifecycle] websocket silent drop detected (heartbeat ack timeout); forcing reconnect')
 
     try {
@@ -286,6 +354,7 @@ export class GatewayClient extends EventEmitter {
     // handlers (now identity-gated to ignore unrelated transports)
     // never fire `rejectPending`, leaving callers hanging on promises
     // attached to a discarded child / socket.
+    this.cleanupLoopDelayMonitor()
     this.channel.detach(new Error('gateway restarting'))
     this.ready = false
     this.subscribed = false
@@ -323,10 +392,17 @@ export class GatewayClient extends EventEmitter {
     }, STARTUP_TIMEOUT_MS)
   }
 
-  private handleTransportExit(code: null | number, reason?: string) {
+  private handleTransportExit(
+    code: null | number,
+    reason?: string,
+    source: GatewayExitSource = 'process',
+    clean?: boolean,
+    initiator?: string
+  ) {
     this.clearReadyTimer()
     this.closeSidecarSocket()
-    this.lifecycle(`[lifecycle] transport exit code=${code ?? 'null'} reason=${reason ?? 'none'}`)
+    this.cleanupLoopDelayMonitor()
+    this.lifecycle(`[lifecycle] transport exit code=${code ?? 'null'} reason=${reason ?? 'none'} source=${source}`)
     this.channel.detach(new Error(reason || `gateway exited${code === null ? '' : ` (${code})`}`))
 
     // Self-heal: a dropped transport (real close OR silent drop caught by the
@@ -337,10 +413,18 @@ export class GatewayClient extends EventEmitter {
     // timer so there is only one recovery owner.
     this.scheduleReconnect()
 
+    const context: GatewayExitContext = {
+      code,
+      source,
+      reason,
+      clean,
+      initiator
+    }
+
     if (this.subscribed) {
-      this.emit('exit', code)
+      this.emit('exit', code, context)
     } else {
-      this.pendingExit = code
+      this.pendingExit = { code, context }
     }
   }
 
@@ -482,7 +566,7 @@ export class GatewayClient extends EventEmitter {
       // `gateway.start_timeout`, rejects pending RPCs, and emits or
       // queues a single `exit`.
       this.proc = null
-      this.handleTransportExit(1, `gateway error: ${err.message}`)
+      this.handleTransportExit(1, `gateway error: ${err.message}`, 'process', false, 'proc_error')
     })
     this.proc.on('exit', (code, signal) => {
       // start() can replace `this.proc` while an old child is still
@@ -499,7 +583,7 @@ export class GatewayClient extends EventEmitter {
       this.lifecycle(
         `[lifecycle] child exit ${describeChild(ownedProc)} code=${code ?? 'null'} signal=${signal ?? 'null'}`
       )
-      this.handleTransportExit(code)
+      this.handleTransportExit(code, signal ? `signal ${signal}` : undefined, 'process', code === 0, signal ? `signal_${signal}` : 'proc_exit')
     })
   }
 
@@ -514,7 +598,7 @@ export class GatewayClient extends EventEmitter {
 
       this.pushLog(line)
       this.publish({ type: 'gateway.stderr', payload: { line } })
-      this.handleTransportExit(1, 'gateway websocket unavailable')
+      this.handleTransportExit(1, 'gateway websocket unavailable', 'websocket', false, 'unavailable')
 
       return
     }
@@ -594,10 +678,28 @@ export class GatewayClient extends EventEmitter {
           return
         }
 
-        this.lifecycle(`[lifecycle] websocket close code=${ev.code} clean=${ev.wasClean} ready=${this.ready}`)
+        const initiator = this.closeInitiator ?? 'remote_or_network'
+        this.closeInitiator = null
+
+        this.lifecycle(
+          `[lifecycle] websocket close code=${ev.code} clean=${ev.wasClean} ready=${this.ready} initiator=${initiator}`
+        )
+        const delaySummary = this.getLoopDelaySummary()
+        if (delaySummary) {
+          this.lifecycle(
+            `[lifecycle] event-loop delay max=${delaySummary.maxMs}ms p99=${delaySummary.p99Ms}ms mean=${delaySummary.meanMs}ms`
+          )
+        }
+        this.cleanupLoopDelayMonitor()
         this.ws = null
         this.wsConnectPromise = null
-        this.handleTransportExit(ev.code, `gateway websocket closed${ev.code ? ` (${ev.code})` : ''}`)
+        this.handleTransportExit(
+          ev.code,
+          `gateway websocket closed${ev.code ? ` (${ev.code})` : ''}`,
+          'websocket',
+          ev.wasClean,
+          initiator
+        )
       })
       ws.addEventListener('error', () => {
         const line = '[gateway] websocket transport error'
@@ -607,7 +709,7 @@ export class GatewayClient extends EventEmitter {
       })
     } catch (err) {
       this.pushLog(`[startup] failed to connect websocket gateway ${safeAttachUrl} (constructor error)`)
-      this.handleTransportExit(1, 'gateway websocket startup failed')
+      this.handleTransportExit(1, 'gateway websocket startup failed', 'websocket', false, 'client_error')
     }
   }
 
@@ -623,6 +725,7 @@ export class GatewayClient extends EventEmitter {
     this.sidecarUrl = sidecarUrl
     this.resetStartupState()
     this.clearReconnect()
+    this.initLoopDelayMonitor()
 
     if (this.proc && !this.proc.killed && this.proc.exitCode === null) {
       this.lifecycle(`[lifecycle] replacing live gateway child ${describeChild(this.proc)}`)
@@ -701,10 +804,10 @@ export class GatewayClient extends EventEmitter {
       }
 
       if (this.pendingExit !== undefined) {
-        const code = this.pendingExit
+        const { code, context } = this.pendingExit
 
         this.pendingExit = undefined
-        this.emit('exit', code)
+        this.emit('exit', code, context)
       }
     })
   }
@@ -770,7 +873,9 @@ export class GatewayClient extends EventEmitter {
 
   kill(reason = 'requested') {
     this.disposed = true
+    this.closeInitiator = 'client_kill'
     this.clearReconnect()
+    this.cleanupLoopDelayMonitor()
     const proc = this.proc
     const killed = proc?.kill()
 
