@@ -625,19 +625,22 @@ def _resume_locate(ctx: _Resume) -> dict | None:
         ctx.target = ctx.found["id"]
         return None
     # Runtime SID fallback: if ctx.target is an ephemeral runtime sid, translate to its backing session_key
+    canonical_key: str | None = None
     with _sessions_lock:
         live = _sessions.get(ctx.target)
         if live is not None and _live_profile_matches(live, ctx.profile_home):
-            canonical_key = str(live.get("session_key") or "")
-            if canonical_key and canonical_key != ctx.target:
-                ctx.target = canonical_key
-                ctx.found = ctx.db.get_session(ctx.target)
-                if ctx.found:
-                    return None
-                ctx.found = ctx.db.get_session_by_title(ctx.target)
-                if ctx.found:
-                    ctx.target = ctx.found["id"]
-                    return None
+            raw_key = str(live.get("session_key") or "")
+            if raw_key and raw_key != ctx.target:
+                canonical_key = raw_key
+    if canonical_key:
+        ctx.target = canonical_key
+        ctx.found = ctx.db.get_session(ctx.target)
+        if ctx.found:
+            return None
+        ctx.found = ctx.db.get_session_by_title(ctx.target)
+        if ctx.found:
+            ctx.target = ctx.found["id"]
+            return None
     if ctx.lazy and _child_run_active(ctx.target):
         # Fresh subagent watch window: `subagent.start` relays BEFORE the child's first DB flush. Proceed lazily
         # with empty history — the live mirror streams the turn and the row exists by upgrade time.
