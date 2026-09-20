@@ -1092,9 +1092,11 @@ describe('createGatewayEventHandler', () => {
     const ctx = buildCtx(appended)
 
     ctx.session.newSession = newSession
-    // Mimic resumeById's synchronous status write so the test proves the
-    // "recovering session…" label is applied *after* (and survives) it.
-    ctx.session.resumeById = resumeById.mockImplementation(() => patchUiState({ status: 'resuming…' }))
+    // In production, resumeById clears the recovery ref on successful completion.
+    ctx.session.resumeById = resumeById.mockImplementation(() => {
+      ctx.session.recoverSidRef.current = null
+      patchUiState({ status: 'resuming…' })
+    })
     ctx.session.STARTUP_RESUME_ID = ''
     ctx.session.recoverSidRef = ref<null | string>('sess-crashed')
 
@@ -1104,9 +1106,32 @@ describe('createGatewayEventHandler', () => {
 
     await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('sess-crashed'))
     expect(newSession).not.toHaveBeenCalled()
-    // One-shot: the ref is consumed so a later ordinary restart forges/resumes
-    // per config instead of re-resuming the recovered session.
     expect(ctx.session.recoverSidRef.current).toBeNull()
+    expect(getUiState().status).toBe('recovering session…')
+  })
+
+  it('on gateway.ready, prefers recoverSessionKeyRef and does not clear ref before resumeById succeeds', async () => {
+    const appended: Msg[] = []
+    const newSession = vi.fn()
+    const resumeById = vi.fn()
+    const ctx = buildCtx(appended)
+
+    ctx.session.newSession = newSession
+    ctx.session.STARTUP_RESUME_ID = ''
+    const keyRef = ref<null | string>('durable-key-abc')
+    ;(ctx.session as any).recoverSessionKeyRef = keyRef
+
+    // Mock resumeById that does NOT clear the ref yet (simulating in-flight or failure)
+    ctx.session.resumeById = resumeById.mockImplementation(() => {
+      patchUiState({ status: 'resuming…' })
+    })
+
+    const onEvent = createGatewayEventHandler(ctx)
+    onEvent({ payload: {}, type: 'gateway.ready' } as any)
+
+    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('durable-key-abc'))
+    // Ref is NOT destroyed prematurely by createGatewayEventHandler
+    expect(keyRef.current).toBe('durable-key-abc')
     expect(getUiState().status).toBe('recovering session…')
   })
 

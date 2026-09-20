@@ -1172,10 +1172,19 @@ if _UvicornWebSocketProtocol is not None:
     class HermesWebSocketProtocol(_UvicornWebSocketProtocol):
         """Narrow supported subclass of Uvicorn's WebSocketProtocol.
 
-        Captures keepalive ping timeouts and protocol failure reasons at WARNING level
-        without enabling global websocket DEBUG logging (which could leak payloads/credentials)
-        or monkeypatching globals. Completely content-free: logs only code and reason.
+        1. Disables keepalive ping/pong for internal loopback connections (Node <-> FastAPI),
+           preventing false disconnections when heavy terminal rendering delays Node's event loop.
+        2. Preserves configured keepalive pings for remote clients (e.g. LAN, tunnels).
+        3. Captures keepalive ping timeouts and protocol failure reasons at WARNING level
+           without enabling global websocket DEBUG logging or leaking credentials.
         """
+        def connection_made(self, transport: Any) -> None:
+            super().connection_made(transport)
+            client_host = self.client[0] if self.client else ""
+            if client_host in {"127.0.0.1", "::1", "localhost"}:
+                self.ping_interval = None
+                self.ping_timeout = None
+
         def fail_connection(self, code: int = 1006, reason: str = "") -> None:
             safe_reason = reason if reason in _ALLOWED_WS_FAIL_REASONS else ""
             if safe_reason:
