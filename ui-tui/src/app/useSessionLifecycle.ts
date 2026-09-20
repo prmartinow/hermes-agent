@@ -519,7 +519,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             const info = r.info ?? null
             const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
 
-            if (!isTransportRecovery || !r.messages) {
+            if (!isTransportRecovery) {
               resetSession()
               setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
@@ -577,7 +577,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             const delay = isSettling ? 1000 : Math.min(2000, 250 * Math.pow(2, retryAttempt))
             setTimeout(() => {
               if (replayGeneration.current === generation) {
-                resumeById(id, targetRecoveryRef, retryAttempt + 1)
+                resumeById(id, targetRecoveryRef, retryAttempt + 1, options)
               }
             }, delay)
             return
@@ -586,7 +586,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         if (failure.kind === 'identity') {
           const fileFallback = readActiveSessionFile()
           if (fileFallback && fileFallback !== id) {
-            return resumeById(fileFallback, targetRecoveryRef)
+            return resumeById(fileFallback, targetRecoveryRef, 0, { mode: 'cold-resume' })
           }
         }
         if (failure.kind === 'transport') {

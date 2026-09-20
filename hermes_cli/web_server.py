@@ -142,6 +142,18 @@ async def _lifespan(app: "FastAPI"):
     try:
         import glob, shutil
         for stale_d in glob.glob(os.path.join(tempfile.gettempdir(), "hermes-pty-active-*")):
+            try:
+                raw_pid = stale_d.rsplit("-", 1)[-1]
+                owner_pid = int(raw_pid)
+                if owner_pid == os.getpid():
+                    continue
+                try:
+                    os.kill(owner_pid, 0)
+                    continue  # Process is alive, do not delete
+                except (OSError, ProcessLookupError):
+                    pass  # Process is dead, safe to clean up
+            except (ValueError, IndexError):
+                pass
             shutil.rmtree(stale_d, ignore_errors=True)
     except Exception:
         pass
