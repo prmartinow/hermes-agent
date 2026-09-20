@@ -454,12 +454,22 @@ def _default_pty_spawn():
     return PtyBridge.spawn(argv, cwd=cwd, env=env)
 
 
+def _get_pty_active_dir(app: "FastAPI") -> Path:
+    d = getattr(app.state, "_pty_active_dir", None)
+    if d is None:
+        d = Path(tempfile.gettempdir()) / f"hermes-pty-active-{os.getpid()}"
+        d.mkdir(parents=True, exist_ok=True)
+        app.state._pty_active_dir = d
+    return d
+
+
 def _active_session_file_for_pty(app: "FastAPI", pty_key: str) -> Path:
     """Return the per-PTY file where a dashboard TUI writes its active sid."""
     from hermes_cli.web_server import _get_pty_active_session_files
     files = _get_pty_active_session_files(app)
     if files.get(pty_key) is None:
-        fd, raw_path = tempfile.mkstemp(prefix="hermes-pty-active-", suffix=".json")
+        d = _get_pty_active_dir(app)
+        fd, raw_path = tempfile.mkstemp(dir=str(d), prefix="pty-", suffix=".json")
         os.close(fd)
         files[pty_key] = Path(raw_path)
     return files[pty_key]

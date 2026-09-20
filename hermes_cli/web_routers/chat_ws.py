@@ -471,9 +471,10 @@ async def pty_ws(ws: WebSocket) -> None:
     force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {"1", "true", "yes", "on"}
     active_session_file: Optional[Path] = None
 
-    pty_key = _effective_pty_key(raw_attach, profile, raw_resume) or channel
-    if pty_key:
-        active_session_file = _active_session_file_for_pty(ws.app, pty_key)
+    canonical_pty_key = _effective_pty_key(raw_attach, profile, raw_resume)
+    pty_file_key = canonical_pty_key or channel
+    if pty_file_key:
+        active_session_file = _active_session_file_for_pty(ws.app, pty_file_key)
         if force_fresh:
             resume = None
             try:
@@ -503,7 +504,8 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # Use consistent canonical pty_key computed from logical target and device attach token
-    attach_token = pty_key
+    # If neither attach nor resume was requested, attach_token remains None for the legacy 1:1 path.
+    attach_token = canonical_pty_key
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env)

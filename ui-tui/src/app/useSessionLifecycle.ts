@@ -458,7 +458,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   }, [rpc, setHistoryItems, viewportMeta])
 
   const resumeById = useCallback(
-    (id: string, targetRecoveryRef?: { current: string | null }, retryAttempt = 0) => {
+    (
+      id: string,
+      targetRecoveryRef?: { current: string | null },
+      retryAttempt = 0,
+      options?: { mode?: "transport-recovery" | "cold-resume" }
+    ) => {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
       const generation = INLINE_MODE && DASHBOARD_TUI_MODE ? randomUUID() : null
@@ -490,7 +495,13 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
         const previousSid = getUiState().sid
 
-        return gw.request<SessionResumeResult & { viewport?: SessionViewportMeta }>('session.resume', { cols: colsRef.current, session_id: id })
+        const isTransportRecovery = options?.mode === 'transport-recovery'
+        const resumeParams: Record<string, unknown> = { cols: colsRef.current, session_id: id }
+        if (isTransportRecovery) {
+          resumeParams.omit_messages = true
+        }
+
+        return gw.request<SessionResumeResult & { viewport?: SessionViewportMeta }>('session.resume', resumeParams)
           .then(raw => {
             if (replayGeneration.current !== generation) return
             const r = asRpcResult<SessionResumeResult & { viewport?: SessionViewportMeta }>(raw)
@@ -508,14 +519,25 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             const info = r.info ?? null
             const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
 
-            resetSession()
-            setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
+            if (!isTransportRecovery || !r.messages) {
+              resetSession()
+              setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
-            const transcriptMsgs = toTranscriptMessages(r.messages)
-            const resumed = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
+              const transcriptMsgs = toTranscriptMessages(r.messages ?? [])
+              const resumed = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
 
-            setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
-            setViewportMeta(r.viewport ?? null)
+              setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
+              setViewportMeta(r.viewport ?? null)
+            } else {
+              // Transport recovery fast path: historyItems are already preserved!
+              // Hydrate any newly arrived inflight state
+              if (r.inflight) {
+                setHistoryItems(prev => {
+                  const inflightMsgs = liveSessionInflightMessages(r.inflight, prev)
+                  return inflightMsgs.length > 0 ? [...prev, ...inflightMsgs] : prev
+                })
+              }
+            }
             const durableKey = (r as any).resumed ?? (r as any).session_key ?? (r as any).stored_session_id ?? r.session_id
             writeActiveSessionFile(durableKey)
             patchUiState({
