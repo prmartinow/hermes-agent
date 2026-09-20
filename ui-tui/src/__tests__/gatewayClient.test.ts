@@ -101,9 +101,9 @@ import {
   GatewayClient,
   RECONNECT_BASE_MS,
   RECONNECT_MAX_MS,
+  redactUrl,
   WS_HEARTBEAT_DEAD_MS,
-  WS_HEARTBEAT_INTERVAL_MS,
-  redactUrl
+  WS_HEARTBEAT_INTERVAL_MS
 } from '../gatewayClient.js'
 
 describe('GatewayClient websocket attach mode', () => {
@@ -146,6 +146,7 @@ describe('GatewayClient websocket attach mode', () => {
     const gw = new GatewayClient()
     const events: string[] = []
     gw.on('event', ev => events.push(ev.type + ':' + (ev.payload?.text ?? '')))
+
     try {
       gw.start(); const oldSocket = FakeWebSocket.instances[0]!; oldSocket.open()
       gw.drain(); await Promise.resolve()
@@ -767,5 +768,244 @@ describe('GatewayClient websocket attach mode', () => {
     await vi.advanceTimersByTimeAsync(WS_HEARTBEAT_DEAD_MS + RECONNECT_MAX_MS + 1000)
     expect(FakeWebSocket.instances.length).toBe(1) // no reconnect attempted
     vi.useRealTimers()
+  })
+
+  describe('lifecycle recovery and consumer readiness', () => {
+    it('delivers ready, session completion, and server request exactly once after reconnect without remount', async () => {
+      process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+      delete process.env.HERMES_TUI_SIDECAR_URL
+      const gw = new GatewayClient()
+
+      const events: string[] = []
+      const requests: string[] = []
+      const exits: number[] = []
+
+      // 1. Register listeners on mount
+      gw.on('event', ev => events.push(ev.type))
+      gw.on('request', req => {
+        requests.push(req.method)
+        req.respond({ ok: true })
+      })
+      gw.on('exit', code => exits.push(code ?? -1))
+
+      // 2. Drain on mount
+      gw.drain()
+      await Promise.resolve()
+
+      try {
+        // 3. First transport connects and sends ready
+        gw.start()
+        const socket1 = FakeWebSocket.instances[0]!
+        socket1.open()
+        socket1.message(
+          JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { type: 'gateway.ready', payload: {} } })
+        )
+        await vi.waitFor(() => expect(events).toEqual(['gateway.ready']))
+
+        // 4. Transport disconnects
+        socket1.close(1006, false, 'abnormal drop')
+        expect(exits).toEqual([1006])
+
+        // 5. Reconnect WITHOUT remount (no new listeners, no gw.drain() call)
+        gw.start()
+        const socket2 = FakeWebSocket.instances.at(-1)!
+        expect(socket2).not.toBe(socket1)
+        socket2.open()
+
+        // 6. Second transport sends ready, session completion, and a server request
+        socket2.message(
+          JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { type: 'gateway.ready', payload: {} } })
+        )
+        socket2.message(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'event',
+            params: { type: 'session.complete', payload: { session_id: 's1' } }
+          })
+        )
+        socket2.message(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 'srq-42',
+            method: 'approval',
+            params: { command: 'echo recovery' }
+          })
+        )
+
+        // 7. Ensure delivered to consumer exactly once (not lost or indefinitely buffered)
+        await vi.waitFor(() => expect(events).toEqual(['gateway.ready', 'gateway.reconnecting', 'gateway.ready', 'session.complete']))
+        expect(requests).toEqual(['approval'])
+      } finally {
+        gw.kill()
+      }
+    })
+
+    it('handles synchronous listener-triggered gw.start on exit and scheduled reconnect without duplicate or indefinite buffering', async () => {
+      vi.useFakeTimers()
+      process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+      const gw = new GatewayClient()
+
+      const events: string[] = []
+      let exitCount = 0
+      let autoRestartOnExit = true
+
+      gw.on('event', ev => events.push(ev.type))
+      gw.on('exit', () => {
+        exitCount += 1
+
+        if (autoRestartOnExit) {
+          gw.start()
+        }
+      })
+      gw.drain()
+      await Promise.resolve()
+
+      try {
+        gw.start()
+        const s1 = FakeWebSocket.instances[0]!
+        s1.open()
+        s1.message(
+          JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { type: 'gateway.ready', payload: {} } })
+        )
+        expect(events).toEqual(['gateway.ready'])
+
+        // Synchronous start() triggered on exit
+        s1.close(1011)
+        expect(exitCount).toBe(1)
+        expect(FakeWebSocket.instances).toHaveLength(2)
+
+        // Scheduled reconnect timer must be cancelled by the synchronous start()
+        await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS)
+        expect(FakeWebSocket.instances).toHaveLength(2)
+
+        const s2 = FakeWebSocket.instances[1]!
+        s2.open()
+        s2.message(
+          JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { type: 'gateway.ready', payload: {} } })
+        )
+        expect(events).toEqual(['gateway.ready', 'gateway.reconnecting', 'gateway.ready'])
+
+        // Second disconnect: test scheduled reconnect path
+        autoRestartOnExit = false
+        s2.close(1006)
+        expect(exitCount).toBe(2)
+        expect(FakeWebSocket.instances).toHaveLength(2)
+
+        // Advance timer to trigger scheduled reconnect
+        await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS)
+        expect(FakeWebSocket.instances).toHaveLength(3)
+
+        const s3 = FakeWebSocket.instances[2]!
+        s3.open()
+        s3.message(
+          JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { type: 'gateway.ready', payload: {} } })
+        )
+        s3.message(
+          JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { type: 'message.delta', payload: { text: 'ok' } } })
+        )
+        expect(events).toEqual(['gateway.ready', 'gateway.reconnecting', 'gateway.ready', 'gateway.reconnecting', 'gateway.ready', 'message.delta'])
+      } finally {
+        gw.kill()
+        vi.useRealTimers()
+      }
+    })
+
+    it('excludes stale previous transport events while delivering fresh ones without remount drain', async () => {
+      process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+      const gw = new GatewayClient()
+      const deltas: string[] = []
+
+      gw.on('event', ev => {
+        if (ev.type === 'message.delta') {
+          deltas.push((ev.payload as { text?: string })?.text ?? '')
+        }
+      })
+      gw.drain()
+      await Promise.resolve()
+
+      try {
+        gw.start()
+        const s1 = FakeWebSocket.instances[0]!
+        s1.open()
+
+        gw.start()
+        const s2 = FakeWebSocket.instances.at(-1)!
+        expect(s2).not.toBe(s1)
+        s2.open()
+
+        // Old socket emits stale frame after replacement
+        s1.message(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'event',
+            params: { type: 'message.delta', payload: { text: 'stale-old' } }
+          })
+        )
+        // New socket emits fresh frame
+        s2.message(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'event',
+            params: { type: 'message.delta', payload: { text: 'fresh-new' } }
+          })
+        )
+
+        await vi.waitFor(() => expect(deltas).toEqual(['fresh-new']))
+      } finally {
+        gw.kill()
+      }
+    })
+
+    it('preserves initial startup prelistener buffering and pending exit before mount drain', async () => {
+      process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'
+      const gw = new GatewayClient()
+
+      // Start before any listeners or drain
+      gw.start()
+      const s1 = FakeWebSocket.instances[0]!
+      s1.open()
+
+      // Send events and request before listener attached
+      s1.message(
+        JSON.stringify({ jsonrpc: '2.0', method: 'event', params: { type: 'gateway.ready', payload: {} } })
+      )
+      s1.message(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 'srq-init',
+          method: 'clarify',
+          params: { query: 'pre-mount question' }
+        })
+      )
+      // Socket drops before listeners attached -> pendingExit recorded
+      s1.close(1006, false, 'early drop')
+
+      const events: string[] = []
+      const requests: string[] = []
+      const exits: number[] = []
+
+      // Now consumer mounts: attaches listeners and calls drain
+      gw.on('event', ev => events.push(ev.type))
+      gw.on('request', req => {
+        requests.push(req.method)
+        req.respond({ ok: true })
+      })
+      gw.on('exit', code => exits.push(code ?? -1))
+
+      // Nothing delivered before drain's microtask
+      expect(events).toEqual([])
+      expect(requests).toEqual([])
+      expect(exits).toEqual([])
+
+      gw.drain()
+      await Promise.resolve()
+
+      // Delivered in FIFO order upon mount drain
+      expect(events).toEqual(['gateway.ready', 'gateway.reconnecting'])
+      expect(requests).toEqual(['clarify'])
+      expect(exits).toEqual([1006])
+
+      gw.kill()
+    })
   })
 })
