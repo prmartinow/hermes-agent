@@ -473,7 +473,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       }
 
       const abortReplay = () => {
-        if (generation && replayBegun && replayGeneration.current === generation) {
+        if (generation && replayGeneration.current === generation) {
           process.stdout.write(`\x1b]777;hermes-replay;abort;${generation}\x07`)
         }
       }
@@ -549,8 +549,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         if (replayGeneration.current !== generation) return
         const failure = classifyResumeFailure(e)
         if (failure.kind === 'retry-same') {
-          if (retryAttempt < 3) {
-            const delay = Math.min(1000, 250 * Math.pow(2, retryAttempt))
+          const isSettling = failure.reason === 'disconnect_interrupt_settling'
+          const maxRetries = isSettling ? 15 : 4
+          if (retryAttempt < maxRetries) {
+            const delay = isSettling ? 1000 : Math.min(2000, 250 * Math.pow(2, retryAttempt))
             setTimeout(() => {
               if (replayGeneration.current === generation) {
                 resumeById(id, targetRecoveryRef, retryAttempt + 1)

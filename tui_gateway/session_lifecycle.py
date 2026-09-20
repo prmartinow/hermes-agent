@@ -494,7 +494,7 @@ def _reattach_refusal(rid, sid: str, session: dict) -> dict | None:
     if _sessions.get(sid) is not session:
         return _err(rid, 4007, "session no longer live; retry resume", {"reason": "runtime_replaced", "retryable": True})
     if session.get("_client_gone_interrupt_requested"):
-        return _err(rid, 4009, "session disconnect interrupt settling", {"reason": "disconnect_interrupt_settling", "retryable": True})
+        return _err(rid, 4009, "session disconnect interrupt settling", {"reason": "disconnect_interrupt_settling", "retryable": True, "retry_after_ms": 1000})
     return None
 
 
