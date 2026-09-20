@@ -445,7 +445,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     recoverSessionKeyRef?: { current: string | null }
     recoverSidRef?: { current: string | null }
     resetSession: () => void
-    resumeById: (id: string, targetRecoveryRef?: { current: string | null }) => void
+    resumeById: (id: string, targetRecoveryRef?: { current: string | null }, retryAttempt?: number, options?: { mode?: "transport-recovery" | "cold-resume" }) => void
     setCatalog: (catalog: any) => void
   }
   const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = sessionCtx
@@ -739,7 +739,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     const recoverKey = recoverSessionKeyRef?.current
 
     if (recoverKey) {
-      resumeById(recoverKey)
+      resumeById(recoverKey, undefined, 0, { mode: "transport-recovery" })
       // After resumeById: it synchronously sets status to 'resuming…' on entry,
       // so override it here to keep the distinct "recovering" label visible for
       // the duration of the resume RPC (which later flips status to 'ready').
