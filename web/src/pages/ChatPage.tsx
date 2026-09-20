@@ -102,12 +102,14 @@ import { errorMessage } from "@/lib/api-error";
 // instead of spawning a fresh one. Per-localStorage, so other devices can't grab it.
 // ``rotate`` mints a new token — used when the user explicitly starts a fresh
 // session so the old keep-alive PTY is NOT reattached (the registry reaps it).
-const PTY_ATTACH_TOKEN_KEY = "hermes.pty.token.chat";
+// Per-tab keep-alive PTY token in sessionStorage, isolating independent browser tabs
+// while surviving refreshes within the same tab.
+const PTY_ATTACH_TOKEN_KEY = "hermes.pty.token.chat.v2";
 function ptyAttachToken(rotate = false): string {
   let t = "";
   if (!rotate) {
     try {
-      t = window.localStorage.getItem(PTY_ATTACH_TOKEN_KEY) ?? "";
+      t = window.sessionStorage.getItem(PTY_ATTACH_TOKEN_KEY) ?? "";
     } catch {
       /* private mode / storage blocked */
     }
@@ -117,7 +119,7 @@ function ptyAttachToken(rotate = false): string {
     crypto.getRandomValues(a);
     t = Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
     try {
-      window.localStorage.setItem(PTY_ATTACH_TOKEN_KEY, t);
+      window.sessionStorage.setItem(PTY_ATTACH_TOKEN_KEY, t);
     } catch {
       /* ignore */
     }

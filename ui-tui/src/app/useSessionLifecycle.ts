@@ -26,6 +26,7 @@ import type { Msg, PanelSection, SessionInfo } from '../types.js'
 
 import type { ComposerActions, GatewayRpc, StateSetter } from './interfaces.js'
 import { activeRecoveryTargetRef } from './gatewayRecovery.js'
+import { classifyResumeFailure } from './sessionRecovery.js'
 import { patchOverlayState } from './overlayStore.js'
 import { scheduleResumeScrollToBottom } from './sessionResumeView.js'
 import { turnController } from './turnController.js'
@@ -533,14 +534,22 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               void closeSession(previousSid)
             }
           })
-      }).catch((e: Error) => {
+      }).catch((e: unknown) => {
         if (replayGeneration.current !== generation) return
-        const fileFallback = readActiveSessionFile()
-        if (fileFallback && fileFallback !== id) {
-          return resumeById(fileFallback, targetRecoveryRef)
+        const failure = classifyResumeFailure(e)
+        if (failure.kind === 'identity') {
+          const fileFallback = readActiveSessionFile()
+          if (fileFallback && fileFallback !== id) {
+            return resumeById(fileFallback, targetRecoveryRef)
+          }
+        }
+        if (failure.kind === 'transport') {
+          // Keep recovery target intact across transient transport disconnects
+          patchUiState({ status: 'disconnected' })
+          return
         }
         abortReplay()
-        sys(`error: ${e.message}`)
+        sys(`error: ${e instanceof Error ? e.message : String(e)}`)
         patchUiState({ status: 'ready' })
       })
     },

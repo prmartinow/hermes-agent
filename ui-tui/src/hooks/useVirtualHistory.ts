@@ -680,12 +680,14 @@ export function useVirtualHistory(
     }
   }, [effEnd, effStart, items, liveTailActive, measuredHeightVersion, n, offsets, scrollRef, sticky, top, total, vp])
 
+  const inlineStart = Math.max(0, n - maxMounted)
+
   return {
     bottomSpacer: isInline ? 0 : Math.max(0, total - (offsets[effEnd] ?? total)),
     end: isInline ? n : effEnd,
     measureRef,
     offsets,
-    start: isInline ? 0 : effStart,
+    start: isInline ? inlineStart : effStart,
     topSpacer: isInline ? 0 : (offsets[effStart] ?? 0)
   }
 }

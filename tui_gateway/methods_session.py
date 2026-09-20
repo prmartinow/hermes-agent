@@ -651,7 +651,7 @@ def _resume_locate(ctx: _Resume) -> dict | None:
         return _resume_live_unpersisted(ctx, live_sid, live)
     if ctx.owns_db:
         _resume_adopt_stranded(ctx)
-    return None if ctx.found else _err(ctx.rid, 4007, "session not found")
+    return None if ctx.found else _err(ctx.rid, 4007, "session not found", {"reason": "session_not_found", "identity": True})
 
 
 def _resume_follow_tip(ctx: _Resume) -> None:
