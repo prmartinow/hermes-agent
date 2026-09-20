@@ -486,4 +486,106 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
     client.retireSession("s1")
     expect(client.getSeqWatermarks()).toEqual({ s2: 25 })
   })
+
+  it("detects missing tail when accepted watermark is less than latest_seq", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+
+    client.start()
+    const ws1 = await server.waitForNextConnection()
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
+
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 10, payload: {} } }))
+    await vi.waitFor(() => expect(client?.getSeqWatermarks()).toEqual({ s1: 10 }))
+
+    ws1.terminate()
+
+    const ws2 = await server.waitForNextConnection()
+    ws2.on("message", raw => {
+      const data = JSON.parse(raw.toString())
+      if (data.method === "session.events.since") {
+        // Returns event 11, but claims latest_seq is 12! (Missing 12 at tail)
+        ws2.send(JSON.stringify({
+          jsonrpc: "2.0",
+          id: data.id,
+          result: {
+            epoch: "epoch-1",
+            events: [{ type: "session.event", session_id: "s1", seq: 11, payload: {} }],
+            latest_seq: 12,
+            truncated: false
+          }
+        }))
+      }
+    })
+    ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+
+    await vi.waitFor(() => {
+      const gap = received.find(e => e.type === "gateway.replay_gap")
+      expect(gap).toBeDefined()
+      expect((gap as any).payload.reason).toBe("continuity-gap")
+      expect((gap as any).payload.session_id).toBe("s1")
+      expect((gap as any).payload.last_seen).toBe(11)
+      expect((gap as any).payload.latest_seq).toBe(12)
+    })
+  })
+
+  it("coalesces multiple holes and delivers gateway.replay_gap before gateway.ready without mid-replay ready", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+
+    client.start()
+    const ws1 = await server.waitForNextConnection()
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
+
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 10, payload: {} } }))
+    await vi.waitFor(() => expect(client?.getSeqWatermarks()).toEqual({ s1: 10 }))
+
+    ws1.terminate()
+
+    const ws2 = await server.waitForNextConnection()
+    ws2.on("message", raw => {
+      const data = JSON.parse(raw.toString())
+      if (data.method === "session.events.since") {
+        // Skips 12 and 14! (11, 13, 15)
+        ws2.send(JSON.stringify({
+          jsonrpc: "2.0",
+          id: data.id,
+          result: {
+            epoch: "epoch-1",
+            events: [
+              { type: "session.event", session_id: "s1", seq: 11, payload: {} },
+              { type: "session.event", session_id: "s1", seq: 13, payload: {} },
+              { type: "session.event", session_id: "s1", seq: 15, payload: {} }
+            ],
+            latest_seq: 15,
+            truncated: false
+          }
+        }))
+      }
+    })
+    ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+
+    await vi.waitFor(() => {
+      expect(received.some(e => e.type === "gateway.replay_gap")).toBe(true)
+    })
+
+    const gaps = received.filter(e => e.type === "gateway.replay_gap")
+    const readyEvents = received.filter(e => e.type === "gateway.ready")
+
+    // Verify exactly one coalesced gap per session
+    expect(gaps.length).toBe(1)
+    expect((gaps[0] as any).payload.reason).toBe("continuity-gap")
+    // Second ready occurs AFTER the gap event
+    const gapIdx = received.indexOf(gaps[0]!)
+    const secondReadyIdx = received.lastIndexOf(readyEvents[readyEvents.length - 1]!)
+    expect(secondReadyIdx).toBeGreaterThan(gapIdx)
+  })
 })

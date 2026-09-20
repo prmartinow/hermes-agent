@@ -445,7 +445,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     recoverSessionKeyRef?: { current: string | null }
     recoverSidRef?: { current: string | null }
     resetSession: () => void
-    resumeById: (id: string, targetRecoveryRef?: { current: string | null }, retryAttempt?: number, options?: { mode?: "transport-recovery" | "cold-resume" }) => void
+    resumeById: (id: string, targetRecoveryRef?: { current: string | null }, retryAttempt?: number, options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume" }) => void
     setCatalog: (catalog: any) => void
   }
   const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = sessionCtx
@@ -453,6 +453,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   if (recoverSessionKeyRef) {
     setActiveRecoveryTargetRef(recoverSessionKeyRef)
   }
+  const pendingReplayGapRef = { current: null as null | import('@hermes/shared/gateway-events').ClientLocalGatewayEventMap['gateway.replay_gap'] }
   const { bellOnComplete, bellOnPrompt, stdout, sys } = ctx.system
 
   // display.bell_on_prompt — BEL whenever a blocking prompt modal opens
@@ -739,7 +740,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     const recoverKey = recoverSessionKeyRef?.current
 
     if (recoverKey) {
-      resumeById(recoverKey, undefined, 0, { mode: "transport-recovery" })
+      const pendingGap = pendingReplayGapRef.current
+      pendingReplayGapRef.current = null
+      const recoveryMode = pendingGap ? 'transport-gap-recovery' : 'transport-recovery'
+      resumeById(recoverKey, undefined, 0, { mode: recoveryMode, gapReason: pendingGap?.reason })
       // After resumeById: it synchronously sets status to 'resuming…' on entry,
       // so override it here to keep the distinct "recovering" label visible for
       // the duration of the resume RPC (which later flips status to 'ready').
@@ -1051,12 +1055,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
       case 'gateway.replay_gap': {
         const gap = ev.payload
-        sys(`[gateway] sequence replay gap (${gap?.reason ?? 'unknown'}) - reconciling session state`)
-        const currentSid = getUiState().sid
-        const currentKey = getUiState().sessionKey
-        if (currentKey && (!gap?.session_id || gap.session_id === currentSid)) {
-          resumeById(currentKey, undefined, 0, { mode: 'transport-recovery' })
-        }
+        sys(`[gateway] sequence replay gap (${gap?.reason ?? 'unknown'}) - scheduled for reconciliation`)
+        pendingReplayGapRef.current = gap ?? { reason: 'continuity-gap' }
 
         return
       }
