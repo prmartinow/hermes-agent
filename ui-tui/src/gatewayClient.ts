@@ -2,7 +2,7 @@ import { type ChildProcess, spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
 import { delimiter, resolve } from 'node:path'
-import { monitorEventLoopDelay, type IntervalHistogram } from 'node:perf_hooks'
+import { type IntervalHistogram, monitorEventLoopDelay } from 'node:perf_hooks'
 import { createInterface } from 'node:readline'
 
 import type { GatewayEvent } from '@hermes/shared/gateway-events'
@@ -166,6 +166,7 @@ export class GatewayClient extends EventEmitter {
   private pendingExit: { code: null | number; context: GatewayExitContext } | undefined
   private ready = false
   private readyTimer: ReturnType<typeof setTimeout> | null = null
+  private consumerReady = false
   private subscribed = false
   private drainGeneration = 0
   private stdoutRl: ReturnType<typeof createInterface> | null = null
@@ -221,6 +222,7 @@ export class GatewayClient extends EventEmitter {
 
   private initLoopDelayMonitor() {
     this.cleanupLoopDelayMonitor()
+
     try {
       this.loopDelayMonitor = monitorEventLoopDelay({ resolution: 20 })
       this.loopDelayMonitor.enable()
@@ -236,6 +238,7 @@ export class GatewayClient extends EventEmitter {
       } catch {
         // best effort
       }
+
       this.loopDelayMonitor = null
     }
   }
@@ -357,13 +360,24 @@ export class GatewayClient extends EventEmitter {
     this.cleanupLoopDelayMonitor()
     this.channel.detach(new Error('gateway restarting'))
     this.ready = false
-    this.subscribed = false
+
     // Invalidate any pending deferred drain() flush from a prior transport so
     // its queued microtask becomes a no-op (it captured the old generation).
+    // Always discard per-transport buffers on reset so stale frames are never replayed.
     this.drainGeneration += 1
     this.bufferedEvents.clear()
     this.bufferedRequests = []
     this.pendingExit = undefined
+
+    if (!this.consumerReady) {
+      this.subscribed = false
+    } else if (!this.subscribed) {
+      // Readiness intent was recorded (drain called), but the deferred
+      // microtask from the old generation was invalidated. Re-arm a new-generation
+      // deferred drain so fresh frames are delivered once React commits.
+      this.scheduleDeferredDrain()
+    }
+
     this.stdoutRl?.close()
     this.stderrRl?.close()
     this.stdoutRl = null
@@ -664,7 +678,7 @@ export class GatewayClient extends EventEmitter {
       ws.addEventListener('message', ev => {
         // Old sockets can still have queued events after replacement. Never
         // deliver their ready/delta notifications into the new connection.
-        if (this.ws === ws) this.handleWebSocketFrame(ev.data)
+        if (this.ws === ws) {this.handleWebSocketFrame(ev.data)}
       })
       ws.addEventListener('close', ev => {
         // Skip close events from sockets that have already been
@@ -685,11 +699,13 @@ export class GatewayClient extends EventEmitter {
           `[lifecycle] websocket close code=${ev.code} clean=${ev.wasClean} ready=${this.ready} initiator=${initiator}`
         )
         const delaySummary = this.getLoopDelaySummary()
+
         if (delaySummary) {
           this.lifecycle(
             `[lifecycle] event-loop delay max=${delaySummary.maxMs}ms p99=${delaySummary.p99Ms}ms mean=${delaySummary.meanMs}ms`
           )
         }
+
         this.cleanupLoopDelayMonitor()
         this.ws = null
         this.wsConnectPromise = null
@@ -762,31 +778,14 @@ export class GatewayClient extends EventEmitter {
     recordParentLifecycle(line)
   }
 
-  drain() {
-    // Defer the buffered-event replay to the next microtask, and DO NOT flip
-    // `subscribed` until that microtask runs.
-    //
-    // `drain()` is called from the consumer's mount-time subscribe effect
-    // (ui-tui/src/app/useMainApp.ts). In *attach* mode the gateway is already
-    // running, so it replays `gateway.ready` / `session.info` the instant the
-    // socket connects — those land in `bufferedEvents` *before* the consumer
-    // subscribes. If we emitted them synchronously here, the `gateway.ready`
-    // handler's `patchUiState` / `setHistoryItems` cascade would run while
-    // React is still inside the first commit, tripping "Too many re-renders"
-    // (Minified React error #301) — issue #36658. Spawn/inline/sidecar modes
-    // don't hit this because `gateway.ready` only arrives after the Python
-    // child boots, i.e. on a later async tick.
-    //
-    // Crucially, `subscribed` stays false until the flush so any LIVE event
-    // arriving in the gap between here and the microtask keeps buffering
-    // (publish() pushes when !subscribed) instead of emitting synchronously
-    // and jumping ahead of the chronologically-earlier replayed events. The
-    // flush re-drains the buffer right after flipping `subscribed`, so any
-    // in-window arrivals are delivered in FIFO order. A generation token makes
-    // the queued microtask a no-op if the transport was reset/killed meanwhile.
+  private scheduleDeferredDrain() {
     const generation = this.drainGeneration
 
     queueMicrotask(() => {
+      if (this.disposed) {
+        return
+      }
+
       if (this.drainGeneration !== generation) {
         return
       }
@@ -810,6 +809,37 @@ export class GatewayClient extends EventEmitter {
         this.emit('exit', code, context)
       }
     })
+  }
+
+  drain() {
+    this.consumerReady = true
+
+    if (this.subscribed) {
+      return
+    }
+
+    // Defer the buffered-event replay to the next microtask, and DO NOT flip
+    // `subscribed` until that microtask runs.
+    //
+    // `drain()` is called from the consumer's mount-time subscribe effect
+    // (ui-tui/src/app/useMainApp.ts). In *attach* mode the gateway is already
+    // running, so it replays `gateway.ready` / `session.info` the instant the
+    // socket connects — those land in `bufferedEvents` *before* the consumer
+    // subscribes. If we emitted them synchronously here, the `gateway.ready`
+    // handler's `patchUiState` / `setHistoryItems` cascade would run while
+    // React is still inside the first commit, tripping "Too many re-renders"
+    // (Minified React error #301) — issue #36658. Spawn/inline/sidecar modes
+    // don't hit this because `gateway.ready` only arrives after the Python
+    // child boots, i.e. on a later async tick.
+    //
+    // Crucially, `subscribed` stays false until the flush so any LIVE event
+    // arriving in the gap between here and the microtask keeps buffering
+    // (publish() pushes when !subscribed) instead of emitting synchronously
+    // and jumping ahead of the chronologically-earlier replayed events. The
+    // flush re-drains the buffer right after flipping `subscribed`, so any
+    // in-window arrivals are delivered in FIFO order. A generation token makes
+    // the queued microtask a no-op if the transport was reset/killed meanwhile.
+    this.scheduleDeferredDrain()
   }
 
   getLogTail(limit = 20): string {
