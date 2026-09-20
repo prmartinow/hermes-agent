@@ -383,8 +383,8 @@ describe('sessionKey tracking in useSessionLifecycle', () => {
 
     lifecycle!.resumeById('durable-target-persist')
 
-    await vi.waitFor(() => expect(getUiState().status).toBe('ready'))
-    // Target is NOT destroyed on failure
+    // On transport/network failure, status becomes 'disconnected' and recovery key is preserved
+    await vi.waitFor(() => expect(getUiState().status).toBe('disconnected'))
     expect(recoverSessionKeyRef.current).toBe('durable-target-persist')
   })
 
