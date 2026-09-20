@@ -141,20 +141,30 @@ async def _lifespan(app: "FastAPI"):
     app.state.pty_active_session_files = {}  # dict[str, Path]
     try:
         import glob, shutil
-        for stale_d in glob.glob(os.path.join(tempfile.gettempdir(), "hermes-pty-active-*")):
+        for stale_item in glob.glob(os.path.join(tempfile.gettempdir(), "hermes-pty-active-*")):
+            path = Path(stale_item)
+            if path.is_file():
+                # Clean up legacy flat /tmp/hermes-pty-active-*.json files
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
             try:
-                raw_pid = stale_d.rsplit("-", 1)[-1]
+                raw_pid = stale_item.rsplit("-", 1)[-1]
                 owner_pid = int(raw_pid)
                 if owner_pid == os.getpid():
                     continue
                 try:
                     os.kill(owner_pid, 0)
                     continue  # Process is alive, do not delete
-                except (OSError, ProcessLookupError):
+                except ProcessLookupError:
                     pass  # Process is dead, safe to clean up
+                except PermissionError:
+                    continue  # Process exists under another user, do not touch
             except (ValueError, IndexError):
                 pass
-            shutil.rmtree(stale_d, ignore_errors=True)
+            shutil.rmtree(stale_item, ignore_errors=True)
     except Exception:
         pass
     # Serializes chat-argv resolution so concurrent /api/pty connections don't
