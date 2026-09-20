@@ -371,9 +371,7 @@ export class GatewayClient extends EventEmitter {
     // its queued microtask becomes a no-op (it captured the old generation).
     // Always discard per-transport buffers on reset so stale frames are never replayed.
     this.drainGeneration += 1
-    this.transportGeneration += 1
-    this.replayInFlight = false
-    this.replayHold = null
+    this.invalidateTransportGeneration()
     this.bufferedEvents.clear()
     this.bufferedRequests = []
     this.pendingExit = undefined
@@ -425,6 +423,7 @@ export class GatewayClient extends EventEmitter {
     this.clearReadyTimer()
     this.closeSidecarSocket()
     this.cleanupLoopDelayMonitor()
+    this.invalidateTransportGeneration()
     this.lifecycle(`[lifecycle] transport exit code=${code ?? 'null'} reason=${reason ?? 'none'} source=${source}`)
     this.channel.detach(new Error(reason || `gateway exited${code === null ? '' : ` (${code})`}`))
 
@@ -534,13 +533,49 @@ export class GatewayClient extends EventEmitter {
     this.publish(ev)
   }
 
+  private invalidateTransportGeneration(): void {
+    this.transportGeneration += 1
+    this.replayInFlight = false
+    this.replayHold = null
+  }
+
+  private publishGatewayReady(ev: GatewayEvent<'gateway.ready'>): void {
+    const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
+    this.mirrorEventToSidecar(frame)
+    this.publish(ev)
+  }
+
+  private publishReplayGap(gap: import('@hermes/shared/gateway-events').ClientLocalGatewayEventMap['gateway.replay_gap']): void {
+    const ev: AnyGatewayEvent = {
+      type: 'gateway.replay_gap',
+      payload: gap
+    } as AnyGatewayEvent
+    const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
+    this.mirrorEventToSidecar(frame)
+    this.publish(ev)
+  }
+
   private flushReplayHold(): void {
     const hold = this.replayHold
     this.replayHold = null
     if (!hold) return
 
-    for (const parked of hold.values()) {
+    for (const [sid, parked] of hold.entries()) {
+      let expectedNext = (this.lastSeenSeq.get(sid) ?? 0) + 1
       for (const event of parked) {
+        const seq = (event as any).seq as number | undefined
+        if (typeof seq === 'number' && Number.isFinite(seq)) {
+          if (seq > expectedNext) {
+            this.pushLog(`[replay-hold] session ${sid} continuity gap: expected ${expectedNext}, got ${seq}`)
+            this.publishReplayGap({
+              reason: 'continuity-gap',
+              session_id: sid,
+              last_seen: expectedNext - 1,
+              latest_seq: seq
+            })
+          }
+          expectedNext = Math.max(expectedNext, seq + 1)
+        }
         this.dispatchIfNewer(event, true)
       }
     }
@@ -558,7 +593,7 @@ export class GatewayClient extends EventEmitter {
     if (!this.hadGatewayReady || this.lastSeenSeq.size === 0) {
       this.hadGatewayReady = true
       if (epoch) this.replayEpoch = epoch
-      this.publish(ev)
+      this.publishGatewayReady(ev)
       return
     }
 
@@ -567,8 +602,8 @@ export class GatewayClient extends EventEmitter {
       this.pushLog(`[replay] epoch changed from ${this.replayEpoch} to ${epoch} - clearing watermarks`)
       this.lastSeenSeq.clear()
       this.replayEpoch = epoch
-      this.publish({ type: 'gateway.replay_gap', payload: { reason: 'epoch-reset', epoch } } as any)
-      this.publish(ev)
+      this.publishReplayGap({ reason: 'epoch-reset', epoch })
+      this.publishGatewayReady(ev)
       return
     }
 
@@ -604,20 +639,45 @@ export class GatewayClient extends EventEmitter {
       for (let i = 0; i < entries.length; i++) {
         const [sid, lastSeen] = entries[i]!
         const res = results[i]!
-        if (res.status !== 'fulfilled' || !res.value) continue
+
+        if (res.status !== 'fulfilled' || !res.value) {
+          this.pushLog(`[replay] session ${sid} events request failed`)
+          this.publishReplayGap({
+            reason: 'request-failed',
+            session_id: sid,
+            last_seen: lastSeen
+          })
+          continue
+        }
 
         const val = res.value
         if (val.truncated) {
           this.pushLog(`[replay] session ${sid} events truncated (lastSeen=${lastSeen}, latest=${val.latest_seq})`)
-          this.publish({
-            type: 'gateway.replay_gap',
-            payload: { reason: 'truncated', session_id: sid, last_seen: lastSeen, latest_seq: val.latest_seq }
-          } as any)
+          this.publishReplayGap({
+            reason: 'truncated',
+            session_id: sid,
+            last_seen: lastSeen,
+            latest_seq: val.latest_seq
+          })
         }
 
+        let expectedNext = lastSeen + 1
         if (Array.isArray(val.events)) {
           for (const event of val.events) {
             if (event && event.type) {
+              const seq = (event as any).seq as number | undefined
+              if (typeof seq === 'number' && Number.isFinite(seq)) {
+                if (seq > expectedNext) {
+                  this.pushLog(`[replay] session ${sid} continuity gap: expected ${expectedNext}, got ${seq}`)
+                  this.publishReplayGap({
+                    reason: 'continuity-gap',
+                    session_id: sid,
+                    last_seen: expectedNext - 1,
+                    latest_seq: seq
+                  })
+                }
+                expectedNext = Math.max(expectedNext, seq + 1)
+              }
               this.dispatchIfNewer(event as AnyGatewayEvent, true)
             }
           }
@@ -629,7 +689,7 @@ export class GatewayClient extends EventEmitter {
       if (generation === this.transportGeneration) {
         this.flushReplayHold()
         this.replayInFlight = false
-        this.publish(ev)
+        this.publishGatewayReady(ev)
       }
     }
   }
@@ -1066,6 +1126,7 @@ export class GatewayClient extends EventEmitter {
     this.closeGatewaySocket()
     this.closeSidecarSocket()
     this.clearReadyTimer()
+    this.invalidateTransportGeneration()
     // The ws 'close' handler is identity-gated on `this.ws === ws`
     // and we just nulled `this.ws`, so it will short-circuit and
     // skip handleTransportExit. Reject pending RPCs explicitly so
