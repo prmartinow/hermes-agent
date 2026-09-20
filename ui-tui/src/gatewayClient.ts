@@ -555,7 +555,7 @@ export class GatewayClient extends EventEmitter {
     this.publish(ev)
   }
 
-  private flushReplayHold(): void {
+  private flushReplayHold(pendingGaps?: Map<string, import('@hermes/shared/gateway-events').ClientLocalGatewayEventMap['gateway.replay_gap']>): void {
     const hold = this.replayHold
     this.replayHold = null
     if (!hold) return
@@ -567,12 +567,17 @@ export class GatewayClient extends EventEmitter {
         if (typeof seq === 'number' && Number.isFinite(seq)) {
           if (seq > expectedNext) {
             this.pushLog(`[replay-hold] session ${sid} continuity gap: expected ${expectedNext}, got ${seq}`)
-            this.publishReplayGap({
-              reason: 'continuity-gap',
+            const gap = {
+              reason: 'continuity-gap' as const,
               session_id: sid,
               last_seen: expectedNext - 1,
               latest_seq: seq
-            })
+            }
+            if (pendingGaps) {
+              pendingGaps.set(sid, gap)
+            } else {
+              this.publishReplayGap(gap)
+            }
           }
           expectedNext = Math.max(expectedNext, seq + 1)
         }
@@ -619,6 +624,9 @@ export class GatewayClient extends EventEmitter {
     }
     this.replayHold = hold
 
+    const pendingGaps = new Map<string, import('@hermes/shared/gateway-events').ClientLocalGatewayEventMap['gateway.replay_gap']>()
+    const latestSeqBySid = new Map<string, number>()
+
     try {
       const entries = Array.from(this.lastSeenSeq.entries())
       const results = await Promise.allSettled(
@@ -642,7 +650,7 @@ export class GatewayClient extends EventEmitter {
 
         if (res.status !== 'fulfilled' || !res.value) {
           this.pushLog(`[replay] session ${sid} events request failed`)
-          this.publishReplayGap({
+          pendingGaps.set(sid, {
             reason: 'request-failed',
             session_id: sid,
             last_seen: lastSeen
@@ -651,9 +659,13 @@ export class GatewayClient extends EventEmitter {
         }
 
         const val = res.value
+        if (typeof val.latest_seq === 'number') {
+          latestSeqBySid.set(sid, val.latest_seq)
+        }
+
         if (val.truncated) {
           this.pushLog(`[replay] session ${sid} events truncated (lastSeen=${lastSeen}, latest=${val.latest_seq})`)
-          this.publishReplayGap({
+          pendingGaps.set(sid, {
             reason: 'truncated',
             session_id: sid,
             last_seen: lastSeen,
@@ -669,12 +681,14 @@ export class GatewayClient extends EventEmitter {
               if (typeof seq === 'number' && Number.isFinite(seq)) {
                 if (seq > expectedNext) {
                   this.pushLog(`[replay] session ${sid} continuity gap: expected ${expectedNext}, got ${seq}`)
-                  this.publishReplayGap({
-                    reason: 'continuity-gap',
-                    session_id: sid,
-                    last_seen: expectedNext - 1,
-                    latest_seq: seq
-                  })
+                  if (!pendingGaps.has(sid)) {
+                    pendingGaps.set(sid, {
+                      reason: 'continuity-gap',
+                      session_id: sid,
+                      last_seen: expectedNext - 1,
+                      latest_seq: seq
+                    })
+                  }
                 }
                 expectedNext = Math.max(expectedNext, seq + 1)
               }
@@ -687,8 +701,30 @@ export class GatewayClient extends EventEmitter {
       // Replay failure degrades to snapshot reconciliation
     } finally {
       if (generation === this.transportGeneration) {
-        this.flushReplayHold()
+        this.flushReplayHold(pendingGaps)
         this.replayInFlight = false
+
+        // Verify final latest_seq tail coverage after held events flushed
+        for (const [sid, latest] of latestSeqBySid) {
+          const seen = this.lastSeenSeq.get(sid) ?? 0
+          if (seen < latest) {
+            this.pushLog(`[replay] session ${sid} latest_seq tail gap: seen=${seen}, latest=${latest}`)
+            if (!pendingGaps.has(sid)) {
+              pendingGaps.set(sid, {
+                reason: 'continuity-gap',
+                session_id: sid,
+                last_seen: seen,
+                latest_seq: latest
+              })
+            }
+          }
+        }
+
+        // Publish coalesced gap events in order just before gateway.ready
+        for (const gap of pendingGaps.values()) {
+          this.publishReplayGap(gap)
+        }
+
         this.publishGatewayReady(ev)
       }
     }

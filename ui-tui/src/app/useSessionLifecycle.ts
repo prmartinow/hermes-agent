@@ -467,7 +467,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       id: string,
       targetRecoveryRef?: { current: string | null },
       retryAttempt = 0,
-      options?: { mode?: "transport-recovery" | "cold-resume" }
+      options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume" }
     ) => {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
