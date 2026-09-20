@@ -454,15 +454,18 @@ def _default_pty_spawn():
     return PtyBridge.spawn(argv, cwd=cwd, env=env)
 
 
-def _active_session_file_for_channel(app: "FastAPI", channel: str) -> Path:
-    """Return the per-channel file where a dashboard TUI writes its active sid."""
+def _active_session_file_for_pty(app: "FastAPI", pty_key: str) -> Path:
+    """Return the per-PTY file where a dashboard TUI writes its active sid."""
     from hermes_cli.web_server import _get_pty_active_session_files
     files = _get_pty_active_session_files(app)
-    if files.get(channel) is None:
+    if files.get(pty_key) is None:
         fd, raw_path = tempfile.mkstemp(prefix="hermes-pty-active-", suffix=".json")
         os.close(fd)
-        files[channel] = Path(raw_path)
-    return files[channel]
+        files[pty_key] = Path(raw_path)
+    return files[pty_key]
+
+
+_active_session_file_for_channel = _active_session_file_for_pty
 
 
 # On timeout asyncio cancels the awaitable but the console thread keeps running;

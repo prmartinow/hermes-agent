@@ -458,14 +458,22 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   }, [rpc, setHistoryItems, viewportMeta])
 
   const resumeById = useCallback(
-    (id: string, targetRecoveryRef?: { current: string | null }) => {
+    (id: string, targetRecoveryRef?: { current: string | null }, retryAttempt = 0) => {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
       const generation = INLINE_MODE && DASHBOARD_TUI_MODE ? randomUUID() : null
       replayGeneration.current = generation
-      if (generation) process.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
+      let replayBegun = false
+
+      const startReplay = () => {
+        if (generation && !replayBegun && replayGeneration.current === generation) {
+          replayBegun = true
+          process.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
+        }
+      }
+
       const abortReplay = () => {
-        if (generation && replayGeneration.current === generation) {
+        if (generation && replayBegun && replayGeneration.current === generation) {
           process.stdout.write(`\x1b]777;hermes-replay;abort;${generation}\x07`)
         }
       }
@@ -493,6 +501,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
               return patchUiState({ status: 'ready' })
             }
+
+            // Valid response acquired: begin replay boundary now
+            startReplay()
 
             const info = r.info ?? null
             const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
@@ -537,6 +548,17 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       }).catch((e: unknown) => {
         if (replayGeneration.current !== generation) return
         const failure = classifyResumeFailure(e)
+        if (failure.kind === 'retry-same') {
+          if (retryAttempt < 3) {
+            const delay = Math.min(1000, 250 * Math.pow(2, retryAttempt))
+            setTimeout(() => {
+              if (replayGeneration.current === generation) {
+                resumeById(id, targetRecoveryRef, retryAttempt + 1)
+              }
+            }, delay)
+            return
+          }
+        }
         if (failure.kind === 'identity') {
           const fileFallback = readActiveSessionFile()
           if (fileFallback && fileFallback !== id) {
