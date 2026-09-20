@@ -30,9 +30,10 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     const pushActivityMock = vi.spyOn(turnController, 'pushActivity')
     const resetSpy = vi.spyOn(turnController, 'reset')
 
-    // Simulate an active turn in progress
-    patchUiState({ busy: true, sid: 'session-turn-123', status: 'working…' })
+    // Simulate an active turn in progress with durable sessionKey
+    patchUiState({ busy: true, sessionKey: 'session-durable-123', sid: 'session-turn-123', status: 'working…' })
     expect(getUiState().busy).toBe(true)
+    expect(getUiState().sessionKey).toBe('session-durable-123')
 
     const recoverSidRef = { current: null as string | null }
     const recoveryAtRef = { current: [] as number[] }
@@ -72,8 +73,8 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     // Assert: sid nulled during disconnect to prevent firing RPCs to dead gateway
     expect(getUiState().sid).toBeNull()
 
-    // Assert: recoverSidRef carries the live session id
-    expect(recoverSidRef.current).toBe('session-turn-123')
+    // Assert: recoverSidRef carries the durable sessionKey (not runtime sid)
+    expect(recoverSidRef.current).toBe('session-durable-123')
 
     // Assert: truthful recovery copy shown (no crash claim, no lost reply claim)
     expect(pushActivityMock).toHaveBeenCalledWith(TRANSPORT_RECONNECTING_ACTIVITY, 'warn')
@@ -89,7 +90,7 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     const pushActivityMock = vi.spyOn(turnController, 'pushActivity')
     const resetSpy = vi.spyOn(turnController, 'reset')
 
-    patchUiState({ busy: true, sid: 'session-proc-456', status: 'working…' })
+    patchUiState({ busy: true, sessionKey: 'session-durable-456', sid: 'session-proc-456', status: 'working…' })
 
     const recoverSidRef = { current: null as string | null }
     const recoveryAtRef = { current: [] as number[] }
@@ -126,8 +127,8 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     expect(getUiState().status).toBe('restarting…')
     expect(getUiState().sid).toBeNull()
 
-    // Assert: recovery target preserved
-    expect(recoverSidRef.current).toBe('session-proc-456')
+    // Assert: recovery target preserved with durable sessionKey
+    expect(recoverSidRef.current).toBe('session-durable-456')
 
     // Assert: process crash copy used
     expect(pushActivityMock).toHaveBeenCalledWith(BACKEND_RESTARTING_ACTIVITY, 'warn')
@@ -227,7 +228,7 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     }
 
     // Step 1: Active turn in progress
-    patchUiState({ busy: true, sid: 'session-reconnect-test', status: 'working…' })
+    patchUiState({ busy: true, sessionKey: 'session-durable-reconnect', sid: 'session-reconnect-test', status: 'working…' })
 
     // Step 2: Transport loss occurs via production handler
     const exitHandler = createGatewayExitHandler({
@@ -241,14 +242,16 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     exitHandler(1006, { code: 1006, source: 'websocket' })
 
     expect(getUiState().busy).toBe(true)
-    expect(recoverSidRef.current).toBe('session-reconnect-test')
+    expect(recoverSidRef.current).toBe('session-durable-reconnect')
 
     // Step 3: Reconnect succeeds and gateway.ready arrives
-    const resumeByIdMock = vi.fn((sid: string) => {
-      // Simulate session.resume succeeding with completed messages from backend
+    const resumeByIdMock = vi.fn((durableKey: string) => {
+      // Successful resume clears recovery ref and updates sessionKey + runtime sid
+      recoverSidRef.current = null
       patchUiState({
         busy: false,
-        sid,
+        sessionKey: durableKey,
+        sid: 'session-runtime-new',
         status: 'ready'
       })
       appended.push({
@@ -291,9 +294,10 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
       payload: { heartbeat: true }
     } as any)
 
-    // Assert: resumeById was called for the recovery session
-    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-reconnect-test'))
+    // Assert: resumeById was called with durable sessionKey (not runtime sid)
+    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-durable-reconnect'))
     expect(recoverSidRef.current).toBeNull()
+    expect(getUiState().sessionKey).toBe('session-durable-reconnect')
 
     // Assert: busy reconciled to false and completed text received
     expect(getUiState().busy).toBe(false)
@@ -316,7 +320,7 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     }
 
     // Step 1: Active turn in progress
-    patchUiState({ busy: true, sid: 'session-live-turn', status: 'working…' })
+    patchUiState({ busy: true, sessionKey: 'session-durable-live', sid: 'session-live-turn', status: 'working…' })
 
     // Step 2: Transport loss occurs via production handler
     const exitHandler = createGatewayExitHandler({
@@ -330,14 +334,16 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     exitHandler(1006, { code: 1006, source: 'websocket' })
 
     expect(getUiState().busy).toBe(true)
-    expect(recoverSidRef.current).toBe('session-live-turn')
+    expect(recoverSidRef.current).toBe('session-durable-live')
 
     // Step 3: Reconnect succeeds and gateway.ready arrives
-    const resumeByIdMock = vi.fn((sid: string) => {
-      // Backend is still executing the turn
+    const resumeByIdMock = vi.fn((durableKey: string) => {
+      // Successful resume clears recovery ref and updates sessionKey
+      recoverSidRef.current = null
       patchUiState({
         busy: true,
-        sid,
+        sessionKey: durableKey,
+        sid: 'session-live-turn',
         status: 'working…'
       })
     })
@@ -374,8 +380,9 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
       payload: { heartbeat: true }
     } as any)
 
-    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-live-turn'))
+    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-durable-live'))
     expect(recoverSidRef.current).toBeNull()
+    expect(getUiState().sessionKey).toBe('session-durable-live')
     expect(getUiState().busy).toBe(true)
 
     // Step 4: Streaming deltas arrive after reconnect
@@ -395,5 +402,48 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     } as any)
 
     expect(getUiState().busy).toBe(false)
+  })
+
+  it('does not destroy recovery target prematurely if resumeById is interrupted or fails', async () => {
+    const recoverSidRef = { current: 'session-durable-persisted' }
+    const resumeByIdMock = vi.fn((_key: string) => {
+      // Simulate failure or incomplete resume: do NOT clear recoverSidRef
+      patchUiState({ status: 'ready' })
+    })
+
+    const ctx = {
+      composer: { dequeue: () => undefined, queueEditRef: { current: null }, sendQueued: vi.fn(), setInput: vi.fn() },
+      gateway: {
+        gw: { request: vi.fn() },
+        rpc: vi.fn(async (method: string) => {
+          if (method === 'commands.catalog') return { pairs: [] }
+          return null
+        })
+      },
+      session: {
+        STARTUP_RESUME_ID: '',
+        colsRef: { current: 80 },
+        newSession: vi.fn(),
+        recoverSidRef,
+        resetSession: vi.fn(),
+        resumeById: resumeByIdMock,
+        setCatalog: vi.fn()
+      },
+      submission: { submitRef: { current: vi.fn() } },
+      system: { bellOnComplete: false, sys: vi.fn() },
+      transcript: { appendMessage: vi.fn(), panel: vi.fn(), setHistoryItems: vi.fn() },
+      voice: { setProcessing: vi.fn(), setRecording: vi.fn(), setVoiceEnabled: vi.fn() }
+    }
+
+    const handler = createGatewayEventHandler(ctx as any)
+
+    handler({
+      type: 'gateway.ready',
+      payload: { heartbeat: true }
+    } as any)
+
+    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-durable-persisted'))
+    // Target was NOT destroyed before or during the failed call
+    expect(recoverSidRef.current).toBe('session-durable-persisted')
   })
 })

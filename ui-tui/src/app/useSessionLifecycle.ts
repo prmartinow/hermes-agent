@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 
 import type { ScrollBoxHandle } from '@hermes/ink'
 import { evictInkCaches, writeAfterRender } from '@hermes/ink'
@@ -25,6 +25,7 @@ import { asRpcResult } from '../lib/rpc.js'
 import type { Msg, PanelSection, SessionInfo } from '../types.js'
 
 import type { ComposerActions, GatewayRpc, StateSetter } from './interfaces.js'
+import { activeRecoveryTargetRef } from './gatewayRecovery.js'
 import { patchOverlayState } from './overlayStore.js'
 import { scheduleResumeScrollToBottom } from './sessionResumeView.js'
 import { turnController } from './turnController.js'
@@ -46,6 +47,25 @@ const statusFromLiveSession = (status?: string, running = false) => {
   }
 
   return running || status === 'working' ? 'running…' : 'ready'
+}
+
+export const readActiveSessionFile = (file = process.env.HERMES_TUI_ACTIVE_SESSION_FILE): string | null => {
+  if (!file) {
+    return null
+  }
+  try {
+    const raw = readFileSync(file, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object') {
+      const candidate = parsed.session_id || parsed.session_key
+      if (candidate && typeof candidate === 'string') {
+        return candidate
+      }
+    }
+    return null
+  } catch {
+    return null
+  }
 }
 
 export const writeActiveSessionFile = (sessionId: null | string, file = process.env.HERMES_TUI_ACTIVE_SESSION_FILE) => {
@@ -151,6 +171,8 @@ export interface UseSessionLifecycleOptions {
   gw: GatewayClient
   onFreshSessionStarted?: (sessionId: string) => void
   panel: (title: string, sections: PanelSection[]) => void
+  recoverSessionKeyRef?: { current: string | null }
+  recoverSidRef?: { current: string | null }
   rpc: GatewayRpc
   scrollRef: RefObject<null | ScrollBoxHandle>
   setHistoryItems: StateSetter<Msg[]>
@@ -180,6 +202,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     sys
   } = opts
 
+  const recoverSessionKeyRef = opts.recoverSessionKeyRef ?? opts.recoverSidRef
+
   const closeSession = useCallback(
     (targetSid?: null | string) =>
       targetSid ? rpc<SessionCloseResponse>('session.close', { session_id: targetSid }) : Promise.resolve(null),
@@ -206,7 +230,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     setVoiceProcessing(false)
     setViewportMeta(null)
     isFetchingBacklogRef.current = false
-    patchUiState({ bgTasks: new Set(), info: null, sid: null, usage: ZERO })
+    patchUiState({ bgTasks: new Set(), info: null, sessionKey: null, sid: null, usage: ZERO })
     setHistoryItems([])
     setLastUserMsg('')
     setStickyPrompt('')
@@ -272,9 +296,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       resetSession()
       setSessionStartedAt(Date.now())
 
-      writeActiveSessionFile(r.session_id)
+      const durableKey = (r as any).stored_session_id ?? r.session_id
+      writeActiveSessionFile(durableKey)
       patchUiState({
         info,
+        sessionKey: durableKey,
         sid: r.session_id,
         status: info?.version ? 'ready' : 'starting agent…',
         usage: usageFrom(info)
@@ -365,10 +391,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           const transcriptMsgs = toTranscriptMessages(r.messages)
           const transcript = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
           setHistoryItems(info ? [introMsg(info), ...transcript] : transcript)
-          writeActiveSessionFile(r.session_key ?? r.session_id)
+          const durableKey = (r as any).session_key ?? (r as any).resumed ?? r.session_id
+          writeActiveSessionFile(durableKey)
           patchUiState({
             busy: running,
             info,
+            sessionKey: durableKey,
             sid: r.session_id,
             status: statusFromLiveSession(r.status, running),
             usage: usageFrom(info)
@@ -429,7 +457,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   }, [rpc, setHistoryItems, viewportMeta])
 
   const resumeById = useCallback(
-    (id: string) => {
+    (id: string, targetRecoveryRef?: { current: string | null }) => {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
       const generation = INLINE_MODE && DASHBOARD_TUI_MODE ? randomUUID() : null
@@ -476,14 +504,26 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
             setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
             setViewportMeta(r.viewport ?? null)
-            writeActiveSessionFile(r.resumed ?? r.session_id)
+            const durableKey = (r as any).resumed ?? (r as any).session_key ?? (r as any).stored_session_id ?? r.session_id
+            writeActiveSessionFile(durableKey)
             patchUiState({
               busy: running,
               info,
+              sessionKey: durableKey,
               sid: r.session_id,
               status: statusFromLiveSession(r.status ?? undefined, running),
               usage: usageFrom(info)
             })
+            const activeRecoveryRef = targetRecoveryRef ?? recoverSessionKeyRef ?? activeRecoveryTargetRef
+            if (activeRecoveryRef) {
+              activeRecoveryRef.current = null
+            }
+            if (opts.recoverSidRef && opts.recoverSidRef !== activeRecoveryRef) {
+              opts.recoverSidRef.current = null
+            }
+            if (opts.recoverSessionKeyRef && opts.recoverSessionKeyRef !== activeRecoveryRef) {
+              opts.recoverSessionKeyRef.current = null
+            }
             hydrateLiveSessionInflight(r.inflight)
             setReplayCommitted(generation)
             cancelResumeScrollRef.current?.()
@@ -495,12 +535,16 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           })
       }).catch((e: Error) => {
         if (replayGeneration.current !== generation) return
+        const fileFallback = readActiveSessionFile()
+        if (fileFallback && fileFallback !== id) {
+          return resumeById(fileFallback, targetRecoveryRef)
+        }
         abortReplay()
         sys(`error: ${e.message}`)
         patchUiState({ status: 'ready' })
       })
     },
-    [closeSession, colsRef, gw, panel, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, sys]
+    [closeSession, colsRef, gw, opts.recoverSessionKeyRef, opts.recoverSidRef, panel, recoverSessionKeyRef, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, sys]
   )
 
   const guardBusySessionSwitch = useCallback(

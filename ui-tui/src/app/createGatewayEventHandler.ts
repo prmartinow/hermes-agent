@@ -29,6 +29,7 @@ import { defaultThemeForCurrentBackground, fromSkin, skinIsLight, type Theme, th
 import type { Msg, SessionInfo, SubagentProgress } from '../types.js'
 
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
+import { setActiveRecoveryTargetRef } from './gatewayRecovery.js'
 import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
@@ -437,7 +438,21 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   syncThemeToTerminalBackground()
 
   const { rpc } = ctx.gateway
-  const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
+  const sessionCtx = ctx.session as {
+    STARTUP_RESUME_ID: string
+    colsRef: { current: number }
+    newSession: (msg?: string, title?: string) => void
+    recoverSessionKeyRef?: { current: string | null }
+    recoverSidRef?: { current: string | null }
+    resetSession: () => void
+    resumeById: (id: string, targetRecoveryRef?: { current: string | null }) => void
+    setCatalog: (catalog: any) => void
+  }
+  const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = sessionCtx
+  const recoverSessionKeyRef = sessionCtx.recoverSessionKeyRef ?? sessionCtx.recoverSidRef
+  if (recoverSessionKeyRef) {
+    setActiveRecoveryTargetRef(recoverSessionKeyRef)
+  }
   const { bellOnComplete, bellOnPrompt, stdout, sys } = ctx.system
 
   // display.bell_on_prompt — BEL whenever a blocking prompt modal opens
@@ -717,14 +732,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       .catch((e: unknown) => turnController.pushActivity(`command catalog unavailable: ${rpcErrorMessage(e)}`, 'info'))
 
     // Crash recovery: a respawn triggered by an unexpected gateway death
-    // resumes the session that was live, not a brand-new one. One-shot — the
-    // ref is cleared so an ordinary later restart still forges/resumes per
-    // config. No startup prompt here (this is mid-session, not a cold boot).
-    const recoverSid = recoverSidRef?.current
+    // resumes the session that was live, not a brand-new one. The ref is
+    // cleared on successful resume by resumeById so an ordinary later restart
+    // still forges/resumes per config, while preventing premature destruction
+    // if resume fails. No startup prompt here (this is mid-session, not a cold boot).
+    const recoverKey = recoverSessionKeyRef?.current
 
-    if (recoverSidRef && recoverSid) {
-      recoverSidRef.current = null
-      resumeById(recoverSid)
+    if (recoverKey) {
+      resumeById(recoverKey)
       // After resumeById: it synchronously sets status to 'resuming…' on entry,
       // so override it here to keep the distinct "recovering" label visible for
       // the duration of the resume RPC (which later flips status to 'ready').

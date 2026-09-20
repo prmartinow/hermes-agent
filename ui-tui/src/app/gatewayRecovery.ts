@@ -46,6 +46,12 @@ export function planGatewayRecovery(
   return { attempts: recover ? [...recent, now] : recent, recover, sid }
 }
 
+export let activeRecoveryTargetRef: { current: string | null } | null = null
+
+export function setActiveRecoveryTargetRef(ref: { current: string | null } | null): void {
+  activeRecoveryTargetRef = ref
+}
+
 export interface GatewayRecoveryClient {
   isAttached(): boolean
   start(): void
@@ -64,28 +70,37 @@ export interface HandleGatewayExitOptions {
   context?: GatewayExitContextInput
   gw: GatewayRecoveryClient
   sys: (text: string) => void
-  recoverSidRef: { current: string | null }
+  recoverSessionKeyRef?: { current: string | null }
+  recoverSidRef?: { current: string | null }
   recoveryAtRef: { current: number[] }
   gaveUpRef: { current: boolean }
   turnController?: GatewayRecoveryTurnController
-  getUiState?: () => { sid: null | string; busy: boolean }
-  patchUiState?: (patch: { busy?: boolean; compacting?: boolean; sid?: null | string; status?: string }) => void
+  getUiState?: () => { busy: boolean; sessionKey?: null | string; sid: null | string }
+  patchUiState?: (patch: { busy?: boolean; compacting?: boolean; sessionKey?: null | string; sid?: null | string; status?: string }) => void
   now?: () => number
 }
 
-export function handleGatewayExit({
-  code,
-  context,
-  gw,
-  sys,
-  recoverSidRef,
-  recoveryAtRef,
-  gaveUpRef,
-  turnController = defaultTurnController,
-  getUiState = defaultGetUiState,
-  patchUiState = defaultPatchUiState,
-  now = Date.now
-}: HandleGatewayExitOptions): RecoveryPlan {
+export function handleGatewayExit(options: HandleGatewayExitOptions): RecoveryPlan {
+  const {
+    code,
+    context,
+    gw,
+    sys,
+    recoveryAtRef,
+    gaveUpRef,
+    turnController = defaultTurnController,
+    getUiState = defaultGetUiState,
+    patchUiState = defaultPatchUiState,
+    now = Date.now
+  } = options
+
+  const recoverSessionKeyRef = options.recoverSessionKeyRef ?? options.recoverSidRef
+  if (!recoverSessionKeyRef) {
+    throw new Error('handleGatewayExit requires recoverSessionKeyRef or recoverSidRef')
+  }
+
+  setActiveRecoveryTargetRef(recoverSessionKeyRef)
+
   const source = context?.source ?? (gw.isAttached() ? 'websocket' : 'process')
   const isProcessExit = source === 'process'
 
@@ -104,12 +119,14 @@ export function handleGatewayExit({
   // persisted session via the next gateway.ready, so a single crash / OOM /
   // signal doesn't lose their work. planGatewayRecovery bounds the attempts
   // so a gateway that crash-loops on startup can't spawn-storm, and falls
-  // back to recoverSidRef when sid was already cleared by a prior exit.
-  const plan = planGatewayRecovery(getUiState().sid, recoverSidRef.current, recoveryAtRef.current, now())
+  // back to recoverSessionKeyRef when sid was already cleared by a prior exit.
+  const state = getUiState()
+  const durableKey = state.sessionKey ?? state.sid
+  const plan = planGatewayRecovery(durableKey, recoverSessionKeyRef.current, recoveryAtRef.current, now())
 
   // Clear sid immediately: while the gateway is down, sid-guarded effects
   // (session.active_list poll, queue drain) would otherwise fire RPCs at a
-  // dead/respawning gateway. recoverSidRef carries the session forward, and
+  // dead/respawning gateway. recoverSessionKeyRef carries the session forward, and
   // resumeById restores sid once the fresh gateway is ready.
   recoveryAtRef.current = plan.attempts
   patchUiState({
@@ -120,7 +137,10 @@ export function handleGatewayExit({
   })
 
   if (plan.recover && plan.sid) {
-    recoverSidRef.current = plan.sid
+    recoverSessionKeyRef.current = plan.sid
+    if (options.recoverSidRef && options.recoverSidRef !== recoverSessionKeyRef) {
+      options.recoverSidRef.current = plan.sid
+    }
     turnController.pushActivity(recoveryRestartingActivity(source), 'warn')
     sys(recoveryRestartingMessage(source))
     gw.start()
@@ -133,7 +153,10 @@ export function handleGatewayExit({
   // stderr line, rather than repeating "gateway exited" every tick. Keep the
   // recovery target: when that background reconnect eventually succeeds,
   // gateway.ready must reopen the SAME chat instead of forging a new one.
-  recoverSidRef.current = plan.sid
+  recoverSessionKeyRef.current = plan.sid
+  if (options.recoverSidRef && options.recoverSidRef !== recoverSessionKeyRef) {
+    options.recoverSidRef.current = plan.sid
+  }
   patchUiState({ status: isProcessExit ? 'stopped' : 'disconnected' })
 
   if (!gaveUpRef.current) {

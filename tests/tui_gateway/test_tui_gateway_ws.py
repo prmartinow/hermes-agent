@@ -377,3 +377,50 @@ def test_hermes_websocket_protocol_diagnostics_and_config(caplog):
         assert config.ws is ws_srv.HermesWebSocketProtocol
         config.load()
         assert config.ws_protocol_class is ws_srv.HermesWebSocketProtocol
+
+
+def test_hermes_websocket_protocol_suppresses_ping_on_loopback_connection():
+    from hermes_cli import web_server as ws_srv
+    import uvicorn
+
+    if ws_srv.HermesWebSocketProtocol is None:
+        return
+
+    cfg = uvicorn.Config(ws_srv.app, ws_ping_interval=20.0, ws_ping_timeout=20.0)
+
+    class DummyPeerTransport:
+        def __init__(self, peer):
+            self.peer = peer
+        def get_extra_info(self, name):
+            if name == "peername":
+                return self.peer
+            if name == "sockname":
+                return ("0.0.0.0", 9119)
+            return None
+        def set_write_buffer_limits(self, high=None, low=None):
+            pass
+
+    # Loopback peer: keepalive ping must be disabled
+    for loopback_ip in ["127.0.0.1", "::1", "localhost"]:
+        proto = ws_srv.HermesWebSocketProtocol(
+            config=cfg,
+            server_state=uvicorn.server.ServerState(),
+            app_state={},
+        )
+        proto.connection_made(DummyPeerTransport((loopback_ip, 12345)))
+        assert proto.ping_interval is None
+        assert proto.ping_timeout is None
+        if hasattr(proto, "handler_task") and proto.handler_task:
+            proto.handler_task.cancel()
+
+    # Remote peer: keepalive ping must be preserved
+    proto_remote = ws_srv.HermesWebSocketProtocol(
+        config=cfg,
+        server_state=uvicorn.server.ServerState(),
+        app_state={},
+    )
+    proto_remote.connection_made(DummyPeerTransport(("203.0.113.195", 54321)))
+    assert proto_remote.ping_interval == 20.0
+    assert proto_remote.ping_timeout == 20.0
+    if hasattr(proto_remote, "handler_task") and proto_remote.handler_task:
+        proto_remote.handler_task.cancel()
