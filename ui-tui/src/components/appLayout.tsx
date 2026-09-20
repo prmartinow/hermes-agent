@@ -183,45 +183,64 @@ const TranscriptPane = memo(function TranscriptPane({
         <Box flexDirection="column" paddingX={1}>
           {transcript.virtualHistory.topSpacer > 0 ? <Box height={transcript.virtualHistory.topSpacer} /> : null}
 
-          {transcript.virtualRows.slice(transcript.virtualHistory.start, transcript.virtualHistory.end).map(row => (
-            <Box flexDirection="column" key={row.key} ref={transcript.virtualHistory.measureRef(row.key)}>
-              {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
-                <Box marginTop={1}>
-                  <Text color={ui.theme.color.border}>───</Text>
-                </Box>
-              )}
+          {(() => {
+            const introRow = transcript.virtualRows[0]?.msg.kind === 'intro' ? transcript.virtualRows[0] : null
+            const hasSkippedHistory = INLINE_MODE && introRow && transcript.virtualHistory.start > 0
+            const liveStart = hasSkippedHistory ? Math.max(1, transcript.virtualHistory.start) : transcript.virtualHistory.start
 
-              {row.msg.kind === 'intro' ? (
-                <Box flexDirection="column" paddingTop={1}>
-                  <Banner maxWidth={Math.max(1, cols - 2)} t={ui.theme} />
+            return (
+              <>
+                {hasSkippedHistory && (
+                  <Box flexDirection="column" key={introRow.key} ref={transcript.virtualHistory.measureRef(introRow.key)}>
+                    <Box flexDirection="column" paddingTop={1}>
+                      <Banner maxWidth={Math.max(1, cols - 2)} t={ui.theme} />
+                      {introRow.msg.info && (
+                        <SessionPanel info={introRow.msg.info} maxWidth={Math.max(1, cols - 2)} sid={ui.sid} t={ui.theme} />
+                      )}
+                    </Box>
+                  </Box>
+                )}
 
-                  {row.msg.info && (
-                    <SessionPanel info={row.msg.info} maxWidth={Math.max(1, cols - 2)} sid={ui.sid} t={ui.theme} />
-                  )}
-                </Box>
-              ) : row.msg.kind === 'panel' && row.msg.panelData ? (
-                <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
-              ) : (
-                <MessageLine
-                  cols={bodyCols}
-                  compact={ui.compact}
-                  detailsMode={ui.detailsMode}
-                  detailsModeCommandOverride={ui.detailsModeCommandOverride}
-                  msg={row.msg}
-                  prev={prevRenderedMsg(i => transcript.virtualRows[i]?.msg, row.index, {
-                    commandOverride: ui.detailsModeCommandOverride,
-                    detailsMode: ui.detailsMode,
-                    sections: ui.sections
-                  })}
-                  sections={ui.sections}
-                  t={ui.theme}
-                  timestamps={ui.timestamps}
-                />
-              )}
+                {transcript.virtualRows.slice(liveStart, transcript.virtualHistory.end).map(row => (
+                  <Box flexDirection="column" key={row.key} ref={transcript.virtualHistory.measureRef(row.key)}>
+                    {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
+                      <Box marginTop={1}>
+                        <Text color={ui.theme.color.border}>───</Text>
+                      </Box>
+                    )}
 
+                    {row.msg.kind === 'intro' ? (
+                      <Box flexDirection="column" paddingTop={1}>
+                        <Banner maxWidth={Math.max(1, cols - 2)} t={ui.theme} />
 
-            </Box>
-          ))}
+                        {row.msg.info && (
+                          <SessionPanel info={row.msg.info} maxWidth={Math.max(1, cols - 2)} sid={ui.sid} t={ui.theme} />
+                        )}
+                      </Box>
+                    ) : row.msg.kind === 'panel' && row.msg.panelData ? (
+                      <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
+                    ) : (
+                      <MessageLine
+                        cols={bodyCols}
+                        compact={ui.compact}
+                        detailsMode={ui.detailsMode}
+                        detailsModeCommandOverride={ui.detailsModeCommandOverride}
+                        msg={row.msg}
+                        prev={prevRenderedMsg(i => transcript.virtualRows[i]?.msg, row.index, {
+                          commandOverride: ui.detailsModeCommandOverride,
+                          detailsMode: ui.detailsMode,
+                          sections: ui.sections
+                        })}
+                        sections={ui.sections}
+                        t={ui.theme}
+                        timestamps={ui.timestamps}
+                      />
+                    )}
+                  </Box>
+                ))}
+              </>
+            )
+          })()}
 
           {transcript.virtualHistory.bottomSpacer > 0 ? <Box height={transcript.virtualHistory.bottomSpacer} /> : null}
 
