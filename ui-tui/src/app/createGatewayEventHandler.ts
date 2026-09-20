@@ -1049,6 +1049,18 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'gateway.replay_gap': {
+        const gap = ev.payload
+        sys(`[gateway] sequence replay gap (${gap?.reason ?? 'unknown'}) - reconciling session state`)
+        const currentSid = getUiState().sid
+        const currentKey = getUiState().sessionKey
+        if (currentKey && (!gap?.session_id || gap.session_id === currentSid)) {
+          resumeById(currentKey, undefined, 0, { mode: 'transport-recovery' })
+        }
+
+        return
+      }
+
       case 'browser.progress': {
         const message = String(ev.payload?.message ?? '').trim()
 

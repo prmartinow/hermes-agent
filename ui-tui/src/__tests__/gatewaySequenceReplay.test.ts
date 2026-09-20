@@ -63,9 +63,7 @@ async function createLocalGatewayServer(): Promise<TestServer> {
       for (const client of connections) {
         try {
           client.terminate()
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
       await new Promise<void>(resolve => server.close(() => resolve()))
     },
@@ -116,17 +114,13 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
     client.start()
     const ws = await server.waitForNextConnection()
 
-    // Handshake
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
     await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
 
-    // Send events with seq
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 1, payload: { msg: "first" } } }))
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 2, payload: { msg: "second" } } }))
-    // Send duplicate / older seq
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 2, payload: { msg: "duplicate second" } } }))
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 1, payload: { msg: "older first" } } }))
-    // Send newer seq
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 3, payload: { msg: "third" } } }))
 
     await vi.waitFor(() => {
@@ -151,18 +145,14 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
     client.start()
     let ws = await server.waitForNextConnection()
 
-    // First connect
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
     await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
 
-    // Stream up to seq: 10
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 10, payload: {} } }))
     await vi.waitFor(() => expect(client?.getSeqWatermarks()).toEqual({ s1: 10 }))
 
-    // Simulate disconnect
     ws.terminate()
 
-    // Next connection on reconnect
     client.start()
     const ws2 = await server.waitForNextConnection()
 
@@ -176,7 +166,6 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
           requestedMethod = data.method
           requestedParams = data.params
 
-          // Simulate returning missing events 11 and 12
           const response = {
             jsonrpc: "2.0",
             id: data.id,
@@ -195,7 +184,6 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
       } catch {}
     })
 
-    // Server sends gateway.ready
     ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
 
     await vi.waitFor(() => {
@@ -207,7 +195,6 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
       expect(client?.getSeqWatermarks()).toEqual({ s1: 12 })
     })
 
-    // Check that events 11 and 12 were received BEFORE the second gateway.ready
     const eventOrder = received.map(e => {
       if (e.type === "gateway.ready") return "gateway.ready"
       if ((e as any).seq) return `seq-${(e as any).seq}`
@@ -247,11 +234,9 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
       try {
         const data = JSON.parse(raw.toString())
         if (data.method === "session.events.since") {
-          // While replay is awaiting response, server delivers live event seq 8 and 9!
           ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 8, payload: { live: 8 } } }))
           ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 9, payload: { live: 9 } } }))
 
-          // After 30ms, resolve replay with missing events 6 and 7
           setTimeout(() => {
             ws2.send(JSON.stringify({
               jsonrpc: "2.0",
@@ -298,7 +283,6 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
 
     ws1.terminate()
 
-    // Reconnect with brand new epoch (backend restarted)
     client.start()
     const ws2 = await server.waitForNextConnection()
     ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-B" } } }))
@@ -310,5 +294,196 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
     })
 
     expect(client.getSeqWatermarks()).toEqual({})
+  })
+
+  it("discards stale replay when socket terminates during replay RPC and does not emit old gateway.ready", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+
+    client.start()
+    const ws1 = await server.waitForNextConnection()
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.filter(e => e.type === "gateway.ready").length).toBe(1))
+
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 20, payload: {} } }))
+    await vi.waitFor(() => expect(client?.getSeqWatermarks()).toEqual({ s1: 20 }))
+
+    ws1.terminate()
+
+    // Second connection starts replay
+    client.start()
+    const ws2 = await server.waitForNextConnection()
+    ws2.on("message", () => {
+      // While replay request is in flight, ws2 suddenly drops!
+      ws2.terminate()
+    })
+    ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+
+    // Give time for ws2 drop and rejected promise
+    await new Promise(r => setTimeout(r, 80))
+
+    // Reconnection 3 occurs
+    client.start()
+    const ws3 = await server.waitForNextConnection()
+
+    // Verify gateway.ready was NOT emitted by the dead ws2!
+    expect(received.filter(e => e.type === "gateway.ready").length).toBe(1)
+  })
+
+  it("emits gateway.replay_gap with request-failed when session.events.since rejects", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+
+    client.start()
+    const ws1 = await server.waitForNextConnection()
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
+
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 10, payload: {} } }))
+    await vi.waitFor(() => expect(client?.getSeqWatermarks()).toEqual({ s1: 10 }))
+
+    ws1.terminate()
+
+    client.start()
+    const ws2 = await server.waitForNextConnection()
+    ws2.on("message", raw => {
+      const data = JSON.parse(raw.toString())
+      if (data.method === "session.events.since") {
+        ws2.send(JSON.stringify({
+          jsonrpc: "2.0",
+          id: data.id,
+          error: { code: -32000, message: "backend replay failure" }
+        }))
+      }
+    })
+    ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+
+    await vi.waitFor(() => {
+      const gap = received.find(e => e.type === "gateway.replay_gap")
+      expect(gap).toBeDefined()
+      expect((gap as any).payload.reason).toBe("request-failed")
+      expect((gap as any).payload.session_id).toBe("s1")
+    })
+  })
+
+  it("detects continuity gap when replay response skips sequence numbers", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+
+    client.start()
+    const ws1 = await server.waitForNextConnection()
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
+
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 10, payload: {} } }))
+    await vi.waitFor(() => expect(client?.getSeqWatermarks()).toEqual({ s1: 10 }))
+
+    ws1.terminate()
+
+    client.start()
+    const ws2 = await server.waitForNextConnection()
+    ws2.on("message", raw => {
+      const data = JSON.parse(raw.toString())
+      if (data.method === "session.events.since") {
+        // Skips seq 12! Sends 11 then 13!
+        ws2.send(JSON.stringify({
+          jsonrpc: "2.0",
+          id: data.id,
+          result: {
+            epoch: "epoch-1",
+            events: [
+              { type: "session.event", session_id: "s1", seq: 11, payload: {} },
+              { type: "session.event", session_id: "s1", seq: 13, payload: {} }
+            ],
+            latest_seq: 13,
+            truncated: false
+          }
+        }))
+      }
+    })
+    ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+
+    await vi.waitFor(() => {
+      const gap = received.find(e => e.type === "gateway.replay_gap")
+      expect(gap).toBeDefined()
+      expect((gap as any).payload.reason).toBe("continuity-gap")
+      expect((gap as any).payload.session_id).toBe("s1")
+    })
+  })
+
+  it("emits gateway.replay_gap with truncated when backend ring has rolled over", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+
+    client.start()
+    const ws1 = await server.waitForNextConnection()
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
+
+    ws1.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 5, payload: {} } }))
+    await vi.waitFor(() => expect(client?.getSeqWatermarks()).toEqual({ s1: 5 }))
+
+    ws1.terminate()
+
+    client.start()
+    const ws2 = await server.waitForNextConnection()
+    ws2.on("message", raw => {
+      const data = JSON.parse(raw.toString())
+      if (data.method === "session.events.since") {
+        ws2.send(JSON.stringify({
+          jsonrpc: "2.0",
+          id: data.id,
+          result: {
+            epoch: "epoch-1",
+            events: [{ type: "session.event", session_id: "s1", seq: 600, payload: {} }],
+            latest_seq: 600,
+            truncated: true
+          }
+        }))
+      }
+    })
+    ws2.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+
+    await vi.waitFor(() => {
+      const gap = received.find(e => e.type === "gateway.replay_gap")
+      expect(gap).toBeDefined()
+      expect((gap as any).payload.reason).toBe("truncated")
+      expect((gap as any).payload.session_id).toBe("s1")
+    })
+  })
+
+  it("retires session watermarks via retireSession", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+
+    client.start()
+    const ws = await server.waitForNextConnection()
+    ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
+
+    ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 10, payload: {} } }))
+    ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s2", seq: 25, payload: {} } }))
+
+    await vi.waitFor(() => {
+      expect(client?.getSeqWatermarks()).toEqual({ s1: 10, s2: 25 })
+    })
+
+    client.retireSession("s1")
+    expect(client.getSeqWatermarks()).toEqual({ s2: 25 })
   })
 })

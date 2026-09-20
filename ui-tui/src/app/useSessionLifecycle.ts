@@ -206,9 +206,14 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   const recoverSessionKeyRef = opts.recoverSessionKeyRef ?? opts.recoverSidRef
 
   const closeSession = useCallback(
-    (targetSid?: null | string) =>
-      targetSid ? rpc<SessionCloseResponse>('session.close', { session_id: targetSid }) : Promise.resolve(null),
-    [rpc]
+    (targetSid?: null | string) => {
+      if (targetSid) {
+        gw?.retireSession(targetSid)
+        return rpc<SessionCloseResponse>('session.close', { session_id: targetSid })
+      }
+      return Promise.resolve(null)
+    },
+    [gw, rpc]
   )
 
   const replayGeneration = useRef<string | null>(null)
@@ -564,6 +569,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
 
             if (previousSid && previousSid !== r.session_id) {
+              gw?.retireSession(previousSid)
               void closeSession(previousSid)
             }
           })
