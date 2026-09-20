@@ -30,6 +30,21 @@ router = APIRouter()
 
 # Late-bound so a test's monkeypatch on the owning module wins at call time.
 _active_session_file_for_channel = late("_active_session_file_for_channel", "hermes_cli.web_server_chat")
+_active_session_file_for_pty = late("_active_session_file_for_pty", "hermes_cli.web_server_chat")
+
+
+def _effective_pty_key(
+    raw_attach: Optional[str],
+    profile: Optional[str],
+    resume: Optional[str],
+) -> Optional[str]:
+    """Compute canonical identity key shared between PtySessionRegistry and active session files."""
+    if resume:
+        device_token = raw_attach or ""
+        return f"resume\0{profile or ''}\0{resume}\0{device_token}"
+    if raw_attach is not None and profile:
+        return f"{raw_attach}\0{profile}\0"
+    return raw_attach
 _profile_scope = late("_profile_scope", "hermes_cli.web_server_profiles")
 _resolve_chat_argv_async = late("_resolve_chat_argv_async", "hermes_cli.web_server_chat")
 _resolve_profile_dir = late("_resolve_profile_dir", "hermes_cli.web_server_profiles")
@@ -447,6 +462,7 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
+    raw_attach = ws.query_params.get("attach") or None
     raw_resume = ws.query_params.get("resume") or None
     resume = raw_resume
     profile = ws.query_params.get("profile") or None
@@ -455,8 +471,9 @@ async def pty_ws(ws: WebSocket) -> None:
     force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {"1", "true", "yes", "on"}
     active_session_file: Optional[Path] = None
 
-    if channel:
-        active_session_file = _active_session_file_for_channel(ws.app, channel)
+    pty_key = _effective_pty_key(raw_attach, profile, raw_resume) or channel
+    if pty_key:
+        active_session_file = _active_session_file_for_pty(ws.app, pty_key)
         if force_fresh:
             resume = None
             try:
@@ -485,16 +502,10 @@ async def pty_ws(ws: WebSocket) -> None:
         await _pty_fail(ws, exc)
         return
 
-    attach_token = ws.query_params.get("attach") or None
     registry_resume = raw_resume
     if raw_resume and env:
         registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
-    if registry_resume:
-        # Key PTY per-session AND per-device so each surface has independent native screen geometry
-        device_token = ws.query_params.get("attach") or ""
-        attach_token = f"resume\0{profile or ''}\0{registry_resume}\0{device_token}"
-    elif attach_token is not None and profile:
-        attach_token = f"{attach_token}\0{profile}\0"
+    attach_token = _effective_pty_key(raw_attach, profile, registry_resume)
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env)
