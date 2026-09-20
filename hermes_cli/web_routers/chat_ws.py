@@ -502,10 +502,8 @@ async def pty_ws(ws: WebSocket) -> None:
         await _pty_fail(ws, exc)
         return
 
-    registry_resume = raw_resume
-    if raw_resume and env:
-        registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
-    attach_token = _effective_pty_key(raw_attach, profile, registry_resume)
+    # Use consistent canonical pty_key computed from logical target and device attach token
+    attach_token = pty_key
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env)
