@@ -1104,7 +1104,7 @@ describe('createGatewayEventHandler', () => {
 
     onEvent({ payload: {}, type: 'gateway.ready' } as any)
 
-    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('sess-crashed'))
+    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('sess-crashed', undefined, 0, { mode: 'transport-recovery' }))
     expect(newSession).not.toHaveBeenCalled()
     expect(ctx.session.recoverSidRef.current).toBeNull()
     expect(getUiState().status).toBe('recovering session…')
@@ -1129,7 +1129,7 @@ describe('createGatewayEventHandler', () => {
     const onEvent = createGatewayEventHandler(ctx)
     onEvent({ payload: {}, type: 'gateway.ready' } as any)
 
-    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('durable-key-abc'))
+    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('durable-key-abc', undefined, 0, { mode: 'transport-recovery' }))
     // Ref is NOT destroyed prematurely by createGatewayEventHandler
     expect(keyRef.current).toBe('durable-key-abc')
     expect(getUiState().status).toBe('recovering session…')

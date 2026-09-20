@@ -295,7 +295,7 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
     } as any)
 
     // Assert: resumeById was called with durable sessionKey (not runtime sid)
-    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-durable-reconnect'))
+    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-durable-reconnect', undefined, 0, { mode: 'transport-recovery' }))
     expect(recoverSidRef.current).toBeNull()
     expect(getUiState().sessionKey).toBe('session-durable-reconnect')
 
@@ -380,7 +380,7 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
       payload: { heartbeat: true }
     } as any)
 
-    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-durable-live'))
+    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-durable-live', undefined, 0, { mode: 'transport-recovery' }))
     expect(recoverSidRef.current).toBeNull()
     expect(getUiState().sessionKey).toBe('session-durable-live')
     expect(getUiState().busy).toBe(true)
@@ -442,7 +442,7 @@ describe('Gateway Recovery: WebSocket Transport Loss vs Process Exit', () => {
       payload: { heartbeat: true }
     } as any)
 
-    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-durable-persisted'))
+    await vi.waitFor(() => expect(resumeByIdMock).toHaveBeenCalledWith('session-durable-persisted', undefined, 0, { mode: 'transport-recovery' }))
     // Target was NOT destroyed before or during the failed call
     expect(recoverSidRef.current).toBe('session-durable-persisted')
   })
