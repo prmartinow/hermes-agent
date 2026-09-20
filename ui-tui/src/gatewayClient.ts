@@ -152,12 +152,18 @@ export class GatewayClient extends EventEmitter {
   // only owns the two transports (child stdio, attached socket) and the
   // buffered-event replay that Ink's mount order needs.
   private readonly channel = new JsonRpcRequestChannel({
-    onEvent: ev => this.publish(ev as AnyGatewayEvent),
+    onEvent: ev => this.handleGatewayEvent(ev as AnyGatewayEvent),
     onHeartbeatFailure: () => this.onHeartbeatFailure(),
     onUnhandledRequest: req => this.pushLog(`[protocol] unhandled server request: ${req.method}`),
     requestTimeoutMs: REQUEST_TIMEOUT_MS,
     unrefTimers: true
   })
+  private lastSeenSeq = new Map<string, number>()
+  private replayEpoch: string | null = null
+  private replayInFlight = false
+  private replayHold: Map<string, AnyGatewayEvent[]> | null = null
+  private hadGatewayReady = false
+  private transportGeneration = 0
   private bufferedEvents = new CircularBuffer<AnyGatewayEvent>(MAX_BUFFERED_EVENTS)
   // Server→client requests (clarify, approval, sudo, …) follow the same
   // mount-order contract as events: an attached session mid-turn can send one
@@ -365,6 +371,9 @@ export class GatewayClient extends EventEmitter {
     // its queued microtask becomes a no-op (it captured the old generation).
     // Always discard per-transport buffers on reset so stale frames are never replayed.
     this.drainGeneration += 1
+    this.transportGeneration += 1
+    this.replayInFlight = false
+    this.replayHold = null
     this.bufferedEvents.clear()
     this.bufferedRequests = []
     this.pendingExit = undefined
@@ -489,6 +498,150 @@ export class GatewayClient extends EventEmitter {
     }
   }
 
+
+  private handleGatewayEvent(ev: AnyGatewayEvent) {
+    if (ev.type === 'gateway.ready') {
+      void this.handleGatewayReadyEvent(ev as GatewayEvent<'gateway.ready'>)
+      return
+    }
+
+    const sid = (ev as any).session_id as string | undefined
+    if (this.replayInFlight && sid && this.replayHold?.has(sid)) {
+      this.replayHold.get(sid)!.push(ev)
+      return
+    }
+
+    this.dispatchIfNewer(ev, true)
+  }
+
+  private dispatchIfNewer(ev: AnyGatewayEvent, mirrorSidecar = true) {
+    const sid = (ev as any).session_id as string | undefined
+    const seq = (ev as any).seq as number | undefined
+
+    if (sid && typeof seq === 'number' && Number.isFinite(seq)) {
+      const previous = this.lastSeenSeq.get(sid) ?? 0
+      if (seq <= previous) {
+        return
+      }
+      this.lastSeenSeq.set(sid, seq)
+    }
+
+    if (mirrorSidecar) {
+      const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
+      this.mirrorEventToSidecar(frame)
+    }
+
+    this.publish(ev)
+  }
+
+  private flushReplayHold(): void {
+    const hold = this.replayHold
+    this.replayHold = null
+    if (!hold) return
+
+    for (const parked of hold.values()) {
+      for (const event of parked) {
+        this.dispatchIfNewer(event, true)
+      }
+    }
+  }
+
+  private async handleGatewayReadyEvent(ev: GatewayEvent<'gateway.ready'>) {
+    const generation = ++this.transportGeneration
+    const epoch = (ev.payload as any)?.replay_epoch as string | undefined
+
+    if (ev.payload?.heartbeat === true && this.ws?.readyState === WS_OPEN) {
+      this.channel.startHeartbeat()
+    }
+
+    // First connection or no active sequence watermarks: expose immediately
+    if (!this.hadGatewayReady || this.lastSeenSeq.size === 0) {
+      this.hadGatewayReady = true
+      if (epoch) this.replayEpoch = epoch
+      this.publish(ev)
+      return
+    }
+
+    // Epoch reset (server restarted): invalidate old watermarks
+    if (epoch && this.replayEpoch && epoch !== this.replayEpoch) {
+      this.pushLog(`[replay] epoch changed from ${this.replayEpoch} to ${epoch} - clearing watermarks`)
+      this.lastSeenSeq.clear()
+      this.replayEpoch = epoch
+      this.publish({ type: 'gateway.replay_gap', payload: { reason: 'epoch-reset', epoch } } as any)
+      this.publish(ev)
+      return
+    }
+
+    if (epoch && !this.replayEpoch) {
+      this.replayEpoch = epoch
+    }
+
+    // Establish replay hold for tracked sessions
+    this.replayInFlight = true
+    const hold = new Map<string, AnyGatewayEvent[]>()
+    for (const sid of this.lastSeenSeq.keys()) {
+      hold.set(sid, [])
+    }
+    this.replayHold = hold
+
+    try {
+      const entries = Array.from(this.lastSeenSeq.entries())
+      const results = await Promise.allSettled(
+        entries.map(([sid, lastSeen]) =>
+          this.channel.request<{
+            events?: Array<{ type: string; session_id?: string; seq?: number; payload?: unknown }>
+            truncated?: boolean
+            epoch?: string
+            latest_seq?: number
+          }>('session.events.since', { session_id: sid, last_seen: lastSeen }, 10000)
+        )
+      )
+
+      if (generation !== this.transportGeneration) {
+        return
+      }
+
+      for (let i = 0; i < entries.length; i++) {
+        const [sid, lastSeen] = entries[i]!
+        const res = results[i]!
+        if (res.status !== 'fulfilled' || !res.value) continue
+
+        const val = res.value
+        if (val.truncated) {
+          this.pushLog(`[replay] session ${sid} events truncated (lastSeen=${lastSeen}, latest=${val.latest_seq})`)
+          this.publish({
+            type: 'gateway.replay_gap',
+            payload: { reason: 'truncated', session_id: sid, last_seen: lastSeen, latest_seq: val.latest_seq }
+          } as any)
+        }
+
+        if (Array.isArray(val.events)) {
+          for (const event of val.events) {
+            if (event && event.type) {
+              this.dispatchIfNewer(event as AnyGatewayEvent, true)
+            }
+          }
+        }
+      }
+    } catch {
+      // Replay failure degrades to snapshot reconciliation
+    } finally {
+      if (generation === this.transportGeneration) {
+        this.flushReplayHold()
+        this.replayInFlight = false
+        this.publish(ev)
+      }
+    }
+  }
+
+  getSeqWatermarks(): Record<string, number> {
+    return Object.fromEntries(this.lastSeenSeq)
+  }
+
+  retireSession(sid: string): void {
+    this.lastSeenSeq.delete(sid)
+  }
+
   publishLocalEvent(ev: AnyGatewayEvent) {
     const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
 
@@ -511,9 +664,7 @@ export class GatewayClient extends EventEmitter {
       return
     }
 
-    if (frame.method === 'event') {
-      this.mirrorEventToSidecar(text)
-    }
+    // Sidecar mirroring is handled in dispatchIfNewer() to preserve sequence ordering during replay
   }
 
   private protocolError(what: string, text: string, emptyLabel: string) {
