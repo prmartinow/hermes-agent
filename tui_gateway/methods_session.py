@@ -1901,12 +1901,7 @@ def _(rid, params: dict, session: dict) -> dict:
             )
             messages = _history_to_messages(display_history)
 
-            next_after_row_id = after_id_val
-            for msg in reversed(messages):
-                if msg.get("row_id") is not None:
-                    next_after_row_id = msg["row_id"]
-                    break
-
+            next_after_row_id = int(rows[-1]["id"]) if rows else after_id_val
             has_more = bool(rows and next_after_row_id < snapshot_max_val)
 
             return _ok(
