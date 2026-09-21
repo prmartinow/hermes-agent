@@ -371,6 +371,7 @@ export default class Ink {
       this.hyperlinkPool
     )
     this.log = new LogUpdate({
+      initialRenderMode: (options as any)?.initialRenderMode,
       isTTY: (options.stdout.isTTY as boolean | undefined) || false,
       stylePool: this.stylePool
     })

@@ -33,6 +33,7 @@ type State = {
 }
 
 type Options = {
+  initialRenderMode?: 'clear-terminal' | 'append-to-existing-scrollback'
   isTTY: boolean
   stylePool: StylePool
 }
@@ -152,7 +153,7 @@ export class LogUpdate {
       (prev.viewport.width !== 0 && next.viewport.width !== prev.viewport.width)
     ) {
       return fullResetSequence_CAUSES_FLICKER(
-        next, prev.viewport.width === 0 ? 'init' : 'resize', stylePool, undefined, altScreen
+        next, prev.viewport.width === 0 ? 'init' : 'resize', stylePool, undefined, altScreen, this.options.initialRenderMode
       )
     }
 
@@ -500,21 +501,20 @@ function fullResetSequence_CAUSES_FLICKER(
   reason: FlickerReason,
   stylePool: StylePool,
   debug?: { triggerY: number; prevLine: string; nextLine: string },
-  altScreen = false
+  altScreen = false,
+  initialRenderMode: 'clear-terminal' | 'append-to-existing-scrollback' = (process.env.HERMES_TUI_INITIAL_RENDER_MODE === 'append-to-existing-scrollback' ? 'append-to-existing-scrollback' : 'clear-terminal')
 ): Diff {
   const isResize = reason === 'resize'
   const isInit = reason === 'init'
+  const isAppendInitial = isInit && initialRenderMode === 'append-to-existing-scrollback'
   const t0 = performance.now()
   
   // Static History / Dynamic Active Split:
   // In inline mode, completed turns reside in the terminal emulator's native scrollback,
   // which the terminal automatically and hardware-reflows on window resize.
-  // Only the initial session hydration (isInit) renders fullHistory from line 0.
-  // Resizes and offscreen recoveries only redraw the visible active viewport slice.
-  const fullHistory = altScreen ? true : isInit
+  // When appending to existing scrollback, only the active viewport slice is mounted.
+  const fullHistory = altScreen ? true : (isInit && !isAppendInitial)
   const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
-  // The terminal was homed by the clear patch: its cursor uses viewport,
-  // not transcript, coordinates. Include a cursor-only trailing row too.
   const originY = fullHistory ? 0 : inlineViewportOrigin(frame)
   renderFrameSlice(screen, frame, originY, frame.screen.height, stylePool, originY, !fullHistory)
 
@@ -523,10 +523,11 @@ function fullResetSequence_CAUSES_FLICKER(
     moveCursorTo(screen, frame.cursor.x, fullHistory ? frame.cursor.y : Math.max(0, Math.min(frame.viewport.height - 1, frame.cursor.y - originY)))
   }
 
-  // clearTerminal wipes scrollback (only on initial hydration / altScreen).
-  // clearScreen clears visible screen rows without duplicating or wiping scrollback.
-  const patchType = (altScreen || (isInit && !altScreen)) ? 'clearTerminal' : 'clearScreen'
-  const diff: Diff = [{ type: patchType, reason, debug }, ...screen.diff]
+  // When appending to existing scrollback, do NOT wipe native scrollback!
+  const patchType = isAppendInitial
+    ? undefined
+    : (altScreen || (isInit && !altScreen)) ? 'clearTerminal' : 'clearScreen'
+  const diff: Diff = patchType ? [{ type: patchType, reason, debug }, ...screen.diff] : [...screen.diff]
   if (isResize) {
     logForDebugging(`[tui-perf] fullResetSequence: resize complete in ${(performance.now() - t0).toFixed(1)}ms: rows=${frame.screen.height}, cols=${frame.viewport.width}, patches=${diff.length}`)
   }

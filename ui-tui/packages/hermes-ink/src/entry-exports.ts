@@ -1,3 +1,4 @@
+export { renderToScreen, renderNodeToAnsi, serializeScreenToAnsi } from './ink/render-to-screen.js'
 export { default as useStderr } from './hooks/use-stderr.js'
 export { default as useStdout } from './hooks/use-stdout.js'
 export { logForDebugging } from './utils/debug.js'

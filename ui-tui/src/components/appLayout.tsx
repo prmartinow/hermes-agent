@@ -33,6 +33,7 @@ import { FpsOverlay } from './fpsOverlay.js'
 import { HelpHint } from './helpHint.js'
 import { Journey } from './journey.js'
 import { MessageLine } from './messageLine.js'
+import { TranscriptRowView } from './TranscriptRowView.js'
 import { PetKitty, PetSprite } from './petSprite.js'
 import { QueuedMessages } from './queuedMessages.js'
 import { LiveTodoPanel, StreamingAssistant } from './streamingAssistant.js'
@@ -192,12 +193,13 @@ const TranscriptPane = memo(function TranscriptPane({
               <>
                 {hasSkippedHistory && (
                   <Box flexDirection="column" key={introRow.key} ref={transcript.virtualHistory.measureRef(introRow.key)}>
-                    <Box flexDirection="column" paddingTop={1}>
-                      <Banner maxWidth={Math.max(1, cols - 2)} t={ui.theme} />
-                      {introRow.msg.info && (
-                        <SessionPanel info={introRow.msg.info} maxWidth={Math.max(1, cols - 2)} sid={ui.sid} t={ui.theme} />
-                      )}
-                    </Box>
+                    <TranscriptRowView
+                      cols={cols}
+                      bodyCols={bodyCols}
+                      msg={introRow.msg}
+                      theme={ui.theme}
+                      sid={ui.sid}
+                    />
                   </Box>
                 )}
 
@@ -209,33 +211,23 @@ const TranscriptPane = memo(function TranscriptPane({
                       </Box>
                     )}
 
-                    {row.msg.kind === 'intro' ? (
-                      <Box flexDirection="column" paddingTop={1}>
-                        <Banner maxWidth={Math.max(1, cols - 2)} t={ui.theme} />
-
-                        {row.msg.info && (
-                          <SessionPanel info={row.msg.info} maxWidth={Math.max(1, cols - 2)} sid={ui.sid} t={ui.theme} />
-                        )}
-                      </Box>
-                    ) : row.msg.kind === 'panel' && row.msg.panelData ? (
-                      <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
-                    ) : (
-                      <MessageLine
-                        cols={bodyCols}
-                        compact={ui.compact}
-                        detailsMode={ui.detailsMode}
-                        detailsModeCommandOverride={ui.detailsModeCommandOverride}
-                        msg={row.msg}
-                        prev={prevRenderedMsg(i => transcript.virtualRows[i]?.msg, row.index, {
-                          commandOverride: ui.detailsModeCommandOverride,
-                          detailsMode: ui.detailsMode,
-                          sections: ui.sections
-                        })}
-                        sections={ui.sections}
-                        t={ui.theme}
-                        timestamps={ui.timestamps}
-                      />
-                    )}
+                    <TranscriptRowView
+                      cols={cols}
+                      bodyCols={bodyCols}
+                      compact={ui.compact}
+                      detailsMode={ui.detailsMode}
+                      detailsModeCommandOverride={ui.detailsModeCommandOverride}
+                      msg={row.msg}
+                      prev={prevRenderedMsg(i => transcript.virtualRows[i]?.msg, row.index, {
+                        commandOverride: ui.detailsModeCommandOverride,
+                        detailsMode: ui.detailsMode,
+                        sections: ui.sections
+                      })}
+                      sections={ui.sections}
+                      sid={ui.sid}
+                      theme={ui.theme}
+                      timestamps={ui.timestamps}
+                    />
                   </Box>
                 ))}
               </>
