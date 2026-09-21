@@ -397,12 +397,24 @@ method("session.status", params=SessionStatusParams, result=SessionStatusResult,
 
 
 class SessionHistoryParams(SessionParams):
-    pass
+    after_row_id: int | None = None
+    before_index: int | None = None
+    limit: int | None = None
+    snapshot_max_row_id: int | None = None
+    tail_limit: int | None = None
 
 
 class SessionHistoryResult(Result):
+    after_row_id: int | None = None
     count: int
+    end_index: int | None = None
+    has_more: bool | None = None
+    has_more_before: bool | None = None
     messages: list[TranscriptMessage]
+    next_after_row_id: int | None = None
+    session_id: str | None = None
+    snapshot_max_row_id: int | None = None
+    start_index: int | None = None
 
 
 method("session.history", params=SessionHistoryParams, result=SessionHistoryResult,
