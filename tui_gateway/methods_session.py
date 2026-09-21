@@ -1793,10 +1793,13 @@ def _(rid, params: dict, session: dict) -> dict:
 
 @_session_method("session.history")
 def _(rid, params: dict, session: dict) -> dict:
+    after_row_id = params.get("after_row_id")
+    tail_limit = params.get("tail_limit")
     before_index = params.get("before_index")
     limit_param = params.get("limit")
+    snapshot_max_row_id = params.get("snapshot_max_row_id")
 
-    if before_index is None and limit_param is None:
+    if before_index is None and limit_param is None and after_row_id is None and tail_limit is None:
         history = list(session.get("history", []))
         if session.get("session_key"):
             with _session_db(session) as db:
@@ -1813,15 +1816,6 @@ def _(rid, params: dict, session: dict) -> dict:
         return _ok(rid, {"count": len(history), "messages": _history_to_messages(history)})
 
     stored_id = str(session.get("session_key") or params.get("session_id") or "")
-    try:
-        before_index_val = int(before_index or 0)
-    except (TypeError, ValueError):
-        before_index_val = 0
-    try:
-        limit_val = min(max(int(limit_param or 50), 1), 100)
-    except (TypeError, ValueError):
-        limit_val = 50
-
     with _session_db(session) as db:
         if db is None:
             return _err(rid, 5000, "database unavailable")
@@ -1832,6 +1826,112 @@ def _(rid, params: dict, session: dict) -> dict:
             else db._session_lineage_root_to_tip(stored_id)
         )
         placeholders = ",".join("?" for _ in session_ids)
+
+        if tail_limit is not None:
+            try:
+                tail_val = min(max(int(tail_limit or 100), 1), 500)
+            except (TypeError, ValueError):
+                tail_val = 100
+
+            with db._read_ctx() as conn:
+                rows = conn.execute(
+                    f"SELECT session_id, active, compacted, {db._CONVERSATION_ROW_COLUMNS} "
+                    f"FROM ("
+                    f"  SELECT session_id, active, compacted, {db._CONVERSATION_ROW_COLUMNS}, id "
+                    f"  FROM messages WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1) "
+                    f"  ORDER BY id DESC LIMIT ?"
+                    f") ORDER BY id ASC",
+                    tuple(session_ids) + (tail_val,),
+                ).fetchall()
+
+            display_history = db._rows_to_conversation(
+                rows,
+                session_id=stored_id,
+                include_ancestors=True,
+                repair_alternation=False,
+                include_row_ids=True,
+            )
+            messages = _history_to_messages(display_history)
+            return _ok(
+                rid,
+                {
+                    "session_id": str(params.get("session_id") or ""),
+                    "messages": messages,
+                    "count": len(messages),
+                },
+            )
+
+        if after_row_id is not None:
+            try:
+                after_id_val = max(0, int(after_row_id))
+            except (TypeError, ValueError):
+                after_id_val = 0
+            try:
+                limit_val = min(max(int(limit_param or 100), 1), 500)
+            except (TypeError, ValueError):
+                limit_val = 100
+
+            with db._read_ctx() as conn:
+                if snapshot_max_row_id is None:
+                    max_row = conn.execute(
+                        f"SELECT MAX(id) FROM messages WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)",
+                        tuple(session_ids),
+                    ).fetchone()
+                    snapshot_max_val = max_row[0] if max_row and max_row[0] is not None else 0
+                else:
+                    try:
+                        snapshot_max_val = int(snapshot_max_row_id)
+                    except (TypeError, ValueError):
+                        snapshot_max_val = 0
+
+                rows = conn.execute(
+                    f"SELECT session_id, active, compacted, {db._CONVERSATION_ROW_COLUMNS} "
+                    f"FROM messages WHERE session_id IN ({placeholders}) AND (active = 1 OR compacted = 1) "
+                    f"AND id > ? AND id <= ? "
+                    f"ORDER BY id ASC LIMIT ?",
+                    tuple(session_ids) + (after_id_val, snapshot_max_val, limit_val),
+                ).fetchall()
+
+            display_history = db._rows_to_conversation(
+                rows,
+                session_id=stored_id,
+                include_ancestors=True,
+                repair_alternation=False,
+                include_row_ids=True,
+            )
+            messages = _history_to_messages(display_history)
+
+            next_after_row_id = after_id_val
+            for msg in reversed(messages):
+                if msg.get("row_id") is not None:
+                    next_after_row_id = msg["row_id"]
+                    break
+
+            has_more = bool(rows and next_after_row_id < snapshot_max_val)
+
+            return _ok(
+                rid,
+                {
+                    "session_id": str(params.get("session_id") or ""),
+                    "messages": messages,
+                    "after_row_id": after_id_val,
+                    "next_after_row_id": next_after_row_id,
+                    "snapshot_max_row_id": snapshot_max_val,
+                    "has_more": has_more,
+                    "count": len(messages),
+                },
+            )
+
+        # Existing backward indexed paging
+        try:
+            before_index_val = int(before_index or 0)
+        except (TypeError, ValueError):
+            before_index_val = 0
+        try:
+            limit_val = min(max(int(limit_param or 50), 1), 100)
+        except (TypeError, ValueError):
+            limit_val = 50
+
         offset = max(0, before_index_val - limit_val)
         fetch_count = before_index_val - offset
 
