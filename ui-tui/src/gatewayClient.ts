@@ -738,6 +738,30 @@ export class GatewayClient extends EventEmitter {
     this.lastSeenSeq.delete(sid)
   }
 
+  activateEventBarrier(sid: string): void {
+    if (!this.replayHold) {
+      this.replayHold = new Map()
+    }
+    if (!this.replayHold.has(sid)) {
+      this.replayHold.set(sid, [])
+    }
+    this.replayInFlight = true
+  }
+
+  releaseEventBarrier(sid: string): AnyGatewayEvent[] {
+    if (!this.replayHold) return []
+    const parked = this.replayHold.get(sid) ?? []
+    this.replayHold.delete(sid)
+    if (this.replayHold.size === 0) {
+      this.replayHold = null
+      this.replayInFlight = false
+    }
+    for (const ev of parked) {
+      this.dispatchIfNewer(ev, true)
+    }
+    return parked
+  }
+
   publishLocalEvent(ev: AnyGatewayEvent) {
     const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
 

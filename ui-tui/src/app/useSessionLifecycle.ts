@@ -10,6 +10,7 @@ import { INLINE_MODE, DASHBOARD_TUI_MODE } from '../config/env.js'
 
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
 import { introMsg, toTranscriptMessages } from '../domain/messages.js'
+import { performColdHistoryHydration } from './coldHistoryHydration.js'
 import { ZERO } from '../domain/usage.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
@@ -501,8 +502,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         const previousSid = getUiState().sid
 
         const isTransportRecovery = options?.mode === 'transport-recovery'
+        const isGapRecovery = options?.mode === 'transport-gap-recovery'
         const resumeParams: Record<string, unknown> = { cols: colsRef.current, session_id: id }
-        if (isTransportRecovery) {
+        if (isTransportRecovery || (!isGapRecovery && INLINE_MODE)) {
           resumeParams.omit_messages = true
         }
 
@@ -524,7 +526,34 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             const info = r.info ?? null
             const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
 
-            if (!isTransportRecovery) {
+            if (!isTransportRecovery && !isGapRecovery && INLINE_MODE) {
+              resetSession()
+              setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
+
+              gw.activateEventBarrier(r.session_id)
+
+              performColdHistoryHydration({
+                gateway: gw,
+                sessionId: r.session_id,
+                cols: colsRef.current,
+                theme: getUiState().theme,
+                info,
+                stdout: process.stdout
+              }).then(hydration => {
+                if (replayGeneration.current !== generation) return
+                gw.releaseEventBarrier(r.session_id)
+                const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
+                setHistoryItems(resumed)
+                setViewportMeta(r.viewport ?? null)
+              }).catch(() => {
+                if (replayGeneration.current !== generation) return
+                gw.releaseEventBarrier(r.session_id)
+                const transcriptMsgs = toTranscriptMessages(r.messages ?? [])
+                const resumed = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
+                setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
+                setViewportMeta(r.viewport ?? null)
+              })
+            } else if (!isTransportRecovery) {
               resetSession()
               setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
