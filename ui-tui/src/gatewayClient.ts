@@ -162,6 +162,7 @@ export class GatewayClient extends EventEmitter {
   private replayEpoch: string | null = null
   private replayInFlight = false
   private replayHold: Map<string, AnyGatewayEvent[]> | null = null
+  private eventBarrierOwner = new Map<string, string>()
   private hadGatewayReady = false
   private transportGeneration = 0
   private bufferedEvents = new CircularBuffer<AnyGatewayEvent>(MAX_BUFFERED_EVENTS)
@@ -537,6 +538,7 @@ export class GatewayClient extends EventEmitter {
     this.transportGeneration += 1
     this.replayInFlight = false
     this.replayHold = null
+    this.eventBarrierOwner.clear()
   }
 
   private publishGatewayReady(ev: GatewayEvent<'gateway.ready'>): void {
@@ -738,18 +740,25 @@ export class GatewayClient extends EventEmitter {
     this.lastSeenSeq.delete(sid)
   }
 
-  activateEventBarrier(sid: string): void {
+  activateEventBarrier(sid: string, owner?: string): void {
     if (!this.replayHold) {
       this.replayHold = new Map()
     }
     if (!this.replayHold.has(sid)) {
       this.replayHold.set(sid, [])
     }
+    if (owner) {
+      this.eventBarrierOwner.set(sid, owner)
+    }
     this.replayInFlight = true
   }
 
-  releaseEventBarrier(sid: string): AnyGatewayEvent[] {
+  releaseEventBarrier(sid: string, owner?: string): AnyGatewayEvent[] {
     if (!this.replayHold) return []
+    if (owner && this.eventBarrierOwner.has(sid) && this.eventBarrierOwner.get(sid) !== owner) {
+      return []
+    }
+    this.eventBarrierOwner.delete(sid)
     const parked = this.replayHold.get(sid) ?? []
     this.replayHold.delete(sid)
     if (this.replayHold.size === 0) {
@@ -762,8 +771,12 @@ export class GatewayClient extends EventEmitter {
     return parked
   }
 
-  cancelEventBarrier(sid: string): void {
+  cancelEventBarrier(sid: string, owner?: string): void {
     if (!this.replayHold) return
+    if (owner && this.eventBarrierOwner.has(sid) && this.eventBarrierOwner.get(sid) !== owner) {
+      return
+    }
+    this.eventBarrierOwner.delete(sid)
     this.replayHold.delete(sid)
     if (this.replayHold.size === 0) {
       this.replayHold = null
