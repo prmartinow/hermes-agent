@@ -28,9 +28,10 @@ describe('Cold History Hydration Pipeline', () => {
     const request = vi.fn().mockResolvedValue({
       messages: mockMessages,
       count: 15,
-      after_row_id: 0,
-      next_after_row_id: 15,
-      snapshot_max_row_id: 15,
+      cursor: 0,
+      next_cursor: 15,
+      total: 15,
+      snapshot_token: 'snap-123',
       has_more: false
     })
 
@@ -72,22 +73,24 @@ describe('Cold History Hydration Pipeline', () => {
     }))
 
     const request = vi.fn().mockImplementation((method, params) => {
-      if (params.after_row_id === 0) {
+      if (!params.snapshot_token) {
         return Promise.resolve({
           messages: page1Messages,
           count: 100,
-          after_row_id: 0,
-          next_after_row_id: 100,
-          snapshot_max_row_id: 150,
+          cursor: 0,
+          next_cursor: 100,
+          total: 150,
+          snapshot_token: 'snap-456',
           has_more: true
         })
       }
       return Promise.resolve({
         messages: page2Messages,
         count: 50,
-        after_row_id: 100,
-        next_after_row_id: 150,
-        snapshot_max_row_id: 150,
+        cursor: 100,
+        next_cursor: 150,
+        total: 150,
+        snapshot_token: 'snap-456',
         has_more: false
       })
     })

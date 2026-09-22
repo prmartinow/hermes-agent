@@ -8,6 +8,10 @@ import { TranscriptRowView } from '../components/TranscriptRowView.js'
 interface HistoryPageResult {
   messages: unknown[]
   count: number
+  cursor?: number
+  next_cursor?: number
+  snapshot_token?: string
+  total?: number
   after_row_id?: number
   next_after_row_id?: number
   snapshot_max_row_id?: number
@@ -56,7 +60,9 @@ export async function performColdHistoryHydration(
     timeSliceMs = 20
   } = opts
 
-  let afterRowId = 0
+  let cursor = 0
+  let snapshotToken: string | null = null
+  let totalMessages: number | null = null
   let snapshotMaxRowId: number | null = null
   let materializedCount = 0
   let appendedToScrollback = false
@@ -68,11 +74,11 @@ export async function performColdHistoryHydration(
   while (true) {
     const historyParams: Record<string, unknown> = {
       session_id: sessionId,
-      after_row_id: afterRowId,
+      cursor,
       limit: 100
     }
-    if (snapshotMaxRowId !== null) {
-      historyParams.snapshot_max_row_id = snapshotMaxRowId
+    if (snapshotToken !== null) {
+      historyParams.snapshot_token = snapshotToken
     }
 
     const res: HistoryPageResult | null = await gateway.request<HistoryPageResult>(
@@ -85,13 +91,17 @@ export async function performColdHistoryHydration(
       break
     }
 
-    if (snapshotMaxRowId === null && typeof res.snapshot_max_row_id === 'number') {
-      snapshotMaxRowId = res.snapshot_max_row_id
+    if (snapshotToken === null && typeof res.snapshot_token === 'string') {
+      snapshotToken = res.snapshot_token
+      totalMessages = res.total ?? null
     }
 
     const pageMsgs = toTranscriptMessages(res.messages)
     for (const msg of pageMsgs) {
       deque.push(msg)
+      if (typeof (msg as any).row_id === 'number') {
+        snapshotMaxRowId = Math.max(snapshotMaxRowId ?? 0, (msg as any).row_id)
+      }
     }
 
     // While deque exceeds maxMounted, pop oldest messages and serialize to stdout
@@ -137,7 +147,7 @@ export async function performColdHistoryHydration(
         await writeWithBackpressure(stdout, ansi + '\n')
       }
 
-      onProgress?.(materializedCount, snapshotMaxRowId ?? undefined)
+      onProgress?.(materializedCount, totalMessages ?? undefined)
 
       // Time-budgeted slice: yield event loop every ~20ms
       if (performance.now() - sliceStart > timeSliceMs) {
@@ -146,10 +156,10 @@ export async function performColdHistoryHydration(
       }
     }
 
-    if (!res.has_more || !res.next_after_row_id || res.next_after_row_id <= afterRowId) {
+    if (!res.has_more || res.next_cursor === undefined || res.next_cursor <= cursor) {
       break
     }
-    afterRowId = res.next_after_row_id
+    cursor = res.next_cursor
   }
 
   // Final live messages for the React tree
