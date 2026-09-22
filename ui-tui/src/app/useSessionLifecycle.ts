@@ -217,18 +217,36 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     [gw, rpc]
   )
 
+  const resumeAttemptRef = useRef<string | null>(null)
   const replayGeneration = useRef<string | null>(null)
   const [replayCommitted, setReplayCommitted] = useState<string | null>(null)
-  const pendingColdCommitRef = useRef<{ generation: string; sid: string } | null>(null)
+  const pendingColdCommitRef = useRef<{ attemptId: string; boundaryGeneration: string | null; sid: string } | null>(null)
   const [coldCommitGeneration, setColdCommitGeneration] = useState<string | null>(null)
 
   useLayoutEffect(() => {
     const pending = pendingColdCommitRef.current
-    if (!pending || pending.generation !== replayGeneration.current) return
+    if (!pending) return
+    if (pending.attemptId !== resumeAttemptRef.current) {
+      pendingColdCommitRef.current = null
+      gw?.cancelEventBarrier(pending.sid)
+      return
+    }
     pendingColdCommitRef.current = null
     gw?.releaseEventBarrier(pending.sid)
-    setReplayCommitted(pending.generation)
+    if (pending.boundaryGeneration) {
+      setReplayCommitted(pending.boundaryGeneration)
+    }
   }, [coldCommitGeneration, gw])
+
+  useEffect(() => {
+    return () => {
+      const pending = pendingColdCommitRef.current
+      if (pending) {
+        pendingColdCommitRef.current = null
+        gw?.cancelEventBarrier(pending.sid)
+      }
+    }
+  }, [gw])
 
   useLayoutEffect(() => {
     if (replayCommitted && replayCommitted === replayGeneration.current) {
@@ -483,25 +501,27 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     ) => {
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
-      const generation = INLINE_MODE && DASHBOARD_TUI_MODE ? randomUUID() : null
+      const attemptId = randomUUID()
+      resumeAttemptRef.current = attemptId
+      const generation = INLINE_MODE && DASHBOARD_TUI_MODE ? attemptId : null
       replayGeneration.current = generation
       let replayBegun = false
 
       const startReplay = () => {
-        if (generation && !replayBegun && replayGeneration.current === generation) {
+        if (generation && !replayBegun && resumeAttemptRef.current === attemptId) {
           replayBegun = true
           process.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
         }
       }
 
       const abortReplay = () => {
-        if (generation && replayGeneration.current === generation) {
+        if (generation && resumeAttemptRef.current === attemptId) {
           process.stdout.write(`\x1b]777;hermes-replay;abort;${generation}\x07`)
         }
       }
 
       rpc<SetupStatusResponse>('setup.status', {}).then(setup => {
-        if (replayGeneration.current !== generation) return
+        if (resumeAttemptRef.current !== attemptId) return
         if (setup?.provider_configured === false) {
           abortReplay()
           panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections())
@@ -521,7 +541,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
         return gw.request<SessionResumeResult & { viewport?: SessionViewportMeta }>('session.resume', resumeParams)
           .then(raw => {
-            if (replayGeneration.current !== generation) return
+            if (resumeAttemptRef.current !== attemptId) return
             const r = asRpcResult<SessionResumeResult & { viewport?: SessionViewportMeta }>(raw)
 
             if (!r) {
@@ -552,9 +572,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 theme: getUiState().theme,
                 info,
                 stdout: process.stdout,
-                isCancelled: () => replayGeneration.current !== generation
+                isCancelled: () => resumeAttemptRef.current !== attemptId
               }).then(hydration => {
-                if (replayGeneration.current !== generation) {
+                if (resumeAttemptRef.current !== attemptId) {
                   gw.cancelEventBarrier(r.session_id)
                   return
                 }
@@ -563,10 +583,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 setHistoryItems(resumed)
                 setViewportMeta(r.viewport ?? null)
                 // 2. Queue commit acknowledgement: useLayoutEffect releases barrier and finishes replay after React commits this frame
-                pendingColdCommitRef.current = { generation: generation ?? '', sid: r.session_id }
-                setColdCommitGeneration(generation)
+                pendingColdCommitRef.current = { attemptId, boundaryGeneration: generation, sid: r.session_id }
+                setColdCommitGeneration(attemptId)
               }).catch(err => {
-                if (replayGeneration.current !== generation) {
+                if (resumeAttemptRef.current !== attemptId) {
                   gw.cancelEventBarrier(r.session_id)
                   return
                 }
@@ -578,7 +598,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 const resumed = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
                 setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
                 setViewportMeta(r.viewport ?? null)
-                setReplayCommitted(generation)
+                if (generation) {
+                  setReplayCommitted(generation)
+                }
               })
             } else if (!isTransportRecovery) {
               resetSession()
@@ -631,7 +653,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             }
           })
       }).catch((e: unknown) => {
-        if (replayGeneration.current !== generation) return
+        if (resumeAttemptRef.current !== attemptId) return
         const failure = classifyResumeFailure(e)
         if (failure.kind === 'retry-same') {
           const isSettling = failure.reason === 'disconnect_interrupt_settling'
