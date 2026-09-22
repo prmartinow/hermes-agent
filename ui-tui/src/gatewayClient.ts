@@ -740,22 +740,20 @@ export class GatewayClient extends EventEmitter {
     this.lastSeenSeq.delete(sid)
   }
 
-  activateEventBarrier(sid: string, owner?: string): void {
+  activateEventBarrier(sid: string, owner: string): void {
     if (!this.replayHold) {
       this.replayHold = new Map()
     }
     if (!this.replayHold.has(sid)) {
       this.replayHold.set(sid, [])
     }
-    if (owner) {
-      this.eventBarrierOwner.set(sid, owner)
-    }
+    this.eventBarrierOwner.set(sid, owner)
     this.replayInFlight = true
   }
 
-  releaseEventBarrier(sid: string, owner?: string): AnyGatewayEvent[] {
+  releaseEventBarrier(sid: string, owner: string): AnyGatewayEvent[] {
     if (!this.replayHold) return []
-    if (owner && this.eventBarrierOwner.has(sid) && this.eventBarrierOwner.get(sid) !== owner) {
+    if (this.eventBarrierOwner.get(sid) !== owner) {
       return []
     }
     this.eventBarrierOwner.delete(sid)
@@ -771,9 +769,9 @@ export class GatewayClient extends EventEmitter {
     return parked
   }
 
-  cancelEventBarrier(sid: string, owner?: string): void {
+  cancelEventBarrier(sid: string, owner: string): void {
     if (!this.replayHold) return
-    if (owner && this.eventBarrierOwner.has(sid) && this.eventBarrierOwner.get(sid) !== owner) {
+    if (this.eventBarrierOwner.get(sid) !== owner) {
       return
     }
     this.eventBarrierOwner.delete(sid)
