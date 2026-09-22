@@ -231,18 +231,32 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     }
   }, [])
 
+  const supersedeColdHydration = useCallback(() => {
+    resumeAttemptRef.current = null
+    const pending = pendingColdCommitRef.current
+    if (pending) {
+      pendingColdCommitRef.current = null
+      gw?.cancelEventBarrier(pending.sid, pending.attemptId)
+    }
+    const active = activeColdBarrierRef.current
+    if (active) {
+      activeColdBarrierRef.current = null
+      gw?.cancelEventBarrier(active.sid, active.attemptId)
+    }
+  }, [gw])
+
   useLayoutEffect(() => {
     const pending = pendingColdCommitRef.current
     if (!pending) return
     if (pending.attemptId !== resumeAttemptRef.current) {
       pendingColdCommitRef.current = null
       clearActiveColdBarrier(pending.attemptId, pending.sid)
-      gw?.cancelEventBarrier(pending.sid)
+      gw?.cancelEventBarrier(pending.sid, pending.attemptId)
       return
     }
     pendingColdCommitRef.current = null
     clearActiveColdBarrier(pending.attemptId, pending.sid)
-    gw?.releaseEventBarrier(pending.sid)
+    gw?.releaseEventBarrier(pending.sid, pending.attemptId)
     if (pending.boundaryGeneration) {
       setReplayCommitted(pending.boundaryGeneration)
     }
@@ -250,19 +264,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   useEffect(() => {
     return () => {
-      resumeAttemptRef.current = null
-      const pending = pendingColdCommitRef.current
-      if (pending) {
-        pendingColdCommitRef.current = null
-        gw?.cancelEventBarrier(pending.sid)
-      }
-      const active = activeColdBarrierRef.current
-      if (active) {
-        activeColdBarrierRef.current = null
-        gw?.cancelEventBarrier(active.sid)
-      }
+      supersedeColdHydration()
     }
-  }, [gw])
+  }, [supersedeColdHydration])
 
   useLayoutEffect(() => {
     if (replayCommitted && replayCommitted === replayGeneration.current) {
@@ -319,6 +323,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const startNewSession = useCallback(
     async (msg?: string, title?: string, keepCurrent = false) => {
+      supersedeColdHydration()
       const setup = await rpc<SetupStatusResponse>('setup.status', {})
 
       if (setup?.provider_configured === false) {
@@ -403,7 +408,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
       return r.session_id
     },
-    [closeSession, colsRef, onFreshSessionStarted, panel, resetSession, rpc, setHistoryItems, setSessionStartedAt, sys]
+    [closeSession, colsRef, onFreshSessionStarted, panel, resetSession, rpc, setHistoryItems, setSessionStartedAt, supersedeColdHydration, sys]
   )
 
   const newSession = useCallback(
@@ -422,6 +427,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const activateLiveSession = useCallback(
     (id: string) => {
+      supersedeColdHydration()
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'switching session…' })
 
@@ -462,7 +468,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           patchUiState({ status: 'ready' })
         })
     },
-    [gw, resetSession, scrollRef, setHistoryItems, setSessionStartedAt, sys]
+    [gw, resetSession, scrollRef, setHistoryItems, setSessionStartedAt, supersedeColdHydration, sys]
   )
 
   const fetchOlderBacklog = useCallback(async () => {
@@ -515,6 +521,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       retryAttempt = 0,
       options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume" }
     ) => {
+      supersedeColdHydration()
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
       const attemptId = randomUUID()
@@ -581,10 +588,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
               const previous = activeColdBarrierRef.current
               if (previous && previous.attemptId !== attemptId) {
-                gw?.cancelEventBarrier(previous.sid)
+                gw?.cancelEventBarrier(previous.sid, previous.attemptId)
                 activeColdBarrierRef.current = null
               }
-              gw.activateEventBarrier(r.session_id)
+              gw.activateEventBarrier(r.session_id, attemptId)
               activeColdBarrierRef.current = { attemptId, sid: r.session_id }
 
               performColdHistoryHydration({
@@ -598,7 +605,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               }).then(hydration => {
                 if (resumeAttemptRef.current !== attemptId) {
                   clearActiveColdBarrier(attemptId, r.session_id)
-                  gw.cancelEventBarrier(r.session_id)
+                  gw.cancelEventBarrier(r.session_id, attemptId)
                   return
                 }
                 const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
@@ -611,10 +618,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               }).catch(err => {
                 clearActiveColdBarrier(attemptId, r.session_id)
                 if (resumeAttemptRef.current !== attemptId) {
-                  gw.cancelEventBarrier(r.session_id)
+                  gw.cancelEventBarrier(r.session_id, attemptId)
                   return
                 }
-                gw.cancelEventBarrier(r.session_id)
+                gw.cancelEventBarrier(r.session_id, attemptId)
                 if (err instanceof ColdHydrationCancelledError) {
                   return
                 }
@@ -708,7 +715,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         patchUiState({ status: 'ready' })
       })
     },
-    [closeSession, colsRef, gw, opts.recoverSessionKeyRef, opts.recoverSidRef, panel, recoverSessionKeyRef, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, sys]
+    [closeSession, colsRef, gw, opts.recoverSessionKeyRef, opts.recoverSidRef, panel, recoverSessionKeyRef, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, supersedeColdHydration, sys]
   )
 
   const guardBusySessionSwitch = useCallback(
