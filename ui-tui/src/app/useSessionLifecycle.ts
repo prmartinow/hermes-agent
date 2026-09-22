@@ -224,24 +224,29 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   const activeColdBarrierRef = useRef<{ attemptId: string; sid: string } | null>(null)
   const [coldCommitGeneration, setColdCommitGeneration] = useState<string | null>(null)
 
+  const clearActiveColdBarrier = useCallback((attemptId: string, sid: string) => {
+    const active = activeColdBarrierRef.current
+    if (active?.attemptId === attemptId && active.sid === sid) {
+      activeColdBarrierRef.current = null
+    }
+  }, [])
+
   useLayoutEffect(() => {
     const pending = pendingColdCommitRef.current
     if (!pending) return
     if (pending.attemptId !== resumeAttemptRef.current) {
       pendingColdCommitRef.current = null
-      activeColdBarrierRef.current = null
+      clearActiveColdBarrier(pending.attemptId, pending.sid)
       gw?.cancelEventBarrier(pending.sid)
       return
     }
     pendingColdCommitRef.current = null
-    if (activeColdBarrierRef.current?.attemptId === pending.attemptId) {
-      activeColdBarrierRef.current = null
-    }
+    clearActiveColdBarrier(pending.attemptId, pending.sid)
     gw?.releaseEventBarrier(pending.sid)
     if (pending.boundaryGeneration) {
       setReplayCommitted(pending.boundaryGeneration)
     }
-  }, [coldCommitGeneration, gw])
+  }, [clearActiveColdBarrier, coldCommitGeneration, gw])
 
   useEffect(() => {
     return () => {
@@ -574,6 +579,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               resetSession()
               setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
+              const previous = activeColdBarrierRef.current
+              if (previous && previous.attemptId !== attemptId) {
+                gw?.cancelEventBarrier(previous.sid)
+                activeColdBarrierRef.current = null
+              }
               gw.activateEventBarrier(r.session_id)
               activeColdBarrierRef.current = { attemptId, sid: r.session_id }
 
@@ -587,7 +597,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 isCancelled: () => resumeAttemptRef.current !== attemptId
               }).then(hydration => {
                 if (resumeAttemptRef.current !== attemptId) {
-                  activeColdBarrierRef.current = null
+                  clearActiveColdBarrier(attemptId, r.session_id)
                   gw.cancelEventBarrier(r.session_id)
                   return
                 }
@@ -599,7 +609,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 pendingColdCommitRef.current = { attemptId, boundaryGeneration: generation, sid: r.session_id }
                 setColdCommitGeneration(attemptId)
               }).catch(err => {
-                activeColdBarrierRef.current = null
+                clearActiveColdBarrier(attemptId, r.session_id)
                 if (resumeAttemptRef.current !== attemptId) {
                   gw.cancelEventBarrier(r.session_id)
                   return
