@@ -219,6 +219,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const resumeAttemptRef = useRef<string | null>(null)
   const replayGeneration = useRef<string | null>(null)
+  const activeReplayBoundaryRef = useRef<{ attemptId: string; generation: string } | null>(null)
   const [replayCommitted, setReplayCommitted] = useState<string | null>(null)
   const pendingColdCommitRef = useRef<{ attemptId: string; boundaryGeneration: string | null; sid: string } | null>(null)
   const activeColdBarrierRef = useRef<{ attemptId: string; sid: string } | null>(null)
@@ -233,6 +234,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const supersedeColdHydration = useCallback(() => {
     resumeAttemptRef.current = null
+    const boundary = activeReplayBoundaryRef.current
+    if (boundary) {
+      activeReplayBoundaryRef.current = null
+      process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
+    }
     const pending = pendingColdCommitRef.current
     if (pending) {
       pendingColdCommitRef.current = null
@@ -252,6 +258,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       pendingColdCommitRef.current = null
       clearActiveColdBarrier(pending.attemptId, pending.sid)
       gw?.cancelEventBarrier(pending.sid, pending.attemptId)
+      const boundary = activeReplayBoundaryRef.current
+      if (boundary?.attemptId === pending.attemptId) {
+        activeReplayBoundaryRef.current = null
+        process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
+      }
       return
     }
     pendingColdCommitRef.current = null
@@ -270,6 +281,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   useLayoutEffect(() => {
     if (replayCommitted && replayCommitted === replayGeneration.current) {
+      activeReplayBoundaryRef.current = null
       writeAfterRender(`\x1b]777;hermes-replay;end;${replayCommitted}\x07`, process.stdout, true)
     }
   }, [replayCommitted])
@@ -533,12 +545,16 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       const startReplay = () => {
         if (generation && !replayBegun && resumeAttemptRef.current === attemptId) {
           replayBegun = true
+          activeReplayBoundaryRef.current = { attemptId, generation }
           process.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
         }
       }
 
       const abortReplay = () => {
-        if (generation && resumeAttemptRef.current === attemptId) {
+        if (generation) {
+          if (activeReplayBoundaryRef.current?.attemptId === attemptId) {
+            activeReplayBoundaryRef.current = null
+          }
           process.stdout.write(`\x1b]777;hermes-replay;abort;${generation}\x07`)
         }
       }

@@ -601,9 +601,9 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
     await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
 
-    // Activate barrier for s1 and s2
-    client.activateEventBarrier("s1")
-    client.activateEventBarrier("s2")
+    // Activate barrier for s1 and s2 with specific owner tokens
+    client.activateEventBarrier("s1", "owner-1")
+    client.activateEventBarrier("s2", "owner-2")
 
     // Deliver events for both sessions while barriers active
     ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 10, payload: { msg: "s1 held" } } }))
@@ -615,10 +615,10 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
     expect(received.some(e => (e as any).session_id === "s2")).toBe(false)
 
     // Cancel barrier for s1 (switched away)
-    client.cancelEventBarrier("s1")
+    client.cancelEventBarrier("s1", "owner-1")
 
     // Release barrier for s2 (completed hydration)
-    client.releaseEventBarrier("s2")
+    client.releaseEventBarrier("s2", "owner-2")
 
     await vi.waitFor(() => {
       expect(received.some(e => (e as any).session_id === "s2")).toBe(true)
@@ -628,5 +628,40 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
     expect(received.some(e => (e as any).session_id === "s1")).toBe(false)
     const s2Event = received.find(e => (e as any).session_id === "s2")
     expect((s2Event as any).seq).toBe(20)
+  })
+
+  it("fails closed: refuses to release or cancel barrier with mismatched or unowned attemptId", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+
+    client.start()
+    const ws = await server.waitForNextConnection()
+    ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
+
+    client.activateEventBarrier("s1", "attempt-real")
+    ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 100, payload: { msg: "protected" } } }))
+    await new Promise(r => setTimeout(r, 30))
+
+    // Attempt to cancel with wrong owner -> refused (fail closed)
+    client.cancelEventBarrier("s1", "attempt-imposter")
+    await new Promise(r => setTimeout(r, 20))
+    expect(received.some(e => (e as any).session_id === "s1")).toBe(false)
+
+    // Attempt to release with wrong owner -> refused (fail closed)
+    client.releaseEventBarrier("s1", "attempt-imposter")
+    await new Promise(r => setTimeout(r, 20))
+    expect(received.some(e => (e as any).session_id === "s1")).toBe(false)
+
+    // Legitimate owner releases -> event dispatches
+    client.releaseEventBarrier("s1", "attempt-real")
+    await vi.waitFor(() => {
+      expect(received.some(e => (e as any).session_id === "s1")).toBe(true)
+    })
+    const ev = received.find(e => (e as any).session_id === "s1")
+    expect((ev as any).seq).toBe(100)
   })
 })
