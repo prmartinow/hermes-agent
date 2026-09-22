@@ -10,7 +10,7 @@ import { INLINE_MODE, DASHBOARD_TUI_MODE } from '../config/env.js'
 
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
 import { introMsg, toTranscriptMessages } from '../domain/messages.js'
-import { performColdHistoryHydration } from './coldHistoryHydration.js'
+import { performColdHistoryHydration, ColdHydrationCancelledError } from './coldHistoryHydration.js'
 import { ZERO } from '../domain/usage.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
@@ -219,6 +219,17 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const replayGeneration = useRef<string | null>(null)
   const [replayCommitted, setReplayCommitted] = useState<string | null>(null)
+  const pendingColdCommitRef = useRef<{ generation: string; sid: string } | null>(null)
+  const [coldCommitGeneration, setColdCommitGeneration] = useState<string | null>(null)
+
+  useLayoutEffect(() => {
+    const pending = pendingColdCommitRef.current
+    if (!pending || pending.generation !== replayGeneration.current) return
+    pendingColdCommitRef.current = null
+    gw?.releaseEventBarrier(pending.sid)
+    setReplayCommitted(pending.generation)
+  }, [coldCommitGeneration, gw])
+
   useLayoutEffect(() => {
     if (replayCommitted && replayCommitted === replayGeneration.current) {
       writeAfterRender(`\x1b]777;hermes-replay;end;${replayCommitted}\x07`, process.stdout, true)
@@ -548,16 +559,21 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   return
                 }
                 const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
+                // 1. Commit live tail to React state first
                 setHistoryItems(resumed)
                 setViewportMeta(r.viewport ?? null)
-                gw.releaseEventBarrier(r.session_id)
-                setReplayCommitted(generation)
-              }).catch(() => {
+                // 2. Queue commit acknowledgement: useLayoutEffect releases barrier and finishes replay after React commits this frame
+                pendingColdCommitRef.current = { generation: generation ?? '', sid: r.session_id }
+                setColdCommitGeneration(generation)
+              }).catch(err => {
                 if (replayGeneration.current !== generation) {
                   gw.cancelEventBarrier(r.session_id)
                   return
                 }
                 gw.cancelEventBarrier(r.session_id)
+                if (err instanceof ColdHydrationCancelledError) {
+                  return
+                }
                 const transcriptMsgs = toTranscriptMessages(r.messages ?? [])
                 const resumed = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
                 setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)

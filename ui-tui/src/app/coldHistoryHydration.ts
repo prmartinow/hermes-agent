@@ -1,3 +1,10 @@
+export class ColdHydrationCancelledError extends Error {
+  constructor() {
+    super('Cold hydration was cancelled')
+    this.name = 'ColdHydrationCancelledError'
+  }
+}
+
 import React from 'react'
 import type { SessionInfo } from '../types.js'
 import type { Msg } from '../types.js'
@@ -73,7 +80,9 @@ export async function performColdHistoryHydration(
   let sliceStart = performance.now()
 
   while (true) {
-    if (opts.isCancelled?.()) break
+    if (opts.isCancelled?.()) {
+      throw new ColdHydrationCancelledError()
+    }
     const historyParams: Record<string, unknown> = {
       session_id: sessionId,
       cursor,
@@ -88,6 +97,10 @@ export async function performColdHistoryHydration(
       historyParams,
       15000
     )
+
+    if (opts.isCancelled?.()) {
+      throw new ColdHydrationCancelledError()
+    }
 
     if (!res || !Array.isArray(res.messages)) {
       break
@@ -146,6 +159,9 @@ export async function performColdHistoryHydration(
         cols
       )
 
+      if (opts.isCancelled?.()) {
+        throw new ColdHydrationCancelledError()
+      }
       if (ansi) {
         await writeWithBackpressure(stdout, ansi + '\n')
       }
