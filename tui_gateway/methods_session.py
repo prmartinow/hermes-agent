@@ -1791,15 +1791,137 @@ def _(rid, params: dict, session: dict) -> dict:
     return _ok(rid, {"output": "\n".join(lines)})
 
 
+
+import threading
+import time
+
+_HYDRATION_SNAPSHOTS: dict[str, dict] = {}
+_HYDRATION_SNAPSHOT_LOCK = threading.Lock()
+_HYDRATION_SNAPSHOT_TTL = 600.0
+
+
+def _reap_stale_hydration_snapshots():
+    now = time.time()
+    stale = [k for k, v in _HYDRATION_SNAPSHOTS.items() if now - v.get("created_at", 0) > _HYDRATION_SNAPSHOT_TTL]
+    for k in stale:
+        _HYDRATION_SNAPSHOTS.pop(k, None)
+
 @_session_method("session.history")
 def _(rid, params: dict, session: dict) -> dict:
-    after_row_id = params.get("after_row_id")
+    snapshot_token = params.get("snapshot_token")
+    cursor = params.get("cursor")
     tail_limit = params.get("tail_limit")
+    after_row_id = params.get("after_row_id")
     before_index = params.get("before_index")
     limit_param = params.get("limit")
     snapshot_max_row_id = params.get("snapshot_max_row_id")
 
-    if before_index is None and limit_param is None and after_row_id is None and tail_limit is None:
+    # 1. Existing snapshot continuation: slice from server-side canonical snapshot
+    if snapshot_token is not None:
+        with _HYDRATION_SNAPSHOT_LOCK:
+            _reap_stale_hydration_snapshots()
+            snap = _HYDRATION_SNAPSHOTS.get(snapshot_token)
+        if not snap:
+            return _err(rid, 4004, "hydration snapshot expired or not found")
+
+        canonical_messages = snap["messages"]
+        total = len(canonical_messages)
+        cursor_val = max(0, int(cursor or 0))
+        limit_val = min(max(int(limit_param or 100), 1), 500)
+
+        page_slice = canonical_messages[cursor_val : cursor_val + limit_val]
+        next_cursor = cursor_val + len(page_slice)
+        has_more = next_cursor < total
+
+        return _ok(
+            rid,
+            {
+                "session_id": str(params.get("session_id") or ""),
+                "snapshot_token": snapshot_token,
+                "messages": page_slice,
+                "cursor": cursor_val,
+                "next_cursor": next_cursor,
+                "total": total,
+                "has_more": has_more,
+                "count": len(page_slice),
+            },
+        )
+
+    # 2. Canonical tail limit: exact last N items of canonical display projection
+    if tail_limit is not None:
+        history = []
+        if session.get("session_key"):
+            with _session_db(session) as db:
+                if db is not None:
+                    with contextlib.suppress(Exception):
+                        history = db.get_messages_as_conversation(
+                            session["session_key"],
+                            include_ancestors=True,
+                            include_compacted=True,
+                            include_row_ids=True,
+                        )
+        canonical_messages = _history_to_messages(history)
+        try:
+            tail_val = min(max(int(tail_limit or 100), 1), 500)
+        except (TypeError, ValueError):
+            tail_val = 100
+
+        page_slice = canonical_messages[-tail_val:] if tail_val < len(canonical_messages) else canonical_messages
+        return _ok(
+            rid,
+            {
+                "session_id": str(params.get("session_id") or ""),
+                "messages": page_slice,
+                "total": len(canonical_messages),
+                "count": len(page_slice),
+            },
+        )
+
+    # 3. Canonical snapshot initiation (cursor is specified without snapshot_token)
+    if cursor is not None:
+        import uuid
+        history = []
+        if session.get("session_key"):
+            with _session_db(session) as db:
+                if db is not None:
+                    with contextlib.suppress(Exception):
+                        history = db.get_messages_as_conversation(
+                            session["session_key"],
+                            include_ancestors=True,
+                            include_compacted=True,
+                            include_row_ids=True,
+                        )
+        canonical_messages = _history_to_messages(history)
+        token = f"snap-{uuid.uuid4().hex[:12]}"
+        with _HYDRATION_SNAPSHOT_LOCK:
+            _reap_stale_hydration_snapshots()
+            _HYDRATION_SNAPSHOTS[token] = {
+                "session_id": str(params.get("session_id") or ""),
+                "messages": canonical_messages,
+                "created_at": time.time(),
+            }
+
+        cursor_val = max(0, int(cursor or 0))
+        limit_val = min(max(int(limit_param or 100), 1), 500)
+        page_slice = canonical_messages[cursor_val : cursor_val + limit_val]
+        next_cursor = cursor_val + len(page_slice)
+        has_more = next_cursor < len(canonical_messages)
+
+        return _ok(
+            rid,
+            {
+                "session_id": str(params.get("session_id") or ""),
+                "snapshot_token": token,
+                "messages": page_slice,
+                "cursor": cursor_val,
+                "next_cursor": next_cursor,
+                "total": len(canonical_messages),
+                "has_more": has_more,
+                "count": len(page_slice),
+            },
+        )
+
+    if before_index is None and limit_param is None and after_row_id is None:
         history = list(session.get("history", []))
         if session.get("session_key"):
             with _session_db(session) as db:

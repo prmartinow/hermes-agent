@@ -2760,21 +2760,27 @@ export interface SessionHistoryParams {
   profile?: string | null
   after_row_id?: number | null
   before_index?: number | null
+  cursor?: number | null
   limit?: number | null
   snapshot_max_row_id?: number | null
+  snapshot_token?: string | null
   tail_limit?: number | null
 }
 export interface SessionHistoryResult {
   after_row_id?: number | null
   count: number
+  cursor?: number | null
   end_index?: number | null
   has_more?: boolean | null
   has_more_before?: boolean | null
   messages: TranscriptMessage[]
   next_after_row_id?: number | null
+  next_cursor?: number | null
   session_id?: string | null
   snapshot_max_row_id?: number | null
+  snapshot_token?: string | null
   start_index?: number | null
+  total?: number | null
 }
 export interface SessionUsageParams {
   session_id: string
