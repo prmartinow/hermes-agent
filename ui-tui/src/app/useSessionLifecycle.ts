@@ -526,7 +526,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             const info = r.info ?? null
             const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
 
-            if (!isTransportRecovery && !isGapRecovery && INLINE_MODE) {
+            const isColdHydration = !isTransportRecovery && !isGapRecovery && INLINE_MODE
+
+            if (isColdHydration) {
               resetSession()
               setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
@@ -538,20 +540,29 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 cols: colsRef.current,
                 theme: getUiState().theme,
                 info,
-                stdout: process.stdout
+                stdout: process.stdout,
+                isCancelled: () => replayGeneration.current !== generation
               }).then(hydration => {
-                if (replayGeneration.current !== generation) return
-                gw.releaseEventBarrier(r.session_id)
+                if (replayGeneration.current !== generation) {
+                  gw.cancelEventBarrier(r.session_id)
+                  return
+                }
                 const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
                 setHistoryItems(resumed)
                 setViewportMeta(r.viewport ?? null)
-              }).catch(() => {
-                if (replayGeneration.current !== generation) return
                 gw.releaseEventBarrier(r.session_id)
+                setReplayCommitted(generation)
+              }).catch(() => {
+                if (replayGeneration.current !== generation) {
+                  gw.cancelEventBarrier(r.session_id)
+                  return
+                }
+                gw.cancelEventBarrier(r.session_id)
                 const transcriptMsgs = toTranscriptMessages(r.messages ?? [])
                 const resumed = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
                 setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
                 setViewportMeta(r.viewport ?? null)
+                setReplayCommitted(generation)
               })
             } else if (!isTransportRecovery) {
               resetSession()
@@ -562,6 +573,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
               setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
               setViewportMeta(r.viewport ?? null)
+              setReplayCommitted(generation)
             } else {
               // Transport recovery fast path: historyItems are already preserved!
               // Hydrate any newly arrived inflight state
@@ -571,6 +583,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   return inflightMsgs.length > 0 ? [...prev, ...inflightMsgs] : prev
                 })
               }
+              setReplayCommitted(generation)
             }
             const durableKey = (r as any).resumed ?? (r as any).session_key ?? (r as any).stored_session_id ?? r.session_id
             writeActiveSessionFile(durableKey)
@@ -593,7 +606,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               opts.recoverSessionKeyRef.current = null
             }
             hydrateLiveSessionInflight(r.inflight)
-            setReplayCommitted(generation)
             cancelResumeScrollRef.current?.()
             cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
 

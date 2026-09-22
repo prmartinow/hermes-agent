@@ -762,6 +762,15 @@ export class GatewayClient extends EventEmitter {
     return parked
   }
 
+  cancelEventBarrier(sid: string): void {
+    if (!this.replayHold) return
+    this.replayHold.delete(sid)
+    if (this.replayHold.size === 0) {
+      this.replayHold = null
+      this.replayInFlight = false
+    }
+  }
+
   publishLocalEvent(ev: AnyGatewayEvent) {
     const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
 
