@@ -30,6 +30,7 @@ export interface ColdHydrationOptions {
   maxMounted?: number
   onProgress?: (materialized: number, snapshotMax?: number) => void
   timeSliceMs?: number
+  isCancelled?: () => boolean
 }
 
 export interface ColdHydrationResult {
@@ -72,6 +73,7 @@ export async function performColdHistoryHydration(
   let sliceStart = performance.now()
 
   while (true) {
+    if (opts.isCancelled?.()) break
     const historyParams: Record<string, unknown> = {
       session_id: sessionId,
       cursor,
@@ -106,6 +108,7 @@ export async function performColdHistoryHydration(
 
     // While deque exceeds maxMounted, pop oldest messages and serialize to stdout
     while (deque.length > maxMounted) {
+      if (opts.isCancelled?.()) break
       if (!appendedToScrollback) {
         appendedToScrollback = true
         process.env.HERMES_TUI_INITIAL_RENDER_MODE = 'append-to-existing-scrollback'
