@@ -117,4 +117,54 @@ describe('Cold History Hydration Pipeline', () => {
     // Message 31 and above are in the live tail, not materialized stdout
     expect(written).not.toContain('Message 31')
   })
+
+  it('aborts immediately and throws ColdHydrationCancelledError when isCancelled is true', async () => {
+    const stdout = new PassThrough()
+    const request = vi.fn().mockResolvedValue({
+      messages: [{ role: 'user', text: 'Msg 1', row_id: 1 }],
+      count: 1,
+      has_more: false
+    })
+
+    await expect(performColdHistoryHydration({
+      gateway: { request },
+      sessionId: 'test-sess',
+      cols: 80,
+      theme: DEFAULT_THEME,
+      info: mockInfo,
+      stdout: stdout as any,
+      isCancelled: () => true
+    })).rejects.toThrow('Cold hydration was cancelled')
+
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('aborts and throws ColdHydrationCancelledError if cancelled while page request is awaiting', async () => {
+    const stdout = new PassThrough()
+    let cancelled = false
+
+    const request = vi.fn().mockImplementation(async () => {
+      // simulate cancellation arriving while RPC is in flight
+      cancelled = true
+      return {
+        messages: [{ role: 'user', text: 'Msg 1', row_id: 1 }],
+        count: 1,
+        has_more: true,
+        next_cursor: 1
+      }
+    })
+
+    await expect(performColdHistoryHydration({
+      gateway: { request },
+      sessionId: 'test-sess',
+      cols: 80,
+      theme: DEFAULT_THEME,
+      info: mockInfo,
+      stdout: stdout as any,
+      isCancelled: () => cancelled
+    })).rejects.toThrow('Cold hydration was cancelled')
+
+    // Only called once, does not request page 2
+    expect(request).toHaveBeenCalledTimes(1)
+  })
 })

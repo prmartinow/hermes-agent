@@ -588,4 +588,45 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
     const secondReadyIdx = received.lastIndexOf(readyEvents[readyEvents.length - 1]!)
     expect(secondReadyIdx).toBeGreaterThan(gapIdx)
   })
+
+  it("cancels event barrier safely without dispatching parked events or disturbing other sessions", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+
+    client.start()
+    const ws = await server.waitForNextConnection()
+    ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.some(e => e.type === "gateway.ready")).toBe(true))
+
+    // Activate barrier for s1 and s2
+    client.activateEventBarrier("s1")
+    client.activateEventBarrier("s2")
+
+    // Deliver events for both sessions while barriers active
+    ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s1", seq: 10, payload: { msg: "s1 held" } } }))
+    ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "session.event", session_id: "s2", seq: 20, payload: { msg: "s2 held" } } }))
+
+    await new Promise(r => setTimeout(r, 40))
+    // Neither event should have been dispatched yet
+    expect(received.some(e => (e as any).session_id === "s1")).toBe(false)
+    expect(received.some(e => (e as any).session_id === "s2")).toBe(false)
+
+    // Cancel barrier for s1 (switched away)
+    client.cancelEventBarrier("s1")
+
+    // Release barrier for s2 (completed hydration)
+    client.releaseEventBarrier("s2")
+
+    await vi.waitFor(() => {
+      expect(received.some(e => (e as any).session_id === "s2")).toBe(true)
+    })
+
+    // s1 was discarded, s2 was dispatched
+    expect(received.some(e => (e as any).session_id === "s1")).toBe(false)
+    const s2Event = received.find(e => (e as any).session_id === "s2")
+    expect((s2Event as any).seq).toBe(20)
+  })
 })
