@@ -8,6 +8,8 @@ A :class:`Transport` forwards a JSON-serialisable dict to its peer, so one dispa
 """
 
 from __future__ import annotations
+from collections import deque
+from dataclasses import dataclass, field
 
 from collections import deque
 from dataclasses import dataclass, field
@@ -93,6 +95,14 @@ def serialize_frame(obj: dict, peer: str, log: logging.Logger) -> str:
         fallback = {"jsonrpc": "2.0", "id": rid,
                     "error": {"code": -32603, "message": f"response serialization error: {exc}"}}
         return json.dumps(fallback, ensure_ascii=False)
+
+
+class _DropTransport:
+    """Detached WS sink: keep sessions resumable without writing stale frames."""
+    def write(self, obj: dict) -> bool:
+        return False
+    def close(self) -> None:
+        pass
 
 
 class StdioTransport:

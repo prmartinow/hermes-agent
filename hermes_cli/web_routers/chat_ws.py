@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -29,6 +30,21 @@ router = APIRouter()
 
 # Late-bound so a test's monkeypatch on the owning module wins at call time.
 _active_session_file_for_channel = late("_active_session_file_for_channel", "hermes_cli.web_server_chat")
+_active_session_file_for_pty = late("_active_session_file_for_pty", "hermes_cli.web_server_chat")
+
+
+def _effective_pty_key(
+    raw_attach: Optional[str],
+    profile: Optional[str],
+    resume: Optional[str],
+) -> Optional[str]:
+    """Compute canonical identity key shared between PtySessionRegistry and active session files."""
+    if resume:
+        device_token = raw_attach or ""
+        return f"resume\0{profile or ''}\0{resume}\0{device_token}"
+    if raw_attach is not None and profile:
+        return f"{raw_attach}\0{profile}\0"
+    return raw_attach
 _profile_scope = late("_profile_scope", "hermes_cli.web_server_profiles")
 _resolve_chat_argv_async = late("_resolve_chat_argv_async", "hermes_cli.web_server_chat")
 _resolve_profile_dir = late("_resolve_profile_dir", "hermes_cli.web_server_profiles")
@@ -450,6 +466,7 @@ async def pty_ws(ws: WebSocket) -> None:
         await ws.close(code=1011)
         return
 
+    raw_attach = ws.query_params.get("attach") or None
     raw_resume = ws.query_params.get("resume") or None
     resume = raw_resume
     profile = ws.query_params.get("profile") or None
@@ -458,8 +475,10 @@ async def pty_ws(ws: WebSocket) -> None:
     force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {"1", "true", "yes", "on"}
     active_session_file: Optional[Path] = None
 
-    if channel:
-        active_session_file = _active_session_file_for_channel(ws.app, channel)
+    canonical_pty_key = _effective_pty_key(raw_attach, profile, raw_resume)
+    pty_file_key = canonical_pty_key or channel
+    if pty_file_key:
+        active_session_file = _active_session_file_for_pty(ws.app, pty_file_key)
         if force_fresh:
             resume = None
             try:
@@ -488,13 +507,9 @@ async def pty_ws(ws: WebSocket) -> None:
         await _pty_fail(ws, exc)
         return
 
-    attach_token = ws.query_params.get("attach") or None
-    registry_resume = raw_resume
-    if raw_resume and env:
-        registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
-    if attach_token is not None and (registry_resume or profile):
-        # Key explicit resumes on their canonical target, never the active-session fallback.
-        attach_token = f"{attach_token}\0{profile or ''}\0{registry_resume or ''}"
+    # Use consistent canonical pty_key computed from logical target and device attach token
+    # If neither attach nor resume was requested, attach_token remains None for the legacy 1:1 path.
+    attach_token = canonical_pty_key
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env)
@@ -514,18 +529,29 @@ async def pty_ws(ws: WebSocket) -> None:
 
     # Keep-alive path: the PTY outlives this socket; reattach by token.
     try:
-        session, _created = await PTY_REGISTRY.attach_or_spawn(attach_token, spawn=_spawn)
+        session, _created = await PTY_REGISTRY.attach_or_spawn(
+            attach_token, spawn=_spawn, allow_standby=bool(not resume and not profile)
+        )
     except (PtyUnavailableError, FileNotFoundError, OSError, RegistryFull) as exc:
         await _pty_fail(ws, exc)
         return
 
+    replay_generation: Optional[str] = None
+    if not _created:
+        replay_generation = str(uuid.uuid4())
+        try:
+            await ws.send_json({"type": "replay-start", "generation": replay_generation})
+        except Exception:
+            PTY_REGISTRY.detach(attach_token, ws)
+            return
+
     # A fresh xterm can't rebuild the TUI from an arbitrary tail of alternate-
     # screen differential output; reused PTYs emit a full frame after replay.
-    if not await session.attach(ws, force_redraw=not _created):
+    if not await session.attach(ws, force_redraw=False, generation=replay_generation):
         # attach() detaches itself when the client dropped mid-replay, and a socket
         # superseded during replay is already closed by its replacement; only a
         # stalled redraw write leaves THIS socket attached and worth closing.
-        if session._ws is ws:
+        if ws in session._viewers:
             await _close_stalled_pty_input(ws, path="keepalive-redraw")
         PTY_REGISTRY.detach(attach_token, ws)
         return
@@ -551,7 +577,8 @@ async def pty_ws(ws: WebSocket) -> None:
             # Resize escape is consumed locally, never written to the PTY.
             match = _RESIZE_RE.match(raw)
             if match and match.end() == len(raw):
-                session.bridge.resize(cols=int(match.group(1)), rows=int(match.group(2)))
+                if session.is_leader(ws):
+                    session.bridge.resize(cols=int(match.group(1)), rows=int(match.group(2)))
                 continue
             if not await session.write(ws, raw):
                 await _close_stalled_pty_input(ws, path="keepalive")

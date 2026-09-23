@@ -2,6 +2,7 @@
 heal, latest-descendant lookup and the auto-archive ticker.
 """
 
+import json
 import logging
 import asyncio
 import threading
@@ -43,12 +44,25 @@ def _session_latest_descendant(session_id: str, db):
     if not sid or not db.get_session(sid):
         return None, []
 
-    conn = getattr(db, "_conn", None)
+    conn = getattr(db, "_conn", None) or getattr(db, "conn", None)
     if conn is not None:
         keys = ("id", "parent_session_id", "started_at")
         rows = [dict(zip(keys, row)) for row in conn.execute(_DESCENDANTS_SQL, (sid,)).fetchall()]
     else:
-        rows = db.list_sessions_rich(limit=10000, offset=0, compact_rows=True)
+        all_rows = db.list_sessions_rich(limit=10000, offset=0, compact_rows=True)
+        rows = []
+        for row in all_rows:
+            cfg = row.get("model_config") or {}
+            if isinstance(cfg, str):
+                try:
+                    cfg = json.loads(cfg)
+                except Exception:
+                    cfg = {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+            if cfg.get("_branched_from") or cfg.get("_delegate_from") or cfg.get("_reset_from") or row.get("source") == "tool":
+                continue
+            rows.append(row)
 
     children = {}
     for row in rows:

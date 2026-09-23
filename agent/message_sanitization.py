@@ -241,6 +241,20 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
+    # Repair pass 0.5: Concatenated multiple JSON objects (e.g. '{"a": 1}{"b": 2}')
+    # Extract the first complete valid JSON object.
+    try:
+        decoder = json.JSONDecoder(strict=False)
+        first_obj, end_pos = decoder.raw_decode(raw_stripped)
+        if isinstance(first_obj, dict) and end_pos < len(raw_stripped):
+            logger.warning(
+                "Repaired concatenated multi-root tool_call arguments for %s (extracted first valid JSON object)",
+                tool_name,
+            )
+            return json.dumps(first_obj, separators=(",", ":"))
+    except Exception:
+        pass
+
     # Passes 2-4: strip trailing commas, close unclosed structures, trim excess closers
     # (bounded). Bracket counting is string-aware: delimiters inside string values
     # ({"code": "}"}) are not structure, and the closers land in stack order — a truncated

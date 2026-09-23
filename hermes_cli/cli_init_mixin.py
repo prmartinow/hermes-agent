@@ -104,7 +104,7 @@ class CLIInitMixin:
 
     def _init_model_and_provider(self, model, provider, api_key, base_url):
         """Priority: CLI args > env vars > config file."""
-        from cli import CLI_CONFIG, _normalize_moa_model, _split_model_config_default
+        from cli import CLI_CONFIG, _int_or, _normalize_moa_model, _split_model_config_default
         # LLM_MODEL/OPENAI_MODEL env vars are deliberately NOT checked (multi-agent setups
         # would stomp each other through the environment).
         _model_config = CLI_CONFIG["model"]
@@ -138,6 +138,9 @@ class CLIInitMixin:
         # A ``moa:<preset>`` model string selects the MoA virtual provider in one shot (parity with
         # interactive ``/moa`` and the model picker). See #56828.
         _moa_provider_override, self.model = _normalize_moa_model(self.model)
+        _env_mt = os.environ.get("HERMES_MAX_TOKENS")
+        _mt = _model_config.get("max_tokens")
+        self.max_tokens = _int_or(_env_mt, None) if _env_mt else (_mt if isinstance(_mt, int) else None)
 
         if self.model == "":  # auto-detect from a local server
             _base_url = _model_config.get("base_url") or ""

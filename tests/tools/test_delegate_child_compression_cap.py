@@ -1,7 +1,7 @@
 """``delegation.compression_threshold_tokens`` is an OPTIONAL absolute cap on a subagent's compaction
 trigger, off by default, and its value is validated rather than coerced.
 
-Default off: a 1M-window child compacts at the same 0.50 x window as its parent (500K). A replay of a
+Default off: a child keeps its configured trigger, including provider output headroom. A replay of a
 1,393-agent run put 200K-400K caps within 5% of each other once cache prefixes are intact, and every
 compaction is a chance to lose detail, so the cap is opt-in. The validation matters because YAML
 ``true`` coerces to int 1 (a one-token trigger) and ``"200k"`` would silently read as no cap.
@@ -18,12 +18,13 @@ def _child(window=1_000_000, threshold=0.50, cap=None):
     return SimpleNamespace(context_compressor=cc)
 
 
-def test_default_is_no_cap_child_keeps_the_ratio_trigger():
+def test_default_is_no_cap_child_keeps_the_existing_trigger():
     child = _child()
+    before = child.context_compressor.threshold_tokens
     _apply_child_compression_cap(child, {})
-    assert child.context_compressor.threshold_tokens == 500_000
+    assert child.context_compressor.threshold_tokens == before
     _apply_child_compression_cap(child, {"compression_threshold_tokens": 0})
-    assert child.context_compressor.threshold_tokens == 500_000
+    assert child.context_compressor.threshold_tokens == before
 
 
 def test_explicit_cap_is_the_lower_of_delegation_and_global_and_never_raises():
@@ -49,5 +50,6 @@ def test_config_values_are_validated_not_coerced():
     assert _child_compression_cap_tokens(16_000) == 16_000
     assert _child_compression_cap_tokens(300_000.0) == 300_000
     child = _child()
+    before = child.context_compressor.threshold_tokens
     _apply_child_compression_cap(child, {"compression_threshold_tokens": True})
-    assert child.context_compressor.threshold_tokens == 500_000
+    assert child.context_compressor.threshold_tokens == before

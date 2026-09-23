@@ -228,12 +228,27 @@ class WSTransport:
             _log.debug("ws close after send deadline failed peer=%s error=%s", self._peer, exc)
 
 
+_LOOPBACK_HOST_VALUES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_private_ip(host: str) -> bool:
+    if host in _LOOPBACK_HOST_VALUES:
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False
+
+
 def _ws_peer_label(ws: Any) -> str:
-    """``host:port`` when available, else a stable placeholder."""
+    """``host:port`` when available, with private IPs masked to omit sensitive network topology."""
     client = getattr(ws, "client", None)
     if client is None:
         return "unknown"
     host, port = getattr(client, "host", None) or "unknown", getattr(client, "port", None)
+    if _is_private_ip(host):
+        host = "[redacted-ip]"
     return f"{host}:{port}" if port is not None else host
 
 
@@ -259,6 +274,62 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
+class EventLoopDelayMonitor:
+    """Bounded, low-overhead event loop delay monitor.
+
+    Uses a single call_at/call_later timer to track event loop scheduling lag.
+    Keeps bounded summary statistics (max_delay_ms, mean_delay_ms, samples)
+    with strict lifecycle cleanup (no leaks or unbounded timers).
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, interval_s: float = 2.0) -> None:
+        self.loop = loop
+        self.interval_s = interval_s
+        self._handle: asyncio.TimerHandle | None = None
+        self._next_target = 0.0
+        self.max_delay_ms = 0.0
+        self.total_delay_ms = 0.0
+        self.samples = 0
+        self._running = False
+
+    def start(self) -> None:
+        if self._running or self.loop.is_closed():
+            return
+        self._running = True
+        self._schedule()
+
+    def _schedule(self) -> None:
+        if not self._running or self.loop.is_closed():
+            return
+        self._next_target = self.loop.time() + self.interval_s
+        self._handle = self.loop.call_at(self._next_target, self._tick)
+
+    def _tick(self) -> None:
+        if not self._running:
+            return
+        now = self.loop.time()
+        delay_ms = max(0.0, (now - self._next_target) * 1000.0)
+        self.samples += 1
+        self.total_delay_ms += delay_ms
+        if delay_ms > self.max_delay_ms:
+            self.max_delay_ms = delay_ms
+        self._schedule()
+
+    def summary(self) -> dict[str, float]:
+        mean = (self.total_delay_ms / self.samples) if self.samples > 0 else 0.0
+        return {
+            "samples": float(self.samples),
+            "max_ms": round(self.max_delay_ms, 2),
+            "mean_ms": round(mean, 2),
+        }
+
+    def stop(self) -> None:
+        self._running = False
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+
+
 class _SendFailed(Exception):
     """Raised by handle_ws._reply when a reply could not be written: ends the read loop."""
 
@@ -270,6 +341,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
     peer, transport = _ws_peer_label(ws), None
     messages = parse_errors = dispatch_crashes = send_failures = 0
     disconnect_reason = "not_connected"
+    delay_monitor = EventLoopDelayMonitor(asyncio.get_running_loop())
+    delay_monitor.start()
 
     async def _reply(frame: dict, reason: str, msg: str, *args: Any) -> None:
         """write_async; on failure record *reason*, log *msg* and end the read loop."""
@@ -343,7 +416,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 req = json.loads(line)
             except json.JSONDecodeError as exc:
                 parse_errors += 1
-                _log.warning("ws parse error peer=%s index=%d error=%s payload=%r", peer, messages, exc, line[:_WS_LOG_PAYLOAD_PREVIEW])
+                _log.warning("ws parse error peer=%s index=%d error=%s payload_len=%d", peer, messages, exc, len(line))
                 await _reply(_error(-32700, "parse error", None), "send_failed_after_parse_error",
                              "ws parse-error reply send failed peer=%s", peer)
                 continue
@@ -370,6 +443,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
     except _SendFailed:
         pass
     finally:
+        loop_summary = delay_monitor.summary()
+        delay_monitor.stop()
         reaped_sessions = detached_sessions = 0
         if transport is not None:
             server.unregister_live_transport(transport)
@@ -402,6 +477,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             _log.debug("ws close failed peer=%s error=%s", peer, exc)
         _log.info(
             "ws closed peer=%s reason=%s messages=%d parse_errors=%d "
-            "dispatch_crashes=%d send_failures=%d reaped_sessions=%d detached_sessions=%d",
-            peer, disconnect_reason, messages, parse_errors, dispatch_crashes, send_failures, reaped_sessions, detached_sessions,
+            "dispatch_crashes=%d send_failures=%d reaped_sessions=%d detached_sessions=%d "
+            "loop_delay_max_ms=%.1f loop_delay_mean_ms=%.1f",
+            peer, disconnect_reason, messages, parse_errors, dispatch_crashes, send_failures,
+            reaped_sessions, detached_sessions, loop_summary["max_ms"], loop_summary["mean_ms"],
         )

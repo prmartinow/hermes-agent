@@ -1993,6 +1993,39 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
 
+    def _create_compression_telemetry_payload(
+        self, *, current_tokens: int | None = None, attempt_id: str | None = None,
+        session_id: str | None = None, trigger_source: str | None = None,
+    ) -> Dict[str, Any]:
+        """Construct an isolated telemetry payload dict without mutating compressor state."""
+        seed = getattr(self, "_compression_telemetry_seed", None)
+        seed = seed if isinstance(seed, dict) else {}
+        attempt_id = attempt_id or seed.get("attempt_id")
+        session_id = session_id or seed.get("session_id")
+        trigger_source = trigger_source or seed.get("trigger_source")
+        return {
+            "event": "compression_attempt", "attempt_id": attempt_id or uuid.uuid4().hex,
+            "session_id": session_id or "", "trigger_source": trigger_source or "unknown",
+            "main_provider": self.provider or None, "main_model": self.model or None,
+            "main_context_limit": _safe_int(self.context_length),
+            "current_estimated_tokens": _safe_int(current_tokens),
+            "effective_threshold": _safe_int(self.threshold_tokens), "protected_head_tokens": None,
+            "protected_tail_tokens": None, "middle_window_tokens": None, "prellm_skip_count": 0,
+            "aux_prompt_tokens": None, "aux_prompt_chars": None, "aux_prompt_bytes": None,
+            "estimated_aux_prompt_tokens": None, "aux_provider_prompt_tokens": None,
+            "aux_provider_completion_tokens": None, "aux_provider_total_tokens": None,
+            "aux_output_reservation": None, "aux_provider": None, "aux_model": None,
+            "effective_reasoning": None, "effective_aux_context": None, "fit_margin": None,
+            "chunking": None, "chunk_count": None,
+            "total_duration_ms": None, "aux_call_duration_ms": None, "queue_wait_ms": None, "prompt_build_ms": None,
+            "time_to_first_progress_ms": None, "summary_generation_ms": None, "commit_ms": None,
+            "fallback_used": False, "commit_status": "unknown", "split_status": "unknown", "failure_class": None,
+            # Lean-sampling coverage (filled by _record_summary_input_coverage; None on the legacy path).
+            "summary_input_chars": None, "summary_input_sampled_chars": None, "summary_input_omitted_chars": None,
+            "summary_input_record_count": None, "summary_input_sampled_record_count": None,
+            "summary_input_elided_record_count": None,
+        }
+
     def _begin_compression_telemetry(
         self, *, current_tokens: int | None, attempt_id: str | None = None, session_id: str | None = None,
         trigger_source: str | None = None,
@@ -2003,24 +2036,17 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         attempt_id = attempt_id or seed.get("attempt_id")
         session_id = session_id or seed.get("session_id")
         trigger_source = trigger_source or seed.get("trigger_source")
-        telemetry: Dict[str, Any] = {
-            "event": "compression_attempt", "attempt_id": attempt_id or uuid.uuid4().hex,
-            "session_id": session_id or "", "trigger_source": trigger_source or "unknown",
-            "main_provider": self.provider or "", "main_model": self.model or "",
-            "main_context_limit": _safe_int(self.context_length),
-            "current_estimated_tokens": _safe_int(current_tokens),
-            "effective_threshold": _safe_int(self.threshold_tokens), "protected_head_tokens": None,
-            "protected_tail_tokens": None, "middle_window_tokens": None, "prellm_skip_count": 0,
-            "aux_prompt_tokens": None, "aux_output_reservation": None, "aux_provider": "", "aux_model": "",
-            "effective_aux_context": None, "fit_margin": None, "chunking": False, "chunk_count": 0,
-            "total_duration_ms": None, "aux_call_duration_ms": None, "queue_wait_ms": None, "prompt_build_ms": None,
-            "time_to_first_progress_ms": None, "summary_generation_ms": None, "commit_ms": None,
-            "fallback_used": False, "commit_status": "unknown", "split_status": "unknown", "failure_class": None,
-            # Lean-sampling coverage (filled by _record_summary_input_coverage; None on the legacy path).
-            "summary_input_chars": None, "summary_input_sampled_chars": None, "summary_input_omitted_chars": None,
-            "summary_input_record_count": None, "summary_input_sampled_record_count": None,
-            "summary_input_elided_record_count": None,
-        }
+        existing = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(existing, dict) and attempt_id and existing.get("attempt_id") == attempt_id:
+            if current_tokens is not None and existing.get("current_estimated_tokens") is None:
+                existing["current_estimated_tokens"] = _safe_int(current_tokens)
+            return existing
+        telemetry = self._create_compression_telemetry_payload(
+            current_tokens=current_tokens,
+            attempt_id=attempt_id,
+            session_id=session_id,
+            trigger_source=trigger_source,
+        )
         self._active_compression_telemetry = self._last_compression_telemetry = telemetry
         return telemetry
 
@@ -2038,19 +2064,62 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self, *, prompt_messages: List[Dict[str, Any]], max_tokens: int | None, duration_ms: int,
         aux_provider: str | None = None, aux_model: str | None = None,
         effective_aux_context: int | None = None, phase_timings: Dict[str, Any] | None = None,
+        response: Any = None, reasoning: Any = None,
     ) -> None:
         telemetry = getattr(self, "_active_compression_telemetry", None)
         if not isinstance(telemetry, dict):
             return
         telemetry["aux_prompt_tokens"] = estimate_messages_tokens_rough(prompt_messages)
+        telemetry["estimated_aux_prompt_tokens"] = telemetry["aux_prompt_tokens"]
+        telemetry["aux_prompt_chars"] = sum(
+            len(m.get("content", "")) for m in prompt_messages
+            if isinstance(m, dict) and isinstance(m.get("content"), str)
+        )
+        telemetry["aux_prompt_bytes"] = sum(
+            len(m.get("content", "").encode("utf-8")) for m in prompt_messages
+            if isinstance(m, dict) and isinstance(m.get("content"), str)
+        )
+        usage = getattr(response, "usage", None) if response is not None else None
+        if usage is not None:
+            if isinstance(usage, dict):
+                telemetry["aux_provider_prompt_tokens"] = _safe_int(usage.get("prompt_tokens"))
+                telemetry["aux_provider_completion_tokens"] = _safe_int(usage.get("completion_tokens"))
+                telemetry["aux_provider_total_tokens"] = _safe_int(usage.get("total_tokens"))
+            else:
+                telemetry["aux_provider_prompt_tokens"] = _safe_int(getattr(usage, "prompt_tokens", None))
+                telemetry["aux_provider_completion_tokens"] = _safe_int(getattr(usage, "completion_tokens", None))
+                telemetry["aux_provider_total_tokens"] = _safe_int(getattr(usage, "total_tokens", None))
+        else:
+            telemetry["aux_provider_prompt_tokens"] = None
+            telemetry["aux_provider_completion_tokens"] = None
+            telemetry["aux_provider_total_tokens"] = None
         telemetry["aux_output_reservation"] = _safe_int(max_tokens)
-        if aux_provider:
-            telemetry["aux_provider"] = aux_provider
-        if aux_model:
-            telemetry["aux_model"] = aux_model
+        # Route, prompt size and provider usage describe the latest call;
+        # aux_call_duration_ms accumulates all calls made by this attempt.
+        telemetry["aux_provider"] = aux_provider or None
+        telemetry["aux_model"] = aux_model or None
+        telemetry["effective_reasoning"] = None
+        telemetry["effective_aux_context"] = None
+        telemetry["fit_margin"] = None
+        if reasoning is not None:
+            _SAFE_REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "minimal", "off", "none", "auto", "default"}
+            if isinstance(reasoning, str) and reasoning.lower() in _SAFE_REASONING_EFFORTS:
+                telemetry["effective_reasoning"] = reasoning.lower()
+            elif isinstance(reasoning, dict):
+                effort = reasoning.get("effort")
+                if isinstance(effort, str) and effort.lower() in _SAFE_REASONING_EFFORTS:
+                    telemetry["effective_reasoning"] = effort.lower()
+                elif reasoning.get("enabled") is False:
+                    telemetry["effective_reasoning"] = "off"
+                else:
+                    telemetry["effective_reasoning"] = None
+            else:
+                telemetry["effective_reasoning"] = None
+        elif "effective_reasoning" not in telemetry:
+            telemetry["effective_reasoning"] = None
         if effective_aux_context is not None:
             telemetry["effective_aux_context"] = _safe_int(effective_aux_context)
-        if telemetry["effective_aux_context"] is not None and telemetry["aux_prompt_tokens"] is not None:
+        if telemetry.get("effective_aux_context") is not None and telemetry.get("aux_prompt_tokens") is not None:
             telemetry["fit_margin"] = (telemetry["effective_aux_context"] - telemetry["aux_prompt_tokens"]
                                        - (telemetry["aux_output_reservation"] or 0))
         telemetry["aux_call_duration_ms"] = (telemetry.get("aux_call_duration_ms") or 0) + max(0, int(duration_ms))
@@ -2111,7 +2180,13 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         if self._threshold_tokens is None:
             # Resolve the window first: it may floor threshold_percent as a side effect.
             _ctx = self.context_length
-            self._threshold_tokens = self._compute_threshold_tokens(_ctx, self.threshold_percent, self.max_tokens)
+            self._threshold_tokens = self._compute_threshold_tokens(
+                _ctx,
+                self.threshold_percent,
+                self.max_tokens,
+                model=getattr(self, "model", "") or "",
+                provider=getattr(self, "provider", "") or "",
+            )
             self._apply_threshold_tokens_cap()
         return self._threshold_tokens
 
@@ -2501,7 +2576,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         ceiling, which the feasibility probe re-derives per runtime."""
         base_percent = resolve_model_threshold(model, self.model_thresholds, self._config_threshold_percent, provider)
         effective_percent = self._effective_threshold_percent(context_length, base_percent)
-        threshold = self._compute_threshold_tokens(context_length, effective_percent, self.max_tokens)
+        threshold = self._compute_threshold_tokens(
+            context_length, effective_percent, self.max_tokens, model=model, provider=provider
+        )
         cap = self._effective_threshold_cap(context_length)
         if cap is not None:
             threshold = min(threshold, cap)
@@ -2557,6 +2634,10 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self._reset_proactive_prune_rearm()
         self._clear_durable_proactive_prune_rearm()
 
+    def preview_model_threshold(self, model: str, context_length: int, provider: str = "") -> int:
+        """Resolve a switch's trigger without mutating live compression state."""
+        return self.preview_threshold_tokens(model, context_length, provider)
+
     # When the MINIMUM_CONTEXT_LENGTH floor binds on a small window, trigger near the top instead.
     _MIN_CTX_TRIGGER_RATIO = 0.85
 
@@ -2603,41 +2684,65 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     @staticmethod
     def _compute_threshold_tokens(
-        context_length: int, threshold_percent: float, max_tokens: int | None = None,
+        context_length: int,
+        threshold_percent: float,
+        max_tokens: int | None = None,
+        model: str = "",
+        provider: str = "",
     ) -> int:
         """Compute the compaction trigger in tokens from the effective input budget.
         Base is ``(context_length - max_tokens) * threshold_percent`` floored at MINIMUM_CONTEXT_LENGTH;
         when the floor binds it is capped at 85% of the budget so small windows can still fire.
 
-        The base value is ``effective_input_budget * threshold_percent``, floored at
-        ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress prematurely at 50%. BUT that floor
-        degenerates at small windows: for a model whose ``context_length`` is at/below the minimum (e.g. a
-        64K local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold equal the ENTIRE window —
-        auto-compression can never fire because the provider rejects the request before usage reaches 100%
-        (#14690).
-        The provider reserves ``max_tokens`` of output space out of the same window, so the usable INPUT
-        budget is ``context_length - max_tokens``. With a large ``max_tokens`` (e.g. 65536 on a custom
-        provider) the input budget is materially smaller than the raw window, and a threshold based on the
-        full window lets the session hit a provider 400 before compaction fires (#43547). The percentage and
-        the degenerate-window check below both operate on the effective input budget. ``max_tokens=None``
-        (provider default) conservatively assumes no reservation (full window).
-        """
-        effective_window = context_length - (max_tokens or 0)
-        if effective_window <= 0:
-            effective_window = context_length
-        pct_value = int(effective_window * threshold_percent)
-        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # The floor must not consume output headroom: cap at 85% when it is the binding term. Near-minimum windows
-        # otherwise trigger at ~98%, and providers that silently clip over-window prompts (ollama) never raise the
-        # overflow backstop, so the session wedges. An explicit threshold_percent above 85% is user intent; not capped.
-        trigger_cap = int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
-        if effective_window > 0 and floored > pct_value and floored > trigger_cap:
-            floored = max(pct_value, trigger_cap)
-        # A percentage at/above the window is unreachable; trigger at 85% instead.
-        if effective_window > 0 and floored >= effective_window:
-            return max(1, min(trigger_cap, effective_window - 1))
-        return floored
+        The base value is ``usable_input_budget * threshold_percent``, floored
+        at ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress
+        prematurely at 50%. BUT that floor degenerates at small windows: for a
+        model whose ``context_length`` is at/below the minimum (e.g. a 64K
+        local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold
+        equal the ENTIRE window — auto-compression can never fire because the
+        provider rejects the request before usage reaches 100% (#14690).
 
+        When the floor would meet or exceed the usable input budget, trigger at
+        ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the budget — high enough that a
+        small model uses most of its context before compacting, but below
+        100% so compaction fires before the provider rejects the request.
+
+        The provider reserves ``max_tokens`` of output space out of the same
+        window, so the usable INPUT budget is ``context_length - output_reservation``.
+        When ``max_tokens`` is None and model/provider are provided, we resolve
+        the authoritative native output ceiling via ``get_model_max_output_tokens``.
+        A hard invariant ceiling additionally preserves 1024 safety headroom for
+        system prompts and tool schemas.
+        """
+        if max_tokens is not None and max_tokens > 0:
+            output_reservation = max_tokens
+        elif model or provider:
+            from agent.model_metadata import get_model_max_output_tokens
+
+            output_reservation = get_model_max_output_tokens(
+                model=model, provider=provider, config_max_tokens=max_tokens
+            ) or 0
+        else:
+            output_reservation = 0
+
+        usable_input_budget = max(1, context_length - output_reservation)
+        pct_value = int(usable_input_budget * threshold_percent)
+        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
+        trigger_cap = int(usable_input_budget * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
+        if usable_input_budget > 0 and floored > pct_value and floored > trigger_cap:
+            floored = max(pct_value, trigger_cap)
+        hard_input_cap = max(1, usable_input_budget - 1024)
+
+        if usable_input_budget > 0 and floored >= usable_input_budget:
+            return max(
+                1,
+                min(
+                    trigger_cap,
+                    hard_input_cap,
+                    usable_input_budget - 1,
+                ),
+            )
+        return min(floored, hard_input_cap)
     def __init__(
         self, model: str, threshold_percent: float = 0.50, protect_first_n: int = 3, protect_last_n: int = 20,
         summary_target_ratio: float = 0.20, quiet_mode: bool = False, summary_model_override: str = None,
@@ -3751,20 +3856,23 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             with aux_interrupt_protection():
                 response = call_llm(**call_kwargs)
         finally:
-            route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
+            _aux_provider = _aux_route.get("provider") or None
             _aux_model = _aux_route.get("model") or self.summary_model or self.model or ""
+            route_known = bool(_aux_provider and _aux_model)
+            _aux_reasoning = _aux_route.get("reasoning")
             # Remember the resolved model for the failure path: an ``auto`` route picks one per call
             # without setting ``summary_model``, so only this names it in the user warning (#116472).
             self._last_aux_resolved_model = _aux_model or None
             self._record_aux_compression_call(
                 prompt_messages=call_kwargs["messages"],
-                # max_tokens is intentionally absent; .get() keeps the telemetry hook from breaking the call.
                 max_tokens=call_kwargs.get("max_tokens"),
                 duration_ms=int((time.monotonic() - _aux_call_start) * 1000),
-                aux_provider=_aux_route.get("provider") or self.provider or "",
+                aux_provider=_aux_provider,
                 aux_model=_aux_model,
                 effective_aux_context=self.context_length if route_known and _aux_model == self.model else None,
                 phase_timings=_latency_info,
+                response=response if "response" in locals() else None,
+                reasoning=_aux_reasoning,
             )
         if self._compression_cancelled():
             raise AuxiliaryExplicitCancellation()
@@ -4961,7 +5069,6 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Do NOT reset the *_failure flags: the cooldown early-return doesn't re-assert them, so a
         # reset would fall through to the destructive static fallback (#29559). Success clears them.
         telemetry = self._begin_compression_telemetry(current_tokens=current_tokens)
-        telemetry["chunk_count"] = 0
         # Manual /compress bypasses the failure cooldown and the structural no-op backoff (#93022).
         if force:
             self._clear_compression_failure_cooldown()
@@ -5302,6 +5409,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             head_messages=messages[:compress_start], middle_messages=turns_to_summarize, tail_messages=messages[compress_end:],
         )
         telemetry["chunk_count"] = 1 if turns_to_summarize else 0
+        telemetry["chunking"] = False
         if not turns_to_summarize:
             # Window is only handoff rows (#59496): skip the aux call; _previous_summary is KEPT —
             # it came from this transcript.
@@ -5339,6 +5447,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Phase 4: Assemble compressed message list
         compressed = self._assemble_compressed(messages, compress_start, compress_end, scan, summary)
         return self._finalize_compressed(compressed, messages, n_messages)
+
 
     def _assemble_compressed(
         self, messages: List[Dict[str, Any]], compress_start: int, compress_end: int, scan: "_HandoffScan", summary: str,

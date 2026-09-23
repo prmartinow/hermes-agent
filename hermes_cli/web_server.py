@@ -144,6 +144,34 @@ async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
     app.state.event_lock = asyncio.Lock()
     app.state.pty_active_session_files = {}  # dict[str, Path]
+    try:
+        import glob, shutil
+        for stale_item in glob.glob(os.path.join(tempfile.gettempdir(), "hermes-pty-active-*")):
+            path = Path(stale_item)
+            if path.is_file():
+                # Clean up legacy flat /tmp/hermes-pty-active-*.json files
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            try:
+                raw_pid = stale_item.rsplit("-", 1)[-1]
+                owner_pid = int(raw_pid)
+                if owner_pid == os.getpid():
+                    continue
+                try:
+                    os.kill(owner_pid, 0)
+                    continue  # Process is alive, do not delete
+                except ProcessLookupError:
+                    pass  # Process is dead, safe to clean up
+                except PermissionError:
+                    continue  # Process exists under another user, do not touch
+            except (ValueError, IndexError):
+                pass
+            shutil.rmtree(stale_item, ignore_errors=True)
+    except Exception:
+        pass
     # Serializes chat-argv resolution so concurrent /api/pty connections don't
     # overlap ``npm install`` / ``npm run build``. Locks live on app.state (not
     # module globals) so they bind to the running loop, not the import-time one.
@@ -230,6 +258,10 @@ async def _lifespan(app: "FastAPI"):
 
     # Reap idle/dead keep-alive PTY sessions (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
+    from hermes_cli.web_server_chat import _default_pty_spawn
+    PTY_REGISTRY.configure_standby_spawn(_default_pty_spawn)
+    asyncio.create_task(PTY_REGISTRY.ensure_standby())
+
     # Periodic authenticated self-test feeding the ``dashboard`` component on /api/status.
     selftest_task = asyncio.create_task(_dashboard_selftest_loop())
     # Live auto-archive timer, independent of list requests.
@@ -258,9 +290,21 @@ async def _lifespan(app: "FastAPI"):
 
     start_background_bootstrap()
 
+    # 24/7 Gemini Quota Watcher Daemon — automatically ignites sleeping/expired quota windows
+    try:
+        from hermes_cli.auth import start_gemini_quota_watcher_daemon
+        start_gemini_quota_watcher_daemon(interval_seconds=60.0)
+    except Exception:
+        pass
+
     try:
         yield
     finally:
+        try:
+            from hermes_cli.auth import stop_gemini_quota_watcher_daemon
+            stop_gemini_quota_watcher_daemon()
+        except Exception:
+            pass
         hosted_room_start_cancel.set()
         _hosted_groups.stop_hosted_room_service(timeout=5.0)
         hosted_room_start_thread.join(timeout=1.0)
@@ -270,6 +314,13 @@ async def _lifespan(app: "FastAPI"):
         selftest_task.cancel()
         auto_archive_task.cancel()
         await PTY_REGISTRY.close_all()
+        try:
+            d = getattr(app.state, "_pty_active_dir", None)
+            if d is not None:
+                import shutil
+                shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
         # Stop the managed llama-server with its parent (an orphan pins VRAM).
         try:
             from hermes_cli.local_runtime.bootstrap import shutdown_local_runtime
@@ -393,6 +444,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from hermes_cli.hindsight_webhook import PATH as _HINDSIGHT_WEBHOOK_PATH, receive as _receive_hindsight_webhook
+
+app.add_api_route(_HINDSIGHT_WEBHOOK_PATH, _receive_hindsight_webhook, methods=["POST"])
 
 # Endpoints that do NOT require the session token; everything else under /api/
 # is gated below. Shared with the OAuth gate so the two allowlists cannot
@@ -652,6 +707,14 @@ async def auth_middleware(request: Request, call_next):
     (``token_authenticated``) and when the OAuth gate is active — cookie auth is
     then authoritative and the loopback-only token path must not override it.
     """
+    from hermes_cli.hindsight_webhook import authenticate, is_hindsight_webhook
+
+    if is_hindsight_webhook(request):
+        try:
+            await authenticate(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+        return await call_next(request)
     path = request.url.path
     if (
         not getattr(request.state, "token_authenticated", False)
@@ -958,6 +1021,7 @@ from hermes_cli.web_routers import (  # noqa: E402
     analytics as _analytics_routes,
     chat_ws as _chat_ws_routes,
     dashboard_ui as _dashboard_ui_routes,
+    gemini as _gemini_routes,
 )
 
 app.include_router(_files_routes.router)
@@ -988,6 +1052,7 @@ app.include_router(_tools_routes.router)
 app.include_router(_analytics_routes.router)
 app.include_router(_chat_ws_routes.router)
 app.include_router(_dashboard_ui_routes.router)
+app.include_router(_gemini_routes.router)
 
 # Plugin API routes and the dashboard auth routes (/login, /auth/*, /api/auth/*)
 # mount before the SPA catch-all so /{full_path:path} doesn't swallow them. Auth
@@ -1138,6 +1203,45 @@ def _configure_auth_gate(
         )
 
 
+try:
+    from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol as _UvicornWebSocketProtocol
+except ImportError:
+    _UvicornWebSocketProtocol = None
+
+
+_ALLOWED_WS_FAIL_REASONS = frozenset({
+    "keepalive ping timeout",
+})
+
+
+if _UvicornWebSocketProtocol is not None:
+    class HermesWebSocketProtocol(_UvicornWebSocketProtocol):
+        """Narrow supported subclass of Uvicorn's WebSocketProtocol.
+
+        1. Disables keepalive ping/pong for internal loopback connections (Node <-> FastAPI),
+           preventing false disconnections when heavy terminal rendering delays Node's event loop.
+        2. Preserves configured keepalive pings for remote clients (e.g. LAN, tunnels).
+        3. Captures keepalive ping timeouts and protocol failure reasons at WARNING level
+           without enabling global websocket DEBUG logging or leaking credentials.
+        """
+        def connection_made(self, transport: Any) -> None:
+            super().connection_made(transport)
+            client_host = self.client[0] if self.client else ""
+            if client_host in {"127.0.0.1", "::1", "localhost"}:
+                self.ping_interval = None
+                self.ping_timeout = None
+
+        def fail_connection(self, code: int = 1006, reason: str = "") -> None:
+            safe_reason = reason if reason in _ALLOWED_WS_FAIL_REASONS else ""
+            if safe_reason:
+                _log.warning("ws protocol fail_connection code=%s reason=%s", code, safe_reason)
+            else:
+                _log.warning("ws protocol fail_connection code=%s", code)
+            super().fail_connection(code, reason)
+else:
+    HermesWebSocketProtocol = None  # Telemetry limitation: non-websockets_impl protocol in use
+
+
 def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
     """Build the uvicorn ``Config`` + ``Server`` for this bind (reads ``app.state.auth_required``).
 
@@ -1183,18 +1287,20 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
         served_app = wrap_asgi_with_ws_tracking(app, app.state.ssh_isolated_clients)
         ping_interval, ping_timeout = TUNNEL_WS_PING_INTERVAL_S, TUNNEL_WS_PING_TIMEOUT_S
 
+    ws_protocol = HermesWebSocketProtocol if HermesWebSocketProtocol is not None else "auto"
     config = uvicorn.Config(
         served_app, host=host, port=port, log_level="warning",
         # Off by default so _ws_client_is_allowed sees the real peer, not
         # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
         # X-Forwarded-Proto for cookie Secure flags.
-        proxy_headers=bool(app.state.auth_required),
+        proxy_headers=bool(getattr(app.state, "auth_required", False)),
         # Loopback-only unless the operator trusts a bounded upstream proxy, so
         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
         forwarded_allow_ips=_dashboard_forwarded_allow_ips(_dash_cfg),
         ws_ping_interval=ping_interval,
         ws_ping_timeout=ping_timeout,
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
+        ws=ws_protocol,
     )
     return config, uvicorn.Server(config)
 

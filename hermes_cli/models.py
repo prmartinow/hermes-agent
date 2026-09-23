@@ -1438,8 +1438,6 @@ def _openai_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]
     # Curated order, only models the account has access to; an account serving none of them (rare)
     # falls back to curated so the picker still offers sane defaults.
     discovered = [m for m in curated if m.lower() in live_lower]
-    # Astra is intentionally absent from offline/static catalogs: the official API's
-    # account-scoped /models response is the only source that may advertise it.
     discovered.extend(m for m in live if is_astra_model(m))
     return discovered or curated or live
 
@@ -1494,11 +1492,25 @@ def _azure_foundry_catalog(normalized: str, force_refresh: bool) -> Optional[lis
         return None
 
 
+def _gemini_oauth_catalog(normalized: str, force_refresh: bool) -> list[str]:
+    try:
+        from hermes_cli.auth import fetch_gemini_available_models
+        return fetch_gemini_available_models(account=normalized, force=force_refresh)
+    except Exception:
+        return []
+
+
 # Per-provider catalog sources tried before the generic profile fetch. A fetcher returning None
 # falls through to the profile/curated path; a list is returned as-is (even empty).
 _PROVIDER_CATALOG_FETCHERS: dict[str, Any] = {
     "openrouter": lambda normalized, force_refresh: model_ids(force_refresh=force_refresh),
     "openai-codex": _codex_catalog,
+    "gemini-oauth": _gemini_oauth_catalog,
+    "gemini-1": _gemini_oauth_catalog,
+    "gemini-2": _gemini_oauth_catalog,
+    "gemini-3": _gemini_oauth_catalog,
+    "gemini-4": _gemini_oauth_catalog,
+    "gemini-5": _gemini_oauth_catalog,
     "copilot": _copilot_catalog,
     "copilot-acp": _copilot_catalog,
     "nous": _nous_catalog,

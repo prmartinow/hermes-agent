@@ -693,9 +693,9 @@ def _reattach_refusal(rid, sid: str, session: dict) -> dict | None:
     ``session`` — it is stale, or a client-gone interrupt is still settling and the reap Timer must keep
     polling. None when the reattach may proceed."""
     if _sessions.get(sid) is not session:
-        return _err(rid, 4007, "session no longer live; retry resume")
+        return _err(rid, 4007, "session no longer live; retry resume", {"reason": "runtime_replaced", "retryable": True})
     if session.get("_client_gone_interrupt_requested"):
-        return _err(rid, 4009, "session disconnect interrupt settling")
+        return _err(rid, 4009, "session disconnect interrupt settling", {"reason": "disconnect_interrupt_settling", "retryable": True, "retry_after_ms": 1000})
     return None
 
 

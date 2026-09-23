@@ -76,3 +76,11 @@ def test_unscoped_resume_of_profile_session_fails_closed(live_lazy_session):
 def test_unknown_id_still_404s(home):
     out = _resume({"profile": "ops", "session_id": "ghost-9999", "omit_messages": True})
     assert out.get("error", {}).get("code") == 4007
+
+
+def test_resume_by_runtime_sid_resolves_to_backing_session_key(live_lazy_session):
+    sid, record = live_lazy_session
+    out = _resume({"profile": "ops", "session_id": sid, "omit_messages": True})
+    assert "error" not in out, out
+    assert out["result"]["session_id"] == sid
+    assert out["result"]["stored_session_id"] == record["session_key"]

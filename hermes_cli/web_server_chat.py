@@ -46,7 +46,7 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 # A positive sleep lets other coroutines run and keeps dashboard idle CPU low (#42627).
 _PTY_IDLE_BACKOFF = 0.05
 PTY_REGISTRY = PtySessionRegistry(
-    ttl=30 * 60, max_sessions=16, buffer_cap=1 * 1024 * 1024, read_timeout=_PTY_READ_CHUNK_TIMEOUT)
+    ttl=3 * 60, max_sessions=16, buffer_cap=32 * 1024 * 1024, read_timeout=_PTY_READ_CHUNK_TIMEOUT)
 
 
 async def _close_stalled_pty_input(ws: "WebSocket", *, path: str) -> None:
@@ -343,10 +343,11 @@ def _resolve_chat_argv(
         _log.warning("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
     _apply_tui_python_env(env)
     env.setdefault("NODE_ENV", "production")
-    # Mouse tracking would swallow wheel events the browser needs for
-    # transcript scrolling; disable it for the dashboard PTY only.
-    env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
+    # Client-side wheel decoupling allows native browser scrolling while
+    # button mouse tracking (DEC 1000/1002/1006) preserves click interactivity.
+    env.pop("HERMES_TUI_DISABLE_MOUSE", None)
     env.setdefault("HERMES_TUI_INLINE", "1")
+    env.setdefault("HERMES_TUI_MOUSE_TRACKING", "buttons")
     # chalk in the child picks its color depth from the SERVER env; hosted
     # deploys have no COLORTERM, so hex colors would snap to the 256 palette.
     env.setdefault("COLORTERM", "truecolor")
@@ -357,6 +358,9 @@ def _resolve_chat_argv(
             requested if profile_dir is not None else None, read_only=True)
         try:
             latest_resume, _latest_path = _session_latest_descendant(resume, _resume_db)
+        except Exception:
+            _log.warning("Failed to resolve latest session descendant for %s", resume, exc_info=True)
+            latest_resume = None
         finally:
             _resume_db.close()
         if latest_resume:
@@ -442,15 +446,36 @@ async def _resolve_chat_argv_async(
         return await asyncio.to_thread(_resolve_chat_argv, **kwargs)
 
 
-def _active_session_file_for_channel(app: "FastAPI", channel: str) -> Path:
-    """Return the per-channel file where a dashboard TUI writes its active sid."""
+def _default_pty_spawn():
+    from hermes_cli.pty import PtyBridge, PtyUnavailableError
+    if PtyBridge is None:
+        raise PtyUnavailableError("PTY bridge is not available on this platform")
+    argv, cwd, env = _resolve_chat_argv()
+    return PtyBridge.spawn(argv, cwd=cwd, env=env)
+
+
+def _get_pty_active_dir(app: "FastAPI") -> Path:
+    d = getattr(app.state, "_pty_active_dir", None)
+    if d is None:
+        d = Path(tempfile.gettempdir()) / f"hermes-pty-active-{os.getpid()}"
+        d.mkdir(parents=True, exist_ok=True)
+        app.state._pty_active_dir = d
+    return d
+
+
+def _active_session_file_for_pty(app: "FastAPI", pty_key: str) -> Path:
+    """Return the per-PTY file where a dashboard TUI writes its active sid."""
     from hermes_cli.web_server import _get_pty_active_session_files
     files = _get_pty_active_session_files(app)
-    if files.get(channel) is None:
-        fd, raw_path = tempfile.mkstemp(prefix="hermes-pty-active-", suffix=".json")
+    if files.get(pty_key) is None:
+        d = _get_pty_active_dir(app)
+        fd, raw_path = tempfile.mkstemp(dir=str(d), prefix="pty-", suffix=".json")
         os.close(fd)
-        files[channel] = Path(raw_path)
-    return files[channel]
+        files[pty_key] = Path(raw_path)
+    return files[pty_key]
+
+
+_active_session_file_for_channel = _active_session_file_for_pty
 
 
 # On timeout asyncio cancels the awaitable but the console thread keeps running;

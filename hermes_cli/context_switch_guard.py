@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any, Callable, List, Optional
 
-from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
 from hermes_cli.model_switch import ModelSwitchResult, resolve_display_context_length
 
 
@@ -19,8 +18,11 @@ def _threshold_tokens(compressor: Any, model: str, context_length: int, provider
     """The trigger the compressor WILL use after the switch (cap, model_thresholds and small-window
     floor included), so the warning quotes the real number; duck-typed engines keep the plain ratio."""
     preview = getattr(compressor, "preview_threshold_tokens", None)
+    if not callable(preview):
+        preview = getattr(compressor, "preview_model_threshold", None)
     if callable(preview):
         return int(preview(model, context_length, provider))
+    from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
     return max(int(context_length * float(getattr(compressor, "threshold_percent", 0.5))), MINIMUM_CONTEXT_LENGTH)
 
 

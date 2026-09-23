@@ -612,7 +612,7 @@ def _exchange_copilot_pool_entry(entry: Any, pool_api_key: str) -> str:
 
 
 def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[str, Any], explicit_api_key, explicit_base_url,
-                       target_model) -> Optional[Dict[str, Any]]:
+                       target_model, preferred_account: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Runtime from the provider's credential pool, or None to continue down the ladder."""
     should_use_pool = provider != "openrouter" or _openrouter_should_use_pool(requested_provider, model_cfg, explicit_api_key,
                                                                              explicit_base_url)
@@ -622,7 +622,14 @@ def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[s
         pool = None
     if not (pool and pool.has_credentials()):
         return None
-    entry = pool.select(model=target_model or None)
+    entry = None
+    if preferred_account:
+        try:
+            entry = pool.select(model=target_model or None, preferred_account=preferred_account)
+        except TypeError:
+            entry = pool.select(model=target_model or None)
+    else:
+        entry = pool.select(model=target_model or None)
     if entry is None:
         return None
     pool_api_key = _pool_entry_api_key(entry)
@@ -959,7 +966,8 @@ def _openrouter_fallback(requested_provider, explicit_api_key, explicit_base_url
 
 
 def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_key: Optional[str] = None,
-                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None) -> Dict[str, Any]:
+                             explicit_base_url: Optional[str] = None, target_model: Optional[str] = None,
+                             preferred_account: Optional[str] = None) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution. Ladder (order is behavior — each
     rung returns or raises, else falls to the next):
       1. disabled-provider guard (``providers.<name>.enabled: false``)
@@ -985,7 +993,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     requested_alias = requested_provider
     requested_provider, explicit_base_url = expand_direct_api_alias(requested_provider, explicit_base_url)
     _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
-    runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model) if r)
+    runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model,
+                                           preferred_account=preferred_account) if r)
     _raise_for_credentialless_bare_custom(requested_provider, runtime)
     # model.openai_runtime is applied ONCE, after the ladder: every rung (pool, OAuth store,
     # explicit --api-key/--base-url, env key) hardcodes the wire api_mode for openai/openai-codex,
@@ -1020,7 +1029,8 @@ def _raise_for_credentialless_bare_custom(requested_provider: str, runtime: Dict
     )
 
 
-def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model):
+def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model,
+                  preferred_account: Optional[str] = None):
     """Ladder rungs 2-8, yielded lazily so each is evaluated only when the previous one returned
     nothing; the last rung (OpenRouter / bare-custom fallback) always yields a runtime."""
     yield _resolve_requested_shortcuts(requested_provider, explicit_api_key, explicit_base_url, target_model)
@@ -1036,7 +1046,8 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
                                     explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
                                     target_model=target_model)
-    yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
+    yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model,
+                             preferred_account=preferred_account)
     swallowed_auth_error = None
     if provider in _OAUTH_RUNTIME_PROVIDERS:
         try:

@@ -189,6 +189,10 @@ class TestUnconfiguredErrorEnvelopeParity:
             "TOOL_GATEWAY_DOMAIN",
         ):
             monkeypatch.delenv(k, raising=False)
+        try:
+            monkeypatch.setattr("hermes_cli.auth.has_gemini_oauth_credentials", lambda *a, **kw: False)
+        except Exception:
+            pass
 
     def test_unconfigured_search_emits_top_level_error(self, monkeypatch):
         """``web_search_tool`` with no creds returns ``{"error": "Error searching web: ..."}``
