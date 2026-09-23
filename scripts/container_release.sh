@@ -43,8 +43,14 @@ cmd_build() {
     usage
   fi
 
+  local current_branch
+  current_branch="$(git branch --show-current 2>/dev/null || echo "unknown")"
+  if [ "$current_branch" != "dev" ]; then
+    echo "Notice: Active branch is '$current_branch'. Standard container builds land from 'dev'."
+  fi
+
   local git_sha
-  git_sha="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+  git_sha="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")" 
   local build_date
   build_date="$(date -u +"%Y-%m-%d %H:%M UTC")"
 
@@ -82,6 +88,7 @@ cmd_deploy() {
   fi
 
   echo "=== Deploying $version to Serving Container (Port 9119) ==="
+  docker tag "hermes-agent:$version" hermes-agent:serving
   docker tag "hermes-agent:$version" hermes-agent:local
 
   # Recreate the serving container with the new version tag
@@ -115,6 +122,7 @@ cmd_promote() {
   fi
 
   echo "=== Promoting $version to Serving Slot (Port 9119) ==="
+  docker tag "hermes-agent:$version" hermes-agent:serving
   docker tag "hermes-agent:$version" hermes-agent:local
 
   # Recreate the serving container with the new version tag

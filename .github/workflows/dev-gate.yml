@@ -1,0 +1,80 @@
+name: Dev Gate CI
+
+on:
+  push:
+    branches: [ dev ]
+  pull_request:
+    branches: [ dev ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanitization:
+    name: Sanitization & Path Leak Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for Sensitive Host Paths & LAN IPs
+        run: |
+          echo "Scanning working tree for sensitive patterns..."
+          PATTERNS=("/home/ops" "192.168.1.16" "10.66.66.")
+          FAILED=0
+          for p in "${PATTERNS[@]}"; do
+            if git grep -n "$p" -- ":!*.md" ":!docs/**" ":!.github/**"; then
+              echo "❌ Error: Found sensitive pattern '$p' in code!"
+              FAILED=1
+            fi
+          done
+          if [ $FAILED -ne 0 ]; then
+            exit 1
+          fi
+          echo "✓ Sanitization check passed (0 sensitive hits)."
+
+  linearity:
+    name: Commit Linearity Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Assert Zero Merge Commits on Dev
+        run: |
+          git fetch origin main:main || true
+          MERGES=$(git log main..HEAD --merges --oneline)
+          if [ -n "$MERGES" ]; then
+            echo "❌ Error: Found merge commits on dev! Must be 100% linear rebase on main:"
+            echo "$MERGES"
+            exit 1
+          fi
+          echo "✓ Dev is 100% linear on main."
+
+  tests:
+    name: Core Unit & Lineage Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" pytest pytest-asyncio
+
+      - name: Run Core State DB & Lineage Tests
+        run: |
+          pytest tests/test_state_db_lineage.py tests/test_state_db_compacted_display.py -v

@@ -398,6 +398,8 @@ COPY --chmod=0755 docker/cont-init.d/015-supervise-perms /etc/cont-init.d/015-su
 COPY --chmod=0755 docker/cont-init.d/02-reconcile-profiles /etc/cont-init.d/02-reconcile-profiles
 
 # ---------- Runtime ----------
+ENV HERMES_BUILD_VERSION=${HERMES_VERSION}
+ENV HERMES_BUILD_COMMIT=${HERMES_GIT_SHA}
 ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
 # Point the TUI launcher at the prebuilt bundle baked at build time (Layer 8:
 # `ui-tui && npm run build`). This makes _make_tui_argv take the prebuilt-bundle
