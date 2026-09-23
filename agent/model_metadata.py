@@ -454,9 +454,8 @@ def _normalize_base_url(base_url: str) -> str:
     return (base_url or "").strip().rstrip("/")
 
 
-def _auth_headers(api_key: object = "") -> Dict[str, str]:
-    from agent.command_token_source import materialize_probe_api_key
-    token = materialize_probe_api_key(api_key)
+def _auth_headers(api_key: str = "") -> Dict[str, str]:
+    token = str(api_key or "").strip()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -1074,7 +1073,7 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
         return {}
     alternate = normalized[:-3].rstrip("/") if normalized.endswith("/v1") else normalized + "/v1"
     candidates = [normalized] + ([alternate] if alternate != normalized else [])
-    headers = _auth_headers(api_key)
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     verify = _resolve_requests_verify(normalized)
     last_error: Optional[Exception] = None
     if local:
@@ -1227,6 +1226,45 @@ def get_cached_context_length(model: str, base_url: str, *, bedrock_confirmed: b
         if type(marker) is not int or marker != length:
             return None
     return length
+
+
+def get_model_max_output_tokens(
+    model: str = "",
+    provider: str = "",
+    config_max_tokens: Optional[int] = None,
+) -> int:
+    """Resolve authoritative max output tokens for a model.
+
+    If an explicit positive config_max_tokens is provided, it is honored.
+    Otherwise, returns the native model output ceiling for known large-output
+    models (65536 for Gemini, 64000 for Claude 3.7 / 4.x, 16384 for GPT-4o),
+    catalog values when known, or 0 when unspecified.
+    """
+    if config_max_tokens is not None and int(config_max_tokens) > 0:
+        return int(config_max_tokens)
+
+    norm_provider = (provider or "").strip().lower()
+    norm_model = (model or "").strip().lower()
+    bare_model = strip_codex_context_variant_suffix(norm_model)
+
+    if norm_provider in ("gemini", "gemini-oauth", "google") or "gemini" in bare_model:
+        return 65536
+    if "claude" in bare_model or "anthropic" in norm_provider:
+        if any(v in bare_model for v in ("opus-4-6", "sonnet-4-6", "3-7", "3.7", "4-")):
+            return 64000
+        return 8192
+    if "gpt-4o" in bare_model:
+        return 16384
+
+    try:
+        from agent.models_dev import get_model_capabilities
+
+        caps = get_model_capabilities(provider, bare_model, allow_network=False)
+        if caps and caps.max_output_tokens:
+            return caps.max_output_tokens
+    except Exception:
+        pass
+    return 0
 
 
 def _invalidate_cached_context_length(model: str, base_url: str) -> None:

@@ -1,0 +1,5 @@
+name: gemini-oauth-profile
+kind: model-provider
+version: 1.0.0
+description: Google Gemini (Antigravity) OAuth provider with Cloud Code PA inference and reasoning levels
+author: Antigravity Assistant & Hermes Development Team
