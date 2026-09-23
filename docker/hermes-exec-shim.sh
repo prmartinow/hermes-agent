@@ -40,7 +40,11 @@
 
 set -e
 
-REAL=/opt/hermes/.venv/bin/hermes
+case "$(basename "$0")" in
+    python|python3) REAL=/opt/hermes/.venv/bin/python3 ;;
+    node)           REAL=/usr/local/bin/node ;;
+    *)              REAL=/opt/hermes/.venv/bin/hermes ;;
+esac
 
 # Defensive: if the venv binary is missing (corrupted image, partial
 # install), fail loudly rather than silently masking it.
@@ -82,6 +86,6 @@ fi
 # this, $HOME stays /root and any library that resolves paths off $HOME
 # (XDG caches, lockfiles, .config writes) will try to write to /root and
 # fail with EACCES. Mirrors main-wrapper.sh.
-export HOME=/opt/data
+export HOME="${HOME:-${HERMES_HOME:-/opt/data}}"
 
 exec "$S6_SUID" hermes "$REAL" "$@"
