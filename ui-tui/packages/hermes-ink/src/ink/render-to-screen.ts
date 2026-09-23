@@ -1,3 +1,7 @@
+import { LINK_END, link as oscLink } from './termio/osc.js'
+import { ansiCodesToString, type AnsiCode } from '@alcalzone/ansi-tokenize'
+import { transitionAnsiCodes } from './ansi-transition.js'
+import type { Hyperlink } from './screen.js'
 import noop from 'lodash-es/noop.js'
 import type { ReactElement } from 'react'
 import { LegacyRoot } from 'react-reconciler/constants.js'
@@ -233,4 +237,55 @@ export function applyPositionedHighlight(
   }
 
   return true
+}
+
+/**
+ * Serialize a rendered Screen into ANSI-styled lines for static terminal output.
+ */
+export function serializeScreenToAnsi(screen: Screen, pool?: StylePool): string {
+  const p = pool || stylePool
+  const lines: string[] = []
+  let currentStyles: AnsiCode[] = []
+  let currentHyperlink: Hyperlink = undefined
+
+  for (let y = 0; y < screen.height; y++) {
+    let line = ''
+    for (let x = 0; x < screen.width; x++) {
+      const cell = cellAtIndex(screen, y * screen.width + x)
+      if (cell && cell.width !== CellWidth.SpacerTail) {
+        if (cell.hyperlink !== currentHyperlink) {
+          if (currentHyperlink !== undefined) line += LINK_END
+          if (cell.hyperlink !== undefined) line += oscLink(cell.hyperlink)
+          currentHyperlink = cell.hyperlink
+        }
+        const cellStyles = p ? p.get(cell.styleId) : []
+        const styleDiff = transitionAnsiCodes(currentStyles, cellStyles)
+        if (styleDiff.length > 0) {
+          line += ansiCodesToString(styleDiff)
+          currentStyles = cellStyles
+        }
+        line += cell.char
+      }
+    }
+    if (currentHyperlink !== undefined) {
+      line += LINK_END
+      currentHyperlink = undefined
+    }
+    const resetCodes = transitionAnsiCodes(currentStyles, [])
+    if (resetCodes.length > 0) {
+      line += ansiCodesToString(resetCodes)
+      currentStyles = []
+    }
+    lines.push(line.trimEnd())
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Render any React Ink element directly into ANSI-styled terminal output without
+ * touching the live terminal cursor or wiping scrollback.
+ */
+export function renderNodeToAnsi(node: ReactElement, width: number): string {
+  const { screen } = renderToScreen(node, width)
+  return serializeScreenToAnsi(screen, stylePool)
 }

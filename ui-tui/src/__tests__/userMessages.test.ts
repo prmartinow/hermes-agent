@@ -2,6 +2,11 @@ import { JsonRpcGatewayError } from '@hermes/shared/json-rpc-channel'
 import { describe, expect, it } from 'vitest'
 
 import {
+  BACKEND_RESTARTING,
+  BACKEND_RESTARTING_ACTIVITY,
+  TRANSPORT_GAVE_UP_ACTIVITY,
+  TRANSPORT_RECONNECTING,
+  TRANSPORT_RECONNECTING_ACTIVITY,
   backendGaveUp,
   describeCredentialWarning,
   describeRpcError,
@@ -10,10 +15,15 @@ import {
   isVersionSkewError,
   lastStderrLine,
   promptTimeoutNotice,
+  recoveryGaveUpActivity,
+  recoveryGaveUpMessage,
+  recoveryRestartingActivity,
+  recoveryRestartingMessage,
   setRpcErrorLogSink,
   shouldFallbackToDispatch,
   stderrLooksLikeProblem,
-  stderrProblemActivity
+  stderrProblemActivity,
+  transportGaveUp
 } from '../app/userMessages.js'
 
 // Behaviour contracts for the user-facing wording, not snapshots: each test
@@ -269,5 +279,37 @@ describe('describeCredentialWarning', () => {
     expect(text).toContain('/model')
     expect(text).toContain('/setup')
     expect(describeCredentialWarning('something else')).toBe('something else')
+  })
+})
+
+describe('transport loss recovery copy', () => {
+  it('does not assert process crash or reply loss for websocket transport drops', () => {
+    // Socket 1006 must not claim the process stopped or that the reply was lost
+    expect(TRANSPORT_RECONNECTING).toContain('Connection lost')
+    expect(TRANSPORT_RECONNECTING).not.toMatch(/stopped|crashed|reply in progress was lost/)
+    expect(TRANSPORT_RECONNECTING_ACTIVITY).toBe('Connection lost · reconnecting…')
+
+    const gaveUpText = transportGaveUp(1006)
+    expect(gaveUpText).toContain('Connection to Hermes was lost (code 1006)')
+    expect(gaveUpText).not.toMatch(/Hermes stopped|could not be restarted/)
+    expect(gaveUpText).toContain('/resume')
+    expect(TRANSPORT_GAVE_UP_ACTIVITY).toBe('Connection lost · /logs for details')
+  })
+
+  it('selects truthful copy based on exit source', () => {
+    expect(recoveryRestartingMessage('websocket')).toBe(TRANSPORT_RECONNECTING)
+    expect(recoveryRestartingMessage('process')).toBe(BACKEND_RESTARTING)
+    expect(recoveryRestartingActivity('websocket')).toBe(TRANSPORT_RECONNECTING_ACTIVITY)
+    expect(recoveryRestartingActivity('process')).toBe(BACKEND_RESTARTING_ACTIVITY)
+
+    const wsGaveUp = recoveryGaveUpMessage('websocket', 1006)
+    expect(wsGaveUp).toContain('(code 1006)')
+    expect(wsGaveUp).not.toMatch(/Hermes stopped/)
+
+    const procGaveUp = recoveryGaveUpMessage('process', 1)
+    expect(procGaveUp).toContain('Hermes stopped (exit code 1)')
+
+    expect(recoveryGaveUpActivity('websocket')).toBe(TRANSPORT_GAVE_UP_ACTIVITY)
+    expect(recoveryGaveUpActivity('process')).toBe('Hermes stopped · /logs for details')
   })
 })

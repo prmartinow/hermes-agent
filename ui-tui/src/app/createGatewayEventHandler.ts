@@ -18,6 +18,7 @@ import type {
 } from '../gatewayTypes.js'
 import { billingDialogCopy } from '../lib/billingDialog.js'
 import { isTodoDone } from '../lib/liveProgress.js'
+import { appendTranscriptMessage } from '../lib/messages.js'
 import { openExternalUrl } from '../lib/openExternalUrl.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
@@ -29,6 +30,7 @@ import type { Msg, SessionInfo, SubagentProgress } from '../types.js'
 
 import { applyConnectionRequest, applyConnectionUpdate } from './connectionOperationStore.js'
 import { applyDelegationStatus, getDelegationState } from './delegationStore.js'
+import { setActiveRecoveryTargetRef } from './gatewayRecovery.js'
 import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
 import { getOverlayState, patchOverlayState } from './overlayStore.js'
 import { flashGoodVibes, flashPet } from './petFlashStore.js'
@@ -437,7 +439,22 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   syncThemeToTerminalBackground()
 
   const { rpc } = ctx.gateway
-  const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
+  const sessionCtx = ctx.session as {
+    STARTUP_RESUME_ID: string
+    colsRef: { current: number }
+    newSession: (msg?: string, title?: string) => void
+    recoverSessionKeyRef?: { current: string | null }
+    recoverSidRef?: { current: string | null }
+    resetSession: () => void
+    resumeById: (id: string, targetRecoveryRef?: { current: string | null }, retryAttempt?: number, options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume" }) => void
+    setCatalog: (catalog: any) => void
+  }
+  const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = sessionCtx
+  const recoverSessionKeyRef = sessionCtx.recoverSessionKeyRef ?? sessionCtx.recoverSidRef
+  if (recoverSessionKeyRef) {
+    setActiveRecoveryTargetRef(recoverSessionKeyRef)
+  }
+  const pendingReplayGapRef = { current: null as null | import('@hermes/shared/gateway-events').ClientLocalGatewayEventMap['gateway.replay_gap'] }
   const { bellOnComplete, bellOnPrompt, stdout, sys } = ctx.system
 
   // display.bell_on_prompt — BEL whenever a blocking prompt modal opens
@@ -721,14 +738,26 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       })
       .catch((e: unknown) => turnController.pushActivity(`command catalog unavailable: ${rpcErrorMessage(e)}`, 'info'))
 
-    // Keep the recovery target until resume succeeds, including across a second
-    // disconnect during setup or history loading. Recovery never resends the prompt.
-    const recoverSid = recoverSidRef?.current
+    // Crash recovery: a respawn triggered by an unexpected gateway death
+    // resumes the session that was live, not a brand-new one. Keep the recovery
+    // target until resume succeeds, including across a second disconnect during
+    // setup or history loading. The ref is cleared on successful resume by
+    // resumeById so an ordinary later restart still forges/resumes per config,
+    // while preventing premature destruction if resume fails. Recovery never resends the prompt.
+    const recoverKey = recoverSessionKeyRef?.current
 
-    if (recoverSidRef && recoverSid) {
-      void resumeById(recoverSid).then(() => {
-        if (getUiState().sid && recoverSidRef.current === recoverSid) {
-          recoverSidRef.current = null
+    if (recoverKey) {
+      const pendingGap = pendingReplayGapRef.current
+      pendingReplayGapRef.current = null
+      const recoveryMode = pendingGap ? 'transport-gap-recovery' : 'transport-recovery'
+      void (resumeById(recoverKey, undefined, 0, { mode: recoveryMode, gapReason: pendingGap?.reason }) as unknown as Promise<void> | undefined)?.then?.(() => {
+        if (getUiState().sid) {
+          if (recoverSessionKeyRef.current === recoverKey) {
+            recoverSessionKeyRef.current = null
+          }
+          if (sessionCtx.recoverSidRef && sessionCtx.recoverSidRef.current === recoverKey) {
+            sessionCtx.recoverSidRef.current = null
+          }
         }
       })
       // After resumeById: it synchronously sets status to 'resuming…' on entry,
@@ -822,6 +851,20 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         return
+      case 'session.rewound':
+      case 'session.restored': {
+        const p = ev.payload
+        if (p?.notice) {
+          sys(p.notice)
+        }
+        const restoredSid = p?.session_id || sid
+        if (restoredSid) {
+          ctx.session.resumeById(restoredSid)
+        }
+
+        return
+      }
+
       case 'session.info': {
         let info = ev.payload as SessionInfo | undefined
 
@@ -884,10 +927,26 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         if (text !== undefined) {
           const value = String(text)
           scheduleThinkingStatus(value || statusFromBusy())
+        }
 
-          if (value) {
-            turnController.recordReasoningDelta(value)
-          }
+        return
+      }
+
+      case 'prompt.submitted': {
+        const p = ev.payload
+        const live = getUiState()
+
+        if (p?.session_id === live.sid && p.text) {
+          setHistoryItems(prev => {
+            const last = prev[prev.length - 1]
+
+            if (last && last.role === 'user' && last.text === p.text) {
+              return prev
+            }
+
+            return appendTranscriptMessage(prev, { role: 'user', text: p.text })
+          })
+          patchUiState({ busy: true, status: 'running…' })
         }
 
         return
@@ -1033,6 +1092,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         const { attempt, delay_ms: delayMs } = ev.payload ?? {}
 
         setStatus(backendReconnecting(attempt, delayMs))
+
+        return
+      }
+
+      case 'gateway.replay_gap': {
+        const gap = ev.payload
+        sys(`[gateway] sequence replay gap (${gap?.reason ?? 'unknown'}) - scheduled for reconciliation`)
+        pendingReplayGapRef.current = gap ?? { reason: 'continuity-gap' }
 
         return
       }
@@ -1315,6 +1382,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'todo.updated': {
+        if (ev.payload && 'todos' in ev.payload) {
+          turnController.recordTodos(ev.payload.todos)
+        }
+
+        return
+      }
+
       case 'request.cancel': {
         // The backend withdrew a server→client request (timeout / interrupt /
         // session close): tear down whichever card carries that id. A clarify
@@ -1520,6 +1595,16 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (typeof text === 'string' && text.trim()) {
           turnController.recordInterimMessage(text)
+        }
+
+        return
+      }
+
+      case 'turn.steer': {
+        const text = ev.payload?.text ?? ev.payload?.user_message
+
+        if (typeof text === 'string' && text.trim()) {
+          turnController.recordSteer(text.trim())
         }
 
         return

@@ -692,6 +692,7 @@ export const ToolTrail = memo(function ToolTrail({
   reasoningActive = false,
   reasoning = '',
   reasoningAlwaysVisible = false,
+  thinkingTitle,
   reasoningTokens,
   reasoningStreaming = false,
   sections,
@@ -709,6 +710,7 @@ export const ToolTrail = memo(function ToolTrail({
   preferExpandedThinking?: boolean
   reasoningActive?: boolean
   reasoning?: string
+  thinkingTitle?: string
   // MoA reference blocks (see Msg.isMoaReference) stay visible even when
   // `visible.thinking === 'hidden'` — they're the mixture-of-agents process
   // the user opted into, not private model reasoning (#64657).
@@ -1044,6 +1046,7 @@ export const ToolTrail = memo(function ToolTrail({
   }[] = []
 
   if (hasThinking && (visible.thinking !== 'hidden' || reasoningAlwaysVisible)) {
+    const titleLabel = thinkingTitle ? `Thinking: ${thinkingTitle}` : 'Thinking'
     panels.push({
       header: (
         <Box
@@ -1059,11 +1062,11 @@ export const ToolTrail = memo(function ToolTrail({
             <Text color={t.color.accent}>{openThinking ? '▾ ' : '▸ '}</Text>
             {thinkingLive ? (
               <Text bold color={t.color.text}>
-                Thinking
+                {titleLabel}
               </Text>
             ) : (
               <Text color={t.color.muted} dim>
-                Thinking
+                {titleLabel}
               </Text>
             )}
             {thinkingTokensLabel ? (

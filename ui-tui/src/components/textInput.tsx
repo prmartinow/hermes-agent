@@ -5,7 +5,7 @@ import { type MutableRefObject, useEffect, useMemo, useRef, useState } from 'rea
 import { setInputSelection } from '../app/inputSelectionStore.js'
 import { highlightMask, highlightsStable } from '../domain/composerHighlights.js'
 import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
-import { cursorLayout, offsetFromPosition } from '../lib/inputMetrics.js'
+import { cursorLayout, inputVisualHeight, offsetFromPosition } from '../lib/inputMetrics.js'
 import {
   DEFAULT_VOICE_RECORD_KEY,
   isActionMod,
@@ -375,8 +375,23 @@ export function deleteWordForward(value: string, cursor: number): TextInsertResu
  * is already on the first line (up) or last line (down) — callers use that
  * signal to fall through to history cycling instead of eating the arrow key.
  */
-export function lineNav(s: string, p: number, dir: -1 | 1): null | number {
+export function lineNav(s: string, p: number, dir: -1 | 1, cols?: number): null | number {
   const pos = snapPos(s, p)
+
+  if (cols && cols > 0) {
+    const layout = cursorLayout(s, pos, cols)
+    const totalLines = inputVisualHeight(s, cols)
+    const targetLine = layout.line + dir
+
+    if (targetLine < 0 || targetLine >= totalLines) {
+      return null
+    }
+
+    const nextPos = offsetFromPosition(s, targetLine, layout.column, cols)
+
+    return snapPos(s, nextPos)
+  }
+
   const curStart = s.lastIndexOf('\n', pos - 1) + 1
   const col = pos - curStart
 
@@ -775,6 +790,7 @@ const isPasteResultPromise = (
 ): value is Promise<PasteResult> => !!value && typeof (value as PromiseLike<PasteResult>).then === 'function'
 
 export function TextInput({
+  busy = false,
   columns = 80,
   value,
   onChange,
@@ -813,6 +829,7 @@ export function TextInput({
   const editVersionRef = useRef(0)
   const parentChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingParentValue = useRef<string | null>(null)
+  const pendingParentEchoes = useRef<string[]>([])
   const localRenderTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   // True for one keystroke after a commit took the full Ink render path
   // (syncParent). Ink repaints the whole input line, so the terminal cursor
@@ -835,6 +852,14 @@ export function TextInput({
   cbChange.current = onChange
   cbSubmit.current = onSubmit
   cbPaste.current = onPaste
+
+  const notifyParentChange = (next: string) => {
+    pendingParentEchoes.current.push(next)
+    emittedValueRef.current = next
+    self.current = true
+    cbChange.current(next)
+  }
+
 
   const raw = self.current ? vRef.current : value
   const display = mask ? raw.replace(/[^\n]/g, mask[0] ?? '*') : raw
@@ -928,28 +953,36 @@ export function TextInput({
   }, [accentOpen, cur, display, focus, highlights, nativeCursor, placeholder, placeholderColor, selected])
 
   useEffect(() => {
-    // `value === vRef.current` misses a deferred flush still in flight: the
-    // user typed past the emitted value, so the echo comes back older than
-    // vRef. Treating it as external rewound local keystrokes (cursor jumped
-    // backward, letters vanished — #111934). An echo matching the last value
-    // we emitted is still our own; the pending flush for the newer local
-    // value converges the parent on its next timer.
+    // React can commit an older onChange echo after a newer keystroke has
+    // already advanced vRef. A boolean ownership flag mistakes that echo
+    // for an external replacement and drops the newer characters.
+    // Tracking emitted values keeps stale own-echo flushes from rewinding
+    // composer keystrokes (#111934).
+    const echo = pendingParentEchoes.current.lastIndexOf(value)
+    if (echo >= 0) {
+      pendingParentEchoes.current.splice(0, echo + 1)
+      self.current = value !== vRef.current
+      return
+    }
     const ownEcho = self.current && (value === vRef.current || value === emittedValueRef.current)
     self.current = false
-
     if (ownEcho || value === vRef.current) {
       return
     }
-
-    // An external value replaced the draft. A key burst still waiting on its
+    // A genuine external replacement supersedes queued local notifications.
+    // An external value replaced the draft: a key burst still waiting on its
     // 16ms flush is now stale; letting it fire would hand the parent the old
     // draft on top of the value it just set.
+    pendingParentEchoes.current = []
+    pendingParentValue.current = null
     if (parentChangeTimer.current) {
       clearTimeout(parentChangeTimer.current)
       parentChangeTimer.current = null
     }
-
-    pendingParentValue.current = null
+    if (keyBurstTimer.current) {
+      clearTimeout(keyBurstTimer.current)
+      keyBurstTimer.current = null
+    }
     setCur(value.length)
     setSel(null)
     curRef.current = value.length
@@ -1064,9 +1097,7 @@ export function TextInput({
     pendingParentValue.current = null
 
     if (next !== null) {
-      self.current = true
-      emittedValueRef.current = next
-      cbChange.current(next)
+      notifyParentChange(next)
     }
   }
 
@@ -1156,11 +1187,10 @@ export function TextInput({
       nextLineWidth ?? stringWidth(next.includes('\n') ? next.slice(next.lastIndexOf('\n') + 1) : next)
 
     if (next !== prev) {
+      self.current = true
       if (syncParent) {
         flushParentChange()
-        self.current = true
-        emittedValueRef.current = next
-        cbChange.current(next)
+        notifyParentChange(next)
         // A full Ink repaint just happened. Mark it so any fast-echo backspace
         // later in this IME recompose burst is suppressed (it would write
         // "\b \b" against a baseline Ink just invalidated, stranding the U+202F
@@ -1433,7 +1463,7 @@ export function TextInput({
       if ((k.upArrow || k.downArrow) && !ignoreVerticalArrows) {
         flushKeyBurst()
 
-        const next = lineNav(vRef.current, curRef.current, k.upArrow ? -1 : 1)
+        const next = lineNav(vRef.current, curRef.current, k.upArrow ? -1 : 1, columns)
 
         if (next !== null) {
           moveCursor(next, k.shift)
@@ -1473,8 +1503,12 @@ export function TextInput({
       const range = selRange()
       const delFwd = k.delete || fwdDel.current
 
+      const isUnhandledControl =
+        !event.keypress.isPasted && ((k.ctrl && !k.meta) || Boolean(k.super))
+
       const isPrintableInput =
         !event.isControlChord &&
+        !isUnhandledControl &&
         (event.keypress.isPasted || inp.length > 0) &&
         PRINTABLE.test(inp.replace(BRACKET_PASTE, ''))
 
@@ -1486,9 +1520,6 @@ export function TextInput({
         return swap(undo, redo)
       }
 
-      // Extended-key terminals (kitty CSI-u / modifyOtherKeys) deliver a shifted
-      // letter as its uppercase char, so Cmd+Shift+Z arrives as inp 'Z' — match
-      // case-insensitively like the copy/paste chords above.
       if ((mod && inp === 'y') || (mod && k.shift && inp.toLowerCase() === 'z')) {
         return swap(redo, undo)
       }
@@ -1562,7 +1593,7 @@ export function TextInput({
           const t = wordLeft(v, c)
           v = v.slice(0, t) + v.slice(c)
           c = t
-        } else if (canFastBackspace(v, c)) {
+        } else if (!busy && canFastBackspace(v, c)) {
           const effect = fastBackspaceEffect(v, c)
           v = effect.newValue
           c = effect.newCursor
@@ -1616,7 +1647,13 @@ export function TextInput({
         } else {
           ;({ cursor: c, value: v } = killToLineEnd(v, c))
         }
+      } else if (isUnhandledControl) {
+        return
       } else if (event.keypress.isPasted || (inp.length > 0 && !event.isControlChord)) {
+        // Discard unhandled ANSI escape sequences (e.g. mouse reports, cursor reports, focus reports, OSC)
+        if (!event.keypress.isPasted && eventRaw && (eventRaw.startsWith('\x1b') || eventRaw.includes('\x1b'))) {
+          return
+        }
         const bracketed = event.keypress.isPasted || inp.includes('[200~')
         const text = inp.replace(BRACKET_PASTE, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n')
 
@@ -1677,7 +1714,7 @@ export function TextInput({
             v = inserted.value
             c = inserted.cursor
           } else {
-            const simpleAppend = canFastAppend(v, c, text)
+            const simpleAppend = !busy && canFastAppend(v, c, text)
             const preInsertValue = v
             const preInsertCursor = c
 
@@ -1719,7 +1756,9 @@ export function TextInput({
         return
       }
 
-      commit(v, c)
+      // While assistant is busy streaming, decouple typing from synchronous parent commits
+      // (syncParent=!busy) to avoid freezing the event loop with 3000-line transcript re-renders.
+      commit(v, c, true, !busy, true)
     },
     { isActive: focus }
   )
@@ -1824,6 +1863,8 @@ export interface InputCursorSnapshot {
 interface TextInputProps {
   /** Hex/ansi256 tone for `/skill`, `@ref`, and `[[ token ]]` spans. */
   accentColor?: string
+  /** True when assistant is generating/streaming; disables direct stdout fast-echo to prevent ANSI collisions. */
+  busy?: boolean
   /** Hex color for typed text (theme text); terminal default when omitted. */
   color?: string
   columns?: number

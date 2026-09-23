@@ -235,6 +235,42 @@ export function ModelPicker({
   const listStage = stage === 'provider' || stage === 'model' || stage === 'reasoning'
   useOverlayKeys({ disabled: listStage, onBack: back, onClose: onCancel })
 
+  const chooseProvider = (picked: ModelOptionProvider | undefined) => {
+    if (!picked) return
+    if (picked.authenticated === false) {
+      if (picked.auth_type === 'api_key' && picked.key_env) {
+        const index = providerIndexAfterClearingFilter(providerRows, picked)
+        if (index >= 0) setProviderIdx(index)
+        setStage('key')
+        setKeyInput('')
+        setKeyError('')
+        setFilter('')
+      }
+      return
+    }
+    const index = providerIndexAfterClearingFilter(providerRows, picked)
+    if (index >= 0) setProviderIdx(index)
+    setStage('model')
+    setModelIdx(0)
+    setFilter('')
+  }
+
+  const chooseModel = (model: string | undefined) => {
+    if (!provider || !model) { setStage('provider'); return }
+    if (pickerOffersReasoning(provider, model)) {
+      setPendingModel(model)
+      setReasoningIdx(0)
+      setStage('reasoning')
+    } else {
+      onSelect(modelPickerCommand(model, provider.slug, allowPersistGlobal && persistGlobal))
+    }
+  }
+
+  const chooseReasoning = (index: number) => {
+    if (provider && pendingModel) onSelect(modelPickerCommand(pendingModel, provider.slug,
+      allowPersistGlobal && persistGlobal, REASONING_PICKER_ROWS[index]?.value ?? ''))
+  }
+
   useInput((ch, key) => {
     // Key entry stage handles its own input
     if (stage === 'key') {
@@ -385,16 +421,7 @@ export function ModelPicker({
         return
       }
 
-      if (key.return && provider && pendingModel) {
-        onSelect(
-          modelPickerCommand(
-            pendingModel,
-            provider.slug,
-            allowPersistGlobal && persistGlobal,
-            REASONING_PICKER_ROWS[reasoningIdx]?.value ?? ''
-          )
-        )
-      }
+      if (key.return) chooseReasoning(reasoningIdx)
 
       return
     }
@@ -430,58 +457,8 @@ export function ModelPicker({
     }
 
     if (key.return) {
-      if (stage === 'provider') {
-        if (!provider) {
-          return
-        }
-
-        if (provider.authenticated === false) {
-          // api_key providers: prompt for key inline
-          if (provider.auth_type === 'api_key' && provider.key_env) {
-            const fullProviderIdx = providerIndexAfterClearingFilter(providerRows, provider)
-
-            if (fullProviderIdx >= 0) {
-              setProviderIdx(fullProviderIdx)
-            }
-
-            setStage('key')
-            setKeyInput('')
-            setKeyError('')
-            setFilter('')
-          }
-
-          // Other auth types: no-op (warning shown tells them to run hermes model)
-          return
-        }
-
-        const fullProviderIdx = providerIndexAfterClearingFilter(providerRows, provider)
-
-        if (fullProviderIdx >= 0) {
-          setProviderIdx(fullProviderIdx)
-        }
-
-        setStage('model')
-        setModelIdx(0)
-        setFilter('')
-
-        return
-      }
-
-      const model = models[modelIdx]
-
-      if (provider && model) {
-        if (pickerOffersReasoning(provider, model)) {
-          // Step 3/3: effort for the picked model (skipped on reasoning-free routes).
-          setPendingModel(model)
-          setReasoningIdx(0)
-          setStage('reasoning')
-        } else {
-          onSelect(modelPickerCommand(model, provider.slug, allowPersistGlobal && persistGlobal))
-        }
-      } else {
-        setStage('provider')
-      }
-
+      if (stage === 'provider') chooseProvider(provider)
+      else chooseModel(models[modelIdx])
       return
     }
 
@@ -690,15 +667,16 @@ export function ModelPicker({
             const dimmed = p?.authenticated === false
 
             return row ? (
+              <Box key={p?.slug ?? `row-${idx}`} onMouseDown={(event: { stopImmediatePropagation(): void }) => event.stopImmediatePropagation()} onMouseUp={() => chooseProvider(p)}>
               <Text
                 color={dimmed ? t.color.label : t.color.muted}
                 {...chipRowProps(t, providerIdx === idx)}
-                key={p?.slug ?? `row-${idx}`}
                 wrap="truncate-end"
               >
                 {providerIdx === idx ? '▸ ' : '  '}
                 {idx + 1}. {row}
               </Text>
+              </Box>
             ) : (
               <Text color={t.color.muted} key={`pad-${i}`} wrap="truncate-end">
                 {' '}
@@ -733,15 +711,16 @@ export function ModelPicker({
         </Text>
 
         {REASONING_PICKER_ROWS.map((row, idx) => (
+          <Box key={row.value || 'keep'} onMouseDown={(event: { stopImmediatePropagation(): void }) => event.stopImmediatePropagation()} onMouseUp={() => chooseReasoning(idx)}>
           <Text
             color={t.color.muted}
             {...chipRowProps(t, reasoningIdx === idx)}
-            key={row.value || 'keep'}
             wrap="truncate-end"
           >
             {reasoningIdx === idx ? '▸ ' : '  '}
             {idx + 1}. {row.label}
           </Text>
+          </Box>
         ))}
 
         <Text color={t.color.muted} wrap="truncate-end">
@@ -795,15 +774,16 @@ export function ModelPicker({
         const prefix = modelIdx === idx ? '▸ ' : row === currentModel ? '* ' : '  '
 
         return (
+          <Box key={`${provider?.slug ?? 'prov'}:${idx}:${row}`} onMouseDown={(event: { stopImmediatePropagation(): void }) => event.stopImmediatePropagation()} onMouseUp={() => chooseModel(row)}>
           <Text
             color={t.color.muted}
             {...chipRowProps(t, modelIdx === idx)}
-            key={`${provider?.slug ?? 'prov'}:${idx}:${row}`}
             wrap="truncate-end"
           >
             {prefix}
             {idx + 1}. {row}
           </Text>
+          </Box>
         )
       })}
 

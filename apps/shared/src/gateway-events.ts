@@ -24,6 +24,13 @@ export interface ClientLocalGatewayEventMap {
   'dashboard.new_session_requested': { reason?: string }
   'gateway.protocol_error': { preview?: string }
   'gateway.reconnecting': { attempt?: number; delay_ms?: number }
+  'gateway.replay_gap': {
+    epoch?: string
+    last_seen?: number
+    latest_seq?: number
+    reason: 'continuity-gap' | 'epoch-reset' | 'request-failed' | 'truncated'
+    session_id?: string
+  }
   'gateway.start_timeout': { cwd?: string; python?: string; stderr_tail?: string }
   'gateway.stderr': { line: string }
 }

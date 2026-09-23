@@ -7,6 +7,7 @@ import { logForDebugging } from '../utils/debug.js'
 import type { FrameEvent } from './frame.js'
 import Ink, { type Options as InkOptions } from './ink.js'
 import instances from './instances.js'
+import { enqueueRenderBoundary } from './render-boundary.js'
 
 export type RenderOptions = {
   /**
@@ -89,6 +90,19 @@ export type Root = {
   waitUntilExit: () => Promise<void>
 }
 
+/** Queue a control boundary after the next successfully emitted frame. */
+export const writeAfterRender = (content: string, stdout: NodeJS.WriteStream = process.stdout, replaceFrame = false): boolean => {
+  const instance = instances.get(stdout)
+  if (!instance) return false
+  if (replaceFrame) {
+    instance.repaint()
+    instance.invalidatePrevFrame()
+  }
+  enqueueRenderBoundary(stdout, content)
+  queueMicrotask(() => instance.onRender())
+  return true
+}
+
 export const forceRedraw = (stdout: NodeJS.WriteStream = process.stdout): boolean => {
   const instance = instances.get(stdout)
 
@@ -97,6 +111,18 @@ export const forceRedraw = (stdout: NodeJS.WriteStream = process.stdout): boolea
   }
 
   instance.forceRedraw()
+
+  return true
+}
+
+export const requestRedraw = (generation: string, stdout: NodeJS.WriteStream = process.stdout): boolean => {
+  const instance = instances.get(stdout)
+
+  if (!instance) {
+    return false
+  }
+
+  instance.requestRedraw(generation)
 
   return true
 }

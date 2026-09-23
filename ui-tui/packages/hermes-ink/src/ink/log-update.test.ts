@@ -220,4 +220,23 @@ describe('LogUpdate.render diff contract', () => {
 
     expect(hasDecstbm(stdoutOnly(diff))).toBe(false)
   })
+
+  it('initialRenderMode append-to-existing-scrollback does NOT emit clearTerminal on init', () => {
+    const w = 20
+    const h = 3
+    const prev = mkScreen(0, 0)
+    const next = mkScreen(w, h)
+    paint(next, 0, 'active row')
+    next.damage = { x: 0, y: 0, width: w, height: h }
+
+    const log = new LogUpdate({
+      isTTY: true,
+      stylePool,
+      initialRenderMode: 'append-to-existing-scrollback'
+    })
+    const diff = log.render(mkFrame(prev, 0, 0), mkFrame(next, w, h), false, false)
+
+    expect(diff.some(p => p.type === 'clearTerminal')).toBe(false)
+    expect(stdoutOnly(diff)).toContain('activerow')
+  })
 })

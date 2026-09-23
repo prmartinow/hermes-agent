@@ -1,5 +1,7 @@
+export { renderToScreen, renderNodeToAnsi, serializeScreenToAnsi } from './ink/render-to-screen.js'
 export { default as useStderr } from './hooks/use-stderr.js'
 export { default as useStdout } from './hooks/use-stdout.js'
+export { logForDebugging } from './utils/debug.js'
 export { Ansi } from './ink/Ansi.js'
 export { evictInkCaches, type EvictLevel, type InkCacheSizes } from './ink/cache-eviction.js'
 export { colorize } from './ink/colorize.js'
@@ -26,7 +28,7 @@ export type { TerminalTitlePair } from './ink/hooks/use-terminal-title.js'
 export { useTerminalViewport } from './ink/hooks/use-terminal-viewport.js'
 export { default as measureElement } from './ink/measure-element.js'
 export { scrollFastPathStats, type ScrollFastPathStats } from './ink/render-node-to-output.js'
-export { createRoot, forceRedraw, default as render, renderSync } from './ink/root.js'
+export { createRoot, forceRedraw, requestRedraw, writeAfterRender, default as render, renderSync } from './ink/root.js'
 export { stringWidth } from './ink/stringWidth.js'
 export {
   isXtermJs,

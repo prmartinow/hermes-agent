@@ -33,6 +33,7 @@ import { FpsOverlay } from './fpsOverlay.js'
 import { HelpHint } from './helpHint.js'
 import { Journey } from './journey.js'
 import { MessageLine } from './messageLine.js'
+import { TranscriptRowView } from './TranscriptRowView.js'
 import { PetKitty, PetSprite } from './petSprite.js'
 import { QueuedMessages } from './queuedMessages.js'
 import { LiveTodoPanel, StreamingAssistant } from './streamingAssistant.js'
@@ -138,10 +139,10 @@ const PromptPrefix = memo(function PromptPrefix({
 
 const TranscriptPane = memo(function TranscriptPane({
   actions,
-  composer,
+  cols,
   progress,
   transcript
-}: Pick<AppLayoutProps, 'actions' | 'composer' | 'progress' | 'transcript'>) {
+}: Pick<AppLayoutProps, 'actions' | 'progress' | 'transcript'> & { cols: number }) {
   const ui = useStore($uiState)
   const petBox = useStore($petBox)
   const railCols = useAmbientRailWidth('left') + useAmbientRailWidth('right')
@@ -151,24 +152,11 @@ const TranscriptPane = memo(function TranscriptPane({
   //    (as long as enough width is left for comfortable reading);
   //  - narrow terminals: keep full width and reserve bottom rows instead, so
   //    the newest lines sit above the pet rather than getting cramped.
-  const useGutter = !!petBox && composer.cols - railCols - petBox.width >= MIN_GUTTER_BODY_COLS
-  const bodyCols = Math.max(28, (useGutter && petBox ? composer.cols - petBox.width : composer.cols) - railCols)
+  const useGutter = !!petBox && cols - railCols - petBox.width >= MIN_GUTTER_BODY_COLS
+  const bodyCols = Math.max(28, (useGutter && petBox ? cols - petBox.width : cols) - railCols)
   const petBandRows = petBox && !useGutter ? petBox.height : 0
 
-  // LiveTodoPanel rides as a child of the latest user-message row so it
-  // visually belongs to the prompt and follows it during scroll. -1 when
-  // empty → row.index === -1 is always false → no render.
-  const lastUserIdx = useMemo(() => {
-    const items = transcript.historyItems
 
-    for (let i = items.length - 1; i >= 0; i--) {
-      if (items[i].role === 'user') {
-        return i
-      }
-    }
-
-    return -1
-  }, [transcript.historyItems])
 
   // Index of the first user-role message; every later user message gets a
   // small dash above it so multi-turn transcripts visually segment by
@@ -196,50 +184,55 @@ const TranscriptPane = memo(function TranscriptPane({
         <Box flexDirection="column" paddingX={1}>
           {transcript.virtualHistory.topSpacer > 0 ? <Box height={transcript.virtualHistory.topSpacer} /> : null}
 
-          {transcript.virtualRows.slice(transcript.virtualHistory.start, transcript.virtualHistory.end).map(row => (
-            <Box flexDirection="column" key={row.key} ref={transcript.virtualHistory.measureRef(row.key)}>
-              {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
-                <Box marginTop={1}>
-                  <Text color={ui.theme.color.border}>───</Text>
-                </Box>
-              )}
+          {(() => {
+            const introRow = transcript.virtualRows[0]?.msg.kind === 'intro' ? transcript.virtualRows[0] : null
+            const hasSkippedHistory = INLINE_MODE && introRow && transcript.virtualHistory.start > 0
+            const liveStart = hasSkippedHistory ? Math.max(1, transcript.virtualHistory.start) : transcript.virtualHistory.start
 
-              {row.msg.kind === 'intro' ? (
-                <Box flexDirection="column" paddingTop={1}>
-                  <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
-
-                  {row.msg.info && (
-                    <SessionPanel
-                      info={row.msg.info}
-                      maxWidth={Math.max(1, composer.cols - 2)}
+            return (
+              <>
+                {hasSkippedHistory && (
+                  <Box flexDirection="column" key={introRow.key} ref={transcript.virtualHistory.measureRef(introRow.key)}>
+                    <TranscriptRowView
+                      cols={cols}
+                      bodyCols={bodyCols}
+                      msg={introRow.msg}
+                      theme={ui.theme}
                       sid={ui.sid}
-                      t={ui.theme}
                     />
-                  )}
-                </Box>
-              ) : row.msg.kind === 'panel' && row.msg.panelData ? (
-                <Panel sections={row.msg.panelData.sections} t={ui.theme} title={row.msg.panelData.title} />
-              ) : (
-                <MessageLine
-                  cols={bodyCols}
-                  compact={ui.compact}
-                  detailsMode={ui.detailsMode}
-                  detailsModeCommandOverride={ui.detailsModeCommandOverride}
-                  msg={row.msg}
-                  prev={prevRenderedMsg(i => transcript.virtualRows[i]?.msg, row.index, {
-                    commandOverride: ui.detailsModeCommandOverride,
-                    detailsMode: ui.detailsMode,
-                    sections: ui.sections
-                  })}
-                  sections={ui.sections}
-                  t={ui.theme}
-                  timestamps={ui.timestamps}
-                />
-              )}
+                  </Box>
+                )}
 
-              {row.index === lastUserIdx && <LiveTodoPanel />}
-            </Box>
-          ))}
+                {transcript.virtualRows.slice(liveStart, transcript.virtualHistory.end).map(row => (
+                  <Box flexDirection="column" key={row.key} ref={transcript.virtualHistory.measureRef(row.key)}>
+                    {row.msg.role === 'user' && firstUserIdx >= 0 && row.index > firstUserIdx && (
+                      <Box marginTop={1}>
+                        <Text color={ui.theme.color.border}>───</Text>
+                      </Box>
+                    )}
+
+                    <TranscriptRowView
+                      cols={cols}
+                      bodyCols={bodyCols}
+                      compact={ui.compact}
+                      detailsMode={ui.detailsMode}
+                      detailsModeCommandOverride={ui.detailsModeCommandOverride}
+                      msg={row.msg}
+                      prev={prevRenderedMsg(i => transcript.virtualRows[i]?.msg, row.index, {
+                        commandOverride: ui.detailsModeCommandOverride,
+                        detailsMode: ui.detailsMode,
+                        sections: ui.sections
+                      })}
+                      sections={ui.sections}
+                      sid={ui.sid}
+                      theme={ui.theme}
+                      timestamps={ui.timestamps}
+                    />
+                  </Box>
+                ))}
+              </>
+            )
+          })()}
 
           {transcript.virtualHistory.bottomSpacer > 0 ? <Box height={transcript.virtualHistory.bottomSpacer} /> : null}
 
@@ -258,7 +251,7 @@ const TranscriptPane = memo(function TranscriptPane({
         </Box>
       </ScrollBox>
 
-      <NoSelect flexShrink={0} marginLeft={1}>
+      <NoSelect flexGrow={0} flexShrink={0} marginLeft={1} width={1}>
         <TranscriptScrollbar scrollRef={transcript.scrollRef} t={ui.theme} />
       </NoSelect>
 
@@ -367,8 +360,9 @@ const ComposerPane = memo(function ComposerPane({
         <Box height={1} onMouseDown={captureInputDrag} onMouseDrag={dragFromSpacer} onMouseUp={endInputDrag} />
       )}
 
+      <LiveTodoPanel />
       <LiveAgentsPanel cols={Math.max(1, composer.cols - 2)} />
-      <StatusRulePane at="top" composer={composer} status={status} />
+      <StatusRulePane at="top" cols={composer.cols} status={status} />
       <AmbientDock placement="dock-top" />
 
       <Box flexDirection="column" marginTop={ui.statusBar === 'top' ? 0 : 1} position="relative">
@@ -424,6 +418,7 @@ const ComposerPane = memo(function ComposerPane({
                 {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
                 <TextInput
                   accentColor={ui.theme.color.accent}
+                  busy={ui.busy}
                   color={ui.theme.color.text}
                   columns={inputColumns}
                   cursorSnapshotRef={cursorSnapshotRef}
@@ -454,7 +449,7 @@ const ComposerPane = memo(function ComposerPane({
       {!composer.empty && !ui.sid && <Text color={ui.theme.color.muted}>☤ {ui.status}</Text>}
 
       <AmbientDock placement="dock-bottom" />
-      <StatusRulePane at="bottom" composer={composer} status={status} />
+      <StatusRulePane at="bottom" cols={composer.cols} status={status} />
     </NoSelect>
   )
 })
@@ -483,9 +478,9 @@ const JourneyPane = memo(function JourneyPane() {
 
 const StatusRulePane = memo(function StatusRulePane({
   at,
-  composer,
+  cols,
   status
-}: Pick<AppLayoutProps, 'composer' | 'status'> & { at: 'bottom' | 'top' }) {
+}: Pick<AppLayoutProps, 'status'> & { at: 'bottom' | 'top'; cols: number }) {
   const ui = useStore($uiState)
 
   if (ui.statusBar !== at) {
@@ -498,7 +493,7 @@ const StatusRulePane = memo(function StatusRulePane({
         battery={ui.battery ? ui.batteryStatus : null}
         bgCount={ui.bgTasks.size}
         busy={ui.busy}
-        cols={composer.cols}
+        cols={cols}
         compacting={ui.compacting}
         cwdLabel={status.cwdLabel}
         focusView={ui.focusView}
@@ -506,6 +501,7 @@ const StatusRulePane = memo(function StatusRulePane({
         lastTurnEndedAt={status.lastTurnEndedAt}
         liveSessionCount={ui.liveSessionCount}
         model={ui.info?.model ?? ''}
+        modelAccount={ui.info?.gemini_account}
         modelFast={ui.info?.fast || ui.info?.service_tier === 'priority'}
         modelReasoningEffort={ui.info?.reasoning_effort}
         modelReasoningEffortWire={ui.info?.reasoning_effort_wire}
@@ -548,7 +544,7 @@ export const AppLayout = memo(function AppLayout({
   const shellProps = INLINE_MODE ? {} : { mouseTracking }
 
   return (
-    <Shell {...shellProps}>
+    <AlternateScreen inline={INLINE_MODE} mouseTracking={mouseTracking}>
       <Box flexDirection="column" flexGrow={1} position="relative">
         <Box flexDirection="row" flexGrow={1}>
           {!overlay.agents && !overlay.journey && <AmbientRail side="left" />}
@@ -562,7 +558,7 @@ export const AppLayout = memo(function AppLayout({
             </PerfPane>
           ) : (
             <PerfPane id="transcript">
-              <TranscriptPane actions={actions} composer={composer} progress={progress} transcript={transcript} />
+              <TranscriptPane actions={actions} cols={composer.cols} progress={progress} transcript={transcript} />
             </PerfPane>
           )}
           {!overlay.agents && !overlay.journey && <AmbientRail side="right" />}
@@ -603,7 +599,7 @@ export const AppLayout = memo(function AppLayout({
       </Box>
 
       <ActiveWidgetSlot />
-    </Shell>
+    </AlternateScreen>
   )
 })
 

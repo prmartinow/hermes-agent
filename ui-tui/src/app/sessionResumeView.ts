@@ -2,6 +2,8 @@ import type { ScrollBoxHandle } from '@hermes/ink'
 import { evictInkCaches, forceRedraw } from '@hermes/ink'
 import type { RefObject } from 'react'
 
+import { INLINE_MODE } from '../config/env.js'
+
 export const refreshSessionView = (stdout: NodeJS.WriteStream = process.stdout) => {
   evictInkCaches('all')
   forceRedraw(stdout)
@@ -26,7 +28,7 @@ export const scheduleResumeScrollToBottom = (
       if (!manuallyScrolledAfterResume && (index === 0 || scroll.isSticky())) {
         scroll.scrollToBottom()
 
-        if (index === 0) {
+        if (index === 0 && !INLINE_MODE) {
           refreshSessionView()
         }
       }

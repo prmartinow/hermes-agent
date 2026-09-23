@@ -1,5 +1,6 @@
 import {
   forceRedraw,
+  logForDebugging,
   type ScrollBoxHandle,
   setDimFallbackColor,
   useApp,
@@ -52,7 +53,7 @@ import { applyAgentSnapshot } from './agentRoster.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createServerRequestHandler } from './createServerRequestHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
-import { planGatewayRecovery } from './gatewayRecovery.js'
+import { createGatewayExitHandler } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import { type GatewayRpc, type StateSetter, type TranscriptRow } from './interfaces.js'
 import { $overlayState, patchOverlayState } from './overlayStore.js'
@@ -68,15 +69,6 @@ import { useComposerState } from './useComposerState.js'
 import { useConfigSync } from './useConfigSync.js'
 import { shouldDetachEditedHistoryInput, useInputHandlers } from './useInputHandlers.js'
 import { useLongRunToolCharms } from './useLongRunToolCharms.js'
-import {
-  BACKEND_GAVE_UP_ACTIVITY,
-  BACKEND_RESTARTING,
-  BACKEND_RESTARTING_ACTIVITY,
-  backendGaveUp,
-  CONNECTION_LOST,
-  CONNECTION_LOST_ACTIVITY,
-  lastStderrLine
-} from './userMessages.js'
 import { useSessionLifecycle } from './useSessionLifecycle.js'
 import { useSubmission } from './useSubmission.js'
 
@@ -177,7 +169,11 @@ export function useMainApp(gw: GatewayClient) {
     // first event reflows immediately (the drag stays responsive), the rest
     // collapse to at most one reflow per RESIZE_COALESCE_MS, and the trailing
     // edge always applies the final width so the settled layout is exact.
-    const coalescer = createResizeCoalescer(() => setCols(stdout.columns ?? 80), RESIZE_COALESCE_MS)
+    const coalescer = createResizeCoalescer(() => {
+      logForDebugging(`[tui-perf] resize coalesced: cols=${stdout.columns ?? 80}`)
+      setCols(stdout.columns ?? 80)
+    }, RESIZE_COALESCE_MS)
+
     const sync = () => coalescer.schedule()
 
     stdout.on('resize', sync)
@@ -196,7 +192,10 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [stdout])
 
-  const [historyItems, setHistoryItemsState] = useState<Msg[]>(() => [{ kind: 'intro', role: 'system', text: '' }])
+  const [historyItems, setHistoryItemsState] = useState<Msg[]>(() =>
+    STARTUP_RESUME_ID ? [] : [{ kind: 'intro', role: 'system', text: '' }]
+  )
+
   const [historyGeneration, setHistoryGeneration] = useState(0)
 
   const setHistoryItems = useCallback<StateSetter<Msg[]>>(value => {
@@ -974,64 +973,13 @@ export function useMainApp(gw: GatewayClient) {
       }
     }
 
-    const exitHandler = (code: null | number) => {
-      turnController.reset()
-      const state = getUiState()
-      const storedSid = state.storedSid
-
-      // Attached socket closed: the backend (and any live turn) is still there —
-      // GatewayClient owns the backoff reconnect, and the next gateway.ready
-      // resumes the durable session id. Calling start() here would race that
-      // reconnect and reset its backoff.
-      if (gw.attached) {
-        recoverSidRef.current = storedSid ?? recoverSidRef.current
-        patchUiState({ busy: false, compacting: false, sid: null, status: 'reconnecting…' })
-
-        if (state.sid) {
-          turnController.pushActivity(CONNECTION_LOST_ACTIVITY, 'warn')
-          sys(CONNECTION_LOST)
-        }
-
-        return
-      }
-
-      // A still-owned child dying while the TUI is alive is an *unexpected*
-      // death — respawn the gateway and resume the persisted session via the
-      // next gateway.ready. session.resume takes the durable stored id, not the
-      // process-local runtime sid. planGatewayRecovery bounds the attempts so a
-      // crash-looping gateway can't spawn-storm.
-      const plan = planGatewayRecovery(storedSid, recoverSidRef.current, recoveryAtRef.current, Date.now())
-
-      // Clear sid immediately: while the gateway is down, sid-guarded effects
-      // (session.active_list poll, queue drain) would otherwise fire RPCs at a
-      // dead/respawning gateway. recoverSidRef carries the session forward, and
-      // resumeById restores sid once the fresh gateway is ready.
-      recoveryAtRef.current = plan.attempts
-      patchUiState({ busy: false, compacting: false, sid: null, status: 'restarting…' })
-
-      if (plan.recover && plan.sid) {
-        recoverSidRef.current = plan.sid
-        turnController.pushActivity(BACKEND_RESTARTING_ACTIVITY, 'warn')
-        sys(BACKEND_RESTARTING)
-        gw.start()
-
-        return
-      }
-
-      // Budget spent (crash loop) or nothing to recover: GatewayClient keeps
-      // retrying on its backoff — say so ONCE, with the exit code and the last
-      // stderr line, rather than repeating "gateway exited" every tick. Keep the
-      // recovery target: when that background reconnect eventually succeeds,
-      // gateway.ready must reopen the SAME chat instead of forging a new one.
-      recoverSidRef.current = plan.sid
-      patchUiState({ status: 'stopped' })
-
-      if (!gaveUpRef.current) {
-        gaveUpRef.current = true
-        turnController.pushActivity(BACKEND_GAVE_UP_ACTIVITY, 'error')
-        sys(`error: ${backendGaveUp(code, lastStderrLine(gw.getLogTail(20)))}`)
-      }
-    }
+    const exitHandler = createGatewayExitHandler({
+      gaveUpRef,
+      gw,
+      recoverSidRef,
+      recoveryAtRef,
+      sys
+    })
 
     gw.on('event', handler)
     gw.on('request', requestHandler)
