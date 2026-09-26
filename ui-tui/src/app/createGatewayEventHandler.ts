@@ -446,7 +446,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     recoverSessionKeyRef?: { current: string | null }
     recoverSidRef?: { current: string | null }
     resetSession: () => void
-    resumeById: (id: string, targetRecoveryRef?: { current: string | null }, retryAttempt?: number, options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume" }) => void
+    resumeById: (id: string, targetRecoveryRef?: { current: string | null }, retryAttempt?: number, options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume"; durableKey?: string }) => Promise<void>
     setCatalog: (catalog: any) => void
   }
   const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = sessionCtx

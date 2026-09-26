@@ -121,7 +121,7 @@ export async function performColdHistoryHydration(
 
     // While deque exceeds maxMounted, pop oldest messages and serialize to stdout
     while (deque.length > maxMounted) {
-      if (opts.isCancelled?.()) break
+      if (opts.isCancelled?.()) throw new ColdHydrationCancelledError()
       if (!appendedToScrollback) {
         appendedToScrollback = true
         process.env.HERMES_TUI_INITIAL_RENDER_MODE = 'append-to-existing-scrollback'

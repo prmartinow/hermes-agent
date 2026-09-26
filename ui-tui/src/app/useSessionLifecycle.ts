@@ -183,6 +183,7 @@ export interface UseSessionLifecycleOptions {
   panel: (title: string, sections: PanelSection[]) => void
   recoverSessionKeyRef?: { current: string | null }
   recoverSidRef?: { current: string | null }
+  coldHydrationIncompleteRef?: { current: string | null }
   rpc: GatewayRpc
   scrollRef: RefObject<null | ScrollBoxHandle>
   setHistoryItems: StateSetter<Msg[]>
@@ -232,6 +233,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   const pendingColdCommitRef = useRef<{ attemptId: string; boundaryGeneration: string | null; sid: string } | null>(null)
   const activeColdBarrierRef = useRef<{ attemptId: string; sid: string } | null>(null)
   const [coldCommitGeneration, setColdCommitGeneration] = useState<string | null>(null)
+  const localColdHydrationIncompleteRef = useRef<string | null>(null)
+  const coldHydrationIncompleteRef = opts.coldHydrationIncompleteRef ?? localColdHydrationIncompleteRef
 
   const clearActiveColdBarrier = useCallback((attemptId: string, sid: string) => {
     const active = activeColdBarrierRef.current
@@ -250,12 +253,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     const pending = pendingColdCommitRef.current
     if (pending) {
       pendingColdCommitRef.current = null
-      gw?.cancelEventBarrier(pending.sid, pending.attemptId)
+      gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
     }
     const active = activeColdBarrierRef.current
     if (active) {
       activeColdBarrierRef.current = null
-      gw?.cancelEventBarrier(active.sid, active.attemptId)
+      gw?.cancelEventBarrier?.(active.sid, active.attemptId)
     }
   }, [gw])
 
@@ -265,7 +268,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     if (pending.attemptId !== resumeAttemptRef.current) {
       pendingColdCommitRef.current = null
       clearActiveColdBarrier(pending.attemptId, pending.sid)
-      gw?.cancelEventBarrier(pending.sid, pending.attemptId)
+      gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
       const boundary = activeReplayBoundaryRef.current
       if (boundary?.attemptId === pending.attemptId) {
         activeReplayBoundaryRef.current = null
@@ -275,7 +278,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     }
     pendingColdCommitRef.current = null
     clearActiveColdBarrier(pending.attemptId, pending.sid)
-    gw?.releaseEventBarrier(pending.sid, pending.attemptId)
+    gw?.releaseEventBarrier?.(pending.sid, pending.attemptId)
+    coldHydrationIncompleteRef.current = null
     if (pending.boundaryGeneration) {
       setReplayCommitted(pending.boundaryGeneration)
     }
@@ -554,7 +558,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       id: string,
       targetRecoveryRef?: { current: string | null },
       retryAttempt = 0,
-      options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume" }
+      options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume"; durableKey?: string }
     ): Promise<void> => {
       supersedeColdHydration()
       patchOverlayState({ sessions: false })
@@ -594,7 +598,14 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
         const previousSid = getUiState().sid
 
-        const isTransportRecovery = options?.mode === 'transport-recovery'
+        const isColdIncomplete = Boolean(
+          coldHydrationIncompleteRef.current && (
+            coldHydrationIncompleteRef.current === id ||
+            coldHydrationIncompleteRef.current === previousSid ||
+            coldHydrationIncompleteRef.current === (options as any)?.durableKey
+          )
+        )
+        const isTransportRecovery = options?.mode === 'transport-recovery' && !isColdIncomplete
         const isGapRecovery = options?.mode === 'transport-gap-recovery'
         const resumeParams: Record<string, unknown> = { cols: colsRef.current, session_id: id }
         if (isTransportRecovery || (!isGapRecovery && INLINE_MODE)) {
@@ -619,19 +630,21 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             const storedSid = r.info?.stored_session_id || r.stored_session_id || r.resumed || id
             const info = r.info ? { ...r.info, stored_session_id: storedSid } : null
             const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
+            const durableKey = (r as any).resumed ?? (r as any).session_key ?? (r as any).stored_session_id ?? r.session_id
 
             const isColdHydration = !isTransportRecovery && !isGapRecovery && INLINE_MODE
 
             if (isColdHydration) {
+              coldHydrationIncompleteRef.current = String(durableKey || r.session_id || id)
               resetSession()
               setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
 
               const previous = activeColdBarrierRef.current
               if (previous && previous.attemptId !== attemptId) {
-                gw?.cancelEventBarrier(previous.sid, previous.attemptId)
+                gw?.cancelEventBarrier?.(previous.sid, previous.attemptId)
                 activeColdBarrierRef.current = null
               }
-              gw.activateEventBarrier(r.session_id, attemptId)
+              gw?.activateEventBarrier?.(r.session_id, attemptId)
               activeColdBarrierRef.current = { attemptId, sid: r.session_id }
 
               performColdHistoryHydration({
@@ -645,7 +658,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               }).then(hydration => {
                 if (resumeAttemptRef.current !== attemptId) {
                   clearActiveColdBarrier(attemptId, r.session_id)
-                  gw.cancelEventBarrier(r.session_id, attemptId)
+                  gw?.cancelEventBarrier?.(r.session_id, attemptId)
                   return
                 }
                 const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
@@ -658,19 +671,17 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               }).catch(err => {
                 clearActiveColdBarrier(attemptId, r.session_id)
                 if (resumeAttemptRef.current !== attemptId) {
-                  gw.cancelEventBarrier(r.session_id, attemptId)
+                  gw?.cancelEventBarrier?.(r.session_id, attemptId)
                   return
                 }
-                gw.cancelEventBarrier(r.session_id, attemptId)
+                gw?.cancelEventBarrier?.(r.session_id, attemptId)
                 if (err instanceof ColdHydrationCancelledError) {
                   return
                 }
-                const transcriptMsgs = toTranscriptMessages(r.messages ?? [])
-                const resumed = [...transcriptMsgs, ...liveSessionInflightMessages(r.inflight, transcriptMsgs)]
-                setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
-                setViewportMeta(r.viewport ?? null)
-                if (generation) {
-                  setReplayCommitted(generation)
+                const boundary = activeReplayBoundaryRef.current
+                if (boundary?.attemptId === attemptId) {
+                  activeReplayBoundaryRef.current = null
+                  process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
                 }
               })
             } else if (!isTransportRecovery) {
@@ -694,7 +705,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               }
               setReplayCommitted(generation)
             }
-            const durableKey = (r as any).resumed ?? (r as any).session_key ?? (r as any).stored_session_id ?? r.session_id
             writeActiveSessionFile(durableKey)
             patchUiState({
               busy: running,
@@ -783,6 +793,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     () => ({
       activateLiveSession,
       closeSession,
+      coldHydrationIncompleteRef,
       fetchOlderBacklog,
       guardBusySessionSwitch,
       newLiveSession,
@@ -796,6 +807,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     [
       activateLiveSession,
       closeSession,
+      coldHydrationIncompleteRef,
       fetchOlderBacklog,
       guardBusySessionSwitch,
       newLiveSession,
