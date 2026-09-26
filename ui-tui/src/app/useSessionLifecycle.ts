@@ -253,12 +253,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     const pending = pendingColdCommitRef.current
     if (pending) {
       pendingColdCommitRef.current = null
-      gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
+      gw?.cancelEventBarrier(pending.sid, pending.attemptId)
     }
     const active = activeColdBarrierRef.current
     if (active) {
       activeColdBarrierRef.current = null
-      gw?.cancelEventBarrier?.(active.sid, active.attemptId)
+      gw?.cancelEventBarrier(active.sid, active.attemptId)
     }
   }, [gw])
 
@@ -268,7 +268,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     if (pending.attemptId !== resumeAttemptRef.current) {
       pendingColdCommitRef.current = null
       clearActiveColdBarrier(pending.attemptId, pending.sid)
-      gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
+      gw?.cancelEventBarrier(pending.sid, pending.attemptId)
       const boundary = activeReplayBoundaryRef.current
       if (boundary?.attemptId === pending.attemptId) {
         activeReplayBoundaryRef.current = null
@@ -278,7 +278,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     }
     pendingColdCommitRef.current = null
     clearActiveColdBarrier(pending.attemptId, pending.sid)
-    gw?.releaseEventBarrier?.(pending.sid, pending.attemptId)
+    gw?.releaseEventBarrier(pending.sid, pending.attemptId)
     coldHydrationIncompleteRef.current = null
     if (pending.boundaryGeneration) {
       setReplayCommitted(pending.boundaryGeneration)
@@ -641,10 +641,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
               const previous = activeColdBarrierRef.current
               if (previous && previous.attemptId !== attemptId) {
-                gw?.cancelEventBarrier?.(previous.sid, previous.attemptId)
+                gw?.cancelEventBarrier(previous.sid, previous.attemptId)
                 activeColdBarrierRef.current = null
               }
-              gw?.activateEventBarrier?.(r.session_id, attemptId)
+              gw?.activateEventBarrier(r.session_id, attemptId)
               activeColdBarrierRef.current = { attemptId, sid: r.session_id }
 
               performColdHistoryHydration({
@@ -658,7 +658,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               }).then(hydration => {
                 if (resumeAttemptRef.current !== attemptId) {
                   clearActiveColdBarrier(attemptId, r.session_id)
-                  gw?.cancelEventBarrier?.(r.session_id, attemptId)
+                  gw?.cancelEventBarrier(r.session_id, attemptId)
                   return
                 }
                 const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
@@ -671,10 +671,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               }).catch(err => {
                 clearActiveColdBarrier(attemptId, r.session_id)
                 if (resumeAttemptRef.current !== attemptId) {
-                  gw?.cancelEventBarrier?.(r.session_id, attemptId)
+                  gw?.cancelEventBarrier(r.session_id, attemptId)
                   return
                 }
-                gw?.cancelEventBarrier?.(r.session_id, attemptId)
+                gw?.cancelEventBarrier(r.session_id, attemptId)
                 if (err instanceof ColdHydrationCancelledError) {
                   return
                 }
@@ -694,6 +694,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
               setViewportMeta(r.viewport ?? null)
               setReplayCommitted(generation)
+              coldHydrationIncompleteRef.current = null
             } else {
               // Transport recovery fast path: historyItems are already preserved!
               // Hydrate any newly arrived inflight state

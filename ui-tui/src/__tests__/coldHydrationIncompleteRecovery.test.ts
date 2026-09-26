@@ -307,9 +307,11 @@ describe('cold hydration incomplete recovery & cancellation consistency', () => 
       messages
     })
 
-    // maxMounted: 2 forces deque eviction loop while deque.length > maxMounted
-    // isCancelled returns true on eviction check
-    const isCancelled = () => true
+    let checks = 0
+    const isCancelled = () => {
+      checks += 1
+      return checks >= 3
+    }
 
     await expect(performColdHistoryHydration({
       cols: 80,
@@ -320,5 +322,7 @@ describe('cold hydration incomplete recovery & cancellation consistency', () => 
       stdout: stdout as any,
       theme: { color: {} }
     })).rejects.toThrow(ColdHydrationCancelledError)
+
+    expect(request).toHaveBeenCalled()
   })
 })
