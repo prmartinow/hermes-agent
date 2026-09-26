@@ -255,14 +255,14 @@ describe('Hermes Ink Main-Screen Static Output Lease (Step A)', () => {
       await writePromise
       expect(writeResolved).toBe(true)
 
-      // 3. In Step A, dirty release fails closed even with prepareAppendHandoff (Step B provides handoff renderer)
-      lease.prepareAppendHandoff()
-      await expect(lease.release()).rejects.toThrow(
-        'Cannot release dirty main-screen static output lease without handoff: reconstruction required'
-      )
+      // Restore writeReturns = true so handoff frame can write without backpressure
+      stdout.writeReturns = true
 
-      // 4. Aborting clears the lease, after which writing throws
-      await lease.abort()
+      // 3. Step B handoff: prepareAppendHandoff() + release() cleanly renders handoff frame and restores Ink
+      lease.prepareAppendHandoff()
+      await lease.release()
+
+      // 4. Writing after release throws
       await expect(lease.write('post-release')).rejects.toThrow(
         'Invalid or unheld main-screen static output lease'
       )
@@ -383,9 +383,7 @@ describe('Hermes Ink Main-Screen Static Output Lease (Step A)', () => {
       const lease = await acquireMainScreenStaticOutput(stdout as any)
       await lease.write('test data\r\n')
       lease.prepareAppendHandoff()
-      await expect(lease.release()).rejects.toThrow(
-        'Cannot release dirty main-screen static output lease without handoff: reconstruction required'
-      )
+      await lease.release()
 
       const allOutput = stdout.chunks.join('')
       expect(allOutput.includes('\x1b[?1049h')).toBe(false)
@@ -448,10 +446,10 @@ describe('Hermes Ink Main-Screen Static Output Lease (Step A)', () => {
     expect((ink as any).altScreenActive).toBe(false)
     expect((ink as any).mainScreenLease.modeTransitionRequested).toBe(true)
 
-    // Dirty release fails closed even if prepareAppendHandoff was called (until Step B implements handoff)
+    // Dirty release fails closed even if prepareAppendHandoff was called (because layout was invalidated by resize)
     lease.prepareAppendHandoff()
     await expect(lease.release()).rejects.toThrow(
-      'Cannot release dirty main-screen static output lease without handoff: reconstruction required'
+      'Cannot hand off: terminal resized after static output, reconstruction required'
     )
 
     ink.unmount()
@@ -484,6 +482,100 @@ describe('Hermes Ink Main-Screen Static Output Lease (Step A)', () => {
       'Invalid or unheld main-screen static output lease'
     )
 
+    instances.delete(stdout as any)
+  })
+  it('Step B: executes one-shot append handoff with no clearTerminal/clearScreen and restores diff baseline', async () => {
+    const stdout = new MockTty()
+    const ink = createTestInk(stdout)
+
+    let updateText: (t: string) => void = () => {}
+
+    function App() {
+      const [msg, setMsg] = useState('initial-live-line')
+      updateText = setMsg
+      return React.createElement(Box, null, React.createElement(Text, null, msg))
+    }
+
+    ink.render(React.createElement(App, null))
+    await new Promise(r => setTimeout(r, 20))
+
+    const writesBeforeLease = stdout.chunks.length
+
+    // 1. Acquire lease
+    const lease = await acquireMainScreenStaticOutput(stdout as any)
+
+    // 2. Write static history
+    await lease.write('--- Historical Transcript ---\r\n')
+    const writesAfterStatic = stdout.chunks.length
+    expect(writesAfterStatic).toBeGreaterThan(writesBeforeLease)
+
+    // 3. React update occurs while leased
+    updateText('updated-live-tail')
+    await new Promise(r => setTimeout(r, 20))
+    // Ink was silent
+    expect(stdout.chunks.length).toBe(writesAfterStatic)
+
+    // 4. Arm handoff and release
+    lease.prepareAppendHandoff()
+    await lease.release()
+
+    // Handoff frame was emitted
+    const handoffChunks = stdout.chunks.slice(writesAfterStatic)
+    expect(handoffChunks.length).toBeGreaterThan(0)
+    const handoffOutput = handoffChunks.join('')
+
+    // Crucial: NO clearTerminal or clearScreen in append handoff!
+    expect(handoffOutput.includes('\x1bc')).toBe(false)
+    expect(handoffOutput.includes('\x1b[2J')).toBe(false)
+    expect(handoffOutput.includes('\x1b[3J')).toBe(false)
+    expect(handoffOutput.includes('updated-live-tail')).toBe(true)
+
+    // 5. Subsequent React update renders as normal incremental diff
+    const countBeforeNext = stdout.chunks.length
+    updateText('subsequent-turn')
+    await new Promise(r => setTimeout(r, 20))
+    expect(stdout.chunks.length).toBeGreaterThan(countBeforeNext)
+
+    ink.unmount()
+    instances.delete(stdout as any)
+  })
+
+  it('Step B: rejects handoff when layoutInvalid (resize occurred after dirty static output)', async () => {
+    const stdout = new MockTty()
+    const ink = createTestInk(stdout)
+
+    const lease = await acquireMainScreenStaticOutput(stdout as any)
+    await lease.write('static-line\r\n')
+
+    // Resize after dirty sets layoutInvalid = true
+    stdout.columns = 120
+    stdout.emit('resize')
+
+    lease.prepareAppendHandoff()
+    await expect(lease.release()).rejects.toThrow(
+      'Cannot hand off: terminal resized after static output, reconstruction required'
+    )
+
+    ink.unmount()
+    instances.delete(stdout as any)
+  })
+
+  it('Step B: rejects handoff when alternate screen transition was attempted while leased', async () => {
+    const stdout = new MockTty()
+    const ink = createTestInk(stdout)
+
+    const lease = await acquireMainScreenStaticOutput(stdout as any)
+    await lease.write('static-line\r\n')
+
+    // Alt screen transition attempted while leased sets modeTransitionRequested
+    ink.setAltScreenActive(true)
+
+    lease.prepareAppendHandoff()
+    await expect(lease.release()).rejects.toThrow(
+      'Cannot hand off: alternate-screen transition attempted while leased, reconstruction required'
+    )
+
+    ink.unmount()
     instances.delete(stdout as any)
   })
 })

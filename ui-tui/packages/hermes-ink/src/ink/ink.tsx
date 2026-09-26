@@ -241,6 +241,7 @@ export default class Ink {
     cacheHits: 0,
     live: 0
   }
+  private pendingInitialRenderMode: 'clear-terminal' | 'append-to-existing-scrollback' | null = null
   private mainScreenLease: MainScreenLeaseState = null
   private renderRequestedWhilePaused = false
   private altScreenParkPatch: Readonly<{
@@ -386,7 +387,6 @@ export default class Ink {
       this.hyperlinkPool
     )
     this.log = new LogUpdate({
-      initialRenderMode: (options as any)?.initialRenderMode,
       isTTY: (options.stdout.isTTY as boolean | undefined) || false,
       stylePool: this.stylePool
     })
@@ -1086,16 +1086,21 @@ export default class Ink {
 
     const tDiff = performance.now()
 
-    const diff = this.log.render(
-      prevFrame,
-      frame,
-      this.altScreenActive,
-      // DECSTBM needs BSU/ESU atomicity — without it the outer terminal
-      // renders the scrolled-but-not-yet-repainted intermediate state.
-      // tmux is the main case (re-emits DECSTBM with its own timing and
-      // doesn't implement DEC 2026, so SYNC_OUTPUT_SUPPORTED is false).
-      SYNC_OUTPUT_SUPPORTED
-    )
+    const handoffMode = this.pendingInitialRenderMode
+    this.pendingInitialRenderMode = null
+
+    const diff = handoffMode
+      ? this.log.renderInitial(frame, handoffMode, this.altScreenActive)
+      : this.log.render(
+          prevFrame,
+          frame,
+          this.altScreenActive,
+          // DECSTBM needs BSU/ESU atomicity — without it the outer terminal
+          // renders the scrolled-but-not-yet-repainted intermediate state.
+          // tmux is the main case (re-emits DECSTBM with its own timing and
+          // doesn't implement DEC 2026, so SYNC_OUTPUT_SUPPORTED is false).
+          SYNC_OUTPUT_SUPPORTED
+        )
 
     const diffMs = performance.now() - tDiff
     // Swap buffers
@@ -2973,15 +2978,62 @@ export default class Ink {
     return { requiresReconstruction: false }
   }
 
+  async emitAppendHandoffFrame(token: symbol): Promise<void> {
+    if (!this.mainScreenLease || this.mainScreenLease.token !== token) {
+      throw new Error('Invalid or unheld main-screen static output lease')
+    }
+
+    if (this.mainScreenLease.layoutInvalid) {
+      throw new Error('Cannot hand off: terminal resized after static output, reconstruction required')
+    }
+
+    if (this.mainScreenLease.modeTransitionRequested) {
+      throw new Error('Cannot hand off: alternate-screen transition attempted while leased, reconstruction required')
+    }
+
+    if (this.isUnmounted) {
+      throw new Error('Ink instance is unmounted')
+    }
+
+    // React tree reconciliation: ensure current React tree is fully committed to rootNode
+    reconciler.flushSyncFromReconciler()
+
+    // Temporarily unpause for exactly one synchronous render
+    this.isPaused = false
+    this.pendingInitialRenderMode = 'append-to-existing-scrollback'
+
+    this.onRender()
+
+    // Re-freeze immediately before event loop control returns
+    this.isPaused = true
+
+    // Await stdout flush of the handoff frame
+    await new Promise<void>(resolve => {
+      this.options.stdout.write('', () => resolve())
+    })
+
+    // Release lease and restore normal Ink ownership
+    this.mainScreenLease = null
+    this.isPaused = false
+
+    if (this.renderRequestedWhilePaused) {
+      this.renderRequestedWhilePaused = false
+      this.scheduleRender()
+    }
+  }
+
   async releaseMainScreenStaticOutput(token: symbol): Promise<void> {
     if (!this.mainScreenLease || this.mainScreenLease.token !== token) {
       throw new Error('Invalid or unheld main-screen static output lease')
     }
 
     if (this.mainScreenLease.dirty) {
-      // Fail closed: until Step B implements the one-shot append handoff,
-      // releasing dirty physical output cannot safely resume ordinary diff rendering.
-      throw new Error('Cannot release dirty main-screen static output lease without handoff: reconstruction required')
+      if (this.mainScreenLease.state !== 'append-handoff') {
+        throw new Error('Cannot release dirty main-screen static output lease without handoff: reconstruction required')
+      }
+
+      await this.emitAppendHandoffFrame(token)
+      return
     }
 
     this.mainScreenLease = null

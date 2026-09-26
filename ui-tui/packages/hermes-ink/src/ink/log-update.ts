@@ -33,7 +33,6 @@ type State = {
 }
 
 type Options = {
-  initialRenderMode?: 'clear-terminal' | 'append-to-existing-scrollback'
   isTTY: boolean
   stylePool: StylePool
 }
@@ -48,6 +47,21 @@ export class LogUpdate {
     this.state = {
       previousOutput: ''
     }
+  }
+
+  renderInitial(
+    next: Frame,
+    mode: 'clear-terminal' | 'append-to-existing-scrollback' = 'clear-terminal',
+    altScreen = false
+  ): Diff {
+    return fullResetSequence_CAUSES_FLICKER(
+      next,
+      'init',
+      this.options.stylePool,
+      undefined,
+      altScreen,
+      mode
+    )
   }
 
   renderPreviousOutput_DEPRECATED(prevFrame: Frame): Diff {
@@ -153,7 +167,7 @@ export class LogUpdate {
       (prev.viewport.width !== 0 && next.viewport.width !== prev.viewport.width)
     ) {
       return fullResetSequence_CAUSES_FLICKER(
-        next, prev.viewport.width === 0 ? 'init' : 'resize', stylePool, undefined, altScreen, this.options.initialRenderMode
+        next, prev.viewport.width === 0 ? 'init' : 'resize', stylePool, undefined, altScreen
       )
     }
 
@@ -502,7 +516,7 @@ function fullResetSequence_CAUSES_FLICKER(
   stylePool: StylePool,
   debug?: { triggerY: number; prevLine: string; nextLine: string },
   altScreen = false,
-  initialRenderMode: 'clear-terminal' | 'append-to-existing-scrollback' = (process.env.HERMES_TUI_INITIAL_RENDER_MODE === 'append-to-existing-scrollback' ? 'append-to-existing-scrollback' : 'clear-terminal')
+  initialRenderMode: 'clear-terminal' | 'append-to-existing-scrollback' = 'clear-terminal'
 ): Diff {
   const isResize = reason === 'resize'
   const isInit = reason === 'init'
