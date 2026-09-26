@@ -103,6 +103,58 @@ export const writeAfterRender = (content: string, stdout: NodeJS.WriteStream = p
   return true
 }
 
+export interface MainScreenStaticOutputLease {
+  readonly token: symbol
+
+  /**
+   * Write static output while Ink is paused.
+   * Marks the physical terminal as externally modified.
+   * Honors stdout backpressure.
+   */
+  write(data: string | Uint8Array): Promise<void>
+
+  /**
+   * Step B: declare that the next Ink frame must adopt
+   * the existing static scrollback without clearing it.
+   */
+  prepareAppendHandoff(): void
+
+  /**
+   * Release normally.
+   * Fails closed if static output was written but no valid
+   * handoff/reconstruction strategy was selected.
+   */
+  release(): Promise<void>
+
+  /**
+   * Abandon ownership. Returns whether physical output had
+   * already been modified and therefore needs reconstruction.
+   */
+  abort(): Promise<{ requiresReconstruction: boolean }>
+}
+
+export async function acquireMainScreenStaticOutput(
+  stdout: NodeJS.WriteStream = process.stdout
+): Promise<MainScreenStaticOutputLease> {
+  const instance = instances.get(stdout)
+  if (!instance) {
+    throw new Error('No active Ink instance found for stdout')
+  }
+
+  const token = Symbol('MainScreenStaticOutputLease')
+  await instance.acquireMainScreenStaticOutput(token)
+
+  return {
+    get token() {
+      return token
+    },
+    write: (data: string | Uint8Array) => instance.writeMainScreenStaticOutput(token, data),
+    prepareAppendHandoff: () => instance.prepareMainScreenAppendHandoff(token),
+    release: () => instance.releaseMainScreenStaticOutput(token),
+    abort: () => instance.abortMainScreenStaticOutput(token)
+  }
+}
+
 export const forceRedraw = (stdout: NodeJS.WriteStream = process.stdout): boolean => {
   const instance = instances.get(stdout)
 

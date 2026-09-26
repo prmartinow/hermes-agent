@@ -750,7 +750,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       const pendingGap = pendingReplayGapRef.current
       pendingReplayGapRef.current = null
       const recoveryMode = pendingGap ? 'transport-gap-recovery' : 'transport-recovery'
-      void resumeById(recoverKey, undefined, 0, { mode: recoveryMode, gapReason: pendingGap?.reason }).then(() => {
+      void Promise.resolve(resumeById(recoverKey, undefined, 0, { mode: recoveryMode, gapReason: pendingGap?.reason })).then(() => {
         if (getUiState().sid) {
           if (recoverSessionKeyRef.current === recoverKey) {
             recoverSessionKeyRef.current = null

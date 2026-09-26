@@ -174,6 +174,25 @@ export type Options = {
    */
   onHyperlinkClick?: (url: string) => void
 }
+export type MainScreenLeaseState =
+  | {
+      state: 'leased'
+      token: symbol
+      dirty: boolean
+      resized: boolean
+      acquireCols: number
+      acquireRows: number
+    }
+  | {
+      state: 'append-handoff'
+      token: symbol
+      dirty: boolean
+      resized: boolean
+      acquireCols: number
+      acquireRows: number
+    }
+  | null
+
 export default class Ink {
   private readonly log: LogUpdate
   private readonly terminal: Terminal
@@ -228,6 +247,8 @@ export default class Ink {
     cacheHits: 0,
     live: 0
   }
+  private mainScreenLease: MainScreenLeaseState = null
+  private renderRequestedWhilePaused = false
   private altScreenParkPatch: Readonly<{
     type: 'stdout'
     content: string
@@ -413,8 +434,20 @@ export default class Ink {
     this.focusManager = new FocusManager((target, event) => dispatcher.dispatchDiscrete(target, event))
     this.rootNode.focusManager = this.focusManager
     this.renderer = createRenderer(this.rootNode, this.stylePool)
-    this.rootNode.onRender = this.scheduleRender
-    this.rootNode.onImmediateRender = this.onRender
+    this.rootNode.onRender = () => {
+      if (this.isPaused) {
+        this.renderRequestedWhilePaused = true
+        return
+      }
+      this.scheduleRender()
+    }
+    this.rootNode.onImmediateRender = () => {
+      if (this.isPaused) {
+        this.renderRequestedWhilePaused = true
+        return
+      }
+      this.onRender()
+    }
 
     this.rootNode.onComputeLayout = () => {
       // Calculate layout during React's commit phase so useLayoutEffect hooks
@@ -465,7 +498,7 @@ export default class Ink {
     }
   }
   private handleResume = () => {
-    if (!this.options.stdout.isTTY) {
+    if (!this.options.stdout.isTTY || this.isPaused) {
       return
     }
 
@@ -522,6 +555,25 @@ export default class Ink {
       this.terminalColumns = cols
       this.terminalRows = rows
       this.altScreenParkPatch = makeAltScreenParkPatch(this.terminalRows)
+    }
+
+    if (this.mainScreenLease) {
+      this.mainScreenLease.resized = true
+      this.scheduleRender.cancel?.()
+      if (this.drainTimer !== null) {
+        clearTimeout(this.drainTimer)
+        this.drainTimer = null
+      }
+      if (this.resizeSettleTimer !== null) {
+        clearTimeout(this.resizeSettleTimer)
+        this.resizeSettleTimer = null
+      }
+      queueMicrotask(() => {
+        if (!this.isUnmounted && this.currentNode) {
+          this.render(this.currentNode)
+        }
+      })
+      return
     }
 
     // Pending throttled/drain work captured stale dims — cancel so
@@ -770,6 +822,9 @@ export default class Ink {
   }
   onRender() {
     if (this.isUnmounted || this.isPaused) {
+      if (this.isPaused) {
+        this.renderRequestedWhilePaused = true
+      }
       return
     }
 
@@ -1593,6 +1648,9 @@ export default class Ink {
    * as restoring the saved cursor position — clobbering the resume hint.
    */
   detachForShutdown(): void {
+    if (this.mainScreenLease) {
+      this.mainScreenLease = null
+    }
     this.isUnmounted = true
     // Cancel any pending throttled render so it doesn't fire between
     // cleanupTerminalModes() and process.exit() and write to main screen.
@@ -2688,6 +2746,146 @@ export default class Ink {
       this.resolveExitPromise()
     }
   }
+  async acquireMainScreenStaticOutput(token: symbol): Promise<void> {
+    if (this.isUnmounted) {
+      throw new Error('Ink instance is unmounted')
+    }
+
+    if (this.altScreenActive) {
+      throw new Error('main-screen static output lease unavailable in alternate screen')
+    }
+
+    if (this.mainScreenLease) {
+      throw new Error('main-screen output already leased')
+    }
+
+    // Commit everything React already knows about.
+    reconciler.flushSyncFromReconciler()
+
+    // Emit one final ordinary Ink frame.
+    this.onRender()
+
+    // From this point forward Ink is silent.
+    this.isPaused = true
+
+    this.scheduleRender.cancel?.()
+
+    if (this.drainTimer !== null) {
+      clearTimeout(this.drainTimer)
+      this.drainTimer = null
+    }
+
+    if (this.resizeSettleTimer !== null) {
+      clearTimeout(this.resizeSettleTimer)
+      this.resizeSettleTimer = null
+    }
+
+    this.immediateRerenderRequested = false
+
+    this.mainScreenLease = {
+      state: 'leased',
+      token,
+      dirty: false,
+      resized: false,
+      acquireCols: this.terminalColumns,
+      acquireRows: this.terminalRows
+    }
+
+    // Await stdout flush: all prior Ink bytes are now ahead of us on the wire.
+    await new Promise<void>(resolve => {
+      this.options.stdout.write('', () => resolve())
+    })
+  }
+
+  async writeMainScreenStaticOutput(token: symbol, data: string | Uint8Array): Promise<void> {
+    if (!this.mainScreenLease || this.mainScreenLease.token !== token) {
+      throw new Error('Invalid or unheld main-screen static output lease')
+    }
+
+    if (this.isUnmounted) {
+      throw new Error('Ink instance is unmounted')
+    }
+
+    this.mainScreenLease.dirty = true
+
+    await new Promise<void>((resolve, reject) => {
+      let drained = false
+      let writeCompleted = false
+
+      const ok = this.options.stdout.write(data, (err?: Error | null) => {
+        if (err) {
+          reject(err)
+          return
+        }
+        writeCompleted = true
+        if (drained) {
+          resolve()
+        }
+      })
+
+      if (ok) {
+        drained = true
+        if (writeCompleted) {
+          resolve()
+        }
+      } else {
+        this.options.stdout.once('drain', () => {
+          drained = true
+          if (writeCompleted) {
+            resolve()
+          }
+        })
+      }
+    })
+  }
+
+  prepareMainScreenAppendHandoff(token: symbol): void {
+    if (!this.mainScreenLease || this.mainScreenLease.token !== token) {
+      throw new Error('Invalid or unheld main-screen static output lease')
+    }
+
+    this.mainScreenLease.state = 'append-handoff'
+  }
+
+  async abortMainScreenStaticOutput(token: symbol): Promise<{ requiresReconstruction: boolean }> {
+    if (!this.mainScreenLease || this.mainScreenLease.token !== token) {
+      throw new Error('Invalid or unheld main-screen static output lease')
+    }
+
+    const dirty = this.mainScreenLease.dirty
+    this.mainScreenLease = null
+
+    if (dirty) {
+      return { requiresReconstruction: true }
+    }
+
+    this.isPaused = false
+    if (this.renderRequestedWhilePaused) {
+      this.renderRequestedWhilePaused = false
+      this.scheduleRender()
+    }
+
+    return { requiresReconstruction: false }
+  }
+
+  async releaseMainScreenStaticOutput(token: symbol): Promise<void> {
+    if (!this.mainScreenLease || this.mainScreenLease.token !== token) {
+      throw new Error('Invalid or unheld main-screen static output lease')
+    }
+
+    if (this.mainScreenLease.dirty && this.mainScreenLease.state !== 'append-handoff') {
+      throw new Error('Cannot release dirty main-screen static output lease without handoff: reconstruction required')
+    }
+
+    this.mainScreenLease = null
+    this.isPaused = false
+
+    if (this.renderRequestedWhilePaused) {
+      this.renderRequestedWhilePaused = false
+      this.scheduleRender()
+    }
+  }
+
   async waitUntilExit(): Promise<void> {
     this.exitPromise ||= new Promise((resolve, reject) => {
       this.resolveExitPromise = resolve
