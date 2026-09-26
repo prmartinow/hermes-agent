@@ -107,6 +107,13 @@ export interface MainScreenStaticOutputLease {
   readonly token: symbol
 
   /**
+   * Initialize main-screen physical surface for static history output.
+   * Clears visible screen (CSI 2J) and homes cursor (CSI H) while
+   * preserving native terminal scrollback. Marks lease dirty.
+   */
+  beginStaticAppendSurface(): Promise<void>
+
+  /**
    * Write static output while Ink is paused.
    * Marks the physical terminal as externally modified.
    * Honors stdout backpressure.
@@ -148,6 +155,7 @@ export async function acquireMainScreenStaticOutput(
     get token() {
       return token
     },
+    beginStaticAppendSurface: () => instance.beginStaticAppendSurface(token),
     write: (data: string | Uint8Array) => instance.writeMainScreenStaticOutput(token, data),
     prepareAppendHandoff: () => instance.prepareMainScreenAppendHandoff(token),
     release: () => instance.releaseMainScreenStaticOutput(token),

@@ -817,11 +817,13 @@ export default class Ink {
           : '')
     )
   }
-  onRender() {
-    if (this.isUnmounted || this.isPaused) {
-      if (this.isPaused) {
-        this.renderRequestedWhilePaused = true
-      }
+  onRender(forceAuthorizedMode?: 'append-handoff' | 'clean-release-flush') {
+    if (this.isUnmounted) {
+      return
+    }
+
+    if (this.isPaused && !forceAuthorizedMode) {
+      this.renderRequestedWhilePaused = true
       return
     }
 
@@ -857,6 +859,7 @@ export default class Ink {
     // coalescing forever. Only on a TTY; piped stdout has no flow control and
     // pendingWriteStart is never set there.
     if (
+      !forceAuthorizedMode &&
       this.options.stdout.isTTY &&
       this.pendingWriteStart !== null &&
       this.coalescedBackpressureFrames < MAX_COALESCED_BACKPRESSURE_FRAMES
@@ -1086,8 +1089,14 @@ export default class Ink {
 
     const tDiff = performance.now()
 
-    const handoffMode = this.pendingInitialRenderMode
+    const isAppendHandoff = forceAuthorizedMode === 'append-handoff' || this.pendingInitialRenderMode === 'append-to-existing-scrollback'
+    const handoffMode = isAppendHandoff ? 'append-to-existing-scrollback' : this.pendingInitialRenderMode
     this.pendingInitialRenderMode = null
+
+    if (isAppendHandoff) {
+      this.needsEraseBeforePaint = false
+      this.displayCursor = null
+    }
 
     const diff = handoffMode
       ? this.log.renderInitial(frame, handoffMode, this.altScreenActive)
@@ -1166,7 +1175,7 @@ export default class Ink {
       }
 
       optimized.push(this.altScreenParkPatch)
-    } else if (this.needsEraseBeforePaint) {
+    } else if (this.needsEraseBeforePaint && !isAppendHandoff) {
       // Main screen (INLINE_MODE / Termux). Same atomicity contract as the
       // alt-screen branch above: fold the clear into this frame's patch list
       // so clear+paint land in one write instead of a bare
@@ -1214,7 +1223,7 @@ export default class Ink {
       // physical cursor is at prevFrame.cursor. If last frame parked it
       // elsewhere, move back before the diff runs. Alt-screen's CSI H
       // already resets to (0,0) so no preamble needed.
-      if (parked !== null && !this.altScreenActive && hasDiff) {
+      if (parked !== null && !this.altScreenActive && !isAppendHandoff && hasDiff) {
         const pdx = prevFrame.cursor.x - parked.x
         const pdy = prevFrame.cursor.y - parked.y
 
@@ -1288,13 +1297,16 @@ export default class Ink {
     // the emitted viewport origin until a reset deliberately remaps it.
     if (!this.altScreenActive) {
       const origin = inlineViewportOrigin(frame, terminalRows)
-      this.inlineViewportOriginY = diff.some(p => p.type === 'clearScreen' || p.type === 'clearTerminal')
-        ? origin : Math.max(this.inlineViewportOriginY, origin)
+      this.inlineViewportOriginY = isAppendHandoff
+        ? origin
+        : diff.some(p => p.type === 'clearScreen' || p.type === 'clearTerminal')
+          ? origin
+          : Math.max(this.inlineViewportOriginY, origin)
     }
 
-    // Completion markers must follow this frame's bytes, including when a
-    // previous render was deferred by stdout backpressure.
-    const boundary = takeRenderBoundary(this.options.stdout)
+    // Completion markers must follow this frame's bytes, but append handoff
+    // must not consume unrelated queued boundaries (belongs to post-handoff frame)
+    const boundary = isAppendHandoff ? null : takeRenderBoundary(this.options.stdout)
     if (boundary) optimized.push({ type: 'stdout', content: boundary })
     const tWrite = performance.now()
 
@@ -2765,6 +2777,81 @@ export default class Ink {
     return this.mainScreenLease !== null
   }
 
+  private async writeAndDrain(data: string | Uint8Array): Promise<void> {
+    if (this.isUnmounted) {
+      throw new Error('Ink instance is unmounted')
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false
+      let drained = false
+      let writeCompleted = false
+
+      const cleanup = () => {
+        this.options.stdout.off('drain', onDrain)
+        this.options.stdout.off('error', onError)
+        this.options.stdout.off('close', onClose)
+      }
+
+      const onDrain = () => {
+        drained = true
+        if (writeCompleted && !settled) {
+          settled = true
+          cleanup()
+          resolve()
+        }
+      }
+
+      const onError = (err: Error) => {
+        if (!settled) {
+          settled = true
+          cleanup()
+          reject(err)
+        }
+      }
+
+      const onClose = () => {
+        if (!settled) {
+          settled = true
+          cleanup()
+          reject(new Error('stdout stream closed'))
+        }
+      }
+
+      this.options.stdout.once('drain', onDrain)
+      this.options.stdout.once('error', onError)
+      this.options.stdout.once('close', onClose)
+
+      let ok: boolean
+      try {
+        ok = this.options.stdout.write(data, (err?: Error | null) => {
+          if (err) {
+            onError(err)
+            return
+          }
+          writeCompleted = true
+          if (drained && !settled) {
+            settled = true
+            cleanup()
+            resolve()
+          }
+        })
+      } catch (err) {
+        onError(err as Error)
+        return
+      }
+
+      if (ok) {
+        drained = true
+        if (writeCompleted && !settled) {
+          settled = true
+          cleanup()
+          resolve()
+        }
+      }
+    })
+  }
+
   async acquireMainScreenStaticOutput(token: symbol): Promise<void> {
     if (this.isUnmounted) {
       throw new Error('Ink instance is unmounted')
@@ -2815,57 +2902,29 @@ export default class Ink {
     // Await stdout flush: all prior Ink bytes are now ahead of us on the wire.
     // If stream fails before flush, roll back lease state.
     try {
-      await new Promise<void>((resolve, reject) => {
-        let settled = false
-        const cleanup = () => {
-          this.options.stdout.off('error', onError)
-          this.options.stdout.off('close', onClose)
-        }
-        const onError = (err: Error) => {
-          if (!settled) {
-            settled = true
-            cleanup()
-            reject(err)
-          }
-        }
-        const onClose = () => {
-          if (!settled) {
-            settled = true
-            cleanup()
-            reject(new Error('stdout stream closed during lease acquisition'))
-          }
-        }
-        this.options.stdout.once('error', onError)
-        this.options.stdout.once('close', onClose)
-
-        try {
-          const ok = this.options.stdout.write('', (err?: Error | null) => {
-            if (err) {
-              onError(err)
-            } else if (!settled) {
-              settled = true
-              cleanup()
-              resolve()
-            }
-          })
-          if (!ok) {
-            this.options.stdout.once('drain', () => {
-              if (!settled) {
-                settled = true
-                cleanup()
-                resolve()
-              }
-            })
-          }
-        } catch (err) {
-          onError(err as Error)
-        }
-      })
+      await this.writeAndDrain('')
     } catch (err) {
       this.mainScreenLease = null
       this.isPaused = false
       throw err
     }
+  }
+
+  async beginStaticAppendSurface(token: symbol): Promise<void> {
+    if (!this.mainScreenLease || this.mainScreenLease.token !== token) {
+      throw new Error('Invalid or unheld main-screen static output lease')
+    }
+
+    if (this.isUnmounted) {
+      throw new Error('Ink instance is unmounted')
+    }
+
+    this.mainScreenLease.dirty = true
+    this.displayCursor = null
+    this.needsEraseBeforePaint = false
+
+    // CSI 2J (clear visible screen only, preserving scrollback) + CSI H (home cursor)
+    await this.writeAndDrain('[2J[H')
   }
 
   async writeMainScreenStaticOutput(token: symbol, data: string | Uint8Array): Promise<void> {
@@ -2878,75 +2937,7 @@ export default class Ink {
     }
 
     this.mainScreenLease.dirty = true
-
-    await new Promise<void>((resolve, reject) => {
-      let settled = false
-      let drained = false
-      let writeCompleted = false
-
-      const cleanup = () => {
-        this.options.stdout.off('drain', onDrain)
-        this.options.stdout.off('error', onError)
-        this.options.stdout.off('close', onClose)
-      }
-
-      const onDrain = () => {
-        drained = true
-        if (writeCompleted && !settled) {
-          settled = true
-          cleanup()
-          resolve()
-        }
-      }
-
-      const onError = (err: Error) => {
-        if (!settled) {
-          settled = true
-          cleanup()
-          reject(err)
-        }
-      }
-
-      const onClose = () => {
-        if (!settled) {
-          settled = true
-          cleanup()
-          reject(new Error('stdout stream closed while writing static output'))
-        }
-      }
-
-      this.options.stdout.once('drain', onDrain)
-      this.options.stdout.once('error', onError)
-      this.options.stdout.once('close', onClose)
-
-      let ok: boolean
-      try {
-        ok = this.options.stdout.write(data, (err?: Error | null) => {
-          if (err) {
-            onError(err)
-            return
-          }
-          writeCompleted = true
-          if (drained && !settled) {
-            settled = true
-            cleanup()
-            resolve()
-          }
-        })
-      } catch (err) {
-        onError(err as Error)
-        return
-      }
-
-      if (ok) {
-        drained = true
-        if (writeCompleted && !settled) {
-          settled = true
-          cleanup()
-          resolve()
-        }
-      }
-    })
+    await this.writeAndDrain(data)
   }
 
   prepareMainScreenAppendHandoff(token: symbol): void {
@@ -2998,19 +2989,11 @@ export default class Ink {
     // React tree reconciliation: ensure current React tree is fully committed to rootNode
     reconciler.flushSyncFromReconciler()
 
-    // Temporarily unpause for exactly one synchronous render
-    this.isPaused = false
-    this.pendingInitialRenderMode = 'append-to-existing-scrollback'
-
-    this.onRender()
-
-    // Re-freeze immediately before event loop control returns
-    this.isPaused = true
+    // Render handoff frame while isPaused stays true throughout!
+    this.onRender('append-handoff')
 
     // Await stdout flush of the handoff frame
-    await new Promise<void>(resolve => {
-      this.options.stdout.write('', () => resolve())
-    })
+    await this.writeAndDrain('')
 
     // Release lease and restore normal Ink ownership
     this.mainScreenLease = null
@@ -3036,13 +3019,15 @@ export default class Ink {
       return
     }
 
-    this.mainScreenLease = null
-    this.isPaused = false
-
+    // Clean release: if state changed while paused, render one authorized frame and flush
     if (this.renderRequestedWhilePaused) {
       this.renderRequestedWhilePaused = false
-      this.scheduleRender()
+      this.onRender('clean-release-flush')
+      await this.writeAndDrain('')
     }
+
+    this.mainScreenLease = null
+    this.isPaused = false
   }
 
   async waitUntilExit(): Promise<void> {

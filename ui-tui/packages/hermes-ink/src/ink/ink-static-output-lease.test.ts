@@ -578,4 +578,23 @@ describe('Hermes Ink Main-Screen Static Output Lease (Step A)', () => {
     ink.unmount()
     instances.delete(stdout as any)
   })
+  it('beginStaticAppendSurface initializes terminal with CSI 2J CSI H and marks lease dirty', async () => {
+    const stdout = new MockTty()
+    const ink = createTestInk(stdout)
+
+    const lease = await acquireMainScreenStaticOutput(stdout as any)
+    expect((ink as any).mainScreenLease.dirty).toBe(false)
+    const countBefore = stdout.chunks.length
+
+    await lease.beginStaticAppendSurface()
+    expect((ink as any).mainScreenLease.dirty).toBe(true)
+    expect(stdout.chunks.length).toBe(countBefore + 1)
+    expect(stdout.chunks[stdout.chunks.length - 1]).toBe('\x1b[2J\x1b[H')
+
+    lease.prepareAppendHandoff()
+    await lease.release()
+
+    ink.unmount()
+    instances.delete(stdout as any)
+  })
 })
