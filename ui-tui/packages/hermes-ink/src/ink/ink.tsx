@@ -176,18 +176,12 @@ export type Options = {
 }
 export type MainScreenLeaseState =
   | {
-      state: 'leased'
+      state: 'leased' | 'append-handoff'
       token: symbol
       dirty: boolean
       resized: boolean
-      acquireCols: number
-      acquireRows: number
-    }
-  | {
-      state: 'append-handoff'
-      token: symbol
-      dirty: boolean
-      resized: boolean
+      layoutInvalid: boolean
+      modeTransitionRequested: boolean
       acquireCols: number
       acquireRows: number
     }
@@ -559,6 +553,9 @@ export default class Ink {
 
     if (this.mainScreenLease) {
       this.mainScreenLease.resized = true
+      if (this.mainScreenLease.dirty) {
+        this.mainScreenLease.layoutInvalid = true
+      }
       this.scheduleRender.cancel?.()
       if (this.drainTimer !== null) {
         clearTimeout(this.drainTimer)
@@ -1508,6 +1505,11 @@ export default class Ink {
    */
   setAltScreenActive(active: boolean, mouseTracking: MouseTrackingMode = 'off'): void {
     if (this.altScreenActive === active) {
+      return
+    }
+
+    if (this.mainScreenLease && active !== this.altScreenActive) {
+      this.mainScreenLease.modeTransitionRequested = true
       return
     }
 
@@ -2530,6 +2532,10 @@ export default class Ink {
   // cascades through useContext → <AlternateScreen>'s useLayoutEffect dep
   // array → spurious exit+re-enter of the alt screen on every SIGWINCH.
   private writeRaw(data: string): void {
+    if (this.isUnmounted || this.isPaused) {
+      return
+    }
+
     this.options.stdout.write(data)
   }
   private setCursorDeclaration: CursorDeclarationSetter = (decl, clearIfNode) => {
@@ -2684,6 +2690,10 @@ export default class Ink {
     // may not work correctly (e.g., in tmux, screen) and these are no-ops on
     // terminals that don't support them.
 
+    if (this.mainScreenLease) {
+      this.mainScreenLease = null
+    }
+
     if (this.options.stdout.isTTY) {
       if (this.altScreenActive) {
         // <AlternateScreen>'s unmount effect won't run during signal-exit.
@@ -2746,6 +2756,10 @@ export default class Ink {
       this.resolveExitPromise()
     }
   }
+  isMainScreenLeased(): boolean {
+    return this.mainScreenLease !== null
+  }
+
   async acquireMainScreenStaticOutput(token: symbol): Promise<void> {
     if (this.isUnmounted) {
       throw new Error('Ink instance is unmounted')
@@ -2787,14 +2801,66 @@ export default class Ink {
       token,
       dirty: false,
       resized: false,
+      layoutInvalid: false,
+      modeTransitionRequested: false,
       acquireCols: this.terminalColumns,
       acquireRows: this.terminalRows
     }
 
     // Await stdout flush: all prior Ink bytes are now ahead of us on the wire.
-    await new Promise<void>(resolve => {
-      this.options.stdout.write('', () => resolve())
-    })
+    // If stream fails before flush, roll back lease state.
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false
+        const cleanup = () => {
+          this.options.stdout.off('error', onError)
+          this.options.stdout.off('close', onClose)
+        }
+        const onError = (err: Error) => {
+          if (!settled) {
+            settled = true
+            cleanup()
+            reject(err)
+          }
+        }
+        const onClose = () => {
+          if (!settled) {
+            settled = true
+            cleanup()
+            reject(new Error('stdout stream closed during lease acquisition'))
+          }
+        }
+        this.options.stdout.once('error', onError)
+        this.options.stdout.once('close', onClose)
+
+        try {
+          const ok = this.options.stdout.write('', (err?: Error | null) => {
+            if (err) {
+              onError(err)
+            } else if (!settled) {
+              settled = true
+              cleanup()
+              resolve()
+            }
+          })
+          if (!ok) {
+            this.options.stdout.once('drain', () => {
+              if (!settled) {
+                settled = true
+                cleanup()
+                resolve()
+              }
+            })
+          }
+        } catch (err) {
+          onError(err as Error)
+        }
+      })
+    } catch (err) {
+      this.mainScreenLease = null
+      this.isPaused = false
+      throw err
+    }
   }
 
   async writeMainScreenStaticOutput(token: symbol, data: string | Uint8Array): Promise<void> {
@@ -2809,32 +2875,71 @@ export default class Ink {
     this.mainScreenLease.dirty = true
 
     await new Promise<void>((resolve, reject) => {
+      let settled = false
       let drained = false
       let writeCompleted = false
 
-      const ok = this.options.stdout.write(data, (err?: Error | null) => {
-        if (err) {
-          reject(err)
-          return
-        }
-        writeCompleted = true
-        if (drained) {
-          resolve()
-        }
-      })
+      const cleanup = () => {
+        this.options.stdout.off('drain', onDrain)
+        this.options.stdout.off('error', onError)
+        this.options.stdout.off('close', onClose)
+      }
 
-      if (ok) {
+      const onDrain = () => {
         drained = true
-        if (writeCompleted) {
+        if (writeCompleted && !settled) {
+          settled = true
+          cleanup()
           resolve()
         }
-      } else {
-        this.options.stdout.once('drain', () => {
-          drained = true
-          if (writeCompleted) {
+      }
+
+      const onError = (err: Error) => {
+        if (!settled) {
+          settled = true
+          cleanup()
+          reject(err)
+        }
+      }
+
+      const onClose = () => {
+        if (!settled) {
+          settled = true
+          cleanup()
+          reject(new Error('stdout stream closed while writing static output'))
+        }
+      }
+
+      this.options.stdout.once('drain', onDrain)
+      this.options.stdout.once('error', onError)
+      this.options.stdout.once('close', onClose)
+
+      let ok: boolean
+      try {
+        ok = this.options.stdout.write(data, (err?: Error | null) => {
+          if (err) {
+            onError(err)
+            return
+          }
+          writeCompleted = true
+          if (drained && !settled) {
+            settled = true
+            cleanup()
             resolve()
           }
         })
+      } catch (err) {
+        onError(err as Error)
+        return
+      }
+
+      if (ok) {
+        drained = true
+        if (writeCompleted && !settled) {
+          settled = true
+          cleanup()
+          resolve()
+        }
       }
     })
   }
@@ -2873,7 +2978,9 @@ export default class Ink {
       throw new Error('Invalid or unheld main-screen static output lease')
     }
 
-    if (this.mainScreenLease.dirty && this.mainScreenLease.state !== 'append-handoff') {
+    if (this.mainScreenLease.dirty) {
+      // Fail closed: until Step B implements the one-shot append handoff,
+      // releasing dirty physical output cannot safely resume ordinary diff rendering.
       throw new Error('Cannot release dirty main-screen static output lease without handoff: reconstruction required')
     }
 

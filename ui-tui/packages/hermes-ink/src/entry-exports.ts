@@ -30,6 +30,7 @@ export { default as measureElement } from './ink/measure-element.js'
 export { scrollFastPathStats, type ScrollFastPathStats } from './ink/render-node-to-output.js'
 export {
   acquireMainScreenStaticOutput,
+  isMainScreenStaticOutputLeased,
   type MainScreenStaticOutputLease,
   createRoot,
   forceRedraw,

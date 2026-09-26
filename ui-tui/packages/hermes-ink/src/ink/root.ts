@@ -155,6 +155,13 @@ export async function acquireMainScreenStaticOutput(
   }
 }
 
+export function isMainScreenStaticOutputLeased(
+  stdout: NodeJS.WriteStream = process.stdout
+): boolean {
+  const instance = instances.get(stdout)
+  return instance ? instance.isMainScreenLeased() : false
+}
+
 export const forceRedraw = (stdout: NodeJS.WriteStream = process.stdout): boolean => {
   const instance = instances.get(stdout)
 

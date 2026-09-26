@@ -6,7 +6,7 @@ import Text from './components/Text.js'
 import Box from './components/Box.js'
 import Ink from './ink.js'
 import instances from './instances.js'
-import { acquireMainScreenStaticOutput, type MainScreenStaticOutputLease } from './root.js'
+import { acquireMainScreenStaticOutput, isMainScreenStaticOutputLeased, type MainScreenStaticOutputLease } from './root.js'
 
 class MockTty extends EventEmitter {
   chunks: string[] = []
@@ -255,11 +255,14 @@ describe('Hermes Ink Main-Screen Static Output Lease (Step A)', () => {
       await writePromise
       expect(writeResolved).toBe(true)
 
-      // 3. Prepare append handoff and release
+      // 3. In Step A, dirty release fails closed even with prepareAppendHandoff (Step B provides handoff renderer)
       lease.prepareAppendHandoff()
-      await lease.release()
+      await expect(lease.release()).rejects.toThrow(
+        'Cannot release dirty main-screen static output lease without handoff: reconstruction required'
+      )
 
-      // 4. Writing after release throws
+      // 4. Aborting clears the lease, after which writing throws
+      await lease.abort()
       await expect(lease.write('post-release')).rejects.toThrow(
         'Invalid or unheld main-screen static output lease'
       )
@@ -380,7 +383,9 @@ describe('Hermes Ink Main-Screen Static Output Lease (Step A)', () => {
       const lease = await acquireMainScreenStaticOutput(stdout as any)
       await lease.write('test data\r\n')
       lease.prepareAppendHandoff()
-      await lease.release()
+      await expect(lease.release()).rejects.toThrow(
+        'Cannot release dirty main-screen static output lease without handoff: reconstruction required'
+      )
 
       const allOutput = stdout.chunks.join('')
       expect(allOutput.includes('\x1b[?1049h')).toBe(false)
@@ -389,5 +394,96 @@ describe('Hermes Ink Main-Screen Static Output Lease (Step A)', () => {
       ink.unmount()
       instances.delete(stdout as any)
     }
+  })
+  it('tracks isMainScreenStaticOutputLeased status and suppresses writeRaw while leased', async () => {
+    const stdout = new MockTty()
+    const ink = createTestInk(stdout)
+
+    expect(isMainScreenStaticOutputLeased(stdout as any)).toBe(false)
+
+    const lease = await acquireMainScreenStaticOutput(stdout as any)
+    expect(isMainScreenStaticOutputLeased(stdout as any)).toBe(true)
+
+    const countBeforeWriteRaw = stdout.chunks.length
+
+    // Direct writeRaw through Ink is suppressed while leased
+    ;(ink as any).writeRaw('suppressed-raw-write')
+    expect(stdout.chunks.length).toBe(countBeforeWriteRaw)
+
+    await lease.release()
+    expect(isMainScreenStaticOutputLeased(stdout as any)).toBe(false)
+
+    // writeRaw resumes functioning when unpaused/released
+    ;(ink as any).writeRaw('active-raw-write')
+    expect(stdout.chunks.length).toBe(countBeforeWriteRaw + 1)
+    expect(stdout.chunks[stdout.chunks.length - 1]).toBe('active-raw-write')
+
+    ink.unmount()
+    instances.delete(stdout as any)
+  })
+
+  it('marks layoutInvalid on resize-after-dirty and ignores mode transitions while leased', async () => {
+    const stdout = new MockTty()
+    const ink = createTestInk(stdout)
+
+    const lease = await acquireMainScreenStaticOutput(stdout as any)
+
+    // Resize BEFORE dirty does NOT set layoutInvalid
+    stdout.columns = 100
+    stdout.emit('resize')
+    expect((ink as any).mainScreenLease.layoutInvalid).toBe(false)
+
+    // Write static output -> dirty = true
+    await lease.write('static-data\r\n')
+    expect((ink as any).mainScreenLease.dirty).toBe(true)
+
+    // Resize AFTER dirty DOES set layoutInvalid = true
+    stdout.columns = 120
+    stdout.emit('resize')
+    expect((ink as any).mainScreenLease.layoutInvalid).toBe(true)
+
+    // Alt-screen transition attempt while leased sets modeTransitionRequested and does not enter alt screen
+    expect((ink as any).altScreenActive).toBe(false)
+    ink.setAltScreenActive(true)
+    expect((ink as any).altScreenActive).toBe(false)
+    expect((ink as any).mainScreenLease.modeTransitionRequested).toBe(true)
+
+    // Dirty release fails closed even if prepareAppendHandoff was called (until Step B implements handoff)
+    lease.prepareAppendHandoff()
+    await expect(lease.release()).rejects.toThrow(
+      'Cannot release dirty main-screen static output lease without handoff: reconstruction required'
+    )
+
+    ink.unmount()
+    instances.delete(stdout as any)
+  })
+
+  it('unmount while leased invalidates lease and rejects subsequent lease operations', async () => {
+    const stdout = new MockTty()
+    const ink = createTestInk(stdout)
+
+    const lease = await acquireMainScreenStaticOutput(stdout as any)
+    expect((ink as any).mainScreenLease).not.toBeNull()
+
+    // Unmount while leased
+    ink.unmount()
+    expect((ink as any).isUnmounted).toBe(true)
+    expect((ink as any).mainScreenLease).toBeNull()
+
+    // Operations on old lease object now reject
+    await expect(lease.write('test')).rejects.toThrow(
+      'Invalid or unheld main-screen static output lease'
+    )
+    await expect(lease.release()).rejects.toThrow(
+      'Invalid or unheld main-screen static output lease'
+    )
+    await expect(lease.abort()).rejects.toThrow(
+      'Invalid or unheld main-screen static output lease'
+    )
+    expect(() => lease.prepareAppendHandoff()).toThrow(
+      'Invalid or unheld main-screen static output lease'
+    )
+
+    instances.delete(stdout as any)
   })
 })
