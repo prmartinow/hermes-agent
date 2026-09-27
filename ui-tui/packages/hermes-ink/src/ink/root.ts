@@ -134,6 +134,13 @@ export interface MainScreenStaticOutputLease {
   release(): Promise<void>
 
   /**
+   * Reconstruct terminal after dirty static output.
+   * Clears terminal screen, resets virtual frame buffer,
+   * releases lease, and renders a clean initial interactive frame.
+   */
+  reconstructAndRelease(): Promise<void>
+
+  /**
    * Abandon ownership. Returns whether physical output had
    * already been modified and therefore needs reconstruction.
    */
@@ -159,6 +166,7 @@ export async function acquireMainScreenStaticOutput(
     write: (data: string | Uint8Array) => instance.writeMainScreenStaticOutput(token, data),
     prepareAppendHandoff: () => instance.prepareMainScreenAppendHandoff(token),
     release: () => instance.releaseMainScreenStaticOutput(token),
+    reconstructAndRelease: () => instance.reconstructAndReleaseMainScreenStaticOutput(token),
     abort: () => instance.abortMainScreenStaticOutput(token)
   }
 }

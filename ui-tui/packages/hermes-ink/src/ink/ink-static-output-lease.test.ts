@@ -316,6 +316,34 @@ describe('Hermes Ink Main-Screen Static Output Lease (Step A)', () => {
     }
   })
 
+  it('reconstructAndRelease() wipes terminal screen, restores frames, unpauses, and emits clean initial frame', async () => {
+    const stdout = new MockTty()
+    const ink = createTestInk(stdout)
+
+    try {
+      ink.render(React.createElement('ink-text', null, 'Active Dashboard View'))
+      const lease = await acquireMainScreenStaticOutput(stdout as any)
+      await lease.beginStaticAppendSurface()
+      await lease.write('dirty static bytes\r\n')
+      expect((ink as any).isPaused).toBe(true)
+
+      stdout.chunks = []
+      await lease.reconstructAndRelease()
+
+      expect((ink as any).isPaused).toBe(false)
+      expect((ink as any).mainScreenLease).toBeNull()
+
+      // Verify screen clear escape \x1b[2J\x1b[H was emitted
+      const output = stdout.chunks.join('')
+      expect(output).toContain('\x1b[2J\x1b[H')
+      const plain = (await import('node:util')).stripVTControlCharacters(output)
+      expect(plain).toContain('ActiveDashboardView')
+    } finally {
+      ink.unmount()
+      instances.delete(stdout as any)
+    }
+  })
+
   it('awaits prior stdout flush before lease acquisition resolves (byte-boundary invariant)', async () => {
     class DelayedFlushTty extends EventEmitter {
       chunks: string[] = []

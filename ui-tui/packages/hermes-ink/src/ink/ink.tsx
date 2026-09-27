@@ -817,7 +817,7 @@ export default class Ink {
           : '')
     )
   }
-  onRender(forceAuthorizedMode?: 'append-handoff' | 'clean-release-flush') {
+  onRender(forceAuthorizedMode?: 'append-handoff' | 'clean-release-flush' | 'reconstruct-clean') {
     if (this.isUnmounted) {
       return
     }
@@ -2696,7 +2696,7 @@ export default class Ink {
 
     // Non-TTY environments don't handle erasing ansi escapes well, so it's better to
     // only render last frame of non-static output
-    const diff = this.log.renderPreviousOutput_DEPRECATED(this.frontFrame)
+    const diff = this.frontFrame ? this.log.renderPreviousOutput_DEPRECATED(this.frontFrame) : []
     writeDiffToTerminal(this.terminal, optimize(diff))
 
     // Clean up terminal modes synchronously before process exit.
@@ -2946,6 +2946,29 @@ export default class Ink {
     }
 
     this.mainScreenLease.state = 'append-handoff'
+  }
+
+  async reconstructAndReleaseMainScreenStaticOutput(token: symbol): Promise<void> {
+    if (!this.mainScreenLease || this.mainScreenLease.token !== token) {
+      throw new Error('Invalid or unheld main-screen static output lease')
+    }
+
+    if (this.isUnmounted) {
+      throw new Error('Ink instance is unmounted')
+    }
+
+    // Set initial render mode to clear-terminal to wipe stale dirty output
+    this.pendingInitialRenderMode = 'clear-terminal'
+    this.log.reset()
+    this.needsEraseBeforePaint = true
+    this.inlineViewportOriginY = 0
+    this.mainScreenLease = null
+    this.isPaused = false
+
+    // Flush any pending React reconciler work and render clean initial frame
+    reconciler.flushSyncFromReconciler()
+    this.onRender('reconstruct-clean')
+    await this.writeAndDrain('')
   }
 
   async abortMainScreenStaticOutput(token: symbol): Promise<{ requiresReconstruction: boolean }> {

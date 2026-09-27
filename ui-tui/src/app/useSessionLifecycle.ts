@@ -264,7 +264,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     }
   }, [])
 
-  const supersedeColdHydration = useCallback(() => {
+  const supersedeColdHydration = useCallback(async () => {
     resumeAttemptRef.current = null
     const boundary = activeReplayBoundaryRef.current
     if (boundary) {
@@ -275,7 +275,15 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     if (pending) {
       pendingColdCommitRef.current = null
       gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
-      void pending.lease.abort()
+      try {
+        if (pending.staticOutputStarted) {
+          await pending.lease.reconstructAndRelease()
+        } else {
+          await pending.lease.abort()
+        }
+      } catch {
+        // Already released/aborted
+      }
     }
     const active = activeColdBarrierRef.current
     if (active) {
@@ -285,7 +293,22 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     const tx = activeColdOutputRef.current
     if (tx) {
       activeColdOutputRef.current = null
-      void tx.lease.abort()
+      if (tx.hydrationPromise) {
+        try {
+          await tx.hydrationPromise
+        } catch {
+          // Ignored during supersession
+        }
+      }
+      try {
+        if (tx.staticOutputStarted) {
+          await tx.lease.reconstructAndRelease()
+        } else {
+          await tx.lease.abort()
+        }
+      } catch {
+        // Already released/aborted
+      }
     }
   }, [gw])
 
@@ -320,7 +343,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         if (activeColdOutputRef.current === pending) {
           activeColdOutputRef.current = null
         }
-        void pending.lease.abort()
+        if (pending.staticOutputStarted) {
+          await pending.lease.reconstructAndRelease()
+        } else {
+          await pending.lease.abort()
+        }
         const boundary = activeReplayBoundaryRef.current
         if (boundary?.attemptId === pending.attemptId) {
           activeReplayBoundaryRef.current = null
@@ -348,7 +375,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   useEffect(() => {
     return () => {
-      supersedeColdHydration()
+      void supersedeColdHydration()
     }
   }, [supersedeColdHydration])
 
@@ -616,13 +643,13 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   }, [rpc, setHistoryItems, viewportMeta])
 
   const resumeById = useCallback(
-    (
+    async (
       id: string,
       targetRecoveryRef?: { current: string | null },
       retryAttempt = 0,
       options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume"; durableKey?: string }
     ): Promise<void> => {
-      supersedeColdHydration()
+      await supersedeColdHydration()
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
       const attemptId = randomUUID()
@@ -761,7 +788,10 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                     tx.staticOutputStarted = true
                     await lease.beginStaticAppendSurface()
                   },
-                  write: data => lease.write(data)
+                  write: async data => {
+                    tx.staticOutputStarted = true
+                    await lease.write(data)
+                  }
                 }
 
                 const hydrationPromise = performColdHistoryHydration({
@@ -796,7 +826,15 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   if (activeColdOutputRef.current === tx) {
                     activeColdOutputRef.current = null
                   }
-                  void lease.abort()
+                  try {
+                    if (tx.staticOutputStarted) {
+                      await lease.reconstructAndRelease()
+                    } else {
+                      await lease.abort()
+                    }
+                  } catch {
+                    // Already released/aborted
+                  }
                   if (resumeAttemptRef.current !== attemptId) {
                     return
                   }

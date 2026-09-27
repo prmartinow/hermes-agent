@@ -50,6 +50,7 @@ export interface ColdHydrationOptions {
   onProgress?: (materialized: number, snapshotMax?: number) => void
   timeSliceMs?: number
   isCancelled?: () => boolean
+  onStaticOutputStarted?: () => void
 }
 
 export interface ColdHydrationResult {
@@ -141,6 +142,7 @@ export async function performColdHistoryHydration(
       if (opts.isCancelled?.()) throw new ColdHydrationCancelledError()
       if (!appendedToScrollback) {
         appendedToScrollback = true
+        opts.onStaticOutputStarted?.()
         await output.beginStaticAppendSurface()
 
         // Materialize Banner & SessionPanel once at line 0
