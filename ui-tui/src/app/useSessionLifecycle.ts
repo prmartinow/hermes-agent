@@ -21,6 +21,10 @@ import {
   type ColdHistoryOutput
 } from './coldHistoryHydration.js'
 
+export type ColdSettlement =
+  | { ok: true }
+  | { ok: false; error: unknown }
+
 export interface ActiveColdOutputTransaction {
   attemptId: string
   sid: string
@@ -28,8 +32,8 @@ export interface ActiveColdOutputTransaction {
   lease: MainScreenStaticOutputLease
   boundaryGeneration: string | null
   staticOutputStarted: boolean
-  settlementPromise: Promise<void>
-  settle: () => void
+  settlementPromise: Promise<ColdSettlement>
+  complete: (result: ColdSettlement) => void
   appendedToScrollback?: boolean
 }
 import { ZERO } from '../domain/usage.js'
@@ -277,24 +281,49 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       activeReplayBoundaryRef.current = null
       stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
     }
+
     const pending = pendingColdCommitRef.current
     if (pending) {
+      // Ownership transferred atomically to superseder
       pendingColdCommitRef.current = null
+      clearActiveColdBarrier(pending.attemptId, pending.sid)
       gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
+
+      try {
+        if (pending.staticOutputStarted) {
+          await pending.lease.reconstructAndRelease()
+        } else {
+          await pending.lease.abort()
+        }
+        pending.complete({ ok: true })
+      } catch (error) {
+        pending.complete({ ok: false, error })
+        throw error
+      } finally {
+        if (activeColdOutputRef.current === pending) {
+          activeColdOutputRef.current = null
+        }
+      }
+      return
     }
+
     const active = activeColdBarrierRef.current
     if (active) {
       activeColdBarrierRef.current = null
       gw?.cancelEventBarrier?.(active.sid, active.attemptId)
     }
+
     const tx = activeColdOutputRef.current
     if (tx) {
-      await tx.settlementPromise
+      const result = await tx.settlementPromise
       if (activeColdOutputRef.current === tx) {
         activeColdOutputRef.current = null
       }
+      if (!result.ok) {
+        throw result.error
+      }
     }
-  }, [gw, stdout])
+  }, [clearActiveColdBarrier, gw, stdout])
 
   useLayoutEffect(() => {
     const pending = pendingColdCommitRef.current
@@ -310,12 +339,20 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
       }
       void (async () => {
-        if (pending.staticOutputStarted) {
-          await pending.lease.reconstructAndRelease()
-        } else {
-          await pending.lease.abort()
+        try {
+          if (pending.staticOutputStarted) {
+            await pending.lease.reconstructAndRelease()
+          } else {
+            await pending.lease.abort()
+          }
+          pending.complete({ ok: true })
+        } catch (error) {
+          pending.complete({ ok: false, error })
+        } finally {
+          if (activeColdOutputRef.current === pending) {
+            activeColdOutputRef.current = null
+          }
         }
-        pending.settle()
       })()
       return
     }
@@ -331,25 +368,33 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         // Fail-closed invariant: if lease release/handoff fails, abort and do not release event barrier or clear incomplete marker!
         clearActiveColdBarrier(pending.attemptId, pending.sid)
         gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
-        if (activeColdOutputRef.current === pending) {
-          activeColdOutputRef.current = null
-        }
-        if (pending.staticOutputStarted) {
-          await pending.lease.reconstructAndRelease()
-        } else {
-          await pending.lease.abort()
-        }
         const boundary = activeReplayBoundaryRef.current
         if (boundary?.attemptId === pending.attemptId) {
           activeReplayBoundaryRef.current = null
           stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
         }
-        pending.settle()
+        try {
+          if (pending.staticOutputStarted) {
+            await pending.lease.reconstructAndRelease()
+          } else {
+            await pending.lease.abort()
+          }
+          pending.complete({ ok: false, error: err })
+        } catch (reconstructErr) {
+          pending.complete({ ok: false, error: reconstructErr })
+        } finally {
+          if (activeColdOutputRef.current === pending) {
+            activeColdOutputRef.current = null
+          }
+        }
         return
       }
 
       if (pending.attemptId !== resumeAttemptRef.current) {
-        pending.settle()
+        if (activeColdOutputRef.current === pending) {
+          activeColdOutputRef.current = null
+        }
+        pending.complete({ ok: true })
         return
       }
 
@@ -363,13 +408,17 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       if (pending.boundaryGeneration) {
         setReplayCommitted({ generation: pending.boundaryGeneration, replaceFrame: false })
       }
-      pending.settle()
+      pending.complete({ ok: true })
     })()
-  }, [clearActiveColdBarrier, coldCommitGeneration, gw, coldHydrationIncompleteRef])
+  }, [clearActiveColdBarrier, coldCommitGeneration, coldHydrationIncompleteRef, gw, stdout])
 
   useEffect(() => {
     return () => {
-      void supersedeColdHydration()
+      const tx = activeColdOutputRef.current
+      if (tx) {
+        tx.complete({ ok: true })
+      }
+      void supersedeColdHydration().catch(() => {})
     }
   }, [supersedeColdHydration])
 
@@ -527,12 +576,13 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const newLiveSession = useCallback(
-    (msg = 'new live session started', title?: string) => {
+    async (msg = 'new live session started', title?: string) => {
+      await supersedeColdHydration()
       patchOverlayState({ sessions: false })
 
       return startNewSession(msg, title, true)
     },
-    [startNewSession]
+    [startNewSession, supersedeColdHydration]
   )
 
   const activateLiveSession = useCallback(
@@ -543,14 +593,15 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       // The card belongs to the session being left; the activated one answers with its own.
       clearConnectionOperation()
 
-      gw.request<SessionActivateResponse>('session.activate', { session_id: id })
+      return gw.request<SessionActivateResponse>('session.activate', { session_id: id })
         .then(raw => {
           const r = asRpcResult<SessionActivateResponse>(raw)
 
           if (!r) {
             sys('error: invalid response: session.activate')
 
-            return patchUiState({ status: 'ready' })
+            patchUiState({ status: 'ready' })
+            return null
           }
 
           const info = r.info ?? null
@@ -583,11 +634,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
           cancelResumeScrollRef.current?.()
           cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
+          return r.session_id
         })
         .catch((e: Error) => {
-
           sys(`error: ${e.message}`)
           patchUiState({ status: 'ready' })
+          return null
         })
     },
     [gw, resetSession, scrollRef, setHistoryItems, setSessionStartedAt, supersedeColdHydration, sys]
@@ -765,9 +817,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   usage: usageFrom(info)
                 })
 
-                let settleTransaction!: () => void
-                const settlementPromise = new Promise<void>(resolve => {
-                  settleTransaction = resolve
+                let resolveSettlement!: (result: ColdSettlement) => void
+                const settlementPromise = new Promise<ColdSettlement>(resolve => {
+                  resolveSettlement = resolve
                 })
 
                 const tx: ActiveColdOutputTransaction = {
@@ -778,7 +830,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   boundaryGeneration: generation,
                   staticOutputStarted: false,
                   settlementPromise,
-                  settle: () => settleTransaction()
+                  complete: resolveSettlement
                 }
                 activeColdOutputRef.current = tx
 
@@ -808,15 +860,20 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   if (resumeAttemptRef.current !== attemptId) {
                     clearActiveColdBarrier(attemptId, r.session_id)
                     gw?.cancelEventBarrier?.(r.session_id, attemptId)
-                    if (activeColdOutputRef.current === tx) {
-                      activeColdOutputRef.current = null
+                    try {
+                      if (tx.staticOutputStarted) {
+                        await lease.reconstructAndRelease()
+                      } else {
+                        await lease.abort()
+                      }
+                      tx.complete({ ok: true })
+                    } catch (cleanupErr) {
+                      tx.complete({ ok: false, error: cleanupErr })
+                    } finally {
+                      if (activeColdOutputRef.current === tx) {
+                        activeColdOutputRef.current = null
+                      }
                     }
-                    if (tx.staticOutputStarted) {
-                      await lease.reconstructAndRelease()
-                    } else {
-                      await lease.abort()
-                    }
-                    tx.settle()
                     return
                   }
 
@@ -831,28 +888,29 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                 } catch (err) {
                   clearActiveColdBarrier(attemptId, r.session_id)
                   gw?.cancelEventBarrier?.(r.session_id, attemptId)
-                  if (activeColdOutputRef.current === tx) {
-                    activeColdOutputRef.current = null
-                  }
-                  if (tx.staticOutputStarted) {
-                    await lease.reconstructAndRelease()
-                  } else {
-                    await lease.abort()
-                  }
-                  if (resumeAttemptRef.current !== attemptId) {
-                    tx.settle()
-                    return
-                  }
-                  if (err instanceof ColdHydrationCancelledError) {
-                    tx.settle()
-                    return
-                  }
                   const boundary = activeReplayBoundaryRef.current
                   if (boundary?.attemptId === attemptId) {
                     activeReplayBoundaryRef.current = null
                     stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
                   }
-                  tx.settle()
+                  try {
+                    if (tx.staticOutputStarted) {
+                      await lease.reconstructAndRelease()
+                    } else {
+                      await lease.abort()
+                    }
+                    if (resumeAttemptRef.current !== attemptId || err instanceof ColdHydrationCancelledError) {
+                      tx.complete({ ok: true })
+                    } else {
+                      tx.complete({ ok: false, error: err })
+                    }
+                  } catch (cleanupErr) {
+                    tx.complete({ ok: false, error: cleanupErr })
+                  } finally {
+                    if (activeColdOutputRef.current === tx) {
+                      activeColdOutputRef.current = null
+                    }
+                  }
                 }
               })()
             } else if (!isTransportRecovery) {

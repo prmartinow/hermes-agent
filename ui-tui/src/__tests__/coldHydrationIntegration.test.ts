@@ -21,17 +21,23 @@ class DeterministicTty extends EventEmitter {
   }> = []
 
   holdDrain = false
-  pendingCallbacks: Array<() => void> = []
+  blockDrainPattern: RegExp | null = null
+  pendingCallbacks: Array<{ seq: number; cb: () => void }> = []
 
   write(chunk: string | Uint8Array, ...args: any[]): boolean {
     const data = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
     this.chunks.push(data)
+    this.emit('write-chunk', data)
     const cb = args.find(a => typeof a === 'function')
     const seq = ++globalSeq
 
-    if (this.holdDrain) {
+    const hasUnfinishedDrain = this.pendingCallbacks.length > 0
+    const shouldHold = this.holdDrain || hasUnfinishedDrain || (this.blockDrainPattern !== null && this.blockDrainPattern.test(data))
+
+    if (shouldHold) {
       this.writes.push({ seq, data, drained: false })
-      if (cb) this.pendingCallbacks.push(cb)
+      if (cb) this.pendingCallbacks.push({ seq, cb })
+      this.emit('drain-held', { seq, data })
       return false
     }
 
@@ -42,15 +48,19 @@ class DeterministicTty extends EventEmitter {
 
   releaseDrain() {
     this.holdDrain = false
-    const cbs = [...this.pendingCallbacks]
+    this.blockDrainPattern = null
+    const pending = [...this.pendingCallbacks]
     this.pendingCallbacks = []
+    const seq = ++globalSeq
     for (const item of this.writes) {
       item.drained = true
     }
-    for (const cb of cbs) {
-      cb()
+    for (const p of pending) {
+      p.cb()
     }
+    this.emit('drain-released', { seq })
     this.emit('drain')
+    return seq
   }
 
   resize(cols: number, rows: number) {
@@ -85,7 +95,8 @@ class ScriptedGateway {
   })
 
   releaseEventBarrier = vi.fn((sid: string, attemptId: string) => {
-    this.log.push({ seq: ++globalSeq, action: 'barrier-release', sid, attemptId })
+    const seq = ++globalSeq
+    this.log.push({ seq, action: 'barrier-release', sid, attemptId })
     const b = this.barriers.get(sid)
     if (b) b.released = true
     const held = this.heldEvents.get(sid) ?? []
@@ -171,7 +182,7 @@ function IntegrationHarness(props: HarnessProps) {
   )
 }
 
-describe('Cold Hydration Multi-Surface Integration Suite (Step C/D)', () => {
+describe('Cold Hydration Multi-Surface Integration Suite (Step C/D Hardened)', () => {
   let stdout: DeterministicTty
   let gw: ScriptedGateway
   let activeInstance: any = null
@@ -188,7 +199,7 @@ describe('Cold Hydration Multi-Surface Integration Suite (Step C/D)', () => {
     activeInstance = null
   })
 
-  it('A. Contiguous static prefix + live tail rendering without gap or duplicates', async () => {
+  it('A. Contiguous static prefix + live tail rendering without gap, duplicates, or reordering', async () => {
     const totalMsgs = 15
     const messages = Array.from({ length: totalMsgs }, (_, i) => ({
       id: `msg-${i + 1}`,
@@ -229,24 +240,27 @@ describe('Cold Hydration Multi-Surface Integration Suite (Step C/D)', () => {
 
     const allOutput = stripVTControlCharacters(stdout.chunks.join(''))
 
-    // Verify every single token appears exactly once in numerical order
-    for (let i = 1; i <= totalMsgs; i++) {
-      const token = `TOKEN_${String(i).padStart(3, '0')}`
-      expect(allOutput).toContain(token)
-    }
+    // Build the matched token sequence from output and assert exact array equality
+    const matchedTokens = Array.from(allOutput.matchAll(/TOKEN_\d{3}/g), m => m[0])
+    const expectedTokens = Array.from({ length: totalMsgs }, (_, i) => `TOKEN_${String(i + 1).padStart(3, '0')}`)
+    expect(matchedTokens).toEqual(expectedTokens)
 
     // Verify exactly 1 begin and 1 end, 0 abort
-    const rawOutput = stdout.chunks.join('')
-    const beginCount = (rawOutput.match(/\x1b\]777;hermes-replay;begin;/g) || []).length
-    const endCount = (rawOutput.match(/\x1b\]777;hermes-replay;end;/g) || []).length
-    const abortCount = (rawOutput.match(/\x1b\]777;hermes-replay;abort;/g) || []).length
+    await vi.waitFor(() => {
+      const rawOutput = stdout.chunks.join('')
+      const endCount = (rawOutput.match(/\x1b\]777;hermes-replay;end;/g) || []).length
+      expect(endCount).toBe(1)
+    })
+
+    const finalRawOutput = stdout.chunks.join('')
+    const beginCount = (finalRawOutput.match(/\x1b\]777;hermes-replay;begin;/g) || []).length
+    const abortCount = (finalRawOutput.match(/\x1b\]777;hermes-replay;abort;/g) || []).length
 
     expect(beginCount).toBe(1)
-    expect(endCount).toBe(1)
     expect(abortCount).toBe(0)
   })
 
-  it('B. Physical handoff flush precedes gateway event barrier release', async () => {
+  it('B. Physical handoff flush precedes gateway event barrier release and held-event dispatch', async () => {
     gw.requestHandlers.set('session.resume', async () => ({
       session_id: 'sess-drain-order',
       status: 'idle',
@@ -276,30 +290,49 @@ describe('Cold Hydration Multi-Surface Integration Suite (Step C/D)', () => {
 
     await vi.waitFor(() => expect(lifecycle).not.toBeNull())
 
-    // Hold the drain on stdout before resume
-    stdout.holdDrain = true
+    // Block physical drain strictly on the append handoff frame
+    stdout.blockDrainPattern = /PAYLOAD_7/
+
+    let handoffWriteSeq = 0
+    stdout.on('drain-held', e => {
+      if (stdout.blockDrainPattern?.test(e.data)) {
+        handoffWriteSeq = e.seq
+      }
+    })
+
     const resumePromise = lifecycle!.resumeById('sess-drain-order')
 
-    // Wait until at least one write has been received while drain is held
+    // Wait until the handoff write is received and held
     await vi.waitFor(() => {
-      expect(stdout.writes.length).toBeGreaterThan(0)
+      expect(handoffWriteSeq).toBeGreaterThan(0)
     })
+
+    // Queue a live gateway event while drain is held
+    gw.emitSessionEvent('sess-drain-order', { event: 'turn.delta', payload: { delta: 'held-typing' } })
 
     // Barrier must NOT be released while drain is held!
     expect(gw.releaseEventBarrier).not.toHaveBeenCalled()
+    expect(gw.dispatchedEvents.length).toBe(0)
 
-    // Now release drain
-    stdout.releaseDrain()
+    // Release drain and capture drain completion sequence
+    const drainReleaseSeq = stdout.releaseDrain()
     await resumePromise
 
     // Barrier is released after drain
     await vi.waitFor(() => {
       expect(gw.releaseEventBarrier).toHaveBeenCalled()
+      expect(gw.dispatchedEvents.length).toBe(1)
     })
 
-    // Assert sequence order: handoff write < releaseDrain < barrier-release
     const barrierReleaseEntry = gw.log.find(l => l.action === 'barrier-release')
     expect(barrierReleaseEntry).toBeDefined()
+    const barrierReleaseSeq = barrierReleaseEntry!.seq
+    const eventDispatchSeq = gw.dispatchedEvents[0].seq
+
+    // Strict invariant: handoff write < drain completion <= barrier release < held event dispatch
+    expect(handoffWriteSeq).toBeLessThan(drainReleaseSeq)
+    expect(drainReleaseSeq).toBeLessThanOrEqual(barrierReleaseSeq)
+    expect(barrierReleaseSeq).toBeLessThan(eventDispatchSeq)
   })
 
   it('C. Gateway held events remain held through static replay and dispatch after barrier release', async () => {
@@ -332,18 +365,32 @@ describe('Cold Hydration Multi-Surface Integration Suite (Step C/D)', () => {
 
     await vi.waitFor(() => expect(lifecycle).not.toBeNull())
 
-    // Start resume
-    const p = lifecycle!.resumeById('sess-events')
+    // Hold handoff drain
+    stdout.blockDrainPattern = /HIST_5/
 
-    // Wait until barrier is activated
-    await vi.waitFor(() => {
-      expect(gw.activateEventBarrier).toHaveBeenCalled()
+    let emittedMidReplay = false
+    stdout.on('write-chunk', chunk => {
+      // Once static bytes for HIST_0 or HIST_1 have been physically written, emit live event
+      if (!emittedMidReplay && chunk.includes('HIST_1')) {
+        emittedMidReplay = true
+        gw.emitSessionEvent('sess-events', { event: 'turn.delta', payload: { delta: 'live-mid-replay' } })
+      }
     })
 
-    // Emit live event while replay is running
-    gw.emitSessionEvent('sess-events', { event: 'turn.delta', payload: { delta: 'live-typing' } })
+    const p = lifecycle!.resumeById('sess-events')
 
-    // Await resume completion
+    // Wait until event is emitted mid-replay and handoff is held
+    await vi.waitFor(() => {
+      expect(emittedMidReplay).toBe(true)
+      expect(stdout.pendingCallbacks.length).toBeGreaterThan(0)
+    })
+
+    // Dispatched events must be strictly 0 while drain is held!
+    expect(gw.dispatchedEvents.length).toBe(0)
+    expect(gw.releaseEventBarrier).not.toHaveBeenCalled()
+
+    // Release drain
+    stdout.releaseDrain()
     await p
 
     // Wait for barrier release
@@ -351,14 +398,19 @@ describe('Cold Hydration Multi-Surface Integration Suite (Step C/D)', () => {
       expect(gw.releaseEventBarrier).toHaveBeenCalled()
     })
 
-    // Dispatched events must have received the held event exactly once
+    // Dispatched events must now have received the held event exactly once
     expect(gw.dispatchedEvents.length).toBe(1)
     expect(gw.dispatchedEvents[0].event.event).toBe('turn.delta')
+    expect(gw.dispatchedEvents[0].event.payload.delta).toBe('live-mid-replay')
   })
 
   it('D. Clean supersession before first static byte does not emit screen clear', async () => {
+    let resolveFirstHistory!: (val: any) => void
     let rejectFirstHistory!: (err: any) => void
-    const historyPromise = new Promise((_, rej) => { rejectFirstHistory = rej })
+    const historyPromiseA = new Promise((res, rej) => {
+      resolveFirstHistory = res
+      rejectFirstHistory = rej
+    })
 
     gw.requestHandlers.set('session.resume', async (p: any) => ({
       session_id: p.session_id,
@@ -368,7 +420,7 @@ describe('Cold Hydration Multi-Surface Integration Suite (Step C/D)', () => {
 
     gw.requestHandlers.set('session.history', async (p: any) => {
       if (p.session_id === 'sess-A') {
-        return historyPromise
+        return historyPromiseA
       }
       return {
         messages: [{ id: 'b-1', role: 'user', text: 'HELLO_B', row_id: 1 }],
@@ -389,27 +441,38 @@ describe('Cold Hydration Multi-Surface Integration Suite (Step C/D)', () => {
 
     await vi.waitFor(() => expect(lifecycle).not.toBeNull())
 
-    // Begin A
+    // Begin A (history remains pending)
     const pA = lifecycle!.resumeById('sess-A')
 
     await vi.waitFor(() => {
       expect(gw.activateEventBarrier).toHaveBeenCalledWith('sess-A', expect.any(String))
     })
 
-    // Simulate network abort / cancellation on sess-A
-    rejectFirstHistory(new Error('Aborted by client'))
+    // Supersede with B while A\'s history is genuinely in-flight
+    const pB = lifecycle!.resumeById('sess-B')
 
-    // Supersede with B BEFORE A produces any static bytes
-    await lifecycle!.resumeById('sess-B')
+    // Verify A\'s barrier was cancelled by supersession
+    await vi.waitFor(() => {
+      expect(gw.cancelEventBarrier).toHaveBeenCalledWith('sess-A', expect.any(String))
+    })
 
-    // Clean abort of A must NOT emit reconstruct screen clear \x1b[2J\x1b[H
-    const outputBeforeB = stdout.chunks.join('')
-    expect(outputBeforeB).not.toContain('\x1b[2J\x1b[H')
+    // Now resolve/reject A\'s pending history
+    rejectFirstHistory(new Error('Hydration cancelled'))
+    await pB
+
+    await vi.waitFor(() => {
+      expect(gw.releaseEventBarrier).toHaveBeenCalledWith('sess-B', expect.any(String))
+    })
+
+    // Clean abort of A before static bytes must NOT emit reconstruct screen clear \x1b[2J\x1b[H
+    const allOutput = stdout.chunks.join('')
+    expect(allOutput).not.toContain('\x1b[2J\x1b[H')
+    expect(stripVTControlCharacters(allOutput)).toContain('HELLO_B')
   })
 
   it('E. Dirty supersession after static output reconstructs terminal dashboard', async () => {
-    let resolveFirstHistory: (val: any) => void
-    const historyPromise = new Promise(res => { resolveFirstHistory = res })
+    let unblockHistoryA!: () => void
+    const historyGateA = new Promise<void>(res => { unblockHistoryA = res })
 
     gw.requestHandlers.set('session.resume', async (p: any) => ({
       session_id: p.session_id,
@@ -449,23 +512,110 @@ describe('Cold Hydration Multi-Surface Integration Suite (Step C/D)', () => {
 
     await vi.waitFor(() => expect(lifecycle).not.toBeNull())
 
-    // Resume A and wait until static output has started
-    await lifecycle!.resumeById('sess-dirty-A')
+    // Hold handoff drain for A so A stays in dirty leased state
+    stdout.blockDrainPattern = /DIRTY_9/
 
-    // Wait until A completes and barrier releases
-    await vi.waitFor(() => {
-      expect(gw.releaseEventBarrier).toHaveBeenCalledWith('sess-dirty-A', expect.any(String))
+    let staticBytesSeen = false
+    stdout.on('write-chunk', chunk => {
+      if (chunk.includes('DIRTY_1')) {
+        staticBytesSeen = true
+      }
     })
 
-    // Now resume B (switching session from dirty scrollback state)
-    await lifecycle!.resumeById('sess-clean-B')
+    // Resume A
+    const pA = lifecycle!.resumeById('sess-dirty-A')
 
-    // Wait until B completes
+    // Wait until static bytes have physically materialized on stdout
+    await vi.waitFor(() => {
+      expect(staticBytesSeen).toBe(true)
+    })
+
+    // Supersede with B while A is dirty and holding lease
+    const pB = lifecycle!.resumeById('sess-clean-B')
+
+    stdout.releaseDrain()
+    await pB
+
     await vi.waitFor(() => {
       expect(gw.releaseEventBarrier).toHaveBeenCalledWith('sess-clean-B', expect.any(String))
     })
 
-    const fullOutput = stripVTControlCharacters(stdout.chunks.join(''))
-    expect(fullOutput).toContain('CLEAN')
+    // Assert that dirty supersession emitted \x1b[2J\x1b[H (terminal clear) and rendered B
+    const fullRawOutput = stdout.chunks.join('')
+    expect(fullRawOutput).toContain('\x1b[2J\x1b[H')
+    const strippedOutput = stripVTControlCharacters(fullRawOutput)
+    console.log('REPR:', JSON.stringify(strippedOutput)); expect(strippedOutput).toContain('CLEAN')
+  })
+
+  it('F. Pending-commit ownership race: supersession claims queued transaction without deadlock', async () => {
+    gw.requestHandlers.set('session.resume', async (p: any) => ({
+      session_id: p.session_id,
+      status: 'idle',
+      messages: []
+    }))
+
+    gw.requestHandlers.set('session.history', async (p: any) => {
+      if (p.session_id === 'sess-pending-A') {
+        return {
+          messages: Array.from({ length: 6 }, (_, i) => ({
+            id: `p-${i}`,
+            role: 'assistant',
+            text: `PENDING_${i}`,
+            row_id: i
+          })),
+          total: 6
+        }
+      }
+      return {
+        messages: [{ id: 'succ-b', role: 'user', text: 'SUCCESSOR_B', row_id: 1 }],
+        total: 1
+      }
+    })
+
+    let lifecycle: ReturnType<typeof useSessionLifecycle> | null = null
+    activeInstance = renderSync(
+      React.createElement(IntegrationHarness, {
+        gw,
+        stdout,
+        coldHydrationMaxMounted: 2,
+        onReady: l => { lifecycle = l }
+      }),
+      { stdout: stdout as any }
+    )
+
+    await vi.waitFor(() => expect(lifecycle).not.toBeNull())
+
+    // Hold drain when PENDING_5 arrives (the handoff frame queued for commit)
+    stdout.blockDrainPattern = /PENDING_5/
+
+    let handoffQueued = false
+    stdout.on('write-chunk', chunk => {
+      if (chunk.includes('PENDING_5')) {
+        handoffQueued = true
+      }
+    })
+
+    const pA = lifecycle!.resumeById('sess-pending-A')
+
+    await vi.waitFor(() => {
+      expect(handoffQueued).toBe(true)
+    })
+
+    // Trigger supersession precisely in the pending-commit window
+    const pB = lifecycle!.resumeById('sess-successor-B')
+
+    stdout.releaseDrain()
+
+    // Must resolve cleanly without deadlock!
+    await pB
+
+    await vi.waitFor(() => {
+      expect(gw.releaseEventBarrier).toHaveBeenCalledWith('sess-successor-B', expect.any(String))
+    })
+
+    const fullRawOutput = stdout.chunks.join('')
+    expect(fullRawOutput).toContain('\x1b[2J\x1b[H')
+    const strippedOutput = stripVTControlCharacters(fullRawOutput)
+    expect(strippedOutput).toContain('SUCCESSOR_B')
   })
 })

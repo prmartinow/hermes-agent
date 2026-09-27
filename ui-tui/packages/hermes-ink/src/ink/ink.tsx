@@ -3005,16 +3005,16 @@ export default class Ink {
       throw new Error('Invalid or unheld main-screen static output lease')
     }
 
+    if (this.isUnmounted) {
+      throw new Error('Ink instance is unmounted')
+    }
+
     if (this.mainScreenLease.layoutInvalid) {
       throw new Error('Cannot hand off: terminal resized after static output, reconstruction required')
     }
 
     if (this.mainScreenLease.modeTransitionRequested) {
       throw new Error('Cannot hand off: alternate-screen transition attempted while leased, reconstruction required')
-    }
-
-    if (this.isUnmounted) {
-      throw new Error('Ink instance is unmounted')
     }
 
     // React tree reconciliation: ensure current React tree is fully committed to rootNode
