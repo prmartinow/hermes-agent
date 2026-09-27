@@ -297,9 +297,29 @@ async def _lifespan(app: "FastAPI"):
     except Exception:
         pass
 
+    # Codex Quota Collector — periodic quota snapshot recording for served profile
+    served_codex_profile = (
+        getattr(app.state, "initial_profile", None)
+        or os.getenv("HERMES_PROFILE")
+        or None
+    )
+    if served_codex_profile:
+        served_codex_profile = str(served_codex_profile).strip() or None
+
+    try:
+        from hermes_cli.codex_quota_collector import start_codex_quota_collector
+        start_codex_quota_collector(profile=served_codex_profile)
+    except Exception:
+        pass
+
     try:
         yield
     finally:
+        try:
+            from hermes_cli.codex_quota_collector import stop_codex_quota_collector
+            stop_codex_quota_collector(profile=served_codex_profile)
+        except Exception:
+            pass
         try:
             from hermes_cli.auth import stop_gemini_quota_watcher_daemon
             stop_gemini_quota_watcher_daemon()

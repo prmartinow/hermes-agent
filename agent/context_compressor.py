@@ -699,16 +699,25 @@ def _classify_summary_failure(e: Exception) -> _SummaryFailureKind:
     """
     status = _exc_status_code(e)
     err = str(e).lower()
+    is_timeout = (
+        isinstance(e, TimeoutError)
+        or isinstance(getattr(e, "__cause__", None), TimeoutError)
+        or "timeout" in type(e).__name__.lower()
+        or status in {408, 429, 502, 504}
+        or "timeout" in err
+        or "timed out" in err
+        or "stalled: no new output" in err
+    )
     return _SummaryFailureKind(
         # Permanent-looking error on a distinct summary model: fall back to main instead of cooldown.
         model_not_found=status in {404, 503}
         or any(m in err for m in ("model_not_found", "does not exist", "no available channel")),
-        timeout=status in {408, 429, 502, 504} or "timeout" in err or "timed out" in err,
+        timeout=is_timeout,
         # Malformed/non-JSON bodies (HTML 502 as application/json) surface as JSONDecodeError or
         # APIResponseValidationError "expecting value"; treat as transient.
         json_decode=isinstance(e, json.JSONDecodeError) or "expecting value" in err,
         # httpx premature-close errors are transient; treat like a timeout, not a 60s cooldown.
-        streaming_closed=_is_connection_error(e),
+        streaming_closed=not is_timeout and _is_connection_error(e),
         # HTTP 200 with empty body from a degraded provider, plus the sibling "no usable response"
         # shapes from _validate_llm_response.
         empty_content=isinstance(e, RuntimeError) and any(

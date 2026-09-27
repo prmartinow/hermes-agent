@@ -208,8 +208,29 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
     ):
         api_content = content
     _msg_disp_meta = msg.get("display_metadata")
-    if role == "assistant" and getattr(agent, "provider", None) in {"gemini-oauth", "gemini_oauth"}:
-        if not isinstance(_msg_disp_meta, dict) or not _msg_disp_meta.get("gemini_account"):
+    if role == "assistant":
+        if isinstance(_msg_disp_meta, str):
+            try:
+                _parsed_meta = json.loads(_msg_disp_meta)
+                if isinstance(_parsed_meta, dict):
+                    _msg_disp_meta = _parsed_meta
+                else:
+                    _msg_disp_meta = {}
+            except Exception:
+                _msg_disp_meta = {}
+        elif isinstance(_msg_disp_meta, dict):
+            _msg_disp_meta = dict(_msg_disp_meta)
+        else:
+            _msg_disp_meta = {}
+
+        _act_model = msg.get("model")
+        _act_provider = msg.get("provider")
+        if _act_model and not _msg_disp_meta.get("model"):
+            _msg_disp_meta["model"] = str(_act_model)
+        if _act_provider and not _msg_disp_meta.get("provider"):
+            _msg_disp_meta["provider"] = str(_act_provider)
+
+        if getattr(agent, "provider", None) in {"gemini-oauth", "gemini_oauth"} and not _msg_disp_meta.get("gemini_account"):
             try:
                 from hermes_cli.auth import get_account_alias
                 pool = getattr(agent, "_credential_pool", None)
@@ -224,24 +245,10 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
                 if raw_lbl:
                     _acc_alias = get_account_alias(raw_lbl)
                     if _acc_alias:
-                        if isinstance(_msg_disp_meta, dict):
-                            _msg_disp_meta = dict(_msg_disp_meta)
-                            _msg_disp_meta["gemini_account"] = _acc_alias
-                        elif isinstance(_msg_disp_meta, str):
-                            try:
-                                _parsed_meta = json.loads(_msg_disp_meta)
-                                if isinstance(_parsed_meta, dict):
-                                    _parsed_meta["gemini_account"] = _acc_alias
-                                    _msg_disp_meta = _parsed_meta
-                                else:
-                                    _msg_disp_meta = {"gemini_account": _acc_alias}
-                            except Exception:
-                                _msg_disp_meta = {"gemini_account": _acc_alias}
-                        else:
-                            _msg_disp_meta = {"gemini_account": _acc_alias}
-                        msg["display_metadata"] = _msg_disp_meta
+                        _msg_disp_meta["gemini_account"] = _acc_alias
             except Exception:
                 pass
+        msg["display_metadata"] = _msg_disp_meta
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
         "role": role, "content": _durable_content(content), "tool_name": msg.get("tool_name"),

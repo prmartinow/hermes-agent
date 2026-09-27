@@ -12,8 +12,10 @@ import {
 import {
   api,
   type CodexPlanPeriod,
+  type CodexQuotaTimelineResponse,
   type CodexUsageHistoryResponse,
 } from "../lib/api";
+import CodexQuotaTimelineView from "./CodexQuotaTimelineView";
 
 export interface CodexUsageHistoryPanelProps {
   mode: "history" | "timeline";
@@ -59,6 +61,9 @@ function formatDuration(minutes: number | null | undefined): string {
 }
 
 export default function CodexUsageHistoryPanel({ mode }: CodexUsageHistoryPanelProps) {
+  const [timelineSource, setTimelineSource] = useState<"persisted" | "provider_plan">("persisted");
+  const [selectedWindow, setSelectedWindow] = useState<"primary" | "secondary">("primary");
+  const [timelineData, setTimelineData] = useState<CodexQuotaTimelineResponse | null>(null);
   const [data, setData] = useState<CodexUsageHistoryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -67,145 +72,266 @@ export default function CodexUsageHistoryPanel({ mode }: CodexUsageHistoryPanelP
     const controller = new AbortController();
     let cancelled = false;
 
-    setData(null);
     setLoading(true);
     setError(null);
 
-    api.getCodexUsageHistory({ days: 7, signal: controller.signal })
-      .then((res) => {
-        if (!cancelled) {
-          setData(res);
-          setLoading(false);
-        }
-      })
-      .catch((err: unknown) => {
-        if (!cancelled) {
-          if (err instanceof DOMException && err.name === "AbortError") {
-            return;
+    if (mode === "timeline" && timelineSource === "persisted") {
+      setTimelineData(null);
+      api.getCodexQuotaTimeline({ days: 7, window_id: selectedWindow, signal: controller.signal })
+        .then((res) => {
+          if (!cancelled) {
+            setTimelineData(res);
+            setLoading(false);
           }
-          if (err && typeof err === "object" && "name" in err && err.name === "AbortError") {
-            return;
+        })
+        .catch((err: unknown) => {
+          if (!cancelled) {
+            if (err instanceof DOMException && err.name === "AbortError") {
+              return;
+            }
+            if (err && typeof err === "object" && "name" in err && err.name === "AbortError") {
+              return;
+            }
+            setError(err instanceof Error ? err.message : "Failed to load OpenAI Codex quota timeline");
+            setLoading(false);
           }
-          setError(err instanceof Error ? err.message : "Failed to load OpenAI Codex usage history");
-          setLoading(false);
-        }
-      });
+        });
+    } else {
+      setData(null);
+      api.getCodexUsageHistory({ days: 7, signal: controller.signal })
+        .then((res) => {
+          if (!cancelled) {
+            setData(res);
+            setLoading(false);
+          }
+        })
+        .catch((err: unknown) => {
+          if (!cancelled) {
+            if (err instanceof DOMException && err.name === "AbortError") {
+              return;
+            }
+            if (err && typeof err === "object" && "name" in err && err.name === "AbortError") {
+              return;
+            }
+            setError(err instanceof Error ? err.message : "Failed to load OpenAI Codex usage history");
+            setLoading(false);
+          }
+        });
+    }
 
     return () => {
       cancelled = true;
       controller.abort();
     };
-  }, [mode]);
+  }, [mode, timelineSource, selectedWindow]);
 
   const tokenBreakdown = data?.daily_token_usage_breakdown;
   const planHistory = data?.plan_limit_history;
 
+  const currentProvider =
+    mode === "timeline" && timelineSource === "persisted"
+      ? timelineData?.provider || "openai-codex"
+      : data?.provider || "openai-codex";
+
+  const currentAccountId =
+    mode === "timeline" && timelineSource === "persisted"
+      ? timelineData?.intervals?.[0]?.account_id || timelineData?.rows?.[0]?.account_id || "unknown"
+      : data?.account_id || "unknown";
+
   return (
     <div className="flex flex-col gap-5 w-full font-mono text-foreground" data-testid="codex-usage-panel">
       {/* Account Scope & Metadata Card */}
-      {data && (
+      {((mode === "timeline" && timelineSource === "persisted" && timelineData) || (data)) && (
         <div className="border border-midground/20 rounded-lg p-4 bg-black/40 flex flex-col gap-3">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-midground/15 pb-3">
-          <div className="flex items-center gap-2">
-            <Cpu className="w-5 h-5 text-purple-400" />
-            <h2 className="text-base font-bold tracking-wide text-foreground uppercase">
-              {data?.provider === "openai-codex" ? "OpenAI Codex" : (data?.provider || "OpenAI Codex")}
-            </h2>
-            <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-purple-500/10 text-purple-300 border border-purple-500/30">
-              {mode === "history" ? "Daily Token Usage" : "Plan Quota Timeline"}
-            </span>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-midground/15 pb-3">
+            <div className="flex items-center gap-2">
+              <Cpu className="w-5 h-5 text-purple-400" />
+              <h2 className="text-base font-bold tracking-wide text-foreground uppercase">
+                {currentProvider === "openai-codex" ? "OpenAI Codex" : currentProvider}
+              </h2>
+              <span className="px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-purple-500/10 text-purple-300 border border-purple-500/30">
+                {mode === "history" ? "Daily Token Usage" : "Plan Quota Timeline"}
+              </span>
+            </div>
+
+            {/* Account Scope Notice */}
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded text-xs ${
+                mode === "timeline" && timelineSource === "persisted"
+                  ? "bg-amber-500/10 border border-amber-500/30 text-amber-300"
+                  : "bg-midground/10 border border-midground/20 text-text-secondary"
+              }`}
+              data-testid="codex-scope-notice"
+            >
+              <Shield className="w-3.5 h-3.5 text-midground shrink-0" />
+              <span className="font-semibold text-foreground">Scope:</span>
+              <span>
+                {mode === "timeline" && timelineSource === "persisted"
+                  ? "Profile-local activity; account match unverified; external usage possible"
+                  : "Account-wide (not Hermes-session-specific)"}
+              </span>
+            </div>
           </div>
 
-          {/* Account Scope Notice */}
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded bg-midground/10 border border-midground/20 text-xs text-text-secondary">
-            <Shield className="w-3.5 h-3.5 text-midground shrink-0" />
-            <span className="font-semibold text-foreground">Scope:</span>
-            <span>Account-wide (not Hermes-session-specific)</span>
-          </div>
-        </div>
+          {/* Freshness & Metadata Details */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+            <div className="flex flex-col">
+              <span className="text-[10px] text-text-secondary/70 uppercase">Account ID</span>
+              <span className="font-mono text-foreground truncate" title={currentAccountId}>
+                {currentAccountId}
+              </span>
+            </div>
 
-        {/* Freshness & Metadata Details */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
-          <div className="flex flex-col">
-            <span className="text-[10px] text-text-secondary/70 uppercase">Account ID</span>
-            <span className="font-mono text-foreground truncate" title={data?.account_id ?? "unknown"}>
-              {data?.account_id || "unknown"}
-            </span>
-          </div>
-
-          <div className="flex flex-col">
-            <span className="text-[10px] text-text-secondary/70 uppercase">Fetched At</span>
-            <span className="font-mono text-foreground">
-              {formatTimestamp(data?.fetched_at)}
-            </span>
-          </div>
-
-          {mode === "history" && tokenBreakdown?.data && (
-            <>
+            {mode === "history" && (
               <div className="flex flex-col">
-                <span className="text-[10px] text-text-secondary/70 uppercase">Data Freshness</span>
+                <span className="text-[10px] text-text-secondary/70 uppercase">Fetched At</span>
                 <span className="font-mono text-foreground">
-                  {formatTimestamp(tokenBreakdown.data.data_freshness_ts)}
+                  {formatTimestamp(data?.fetched_at)}
                 </span>
               </div>
-              <div className="flex flex-col">
-                <span className="text-[10px] text-text-secondary/70 uppercase">Units</span>
-                <span className="font-mono text-foreground">
-                  {tokenBreakdown.data.units || "unknown"}
+            )}
+
+            {mode === "history" && tokenBreakdown?.data && (
+              <>
+                <div className="flex flex-col">
+                  <span className="text-[10px] text-text-secondary/70 uppercase">Data Freshness</span>
+                  <span className="font-mono text-foreground">
+                    {formatTimestamp(tokenBreakdown.data.data_freshness_ts)}
+                  </span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[10px] text-text-secondary/70 uppercase">Units</span>
+                  <span className="font-mono text-foreground">
+                    {tokenBreakdown.data.units || "unknown"}
+                  </span>
+                </div>
+              </>
+            )}
+
+            {mode === "timeline" && timelineSource === "provider_plan" && planHistory?.data && (
+              <>
+                <div className="flex flex-col">
+                  <span className="text-[10px] text-text-secondary/70 uppercase">Fetched At</span>
+                  <span className="font-mono text-foreground">
+                    {formatTimestamp(data?.fetched_at)}
+                  </span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[10px] text-text-secondary/70 uppercase">Data As Of</span>
+                  <span className="font-mono text-foreground">
+                    {formatTimestamp(planHistory.data.data_as_of)}
+                  </span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[10px] text-text-secondary/70 uppercase">Coverage Start</span>
+                  <span className="font-mono text-foreground">
+                    {formatTimestamp(planHistory.data.coverage_start)}
+                  </span>
+                </div>
+              </>
+            )}
+
+            {mode === "timeline" && timelineSource === "persisted" && timelineData && (
+              <>
+                <div className="flex flex-col">
+                  <span className="text-[10px] text-text-secondary/70 uppercase">Window Scope</span>
+                  <span className="font-mono text-purple-300 font-semibold uppercase">
+                    {selectedWindow} Window
+                  </span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[10px] text-text-secondary/70 uppercase">Attribution</span>
+                  <span className="font-mono text-foreground">
+                    {timelineData.attribution_status}
+                  </span>
+                </div>
+                <div className="flex flex-col">
+                  <span className="text-[10px] text-text-secondary/70 uppercase">Intervals</span>
+                  <span className="font-mono text-foreground">
+                    {timelineData.intervals?.length ?? 0} ({timelineData.days}d)
+                  </span>
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* Timeline Coverage Indicators for Provider Plan */}
+          {mode === "timeline" && timelineSource === "provider_plan" && planHistory?.data && (
+            <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-midground/10">
+              {planHistory.data.coverage_complete === false && (
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/30">
+                  <AlertTriangle className="w-3.5 h-3.5" />
+                  Coverage Incomplete
                 </span>
-              </div>
-            </>
+              )}
+              {planHistory.data.coverage_complete === true && (
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  Coverage Complete
+                </span>
+              )}
+              {planHistory.data.approximate === true && (
+                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-bold bg-blue-500/10 text-blue-400 border border-blue-500/30">
+                  <Info className="w-3.5 h-3.5" />
+                  Approximate Data
+                </span>
+              )}
+            </div>
           )}
-
-          {mode === "timeline" && planHistory?.data && (
-            <>
-              <div className="flex flex-col">
-                <span className="text-[10px] text-text-secondary/70 uppercase">Data As Of</span>
-                <span className="font-mono text-foreground">
-                  {formatTimestamp(planHistory.data.data_as_of)}
-                </span>
-              </div>
-              <div className="flex flex-col">
-                <span className="text-[10px] text-text-secondary/70 uppercase">Coverage Start</span>
-                <span className="font-mono text-foreground">
-                  {formatTimestamp(planHistory.data.coverage_start)}
-                </span>
-              </div>
-            </>
-          )}
         </div>
+      )}
 
-        {/* Timeline Coverage Indicators */}
-        {mode === "timeline" && planHistory?.data && (
-          <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-midground/10">
-            {planHistory.data.coverage_complete === false && (
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-bold bg-amber-500/10 text-amber-400 border border-amber-500/30">
-                <AlertTriangle className="w-3.5 h-3.5" />
-                Coverage Incomplete
-              </span>
-            )}
-            {planHistory.data.coverage_complete === true && (
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/30">
-                <CheckCircle2 className="w-3.5 h-3.5" />
-                Coverage Complete
-              </span>
-            )}
-            {planHistory.data.approximate === true && (
-              <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-bold bg-blue-500/10 text-blue-400 border border-blue-500/30">
-                <Info className="w-3.5 h-3.5" />
-                Approximate Data
-              </span>
-            )}
+      {/* Timeline Mode Source Toggle */}
+      {mode === "timeline" && (
+        <div className="flex items-center justify-between gap-3 border border-midground/20 rounded-lg p-3 bg-black/40">
+          <div className="flex items-center gap-2 flex-wrap">
+            <span className="text-xs text-text-secondary font-semibold uppercase tracking-wider">
+              Timeline Source:
+            </span>
+            <div className="inline-flex rounded-md p-0.5 bg-midground/20 border border-midground/20">
+              <button
+                type="button"
+                onClick={() => setTimelineSource("persisted")}
+                data-testid="codex-source-persisted"
+                className={`px-3 py-1 text-xs rounded transition-colors ${
+                  timelineSource === "persisted"
+                    ? "bg-purple-600 text-white font-bold shadow-sm"
+                    : "text-text-secondary hover:text-foreground"
+                }`}
+              >
+                Persisted Quota Timeline
+              </button>
+              <button
+                type="button"
+                onClick={() => setTimelineSource("provider_plan")}
+                data-testid="codex-source-provider-plan"
+                className={`px-3 py-1 text-xs rounded transition-colors ${
+                  timelineSource === "provider_plan"
+                    ? "bg-purple-600 text-white font-bold shadow-sm"
+                    : "text-text-secondary hover:text-foreground"
+                }`}
+              >
+                Provider Plan History (On-demand)
+              </button>
+            </div>
           </div>
-        )}
-      </div>
+          <span className="text-[11px] text-text-secondary hidden sm:inline">
+            {timelineSource === "persisted"
+              ? "Persisted observations & activity correlation"
+              : "On-demand plan quota periods from provider"}
+          </span>
+        </div>
       )}
 
       {/* Loading & Top-Level Error */}
-      {loading && !data && (
+      {loading && !data && !timelineData && (
         <div className="border border-midground/20 rounded-lg p-12 bg-black/30 flex flex-col items-center justify-center gap-3 text-text-secondary">
           <RefreshCw className="w-6 h-6 animate-spin text-purple-400" />
-          <span className="text-xs">Loading OpenAI Codex usage & quota data…</span>
+          <span className="text-xs">
+            {mode === "timeline" && timelineSource === "persisted"
+              ? "Loading OpenAI Codex quota timeline…"
+              : "Loading OpenAI Codex usage & quota data…"}
+          </span>
         </div>
       )}
 
@@ -214,6 +340,20 @@ export default function CodexUsageHistoryPanel({ mode }: CodexUsageHistoryPanelP
           <ShieldAlert className="w-4 h-4 shrink-0" />
           <span>{error}</span>
         </div>
+      )}
+
+      {/* Timeline Mode: Persisted Quota Timeline View */}
+      {mode === "timeline" && timelineSource === "persisted" && (
+        <CodexQuotaTimelineView
+          timelineData={timelineData}
+          loading={loading}
+          error={error}
+          selectedWindow={selectedWindow}
+          onSelectWindow={setSelectedWindow}
+          formatTimestamp={formatTimestamp}
+          formatTokens={formatTokens}
+          formatDuration={formatDuration}
+        />
       )}
 
       {/* History Mode: Daily Token Usage Breakdown */}
@@ -310,8 +450,8 @@ export default function CodexUsageHistoryPanel({ mode }: CodexUsageHistoryPanelP
         </div>
       )}
 
-      {/* Timeline Mode: Plan Limit Windows */}
-      {mode === "timeline" && data && planHistory && (
+      {/* Timeline Mode: On-Demand Provider Plan Limit Windows */}
+      {mode === "timeline" && timelineSource === "provider_plan" && data && planHistory && (
         <div className="border border-midground/20 rounded-lg overflow-hidden bg-black/30">
           {/* Status Banners */}
           {planHistory.status === "unavailable" && (

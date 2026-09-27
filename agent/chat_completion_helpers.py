@@ -1727,6 +1727,12 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
                     msg["display_metadata"] = {"gemini_account": _acc_alias}
             except Exception:
                 msg["display_metadata"] = {"gemini_account": _acc_alias}
+
+    if getattr(agent, "model", None) and "model" not in msg:
+        msg["model"] = agent.model
+    if getattr(agent, "provider", None) and "provider" not in msg:
+        msg["provider"] = agent.provider
+
     return msg
 
 

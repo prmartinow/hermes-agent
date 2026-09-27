@@ -554,9 +554,17 @@ export const api = {
     const qs = params.toString();
     return fetchJSON<GeminiAccountHistoryResponse>(`/api/gemini/account-history${qs ? `?${qs}` : ""}`);
   },
-  getGeminiSessionHistories: (options?: { limit?: number }) => {
+  getGeminiSessionHistories: (options?: {
+    limit?: number;
+    offset?: number;
+    include_subagents?: boolean;
+    scope?: string;
+  }) => {
     const params = new URLSearchParams();
-    if (options?.limit) params.set("limit", String(options.limit));
+    if (options?.limit !== undefined) params.set("limit", String(options.limit));
+    if (options?.offset !== undefined) params.set("offset", String(options.offset));
+    if (options?.include_subagents !== undefined) params.set("include_subagents", String(options.include_subagents));
+    if (options?.scope !== undefined) params.set("scope", options.scope);
     const qs = params.toString();
     return fetchJSON<GeminiSessionHistoriesResponse>(`/api/gemini/session-histories${qs ? `?${qs}` : ""}`);
   },
@@ -570,6 +578,24 @@ export const api = {
   getCodexUsageHistory: (options?: { days?: number; signal?: AbortSignal }) => {
     const days = options?.days ?? 7;
     return fetchJSON<CodexUsageHistoryResponse>(`/api/codex/usage-history?days=${days}`, {
+      signal: options?.signal,
+    });
+  },
+  getCodexQuotaTimeline: (options?: {
+    days?: number;
+    window_id?: "primary" | "secondary" | string;
+    profile?: string;
+    account_id?: string;
+    signal?: AbortSignal;
+  }) => {
+    const days = options?.days ?? 7;
+    const windowId = options?.window_id ?? "primary";
+    const params = new URLSearchParams();
+    params.set("days", String(days));
+    params.set("window_id", windowId);
+    if (options?.profile) params.set("profile", options.profile);
+    if (options?.account_id) params.set("account_id", options.account_id);
+    return fetchJSON<CodexQuotaTimelineResponse>(`/api/codex/quota-timeline?${params.toString()}`, {
       signal: options?.signal,
     });
   },
@@ -2113,9 +2139,9 @@ export interface GeminiAccountEvent {
   session_id?: string | null;
   session_title?: string | null;
   from_account?: string | null;
-  to_account: string;
+  to_account?: string | null;
   from_alias?: string | null;
-  to_alias: string;
+  to_alias?: string | null;
   event_type: string;
   turn_number?: number;
   api_calls?: number;
@@ -2124,6 +2150,11 @@ export interface GeminiAccountEvent {
   tokens_in?: number;
   tokens_out?: number;
   details: string;
+  model?: string | null;
+  models?: string[];
+  provider?: string | null;
+  providers?: string[];
+  model_provenance?: string | null;
 }
 
 export interface GeminiSessionAccountHistory {
@@ -2144,6 +2175,9 @@ export interface GeminiSessionAccountHistory {
 export interface GeminiSessionHistoriesResponse {
   sessions: GeminiSessionAccountHistory[];
   total: number;
+  limit?: number;
+  offset?: number;
+  has_more?: boolean;
 }
 
 export interface GeminiAccountHistoryResponse {
@@ -2250,6 +2284,99 @@ export interface CodexUsageHistoryResponse {
     error: string | null;
     data: CodexDailyTokenUsageBreakdown | null;
   };
+}
+
+export interface CodexActivityCounters {
+  api_call_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cache_tokens?: number;
+  total_tokens?: number;
+}
+
+export interface CodexSessionActivityDelta {
+  session_id: string;
+  model: string;
+  task: string;
+  status: string;
+  is_discontinuity: boolean;
+  has_baseline: boolean;
+  activity_scope?: string;
+  confirmed_same_account?: boolean;
+  baseline_counters: CodexActivityCounters | null;
+  current_counters: CodexActivityCounters | null;
+  delta_counters: CodexActivityCounters | null;
+  reason: string | null;
+}
+
+export interface CodexCheckpointDelta {
+  account_id: string;
+  start_checkpoint_id: string | null;
+  end_checkpoint_id: string | null;
+  start_observed_at: number | null;
+  end_observed_at: number;
+  status: string;
+  has_baseline: boolean;
+  has_discontinuity: boolean;
+  attribution_status?: string;
+  external_usage_possible?: boolean;
+  activity_scope?: string;
+  confirmed_same_account?: boolean;
+  total_delta: CodexActivityCounters | null;
+  known_delta: CodexActivityCounters;
+  discontinuity_reasons: string[];
+  session_deltas: CodexSessionActivityDelta[];
+}
+
+export interface CodexQuotaSnapshotRow {
+  id: number;
+  observation_id: string;
+  observed_at: number;
+  time_label: string;
+  account_id: string;
+  status: string;
+  error_code: string | null;
+  plan_type: string | null;
+  primary_used_percent: number | null;
+  primary_reset_at: number | null;
+  primary_window_seconds: number | null;
+  secondary_used_percent: number | null;
+  secondary_reset_at: number | null;
+  secondary_window_seconds: number | null;
+  created_at: number;
+}
+
+export interface CodexQuotaInterval {
+  account_id: string;
+  window_id: string;
+  start_time: number;
+  end_time: number;
+  duration_seconds: number;
+  start_used_percent: number | null;
+  end_used_percent: number | null;
+  delta_used_percent: number | null;
+  start_reset_at: number | null;
+  end_reset_at: number | null;
+  reset_at_changed: boolean;
+  kind: string;
+  status: string;
+  description: string;
+  checkpoint_delta: CodexCheckpointDelta;
+}
+
+export interface CodexQuotaTimelineResponse {
+  provider: "openai-codex" | string;
+  days: number;
+  attribution_status: string;
+  external_usage_possible: boolean;
+  activity_scope: string;
+  confirmed_same_account: boolean;
+  rows: CodexQuotaSnapshotRow[];
+  snapshots: CodexQuotaSnapshotRow[];
+  intervals: CodexQuotaInterval[];
+  checkpoint_deltas: CodexCheckpointDelta[];
 }
 
 export interface SessionInfo {

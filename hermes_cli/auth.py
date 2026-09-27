@@ -2788,7 +2788,12 @@ def list_account_events(session_id: str | None = None, limit: int = 50, offset: 
     return {"events": results, "total": total, "limit": limit, "offset": offset}
 
 
-def list_gemini_session_histories(limit: int = 100) -> dict:
+def list_gemini_session_histories(
+    limit: int = 100,
+    offset: int = 0,
+    include_subagents: bool = True,
+    scope: str = "all",
+) -> dict:
     """Return sessions with their nested Gemini account change history."""
     import sqlite3
     import json
@@ -2799,6 +2804,31 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
     out = []
     conn = None
     try:
+        if hasattr(limit, "default"):
+            limit = limit.default
+        if hasattr(offset, "default"):
+            offset = offset.default
+        if hasattr(include_subagents, "default"):
+            include_subagents = include_subagents.default
+        if hasattr(scope, "default"):
+            scope = scope.default
+
+        try:
+            limit = max(1, min(int(limit), 500))
+        except (TypeError, ValueError):
+            limit = 100
+        try:
+            offset = max(0, int(offset))
+        except (TypeError, ValueError):
+            offset = 0
+
+        if isinstance(include_subagents, str):
+            include_subagents = include_subagents.lower() not in {"0", "false", "no", "off"}
+        else:
+            include_subagents = bool(include_subagents)
+
+        scope = (str(scope or "all")).strip().lower()
+
         db_path = get_hermes_home() / "state.db"
         conn = sqlite3.connect(str(db_path), timeout=5.0)
         conn.row_factory = sqlite3.Row
@@ -2819,7 +2849,22 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
             )
         """)
 
-        cursor.execute("""
+        where_clauses = []
+        params = []
+
+        if not include_subagents:
+            where_clauses.append("s.parent_session_id IS NULL")
+
+        if scope == "gemini":
+            where_clauses.append("(s.model LIKE '%gemini%' OR s.id IN (SELECT DISTINCT session_id FROM gemini_account_events WHERE session_id IS NOT NULL))")
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        cursor.execute(f"SELECT COUNT(*) FROM sessions s {where_sql}", tuple(params))
+        count_row = cursor.fetchone()
+        total = count_row[0] if count_row else 0
+
+        cursor.execute(f"""
             SELECT 
                 s.id,
                 s.title,
@@ -2832,10 +2877,10 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
                 (SELECT COUNT(*) FROM messages WHERE session_id = s.id AND role = 'user') as user_turns,
                 (SELECT substr(content, 1, 60) FROM messages WHERE session_id = s.id AND role = 'user' LIMIT 1) as first_prompt
             FROM sessions s
-            WHERE s.model LIKE '%gemini%' OR s.id IN (SELECT DISTINCT session_id FROM gemini_account_events WHERE session_id IS NOT NULL)
+            {where_sql}
             ORDER BY s.started_at DESC
-            LIMIT ?
-        """, (limit,))
+            LIMIT ? OFFSET ?
+        """, tuple(params) + (limit, offset))
         sessions_raw = cursor.fetchall()
 
         # Load explicit account events
@@ -2920,6 +2965,34 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
             turn_idx = 0
             current_turn = None
 
+            def _finalize_turn(turn_dict):
+                if not turn_dict:
+                    return
+                t_models = turn_dict.pop("_turn_models", [])
+                t_providers = turn_dict.pop("_turn_providers", [])
+                distinct_models = list(dict.fromkeys(t_models))
+                distinct_providers = list(dict.fromkeys(t_providers))
+
+                turn_dict["models"] = distinct_models
+                turn_dict["providers"] = distinct_providers
+
+                if len(distinct_models) == 1:
+                    turn_dict["model"] = distinct_models[0]
+                    turn_dict["model_provenance"] = "message_metadata"
+                elif len(distinct_models) > 1:
+                    turn_dict["model"] = "mixed"
+                    turn_dict["model_provenance"] = "mixed"
+                else:
+                    turn_dict["model"] = None
+                    turn_dict["model_provenance"] = "unknown"
+
+                if len(distinct_providers) == 1:
+                    turn_dict["provider"] = distinct_providers[0]
+                elif len(distinct_providers) > 1:
+                    turn_dict["provider"] = "mixed"
+                else:
+                    turn_dict["provider"] = None
+
             # Add initial pin if recorded
             for e in events_raw:
                 if e["session_id"] == sid and e["event_type"] in {"session_pin", "initial_pin"}:
@@ -2961,6 +3034,7 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
 
                     turn_idx += 1
                     if current_turn:
+                        _finalize_turn(current_turn)
                         timeline.append(current_turn)
 
                     acc_alias = get_account_alias(str(gem_acc).strip()) if gem_acc else None
@@ -2976,6 +3050,8 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
                         "api_calls": 0,
                         "tools_used": [],
                         "details": prompt_txt,
+                        "_turn_models": [],
+                        "_turn_providers": [],
                     }
                 elif current_turn:
                     if role == "assistant":
@@ -2986,10 +3062,17 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
                             if acc_alias:
                                 current_turn["to_alias"] = acc_alias
                                 current_turn["to_account"] = acc_str
+                        msg_model = msg_meta.get("model")
+                        msg_provider = msg_meta.get("provider")
+                        if msg_model:
+                            current_turn["_turn_models"].append(str(msg_model))
+                        if msg_provider:
+                            current_turn["_turn_providers"].append(str(msg_provider))
                     if tool_name and tool_name not in current_turn["tools_used"]:
                         current_turn["tools_used"].append(tool_name)
 
             if current_turn:
+                _finalize_turn(current_turn)
                 timeline.append(current_turn)
 
             # Interleave rotation events from logs (deduped against existing pins/switches)
@@ -3068,7 +3151,15 @@ def list_gemini_session_histories(limit: int = 100) -> dict:
             except Exception:
                 pass
 
-    return {"sessions": out, "total": len(out)}
+    total_val = total if "total" in locals() else len(out)
+    has_more = (offset + len(out)) < total_val
+    return {
+        "sessions": out,
+        "total": total_val,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+    }
 
 
 def _persist_session_gemini_account(db, sid: str, account: str, sess: dict | None = None) -> None:
