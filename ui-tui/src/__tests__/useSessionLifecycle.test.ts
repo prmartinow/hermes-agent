@@ -264,7 +264,12 @@ describe('sessionKey tracking in useSessionLifecycle', () => {
     process.env.HERMES_TUI_ACTIVE_SESSION_FILE = activeFilePath
   })
 
+  let activeInstance: any = null
+
   afterEach(() => {
+    activeInstance?.unmount()
+    activeInstance?.cleanup()
+    activeInstance = null
     delete process.env.HERMES_TUI_ACTIVE_SESSION_FILE
     if (dir) {
       rmSync(dir, { force: true, recursive: true })
@@ -325,7 +330,7 @@ describe('sessionKey tracking in useSessionLifecycle', () => {
       return null
     })
 
-    renderSync(React.createElement(Harness, {
+    activeInstance = renderSync(React.createElement(Harness, {
       onReady: s => { lifecycle = s },
       opts: { rpc }
     }))
@@ -361,7 +366,7 @@ describe('sessionKey tracking in useSessionLifecycle', () => {
       })
     }
 
-    renderSync(React.createElement(Harness, {
+    activeInstance = renderSync(React.createElement(Harness, {
       onReady: s => { lifecycle = s },
       opts: { gw: gw as any, recoverSessionKeyRef, rpc }
     }))
@@ -394,7 +399,7 @@ describe('sessionKey tracking in useSessionLifecycle', () => {
       })
     }
 
-    renderSync(React.createElement(Harness, {
+    activeInstance = renderSync(React.createElement(Harness, {
       onReady: s => { lifecycle = s },
       opts: { gw: gw as any, recoverSessionKeyRef, rpc }
     }))
@@ -422,7 +427,7 @@ describe('sessionKey tracking in useSessionLifecycle', () => {
       })
     }
 
-    renderSync(React.createElement(Harness, {
+    activeInstance = renderSync(React.createElement(Harness, {
       onReady: s => { lifecycle = s },
       opts: { gw: gw as any }
     }))

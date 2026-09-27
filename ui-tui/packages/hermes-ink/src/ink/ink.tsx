@@ -3028,6 +3028,11 @@ export default class Ink {
 
     this.mainScreenLease = null
     this.isPaused = false
+
+    if (this.renderRequestedWhilePaused) {
+      this.renderRequestedWhilePaused = false
+      this.scheduleRender()
+    }
   }
 
   async waitUntilExit(): Promise<void> {

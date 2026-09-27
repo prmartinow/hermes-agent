@@ -25,14 +25,26 @@ interface HistoryPageResult {
   has_more?: boolean
 }
 
+export interface ColdHistoryOutput {
+  beginStaticAppendSurface(): Promise<void>
+  write(data: string | Uint8Array): Promise<void>
+  getColumns(): number
+}
+
+export function normalizeTerminalLines(value: string): string {
+  const normalized = value.replace(/\r?\n/g, '\r\n')
+  return normalized.endsWith('\r\n') ? normalized : `${normalized}\r\n`
+}
+
 export interface ColdHydrationOptions {
   gateway: {
     request: <T = unknown>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
   }
   sessionId: string
-  cols: number
   theme: any
   info?: SessionInfo | null
+  output?: ColdHistoryOutput
+  cols?: number
   stdout?: NodeJS.WriteStream
   maxMounted?: number
   onProgress?: (materialized: number, snapshotMax?: number) => void
@@ -47,26 +59,29 @@ export interface ColdHydrationResult {
   appendedToScrollback: boolean
 }
 
-async function writeWithBackpressure(out: NodeJS.WriteStream, data: string): Promise<void> {
-  if (!out.write(data)) {
-    await new Promise(resolve => out.once('drain', resolve))
-  }
-}
-
 export async function performColdHistoryHydration(
   opts: ColdHydrationOptions
 ): Promise<ColdHydrationResult> {
   const {
     gateway,
     sessionId,
-    cols,
     theme,
     info,
-    stdout = process.stdout,
     maxMounted = 120,
     onProgress,
     timeSliceMs = 20
   } = opts
+
+  const output: ColdHistoryOutput = opts.output ?? {
+    beginStaticAppendSurface: async () => {},
+    write: async (data: string | Uint8Array) => {
+      const out = opts.stdout ?? process.stdout
+      if (!out.write(data)) {
+        await new Promise(resolve => out.once('drain', resolve))
+      }
+    },
+    getColumns: () => opts.cols ?? process.stdout.columns ?? 80
+  }
 
   let cursor = 0
   let snapshotToken: string | null = null
@@ -75,7 +90,9 @@ export async function performColdHistoryHydration(
   let materializedCount = 0
   let appendedToScrollback = false
   const deque: Msg[] = []
-  const bodyCols = Math.max(1, cols - 2)
+
+  let staticCols: number | null = null
+  const getStaticCols = () => (staticCols ??= output.getColumns())
 
   let sliceStart = performance.now()
 
@@ -119,28 +136,30 @@ export async function performColdHistoryHydration(
       }
     }
 
-    // While deque exceeds maxMounted, pop oldest messages and serialize to stdout
+    // While deque exceeds maxMounted, pop oldest messages and serialize to static output
     while (deque.length > maxMounted) {
       if (opts.isCancelled?.()) throw new ColdHydrationCancelledError()
       if (!appendedToScrollback) {
         appendedToScrollback = true
-        process.env.HERMES_TUI_INITIAL_RENDER_MODE = 'append-to-existing-scrollback'
+        await output.beginStaticAppendSurface()
 
         // Materialize Banner & SessionPanel once at line 0
         if (info) {
+          const lockedCols = getStaticCols()
+          const lockedBodyCols = Math.max(1, lockedCols - 2)
           const intro = introMsg(info)
           const introAnsi = renderNodeToAnsi(
             React.createElement(TranscriptRowView, {
-              cols,
-              bodyCols,
+              cols: lockedCols,
+              bodyCols: lockedBodyCols,
               msg: intro,
               theme,
               sid: sessionId
             }),
-            cols
+            lockedCols
           )
           if (introAnsi) {
-            await writeWithBackpressure(stdout, introAnsi + '\n')
+            await output.write(normalizeTerminalLines(introAnsi))
           }
         }
       }
@@ -148,22 +167,24 @@ export async function performColdHistoryHydration(
       const msg = deque.shift()!
       materializedCount++
 
+      const lockedCols = getStaticCols()
+      const lockedBodyCols = Math.max(1, lockedCols - 2)
       const ansi = renderNodeToAnsi(
         React.createElement(TranscriptRowView, {
-          cols,
-          bodyCols,
+          cols: lockedCols,
+          bodyCols: lockedBodyCols,
           msg,
           theme,
           sid: sessionId
         }),
-        cols
+        lockedCols
       )
 
       if (opts.isCancelled?.()) {
         throw new ColdHydrationCancelledError()
       }
       if (ansi) {
-        await writeWithBackpressure(stdout, ansi + '\n')
+        await output.write(normalizeTerminalLines(ansi))
       }
 
       onProgress?.(materializedCount, totalMessages ?? undefined)

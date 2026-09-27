@@ -907,14 +907,16 @@ export function TextInput({
   const hideHardwareCursor = focus && !!stdout?.isTTY && (!!selected || !termFocus || placeholderShowing)
 
   useEffect(() => {
-    if (!hideHardwareCursor || !stdout) {
+    if (!hideHardwareCursor || !stdout || Ink.isMainScreenStaticOutputLeased(stdout)) {
       return
     }
 
     stdout.write('\x1b[?25l')
 
     return () => {
-      stdout.write('\x1b[?25h')
+      if (!Ink.isMainScreenStaticOutputLeased(stdout)) {
+        stdout.write('\x1b[?25h')
+      }
     }
   }, [hideHardwareCursor, stdout])
 
@@ -1130,7 +1132,13 @@ export function TextInput({
   }
 
   const canFastEchoBase = () =>
-    supportsFastEchoTerminal() && focus && termFocus && !selected && !mask && !!stdout?.isTTY
+    supportsFastEchoTerminal() &&
+    focus &&
+    termFocus &&
+    !selected &&
+    !mask &&
+    !!stdout?.isTTY &&
+    !Ink.isMainScreenStaticOutputLeased(stdout)
 
   const canFastAppend = (current: string, cursor: number, text: string) =>
     canFastEchoBase() &&

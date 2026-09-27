@@ -36,8 +36,10 @@ describe('cold hydration incomplete recovery & cancellation consistency', () => 
     resetTurnState()
     turnController.fullReset()
     stdoutWrites = []
-    stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any) => {
+    stdoutSpy = vi.spyOn(process.stdout, 'write').mockImplementation((chunk: any, ...args: any[]) => {
       stdoutWrites.push(String(chunk))
+      const cb = args.find(a => typeof a === 'function')
+      if (cb) cb()
       return true
     })
   })
@@ -214,8 +216,8 @@ describe('cold hydration incomplete recovery & cancellation consistency', () => 
     await lifecycle!.resumeById('session-upgrade-1')
     await vi.waitFor(() => {
       expect(lifecycle!.coldHydrationIncompleteRef.current).toBe('session-upgrade-1')
+      expect(historyCalls.length).toBe(1)
     })
-    expect(historyCalls.length).toBe(1)
 
     // Allow history to succeed on second attempt
     failHistory = false

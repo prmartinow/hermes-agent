@@ -2,7 +2,12 @@ import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 
 import type { ScrollBoxHandle } from '@hermes/ink'
-import { evictInkCaches, writeAfterRender } from '@hermes/ink'
+import {
+  evictInkCaches,
+  writeAfterRender,
+  acquireMainScreenStaticOutput,
+  type MainScreenStaticOutputLease
+} from '@hermes/ink'
 import type { InflightTurn, SessionResumeResult, Usage } from '@hermes/shared/gateway-events'
 import { type RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 
@@ -10,7 +15,22 @@ import { INLINE_MODE, DASHBOARD_TUI_MODE } from '../config/env.js'
 
 import { buildSetupRequiredSections, SETUP_REQUIRED_TITLE } from '../content/setup.js'
 import { introMsg, toTranscriptMessages } from '../domain/messages.js'
-import { performColdHistoryHydration, ColdHydrationCancelledError } from './coldHistoryHydration.js'
+import {
+  performColdHistoryHydration,
+  ColdHydrationCancelledError,
+  type ColdHistoryOutput
+} from './coldHistoryHydration.js'
+
+export interface ActiveColdOutputTransaction {
+  attemptId: string
+  sid: string
+  durableKey: string
+  lease: MainScreenStaticOutputLease
+  boundaryGeneration: string | null
+  staticOutputStarted: boolean
+  hydrationPromise: Promise<unknown> | null
+  appendedToScrollback?: boolean
+}
 import { ZERO } from '../domain/usage.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
@@ -229,8 +249,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   const resumeAttemptRef = useRef<string | null>(null)
   const replayGeneration = useRef<string | null>(null)
   const activeReplayBoundaryRef = useRef<{ attemptId: string; generation: string } | null>(null)
-  const [replayCommitted, setReplayCommitted] = useState<string | null>(null)
-  const pendingColdCommitRef = useRef<{ attemptId: string; boundaryGeneration: string | null; sid: string } | null>(null)
+  const [replayCommitted, setReplayCommitted] = useState<{ generation: string; replaceFrame: boolean } | null>(null)
+  const activeColdOutputRef = useRef<ActiveColdOutputTransaction | null>(null)
+  const pendingColdCommitRef = useRef<ActiveColdOutputTransaction | null>(null)
   const activeColdBarrierRef = useRef<{ attemptId: string; sid: string } | null>(null)
   const [coldCommitGeneration, setColdCommitGeneration] = useState<string | null>(null)
   const localColdHydrationIncompleteRef = useRef<string | null>(null)
@@ -254,19 +275,26 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     if (pending) {
       pendingColdCommitRef.current = null
       gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
+      void pending.lease.abort()
     }
     const active = activeColdBarrierRef.current
     if (active) {
       activeColdBarrierRef.current = null
       gw?.cancelEventBarrier?.(active.sid, active.attemptId)
     }
+    const tx = activeColdOutputRef.current
+    if (tx) {
+      activeColdOutputRef.current = null
+      void tx.lease.abort()
+    }
   }, [gw])
 
   useLayoutEffect(() => {
     const pending = pendingColdCommitRef.current
     if (!pending) return
+    pendingColdCommitRef.current = null
+
     if (pending.attemptId !== resumeAttemptRef.current) {
-      pendingColdCommitRef.current = null
       clearActiveColdBarrier(pending.attemptId, pending.sid)
       gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
       const boundary = activeReplayBoundaryRef.current
@@ -274,16 +302,36 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         activeReplayBoundaryRef.current = null
         process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
       }
+      void pending.lease.abort()
       return
     }
-    pendingColdCommitRef.current = null
-    clearActiveColdBarrier(pending.attemptId, pending.sid)
-    gw?.releaseEventBarrier?.(pending.sid, pending.attemptId)
-    coldHydrationIncompleteRef.current = null
-    if (pending.boundaryGeneration) {
-      setReplayCommitted(pending.boundaryGeneration)
-    }
-  }, [clearActiveColdBarrier, coldCommitGeneration, gw])
+
+    void (async () => {
+      try {
+        if (pending.appendedToScrollback) {
+          pending.lease.prepareAppendHandoff()
+        }
+        await pending.lease.release()
+      } catch (err) {
+        console.error('Lease release failed in finalizeColdCommit:', err)
+      }
+
+      if (pending.attemptId !== resumeAttemptRef.current) {
+        return
+      }
+
+      if (activeColdOutputRef.current === pending) {
+        activeColdOutputRef.current = null
+      }
+
+      clearActiveColdBarrier(pending.attemptId, pending.sid)
+      gw?.releaseEventBarrier?.(pending.sid, pending.attemptId)
+      coldHydrationIncompleteRef.current = null
+      if (pending.boundaryGeneration) {
+        setReplayCommitted({ generation: pending.boundaryGeneration, replaceFrame: false })
+      }
+    })()
+  }, [clearActiveColdBarrier, coldCommitGeneration, gw, coldHydrationIncompleteRef])
 
   useEffect(() => {
     return () => {
@@ -292,9 +340,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   }, [supersedeColdHydration])
 
   useLayoutEffect(() => {
-    if (replayCommitted && replayCommitted === replayGeneration.current) {
+    if (replayCommitted && replayCommitted.generation === replayGeneration.current) {
       activeReplayBoundaryRef.current = null
-      writeAfterRender(`\x1b]777;hermes-replay;end;${replayCommitted}\x07`, process.stdout, true)
+      writeAfterRender(`\x1b]777;hermes-replay;end;${replayCommitted.generation}\x07`, process.stdout, replayCommitted.replaceFrame)
     }
   }, [replayCommitted])
 
@@ -503,6 +551,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           cancelResumeScrollRef.current = scheduleResumeScrollToBottom(scrollRef)
         })
         .catch((e: Error) => {
+
           sys(`error: ${e.message}`)
           patchUiState({ status: 'ready' })
         })
@@ -635,9 +684,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             const isColdHydration = !isTransportRecovery && !isGapRecovery && INLINE_MODE
 
             if (isColdHydration) {
-              coldHydrationIncompleteRef.current = String(durableKey || r.session_id || id)
-              resetSession()
-              setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
+              const durableKeyStr = String(durableKey || r.session_id || id)
+              coldHydrationIncompleteRef.current = durableKeyStr
 
               const previous = activeColdBarrierRef.current
               if (previous && previous.attemptId !== attemptId) {
@@ -647,43 +695,108 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               gw?.activateEventBarrier?.(r.session_id, attemptId)
               activeColdBarrierRef.current = { attemptId, sid: r.session_id }
 
-              performColdHistoryHydration({
-                gateway: gw,
-                sessionId: r.session_id,
-                cols: colsRef.current,
-                theme: getUiState().theme,
-                info,
-                stdout: process.stdout,
-                isCancelled: () => resumeAttemptRef.current !== attemptId
-              }).then(hydration => {
+              void (async () => {
+                let lease: MainScreenStaticOutputLease
+                try {
+                  lease = await acquireMainScreenStaticOutput(process.stdout)
+                } catch (err) {
+                  clearActiveColdBarrier(attemptId, r.session_id)
+                  gw?.cancelEventBarrier?.(r.session_id, attemptId)
+                  console.error('Failed to acquire main-screen static output lease:', err)
+                  return
+                }
+
                 if (resumeAttemptRef.current !== attemptId) {
                   clearActiveColdBarrier(attemptId, r.session_id)
                   gw?.cancelEventBarrier?.(r.session_id, attemptId)
+                  void lease.abort()
                   return
                 }
-                const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
-                // 1. Commit live tail to React state first
-                setHistoryItems(resumed)
-                setViewportMeta(r.viewport ?? null)
-                // 2. Queue commit acknowledgement: useLayoutEffect releases barrier and finishes replay after React commits this frame
-                pendingColdCommitRef.current = { attemptId, boundaryGeneration: generation, sid: r.session_id }
-                setColdCommitGeneration(attemptId)
-              }).catch(err => {
-                clearActiveColdBarrier(attemptId, r.session_id)
-                if (resumeAttemptRef.current !== attemptId) {
+
+                if (generation) {
+                  process.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
+                  activeReplayBoundaryRef.current = { attemptId, generation }
+                }
+
+                resetSession()
+                setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
+                writeActiveSessionFile(durableKey)
+                patchUiState({
+                  busy: running,
+                  info,
+                  sessionKey: durableKey,
+                  sid: r.session_id,
+                  status: statusFromLiveSession(r.status ?? undefined, running),
+                  storedSid,
+                  usage: usageFrom(info)
+                })
+
+                const tx: ActiveColdOutputTransaction = {
+                  attemptId,
+                  sid: r.session_id,
+                  durableKey: durableKeyStr,
+                  lease,
+                  boundaryGeneration: generation,
+                  staticOutputStarted: false,
+                  hydrationPromise: null
+                }
+                activeColdOutputRef.current = tx
+
+                const coldOutput: ColdHistoryOutput = {
+                  getColumns: () => colsRef.current,
+                  beginStaticAppendSurface: async () => {
+                    tx.staticOutputStarted = true
+                    await lease.beginStaticAppendSurface()
+                  },
+                  write: data => lease.write(data)
+                }
+
+                const hydrationPromise = performColdHistoryHydration({
+                  gateway: gw,
+                  sessionId: r.session_id,
+                  theme: getUiState().theme,
+                  info,
+                  output: coldOutput,
+                  isCancelled: () => resumeAttemptRef.current !== attemptId
+                })
+                tx.hydrationPromise = hydrationPromise
+
+                try {
+                  const hydration = await hydrationPromise
+                  if (resumeAttemptRef.current !== attemptId) {
+                    clearActiveColdBarrier(attemptId, r.session_id)
+                    gw?.cancelEventBarrier?.(r.session_id, attemptId)
+                    void lease.abort()
+                    return
+                  }
+                  tx.appendedToScrollback = hydration.appendedToScrollback
+                  const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
+                  // 1. Commit live tail to React state first
+                  setHistoryItems(resumed)
+                  setViewportMeta(r.viewport ?? null)
+                  // 2. Queue commit acknowledgement: useLayoutEffect releases lease and barrier after React commits this frame
+                  pendingColdCommitRef.current = tx
+                  setColdCommitGeneration(attemptId)
+                } catch (err) {
+                  clearActiveColdBarrier(attemptId, r.session_id)
                   gw?.cancelEventBarrier?.(r.session_id, attemptId)
-                  return
+                  if (activeColdOutputRef.current === tx) {
+                    activeColdOutputRef.current = null
+                  }
+                  void lease.abort()
+                  if (resumeAttemptRef.current !== attemptId) {
+                    return
+                  }
+                  if (err instanceof ColdHydrationCancelledError) {
+                    return
+                  }
+                  const boundary = activeReplayBoundaryRef.current
+                  if (boundary?.attemptId === attemptId) {
+                    activeReplayBoundaryRef.current = null
+                    process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
+                  }
                 }
-                gw?.cancelEventBarrier?.(r.session_id, attemptId)
-                if (err instanceof ColdHydrationCancelledError) {
-                  return
-                }
-                const boundary = activeReplayBoundaryRef.current
-                if (boundary?.attemptId === attemptId) {
-                  activeReplayBoundaryRef.current = null
-                  process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
-                }
-              })
+              })()
             } else if (!isTransportRecovery) {
               resetSession()
               setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())
@@ -693,7 +806,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
               setHistoryItems(info ? [introMsg(info), ...resumed] : resumed)
               setViewportMeta(r.viewport ?? null)
-              setReplayCommitted(generation)
+              setReplayCommitted(generation ? { generation, replaceFrame: true } : null)
               coldHydrationIncompleteRef.current = null
             } else {
               // Transport recovery fast path: historyItems are already preserved!
@@ -704,7 +817,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   return inflightMsgs.length > 0 ? [...prev, ...inflightMsgs] : prev
                 })
               }
-              setReplayCommitted(generation)
+              setReplayCommitted(generation ? { generation, replaceFrame: true } : null)
             }
             writeActiveSessionFile(durableKey)
             patchUiState({
