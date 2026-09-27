@@ -3687,6 +3687,7 @@ def _prepare_same_provider_retry(
     max_tokens: Optional[int], tools: Optional[list], effective_timeout: float,
     effective_extra_body: dict, reasoning_config: Optional[dict], async_mode: bool,
     extra_headers: Optional[Dict[str, str]] = None,
+    no_progress_timeout: Optional[float] = None,
 ) -> Tuple[Any, Dict[str, Any]]:
     """Rebuild (client, request kwargs) for a same-provider retry after credential recovery."""
     if task == "vision":
@@ -3705,11 +3706,19 @@ def _prepare_same_provider_retry(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
     retry_base = str(getattr(retry_client, "base_url", "") or "")
+    if no_progress_timeout is None and task:
+        no_progress_timeout = _get_task_no_progress_timeout(task)
+    is_codex = isinstance(retry_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) or (
+        str(effective_provider or resolved_provider or "").strip().lower() in {"openai-codex", "codex", "openai_codex"}
+        or resolved_api_mode == "codex_responses"
+    )
+    effective_no_progress = no_progress_timeout if is_codex else None
     retry_kwargs = _build_call_kwargs(
         effective_provider or resolved_provider, retry_model or final_model, messages,
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url, task=task,
+        no_progress_timeout=effective_no_progress,
     )
     # Preserve per-request attribution headers (e.g. Copilot ``x-initiator``) so the retry keeps capability gating.
     if extra_headers:
@@ -3933,6 +3942,21 @@ def _fallback_destination(
     )
 
 
+def _is_codex_destination(destination: Optional[_FallbackDestination], client: Optional[Any] = None) -> bool:
+    """True when destination or client targets a Codex Responses-API route."""
+    if client is not None and isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
+        return True
+    if destination is None:
+        return False
+    if getattr(destination, "api_mode", None) == "codex_responses":
+        return True
+    prov = str(getattr(destination, "provider", "") or "").strip().lower()
+    if prov in {"openai-codex", "codex", "openai_codex"}:
+        return True
+    from agent.codex_responses_adapter import classify_responses_route
+    return classify_responses_route(destination).is_codex_backend
+
+
 def _replan_synchronous_cache_sections(
     messages: list, tools: Optional[list], *, destination: _FallbackDestination
 ) -> tuple[list, list]:
@@ -3951,6 +3975,7 @@ def _fallback_request_kwargs(
     tools: Optional[list], temperature: Optional[float], max_tokens: Optional[int],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
     fallback_entry: dict, task_config: dict, apply_fast_lane: bool,
+    client: Optional[Any] = None, no_progress_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap)."""
     fallback_max_tokens, fallback_extra_body = max_tokens, effective_extra_body
@@ -3962,10 +3987,15 @@ def _fallback_request_kwargs(
             leak_guard_config=task_config, max_tokens=max_tokens, extra_body=effective_extra_body,
         )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(messages, tools, destination=destination)
+    if no_progress_timeout is None and task:
+        no_progress_timeout = _get_task_no_progress_timeout(task)
+    is_codex = _is_codex_destination(destination, client=client)
+    effective_no_progress = no_progress_timeout if is_codex else None
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task)
+        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task,
+        no_progress_timeout=effective_no_progress)
     return fb_kwargs
 
 
@@ -4000,9 +4030,9 @@ def _plan_fallback_candidate(
             provider, destination.base_url or str(getattr(client, "base_url", "") or ""),
             destination.api_mode, model or destination.model,
         )
-        return retry_destination, _fallback_request_kwargs(retry_destination, **common)
+        return retry_destination, _fallback_request_kwargs(retry_destination, client=client, **common)
 
-    return destination, _fallback_request_kwargs(destination, **common), _rebuild
+    return destination, _fallback_request_kwargs(destination, client=fb_client, **common), _rebuild
 
 
 def _quarantine_fallback_candidate(
@@ -4045,6 +4075,7 @@ def _call_fallback_candidate_sync(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    no_progress_timeout: Optional[float] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery: on an auth error refresh its
     credentials and retry once with a rebuilt client; if that also auth-fails, quarantine the
@@ -4060,7 +4091,7 @@ def _call_fallback_candidate_sync(
         fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
         apply_fast_lane=True, messages=messages, tools=tools, temperature=temperature,
         max_tokens=max_tokens, effective_extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
+        reasoning_config=reasoning_config, no_progress_timeout=no_progress_timeout,
     )
 
     def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
@@ -4110,13 +4141,14 @@ async def _call_fallback_candidate_async(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    no_progress_timeout: Optional[float] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync` (no fast-lane cap on this wire)."""
     destination, fb_kwargs, rebuild = _plan_fallback_candidate(
         fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
         apply_fast_lane=False, messages=messages, tools=tools, temperature=temperature,
         max_tokens=max_tokens, effective_extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
+        reasoning_config=reasoning_config, no_progress_timeout=no_progress_timeout,
     )
 
     async def _send(client: Any, request_kwargs: Dict[str, Any], dest: _FallbackDestination) -> Any:
@@ -7908,6 +7940,7 @@ def _plan_aux_call(
         task=task, messages=messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, effective_timeout=req.effective_timeout,
         effective_extra_body=req.effective_extra_body, reasoning_config=reasoning_config,
+        no_progress_timeout=_get_task_no_progress_timeout(task) if task else None,
     )
     retry_kwargs = dict(
         candidate_kwargs, resolved_base_url=req.resolved_base_url,

@@ -206,6 +206,14 @@ class TestExtractCacheBustingConfig:
         assert sig({}) == sig({"compression": {"threshold_tokens": default_cap}}) == default_cap
         assert sig({"compression": {"threshold_tokens": None}}) is None
 
+    def test_threshold_tokens_exempt_models_busts_agent_cache(self):
+        """Changes to compression.threshold_tokens_exempt_models invalidate the cached agent."""
+        from gateway.run import GatewayRunner
+
+        sig = lambda cfg: GatewayRunner._extract_cache_busting_config(cfg)["compression.threshold_tokens_exempt_models"]  # noqa: E731
+        assert sig({}) == []
+        assert sig({"compression": {"threshold_tokens_exempt_models": ["astra", "gemini"]}}) == ["astra", "gemini"]
+
     def test_legacy_checkpoints_bool_carries_defaults_for_the_other_keys(self):
         """`checkpoints: true` builds the agent with DEFAULT_CONFIG's limits (`_checkpoint_agent_kwargs`), so
         migrating to `checkpoints: {enabled: true}` must not change the signature."""

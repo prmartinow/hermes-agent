@@ -344,3 +344,67 @@ def test_apply_live_compression_config_is_self_contained():
     _apply_live_compression_config(agent, {"compression": {"enabled": True}})
     assert agent.compression_enabled is True
     assert agent.codex_responses_native_compaction is False
+
+
+def test_hot_reload_threshold_tokens_exempt_models(monkeypatch):
+    """Hot-reload of threshold_tokens_exempt_models live updates compressor trigger."""
+    compressor = ContextCompressor(
+        model="gemini-2.5-pro",
+        provider="gemini",
+        config_context_length=1_000_000,
+        threshold_tokens_cap=256_000,
+        quiet_mode=True,
+    )
+    agent = SimpleNamespace(
+        model="gemini-2.5-pro",
+        provider="gemini",
+        base_url="",
+        context_compressor=compressor,
+        compression_enabled=True,
+        compression_idle_compact_after_seconds=0,
+        codex_responses_native_compaction=False,
+        codex_responses_compact_threshold=200_000,
+    )
+    session = {"agent": agent, "session_key": "session-exempt"}
+    # Initially no exemptions: clamped to 256K cap
+    assert compressor.threshold_tokens == 256_000
+
+    # Hot reload with gemini exempt
+    _sync_with_cfg(
+        monkeypatch,
+        session,
+        {
+            "compression": {
+                "threshold_tokens": 256_000,
+                "threshold_tokens_exempt_models": ["gemini"],
+            }
+        },
+    )
+    # Gemini uncaps: context length re-infers to 1,048,576; (1,048,576 - 65,536) * 0.50 = 491,520
+    assert compressor.threshold_tokens == 491_520
+
+    # Hot reload with empty exemptions re-clamps to 256K
+    _sync_with_cfg(
+        monkeypatch,
+        session,
+        {
+            "compression": {
+                "threshold_tokens": 256_000,
+                "threshold_tokens_exempt_models": [],
+            }
+        },
+    )
+    assert compressor.threshold_tokens == 256_000
+
+    # Hot reload with unsupported alias key does NOT grant exemption
+    _sync_with_cfg(
+        monkeypatch,
+        session,
+        {
+            "compression": {
+                "threshold_tokens": 256_000,
+                "threshold_tokens_exempt_families": ["gemini"],
+            }
+        },
+    )
+    assert compressor.threshold_tokens == 256_000

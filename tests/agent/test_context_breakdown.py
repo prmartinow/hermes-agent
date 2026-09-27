@@ -126,3 +126,110 @@ def test_details_lines_caps_listing():
     assert any("… and 5 more" in line for line in lines)
 
 
+
+
+from agent.context_breakdown import format_compaction_budget_lines
+
+
+def test_format_compaction_budget_lines_exempt():
+    exempt_report = {
+        "context_limit": 1_048_576,
+        "output_reservation": 65_536,
+        "usable_tokens": 983_040,
+        "effective_model_ratio": 0.50,
+        "requested_cap": 256_000,
+        "effective_cap": None,
+        "cap_exempt": True,
+        "exemption_reason": "model_family_exemption",
+        "actual_trigger": 491_520,
+        "limiting_reason": "proportional",
+    }
+    lines = format_compaction_budget_lines(exempt_report)
+    assert len(lines) == 2
+    assert lines[0] == "Compaction budget: context limit 1,048,576 · output reservation 65,536 · usable ratio 50% (983,040 tokens)"
+    assert lines[1] == "Requested cap: 256,000 · Effective cap: none (exempt: model_family_exemption) · Actual trigger: 491,520 · Limiting reason: proportional"
+
+
+def test_format_compaction_budget_lines_non_exempt():
+    non_exempt_report = {
+        "context_limit": 1_000_000,
+        "output_reservation": 0,
+        "usable_tokens": 1_000_000,
+        "effective_model_ratio": 0.50,
+        "requested_cap": 256_000,
+        "effective_cap": 256_000,
+        "cap_exempt": False,
+        "exemption_reason": None,
+        "actual_trigger": 256_000,
+        "limiting_reason": "effective_cap",
+    }
+    lines = format_compaction_budget_lines(non_exempt_report)
+    assert len(lines) == 2
+    assert lines[0] == "Compaction budget: context limit 1,000,000 · output reservation 0 · usable ratio 50% (1,000,000 tokens)"
+    assert lines[1] == "Requested cap: 256,000 · Effective cap: 256,000 · Actual trigger: 256,000 · Limiting reason: effective_cap"
+
+
+def test_format_compaction_budget_lines_fallback():
+    assert format_compaction_budget_lines({}) == []
+    assert format_compaction_budget_lines(None) == []
+
+
+def test_render_context_breakdown_with_exempt_and_non_exempt_reports():
+    exempt_report = {
+        "context_limit": 1_048_576,
+        "output_reservation": 65_536,
+        "usable_tokens": 983_040,
+        "effective_model_ratio": 0.50,
+        "requested_cap": 256_000,
+        "effective_cap": None,
+        "cap_exempt": True,
+        "exemption_reason": "model_family_exemption",
+        "actual_trigger": 491_520,
+        "limiting_reason": "proportional",
+    }
+    lines_exempt = render_context_breakdown_lines(_payload(budget_report=exempt_report))
+    text_exempt = "\n".join(lines_exempt)
+    assert "Compaction budget: context limit 1,048,576 · output reservation 65,536 · usable ratio 50% (983,040 tokens)" in text_exempt
+    assert "Requested cap: 256,000 · Effective cap: none (exempt: model_family_exemption) · Actual trigger: 491,520 · Limiting reason: proportional" in text_exempt
+
+    non_exempt_report = {
+        "context_limit": 1_000_000,
+        "output_reservation": 0,
+        "usable_tokens": 1_000_000,
+        "effective_model_ratio": 0.50,
+        "requested_cap": 256_000,
+        "effective_cap": 256_000,
+        "cap_exempt": False,
+        "exemption_reason": None,
+        "actual_trigger": 256_000,
+        "limiting_reason": "effective_cap",
+    }
+    lines_ne = render_context_breakdown_lines(_payload(), budget_report=non_exempt_report)
+    text_ne = "\n".join(lines_ne)
+    assert "Compaction budget: context limit 1,000,000 · output reservation 0 · usable ratio 50% (1,000,000 tokens)" in text_ne
+    assert "Requested cap: 256,000 · Effective cap: 256,000 · Actual trigger: 256,000 · Limiting reason: effective_cap" in text_ne
+
+    # Legacy / no budget report
+    lines_legacy = render_context_breakdown_lines(_payload())
+    text_legacy = "\n".join(lines_legacy)
+    assert "Compaction budget:" not in text_legacy
+
+
+def test_compute_session_context_breakdown_attaches_budget():
+    exempt_report = {
+        "context_limit": 1_048_576,
+        "output_reservation": 65_536,
+        "usable_tokens": 983_040,
+        "effective_model_ratio": 0.50,
+        "requested_cap": 256_000,
+        "effective_cap": None,
+        "cap_exempt": True,
+        "exemption_reason": "model_family_exemption",
+        "actual_trigger": 491_520,
+        "limiting_reason": "proportional",
+    }
+    agent, parts = _make_agent()
+    agent.context_compressor.get_budget_report = lambda: exempt_report
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, [])
+    assert data["budget_report"] == exempt_report

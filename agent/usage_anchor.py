@@ -43,7 +43,14 @@ def message_fingerprint(msg: Any) -> Optional[str]:
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
 
 
-def capture_usage_anchor(prompt_tokens: Any, completion_tokens: Any, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+def capture_usage_anchor(
+    prompt_tokens: Any,
+    completion_tokens: Any,
+    messages: List[Dict[str, Any]],
+    *,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     """Build a usage anchor from provider-reported usage, or None when usage is unusable."""
     try:
         pt = int(prompt_tokens or 0)
@@ -53,13 +60,18 @@ def capture_usage_anchor(prompt_tokens: Any, completion_tokens: Any, messages: L
     if pt <= 0 or not isinstance(messages, list) or not messages:
         return None  # some endpoints omit usage — caller keeps its anchor
     last = messages[-1]
-    return {
+    res: Dict[str, Any] = {
         "prompt_tokens": pt,
         "completion_tokens": max(0, ct),
         "base_count": len(messages),
         "base_last_role": last.get("role") if isinstance(last, dict) else None,
         "base_last_fp": message_fingerprint(last),
     }
+    if model:
+        res["model"] = str(model)
+    if provider:
+        res["provider"] = str(provider)
+    return res
 
 
 def _anchor_matches(messages: List[Dict[str, Any]], anchor: Dict[str, Any]) -> bool:
@@ -74,6 +86,21 @@ def _anchor_matches(messages: List[Dict[str, Any]], anchor: Dict[str, Any]) -> b
         return False
     fp = anchor.get("base_last_fp")
     return isinstance(fp, str) and bool(fp) and message_fingerprint(base_msg) == fp
+
+
+def _anchor_runtime_matches(agent: Any, anchor: Dict[str, Any]) -> bool:
+    """True when anchor's model and provider match the agent's active runtime."""
+    agent_model = getattr(agent, "model", None)
+    anchor_model = anchor.get("model")
+    if anchor_model is not None or agent_model is not None:
+        if str(anchor_model or "").strip() != str(agent_model or "").strip():
+            return False
+    agent_provider = getattr(agent, "provider", None)
+    anchor_provider = anchor.get("provider")
+    if anchor_provider is not None or agent_provider is not None:
+        if str(anchor_provider or "").strip().lower() != str(agent_provider or "").strip().lower():
+            return False
+    return True
 
 
 def anchored_context_tokens(messages: List[Dict[str, Any]], anchor: Optional[Dict[str, Any]], *, charge_stale_thinking: bool = True) -> Optional[int]:
@@ -103,8 +130,18 @@ def _serialize(anchor: Any) -> Optional[Dict[str, Any]]:
     fp, role = anchor.get("base_last_fp"), anchor.get("base_last_role")
     if pt <= 0 or base_count <= 0 or not isinstance(fp, str) or not fp:
         return None
-    return {"prompt_tokens": pt, "completion_tokens": max(0, ct), "base_count": base_count,
-            "base_last_role": role if isinstance(role, str) else None, "base_last_fp": fp}
+    res = {
+        "prompt_tokens": pt,
+        "completion_tokens": max(0, ct),
+        "base_count": base_count,
+        "base_last_role": role if isinstance(role, str) else None,
+        "base_last_fp": fp,
+    }
+    if anchor.get("model"):
+        res["model"] = str(anchor["model"])
+    if anchor.get("provider"):
+        res["provider"] = str(anchor["provider"])
+    return res
 
 
 def persist_usage_anchor(agent: Any, anchor: Optional[Dict[str, Any]]) -> None:
@@ -123,6 +160,11 @@ def persist_usage_anchor(agent: Any, anchor: Optional[Dict[str, Any]]) -> None:
 
 def set_usage_anchor(agent: Any, anchor: Optional[Dict[str, Any]], *, turn_base: bool = False) -> None:
     """Install ``anchor`` on the agent (``None`` clears) and mirror it to the session row."""
+    if isinstance(anchor, dict):
+        if not anchor.get("model") and getattr(agent, "model", None):
+            anchor["model"] = str(agent.model)
+        if not anchor.get("provider") and getattr(agent, "provider", None):
+            anchor["provider"] = str(agent.provider)
     agent._usage_anchor = anchor
     if turn_base or anchor is None:
         agent._turn_base_usage_anchor = anchor
@@ -145,7 +187,7 @@ def restore_usage_anchor(agent: Any, conversation_history: Optional[List[Dict[st
         return
     if anchor is None:
         return
-    if _anchor_matches(conversation_history, anchor):
+    if _anchor_matches(conversation_history, anchor) and _anchor_runtime_matches(agent, anchor):
         agent._usage_anchor = anchor
     else:
         persist_usage_anchor(agent, None)

@@ -1496,6 +1496,11 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     threshold_tokens = cfg.get("threshold_tokens", cfg_get(DEFAULT_CONFIG, "compression", "threshold_tokens"))
     if threshold_tokens is not None:
         threshold_tokens = _positive_int(threshold_tokens)
+    exempt_raw = cfg.get("threshold_tokens_exempt_models")
+    if exempt_raw is None:
+        exempt_raw = cfg_get(DEFAULT_CONFIG, "compression", "threshold_tokens_exempt_models", default=[])
+    from agent.context_compressor import _normalize_exempt_models
+    threshold_tokens_exempt_models = _normalize_exempt_models(exempt_raw)
     # Non-system head messages to protect (system prompt is always protected); 0 is a
     # legitimate "system prompt + summary + tail".
     protect_first = max(0, int(cfg.get("protect_first_n", 3)))
@@ -1536,6 +1541,7 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         },
         threshold_tokens=threshold_tokens,
+        threshold_tokens_exempt_models=threshold_tokens_exempt_models,
         checkpoint_required=checkpoint_required,
         # In-place compaction: no session-id rotation. default=True MUST match DEFAULT_CONFIG
         # (a False default flipped agents into rotation mode when the key was omitted).
@@ -1971,6 +1977,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             abort_on_summary_failure=cs.abort_on_summary_failure,
             max_tokens=_compressor_max_tokens(agent), model_thresholds=cs.model_thresholds,
             threshold_tokens_cap=cs.threshold_tokens,
+            threshold_tokens_exempt_models=getattr(cs, "threshold_tokens_exempt_models", None),
             proactive_prune_tokens=cs.proactive_prune_tokens,
             proactive_prune_min_result_chars=cs.proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,

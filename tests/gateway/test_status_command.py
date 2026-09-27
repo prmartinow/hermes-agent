@@ -764,3 +764,95 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
+
+
+def test_context_compressor_lines_with_budget_report():
+    """_context_compressor_lines formats budget report with all requested fields."""
+    from gateway.slash_commands_status import _context_compressor_lines
+
+    agent = SimpleNamespace(
+        session_api_calls=5,
+        session_input_tokens=1000,
+        session_output_tokens=200,
+        session_reasoning_tokens=50,
+        session_total_tokens=1250,
+    )
+
+    # 1. Exempt report
+    exempt_report = {
+        "context_limit": 1_048_576,
+        "output_reservation": 65_536,
+        "usable_tokens": 983_040,
+        "effective_model_ratio": 0.50,
+        "requested_cap": 256_000,
+        "effective_cap": None,
+        "cap_exempt": True,
+        "exemption_reason": "model_family_exemption",
+        "actual_trigger": 491_520,
+        "limiting_reason": "proportional",
+    }
+    ctx_exempt = SimpleNamespace(
+        get_budget_report=lambda: exempt_report,
+        threshold_tokens=256_000,
+        threshold_percent=0.50,
+        compression_count=1,
+        _last_compression_savings_pct=40.0,
+    )
+    lines = _context_compressor_lines(agent, ctx_exempt, used=100_000)
+    joined = "\n".join(lines)
+
+    assert "Compaction budget: context limit 1,048,576 · output reservation 65,536 · usable ratio 50% (983,040 tokens)" in joined
+    assert "Requested cap: 256,000 · Effective cap: none (exempt: model_family_exemption) · Actual trigger: 491,520 · Limiting reason: proportional" in joined
+    assert "Auto-compresses at: 491,520 (50%)" in joined
+
+    # 2. Non-exempt report with cap clamp
+    non_exempt_report = {
+        "context_limit": 1_000_000,
+        "output_reservation": 0,
+        "usable_tokens": 1_000_000,
+        "effective_model_ratio": 0.50,
+        "requested_cap": 256_000,
+        "effective_cap": 256_000,
+        "cap_exempt": False,
+        "exemption_reason": None,
+        "actual_trigger": 256_000,
+        "limiting_reason": "effective_cap",
+    }
+    ctx_non_exempt = SimpleNamespace(
+        get_budget_report=lambda: non_exempt_report,
+        threshold_tokens=256_000,
+        threshold_percent=0.50,
+        compression_count=0,
+    )
+    lines_ne = _context_compressor_lines(agent, ctx_non_exempt, used=200_000)
+    joined_ne = "\n".join(lines_ne)
+
+    assert "Compaction budget: context limit 1,000,000 · output reservation 0 · usable ratio 50% (1,000,000 tokens)" in joined_ne
+    assert "Requested cap: 256,000 · Effective cap: 256,000 · Actual trigger: 256,000 · Limiting reason: effective_cap" in joined_ne
+    assert "Auto-compresses at: 256,000 (50%)" in joined_ne
+
+    # 3. Fallback safe for legacy context objects without get_budget_report
+    ctx_legacy = SimpleNamespace(
+        threshold_tokens=150_000,
+        threshold_percent=0.75,
+        compression_count=0,
+    )
+    lines_legacy = _context_compressor_lines(agent, ctx_legacy, used=50_000)
+    joined_legacy = "\n".join(lines_legacy)
+    assert "Compaction budget:" not in joined_legacy
+    assert "Auto-compresses at: 150,000 (75%)" in joined_legacy
+
+    # 4. Fallback safe when get_budget_report raises an exception
+    def _exploding_budget():
+        raise RuntimeError("boom")
+
+    ctx_exploding = SimpleNamespace(
+        get_budget_report=_exploding_budget,
+        threshold_tokens=120_000,
+        threshold_percent=0.60,
+        compression_count=0,
+    )
+    lines_exploding = _context_compressor_lines(agent, ctx_exploding, used=50_000)
+    joined_exploding = "\n".join(lines_exploding)
+    assert "Compaction budget:" not in joined_exploding
+    assert "Auto-compresses at: 120,000 (60%)" in joined_exploding

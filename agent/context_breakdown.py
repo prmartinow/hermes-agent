@@ -164,7 +164,19 @@ def compute_session_context_breakdown(agent: Any, messages: Optional[List[dict]]
             delta = delta[1:]
         source = "provider_usage_plus_estimate" if delta else "provider_usage"
 
+    budget_report = None
+    if comp is not None or agent is not None:
+        get_budget = getattr(comp, "get_budget_report", None) or getattr(agent, "get_budget_report", None)
+        if callable(get_budget):
+            try:
+                r = get_budget()
+                if isinstance(r, dict):
+                    budget_report = r
+            except Exception:
+                budget_report = None
+
     return {
+        "budget_report": budget_report,
         "categories": [
             {"color": color, "id": category_id, "label": label, "tokens": tokens_by_id[category_id]}
             for category_id, (label, color, _glyph_) in _CATEGORIES.items()
@@ -286,11 +298,50 @@ def render_context_details_lines(details: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def format_compaction_budget_lines(report: Dict[str, Any]) -> List[str]:
+    """Render human-readable compaction budget lines from a get_budget_report() dict.
+
+    Shared between messaging gateway, TUI live context output, and CLI context breakdown.
+    Exposes context limit, output reservation, usable budget, ratio, requested cap,
+    effective exempt cap, actual trigger, and limiting reason/source without duplicating formulas.
+    """
+    if not isinstance(report, dict) or not report:
+        return []
+
+    ctx_limit = report.get("context_limit") or report.get("context_length") or 0
+    out_res = report.get("output_reservation", 0) or 0
+    usable = report.get("usable_tokens") or report.get("usable_input_budget") or 0
+    ratio_val = report.get("effective_model_ratio", report.get("effective_threshold_percent"))
+    usable_ratio_str = f"{ratio_val * 100:.0f}%" if ratio_val is not None else "n/a"
+    req_cap_raw = report.get("requested_cap")
+    eff_cap_raw = report.get("effective_cap")
+    is_exempt = bool(report.get("cap_exempt") or report.get("is_cap_exempt"))
+    exempt_reason = report.get("exemption_reason") or report.get("cap_exemption_reason")
+    act_trigger = report.get("actual_trigger") or report.get("threshold_tokens") or 0
+    lim_reason = report.get("limiting_reason") or report.get("limiting_source") or "unknown"
+
+    req_cap_str = f"{req_cap_raw:,}" if req_cap_raw is not None else "none"
+    if is_exempt:
+        eff_cap_str = f"none (exempt: {exempt_reason})" if exempt_reason else "none (exempt)"
+    elif eff_cap_raw is not None:
+        eff_cap_str = f"{eff_cap_raw:,}"
+    else:
+        eff_cap_str = "none"
+
+    return [
+        f"Compaction budget: context limit {ctx_limit:,} · output reservation {out_res:,} · "
+        f"usable ratio {usable_ratio_str} ({usable:,} tokens)",
+        f"Requested cap: {req_cap_str} · Effective cap: {eff_cap_str} · "
+        f"Actual trigger: {act_trigger:,} · Limiting reason: {lim_reason}",
+    ]
+
+
 def render_context_breakdown_lines(
     payload: Dict[str, Any],
     *,
     details: Optional[Dict[str, Any]] = None,
     grid: bool = True,
+    budget_report: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Full /context view. ``grid`` prepends the glyph grid (CLI; the gateway
     keeps its own gauge); ``details`` appends the expanded listings."""
@@ -307,6 +358,12 @@ def render_context_breakdown_lines(
             labels = {"local_estimate": "local estimate", "provider_usage": "provider usage",
                       "provider_usage_plus_estimate": "provider usage + estimated new messages"}
             lines.append(f"Source: {labels.get(source, source)}; category counts are local estimates.")
+
+    report = budget_report if budget_report is not None else payload.get("budget_report")
+    if report:
+        budget_lines = format_compaction_budget_lines(report)
+        if budget_lines:
+            lines.extend(["", *budget_lines])
 
     if details is None:
         lines.extend(["", "Use /context all for per-skill and per-toolset costs."])

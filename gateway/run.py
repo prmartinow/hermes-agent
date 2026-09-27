@@ -4383,7 +4383,7 @@ class GatewayRunner(
     _CACHE_BUSTING_CONFIG_KEYS: tuple = (
         ("model", "context_length"), ("compression", "enabled"),
         ("compression", "progress_notices"), ("compression", "threshold"),
-        ("compression", "model_thresholds"), ("compression", "threshold_tokens"),
+        ("compression", "model_thresholds"), ("compression", "threshold_tokens"), ("compression", "threshold_tokens_exempt_models"),
         ("compression", "codex_gpt55_autoraise"), ("compression", "codex_app_server_auto"),
         ("compression", "codex_responses_native"),
         ("compression", "codex_responses_compact_threshold"), ("compression", "in_place"),

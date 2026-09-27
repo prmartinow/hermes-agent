@@ -1997,6 +1997,7 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
     "_credential_pool", "_credential_pool_entry_id",
+    "_usage_anchor", "_turn_base_usage_anchor",
 )
 _MISSING = object()
 
@@ -2008,6 +2009,10 @@ def _snapshot_switch_state(agent) -> Dict[str, Any]:
     snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
     # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
     snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    if isinstance(snapshot.get("_usage_anchor"), dict):
+        snapshot["_usage_anchor"] = copy.deepcopy(snapshot["_usage_anchor"])
+    if isinstance(snapshot.get("_turn_base_usage_anchor"), dict):
+        snapshot["_turn_base_usage_anchor"] = copy.deepcopy(snapshot["_turn_base_usage_anchor"])
     return snapshot
 
 
@@ -2017,6 +2022,10 @@ def _restore_switch_snapshot(agent, snapshot: Dict[str, Any]) -> None:
             continue  # attribute did not exist before the swap; don't fabricate it
         with contextlib.suppress(Exception):
             setattr(agent, name, value)
+    if "_usage_anchor" in snapshot and snapshot["_usage_anchor"] is not _MISSING:
+        with contextlib.suppress(Exception):
+            from agent.usage_anchor import persist_usage_anchor
+            persist_usage_anchor(agent, snapshot["_usage_anchor"])
 
 
 def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm):
@@ -2337,6 +2346,7 @@ def switch_model(
     snapshot and re-raises (callers catch)."""
     old_model = agent.model
     old_provider = agent.provider
+    old_context_length = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
     # ``recover_with_credential_pool`` sees a ``pool.provider != agent.provider`` mismatch and
     # short-circuits, leaving the new provider with no rotation/recovery on 401/429 and burning the original
@@ -2393,6 +2403,21 @@ def switch_model(
         old_model, old_provider, new_model, new_provider,
     )
     _persist_switch_billing_route(agent)
+    # Invalidate stale usage anchors across model, provider, or context length switch so old token counts
+    # never contaminate preflight or suppress/trigger compaction on the new runtime.
+    new_context_length = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+    is_runtime_switch = (
+        (old_model or "").strip() != (new_model or "").strip()
+        or old_norm != new_norm
+        or (
+            old_context_length is not None
+            and new_context_length is not None
+            and old_context_length != new_context_length
+        )
+    )
+    if is_runtime_switch:
+        from agent.usage_anchor import set_usage_anchor
+        set_usage_anchor(agent, None)
 
 
 def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):

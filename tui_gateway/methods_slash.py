@@ -131,8 +131,12 @@ def _format_live_context_output(sid: str, session: dict, arg: str) -> str:
     except Exception:
         messages = []  # malformed db rows fall back to the live history below
     if not messages:
-        with session["history_lock"]:
-            messages = _history_to_messages(list(session.get("history", [])))
+        history_lock = session.get("history_lock") if isinstance(session, dict) else None
+        if history_lock:
+            with history_lock:
+                messages = _history_to_messages(list(session.get("history", [])))
+        else:
+            messages = _history_to_messages(list((session or {}).get("history", [])))
     usage = _session_usage_snapshot(session)
     mirror = _metadata_mirror(session)
     lines = [f"Conversation: {len(messages)} messages" if messages else "Conversation is empty (no messages yet)."]
@@ -150,10 +154,48 @@ def _format_live_context_output(sid: str, session: dict, arg: str) -> str:
         lines.append(f"Context usage: ~{context_used:,} tokens")
     if usage.get("compressions"):
         lines.append(f"Compressions: {int(usage.get('compressions') or 0):,}")
-    if (agent := session.get("agent")) is not None:
+
+    agent = session.get("agent") if isinstance(session, dict) else None
+    report = None
+    if agent is not None:
+        ctx = getattr(agent, "context_compressor", None)
+        get_budget = getattr(ctx, "get_budget_report", None) or getattr(agent, "get_budget_report", None)
+        if callable(get_budget):
+            try:
+                r = get_budget()
+                if isinstance(r, dict):
+                    report = r
+            except Exception:
+                report = None
+    elif isinstance(session, dict):
+        get_budget = session.get("get_budget_report")
+        if callable(get_budget):
+            try:
+                r = get_budget()
+                if isinstance(r, dict):
+                    report = r
+            except Exception:
+                report = None
+        elif isinstance(session.get("budget_report"), dict):
+            report = session.get("budget_report")
+
+    if report:
+        from agent.context_breakdown import format_compaction_budget_lines
+        budget_lines = format_compaction_budget_lines(report)
+        if budget_lines:
+            lines.extend(budget_lines)
+
+    if (agent := (session.get("agent") if isinstance(session, dict) else None)) is not None:
         from agent.context_file_sources import context_file_sources_for_agent, render_context_file_lines
         # RPC thread: bind the session cwd or the discovery walk keys on the backend's cwd, not the workspace.
-        tokens = _set_session_context(session["session_key"], cwd=_session_cwd(session))
+        session_key = session.get("session_key", sid)
+        cwd = session.get("cwd") or ""
+        if not cwd:
+            try:
+                cwd = _session_cwd(session)
+            except Exception:
+                cwd = ""
+        tokens = _set_session_context(session_key, cwd=cwd)
         try:
             file_lines = render_context_file_lines(context_file_sources_for_agent(agent))
         finally:

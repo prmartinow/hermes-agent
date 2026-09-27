@@ -140,8 +140,53 @@ def _context_compressor_lines(agent, ctx, used: int) -> list[str]:
     lines: list[str] = []
     from agent.context_breakdown import context_display_source
     mark = "~" if context_display_source(ctx) != "provider_usage" else ""
-    threshold = _n(ctx, "threshold_tokens")
-    threshold_pct = f"{_n(ctx, 'threshold_percent') * 100:.0f}"
+
+    report = None
+    get_budget = getattr(ctx, "get_budget_report", None)
+    if callable(get_budget):
+        try:
+            r = get_budget()
+            if isinstance(r, dict):
+                report = r
+        except Exception:
+            report = None
+
+    if report:
+        ctx_limit = report.get("context_limit") or report.get("context_length") or 0
+        out_res = report.get("output_reservation", 0)
+        usable = report.get("usable_tokens") or report.get("usable_input_budget") or 0
+        ratio_val = report.get("effective_model_ratio", report.get("effective_threshold_percent"))
+        usable_ratio_str = f"{ratio_val * 100:.0f}%" if ratio_val is not None else "n/a"
+        req_cap_raw = report.get("requested_cap")
+        eff_cap_raw = report.get("effective_cap")
+        is_exempt = bool(report.get("cap_exempt") or report.get("is_cap_exempt"))
+        exempt_reason = report.get("exemption_reason") or report.get("cap_exemption_reason")
+        act_trigger = report.get("actual_trigger") or report.get("threshold_tokens") or 0
+        lim_reason = report.get("limiting_reason") or "unknown"
+
+        req_cap_str = _fmt(req_cap_raw) if req_cap_raw is not None else "none"
+        if is_exempt:
+            eff_cap_str = f"none (exempt: {exempt_reason})" if exempt_reason else "none (exempt)"
+        elif eff_cap_raw is not None:
+            eff_cap_str = _fmt(eff_cap_raw)
+        else:
+            eff_cap_str = "none"
+
+        lines.append(
+            f"Compaction budget: context limit {_fmt(ctx_limit)} · output reservation {_fmt(out_res)} · "
+            f"usable ratio {usable_ratio_str} ({_fmt(usable)} tokens)"
+        )
+        lines.append(
+            f"Requested cap: {req_cap_str} · Effective cap: {eff_cap_str} · "
+            f"Actual trigger: {_fmt(act_trigger)} · Limiting reason: {lim_reason}"
+        )
+
+        threshold = act_trigger or _n(ctx, "threshold_tokens")
+        threshold_pct = f"{ratio_val * 100:.0f}" if ratio_val is not None else f"{_n(ctx, 'threshold_percent') * 100:.0f}"
+    else:
+        threshold = _n(ctx, "threshold_tokens")
+        threshold_pct = f"{_n(ctx, 'threshold_percent') * 100:.0f}"
+
     if threshold > 0:
         if used >= threshold:
             lines.append(t("gateway.context.over_threshold", threshold=_fmt(threshold),
