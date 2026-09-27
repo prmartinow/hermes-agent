@@ -573,18 +573,6 @@ export const api = {
       signal: options?.signal,
     });
   },
-  getCodexUsageHistory: (options?: { days?: number; signal?: AbortSignal }) => {
-    const days = options?.days ?? 7;
-    return fetchJSON<CodexUsageHistoryResponse>(`/api/codex/usage-history?days=${days}`, {
-      signal: options?.signal,
-    });
-  },
-  getCodexUsageHistory: (options?: { days?: number; signal?: AbortSignal }) => {
-    const days = options?.days ?? 7;
-    return fetchJSON<CodexUsageHistoryResponse>(`/api/codex/usage-history?days=${days}`, {
-      signal: options?.signal,
-    });
-  },
   exportSessionUrl: (id: string, profile = getManagementProfile()) =>
     appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile),
   importSessions: (
