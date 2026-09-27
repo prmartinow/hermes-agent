@@ -70,6 +70,7 @@ class PtySession:
         self.buffer = RingBuffer(buffer_cap)
         self.alive = True
         self.attached = False
+        self._retiring = False
         self.last_detached_at: Optional[float] = None
         self._read_timeout = read_timeout
         self._viewers: Set[Any] = set()
@@ -126,11 +127,17 @@ class PtySession:
             generation = self._attach_generation
             delivered = await self.bridge.write(data)
             if not delivered and self.is_leader(ws) and generation == self._attach_generation:
-                self.alive = False
+                # Backpressure is not process death. Otherwise the dead-remnant
+                # cleanup path bypasses cooperative retirement for working agents.
+                probe = getattr(self.bridge, "is_alive", None)
+                if probe is not None and not probe():
+                    self.alive = False
             return delivered
 
     async def attach(self, ws: Any, *, force_redraw: bool = False, generation: Optional[str] = None) -> bool:
         """Attach a browser terminal viewer and replay buffered PTY output without kicking out peers."""
+        if self._retiring:
+            return False
         self._viewers.add(ws)
         self._leader_ws = ws
         self._attach_generation += 1
@@ -193,12 +200,17 @@ async def run_reaper(registry: "PtySessionRegistry", *, interval: float = 30.0) 
 
 
 class PtySessionRegistry:
-    def __init__(self, *, ttl: float, max_sessions: int, buffer_cap: int, read_timeout: float) -> None:
+    def __init__(self, *, ttl: float, max_sessions: int, buffer_cap: int, read_timeout: float,
+                 memory_budget_bytes: int | None = None,
+                 memory_usage: Callable[[list[PtySession]], int | None] | None = None) -> None:
         self._ttl = ttl
         self._max = max_sessions
         self._buffer_cap = buffer_cap
         self._read_timeout = read_timeout
+        self._memory_budget_bytes = memory_budget_bytes
+        self._memory_usage = memory_usage
         self._sessions: Dict[str, PtySession] = {}
+        # Covers admission through completed retirement, not just the victim selection.
         self._attach_lock = asyncio.Lock()
         self._standby_session: Optional[PtySession] = None
         self._standby_lock = asyncio.Lock()
@@ -208,114 +220,159 @@ class PtySessionRegistry:
         self._standby_spawn_fn = spawn_fn
 
     async def ensure_standby(self) -> None:
-        """Pre-spawn one warm standby PTY worker if none exists."""
-        if self._standby_session is not None and self._standby_session.alive:
-            return
-        if self._standby_spawn_fn is None:
+        # A speculative process must not bypass memory admission or the terminal cap.
+        if self._memory_budget_bytes is not None or self._standby_spawn_fn is None:
             return
         async with self._standby_lock:
             if self._standby_session is not None and self._standby_session.alive:
                 return
             try:
                 bridge = await asyncio.to_thread(self._standby_spawn_fn)
-                session = PtySession("__standby__", bridge,
-                                     buffer_cap=self._buffer_cap,
+                session = PtySession("__standby__", bridge, buffer_cap=self._buffer_cap,
                                      read_timeout=self._read_timeout)
                 await session.start()
                 self._standby_session = session
             except Exception:
-                # Standby failure should not crash dashboard; fallback to on-demand spawn
                 self._standby_session = None
+
+    @staticmethod
+    def _dead(session: PtySession) -> bool:
+        probe = getattr(session.bridge, "is_alive", None)
+        return not session.alive or (probe is not None and not probe())
+
+    async def _remove(self, session: PtySession) -> None:
+        session._retiring = True
+        self._sessions.pop(session.key, None)
+        await session.close()
+
+    async def _retire(self, session: PtySession, now: float) -> bool:
+        if session.attached or session.last_detached_at is None:
+            return False
+        probe = getattr(session.bridge, "retire_if_idle", None)
+        if probe is None:
+            return False
+        # Reject a stale attach() caller while the gateway freezes admission.
+        session._retiring = True
+        async def settle_retirement() -> bool:
+            try:
+                approved = await asyncio.to_thread(probe)
+            except Exception:
+                approved = False
+            if approved is True:
+                await self._remove(session)
+                return True
+            # Busy/unknown must not be killed as soon as a long turn finishes.
+            session.last_detached_at = now
+            return False
+
+        # Shield the entire prepare/commit/close transaction, not just the probe.
+        # Releasing the admission lock after commit but before close loses both
+        # the process and its memory accounting if the requesting socket vanishes.
+        operation = asyncio.create_task(settle_retirement())
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            await operation
+            raise
+        finally:
+            if session.alive:
+                session._retiring = False
+
+    def _idle_candidates(self) -> list[PtySession]:
+        return sorted((s for s in self._sessions.values()
+                       if not s.attached and s.last_detached_at is not None),
+                      key=lambda s: s.last_detached_at)
+
+    async def _usage(self) -> int | None:
+        if self._memory_usage is None:
+            return None
+        try:
+            return await asyncio.to_thread(self._memory_usage, list(self._sessions.values()))
+        except Exception:
+            return None
+
+    async def _reclaim_memory(self, now: float) -> bool:
+        if self._memory_budget_bytes is None:
+            return True
+        usage = await self._usage()
+        if usage is None:
+            return False
+        for session in self._idle_candidates():
+            if usage < self._memory_budget_bytes:
+                return True
+            if await self._retire(session, now):
+                usage = await self._usage()
+                if usage is None:
+                    return False
+        return usage < self._memory_budget_bytes
+
+    async def _reap_locked(self, now: float) -> None:
+        if self._standby_session is not None and self._dead(self._standby_session):
+            await self._standby_session.close()
+            self._standby_session = None
+        for session in list(self._sessions.values()):
+            if self._dead(session):
+                await self._remove(session)
+            elif (not session.attached and session.last_detached_at is not None
+                  and now - session.last_detached_at > self._ttl):
+                await self._retire(session, now)
 
     async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object],
                               allow_standby: bool = True) -> Tuple[PtySession, bool]:
-        await self.reap_idle()
         async with self._attach_lock:
             existing = self._sessions.get(key)
-            if existing is not None and existing.alive:
-                # Actively verify the underlying PTY child process is alive (not dead/zombie/hung)
-                is_alive_fn = getattr(existing.bridge, "is_alive", None)
-                if is_alive_fn is not None and not is_alive_fn():
-                    existing.alive = False
-                else:
-                    return existing, False
-            if existing is not None:                       # dead remnant
-                await existing.close()
-                self._sessions.pop(key, None)
+            # Reconnection is not a new allocation, even under memory pressure.
+            if existing is not None and not self._dead(existing):
+                return existing, False
+            now = time.monotonic()
+            await self._reap_locked(now)
             if len(self._sessions) >= self._max:
-                self._reap_one_idle_or_raise()
-
-            # Claim standby worker if available and eligible
+                for victim in self._idle_candidates():
+                    if await self._retire(victim, now):
+                        break
+                if len(self._sessions) >= self._max:
+                    raise RegistryFull("Terminal capacity reached; attached or working sessions are protected.")
+            if not await self._reclaim_memory(now):
+                raise RegistryFull("Terminal memory budget reached or unavailable; existing work is protected.")
             if allow_standby and self._standby_session is not None and self._standby_session.alive:
                 async with self._standby_lock:
-                    if self._standby_session is not None and self._standby_session.alive:
-                        session = self._standby_session
-                        self._standby_session = None
-                        session.key = key
-                        self._sessions[key] = session
-                        # Replenish pool in background
-                        if self._standby_spawn_fn is not None:
-                            asyncio.create_task(self.ensure_standby())
-                        return session, True
-
-            # PTY spawn does blocking fork/exec work — keep it off the event loop (#53227).
-            bridge = await asyncio.to_thread(spawn)
+                    session = self._standby_session
+                    self._standby_session = None
+                    session.key = key
+                    self._sessions[key] = session
+                    asyncio.create_task(self.ensure_standby())
+                    return session, True
+            # Finish a fork even if its requesting socket disappears; do not orphan it.
+            operation = asyncio.create_task(asyncio.to_thread(spawn))
+            try:
+                bridge = await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                bridge = await operation
+                await asyncio.to_thread(bridge.close)
+                raise
             session = PtySession(key, bridge, buffer_cap=self._buffer_cap, read_timeout=self._read_timeout)
             await session.start()
             self._sessions[key] = session
-            # Ensure standby worker is stocked
             if allow_standby and self._standby_spawn_fn is not None:
                 asyncio.create_task(self.ensure_standby())
             return session, True
 
     def detach(self, key: str, ws) -> None:
-        s = self._sessions.get(key)
-        if s is not None:
-            s.detach(ws)
+        session = self._sessions.get(key)
+        if session is not None:
+            session.detach(ws)
 
     async def reap_idle(self, now: Optional[float] = None) -> None:
-        now = time.monotonic() if now is None else now
-        if self._standby_session is not None and not self._standby_session.alive:
-            standby = self._standby_session
-            self._standby_session = None
-            try:
-                await standby.close()
-            except Exception:
-                pass
-            if self._standby_spawn_fn is not None:
-                asyncio.create_task(self.ensure_standby())
-
-        doomed = [
-            key for key, s in self._sessions.items()
-            if not s.alive or (hasattr(s.bridge, "is_alive") and not s.bridge.is_alive()) or (not s.attached and s.last_detached_at is not None and (now - s.last_detached_at) > self._ttl)
-        ]
-        for key in doomed:
-            # Reaps overlap (attach_or_spawn and the background reaper) and close()
-            # awaits, so a concurrent reap can have popped this key already — skip
-            # it instead of raising KeyError into the websocket handler.
-            session = self._sessions.pop(key, None)
-            if session is not None:
-                await session.close()
-
-    def _reap_one_idle_or_raise(self) -> None:
-        idle = [s for s in self._sessions.values() if not s.attached and s.last_detached_at is not None]
-        if not idle:
-            raise RegistryFull()
-        oldest = min(idle, key=lambda s: s.last_detached_at or 0.0)
-        self._sessions.pop(oldest.key, None)
-        asyncio.create_task(oldest.close())
+        async with self._attach_lock:
+            now = time.monotonic() if now is None else now
+            await self._reap_locked(now)
+            await self._reclaim_memory(now)
 
     async def close_all(self) -> None:
-        if self._standby_session is not None:
-            standby = self._standby_session
-            self._standby_session = None
-            try:
-                await standby.close()
-            except Exception:
-                pass
-        for key in list(self._sessions):
-            # Same overlap window as reap_idle: an in-flight reap may have popped
-            # a snapshot key while we awaited an earlier close().
-            session = self._sessions.pop(key, None)
-            if session is not None:
-                await session.close()
+        # Explicit application shutdown differs from idle/capacity reclamation.
+        async with self._attach_lock:
+            if self._standby_session is not None:
+                await self._standby_session.close()
+                self._standby_session = None
+            for session in list(self._sessions.values()):
+                await self._remove(session)

@@ -260,6 +260,13 @@ def _write_or_exit(payload: dict, reason: str) -> None:
 def main():
     _close_rpc_stdin_on_exec()
     _install_sidecar_publisher()
+    retirement_socket = os.environ.pop("HERMES_TUI_RETIREMENT_SOCKET", None)
+    if retirement_socket:
+        try:
+            from hermes_cli.pty_retirement import start_retirement_server
+            start_retirement_server(retirement_socket)
+        except Exception:
+            logger.warning("Private PTY retirement control unavailable; retaining terminal", exc_info=True)
 
     # The heartbeat row lets the orphan sweep tell "live but idle" from "truly orphaned",
     # so it must start BEFORE the sweep.

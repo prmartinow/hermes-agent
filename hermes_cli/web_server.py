@@ -256,7 +256,7 @@ async def _lifespan(app: "FastAPI"):
         )
         cron_thread.start()
 
-    # Reap idle/dead keep-alive PTY sessions (30-min TTL).
+    # Reap idle/dead keep-alive PTYs using the registry's retention policy.
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
     from hermes_cli.web_server_chat import _default_pty_spawn
     PTY_REGISTRY.configure_standby_spawn(_default_pty_spawn)

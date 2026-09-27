@@ -17,7 +17,8 @@ import urllib.request
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pathlib import Path
 from typing import Optional
-from hermes_cli.pty_session import PtySessionRegistry
+from hermes_cli.pty_session import PtySessionRegistry, RegistryFull
+from hermes_cli.pty_memory import pty_memory_usage
 
 # Same logger the code used before extraction (record parity).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -46,7 +47,9 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 # A positive sleep lets other coroutines run and keeps dashboard idle CPU low (#42627).
 _PTY_IDLE_BACKOFF = 0.05
 PTY_REGISTRY = PtySessionRegistry(
-    ttl=3 * 60, max_sessions=16, buffer_cap=32 * 1024 * 1024, read_timeout=_PTY_READ_CHUNK_TIMEOUT)
+    ttl=60 * 60, max_sessions=16, buffer_cap=200 * 1024 * 1024,
+    read_timeout=_PTY_READ_CHUNK_TIMEOUT,
+    memory_budget_bytes=8 * 1024 * 1024 * 1024, memory_usage=pty_memory_usage)
 
 
 async def _close_stalled_pty_input(ws: "WebSocket", *, path: str) -> None:

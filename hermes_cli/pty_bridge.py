@@ -18,7 +18,11 @@ import struct
 import sys
 import termios
 import time
+import tempfile
+from pathlib import Path
 from typing import Optional, Sequence
+
+import psutil
 
 try:
     import ptyprocess  # type: ignore
@@ -72,6 +76,12 @@ class PtyBridge:
         self._proc = proc
         self._fd: int = proc.fd
         self._closed = False
+        self._retirement_dir = None
+        self._retirement_socket = None
+        try:
+            self.process_birth_time = psutil.Process(proc.pid).create_time()
+        except psutil.Error:
+            self.process_birth_time = None
         os.set_blocking(self._fd, False)
 
     @classmethod
@@ -102,12 +112,37 @@ class PtyBridge:
         # (xterm.js never drops frames, so under the dashboard that repaint was a visible flash on
         # every OS app-switch).
         spawn_env[PTY_HOST_ENV] = PTY_HOST_DASHBOARD
-        proc = ptyprocess.PtyProcess.spawn(list(argv), cwd=cwd, env=spawn_env, dimensions=(rows, cols))  # type: ignore[union-attr]
-        return cls(proc)
+        retirement_dir = None
+        spawn_env.pop("HERMES_TUI_RETIREMENT_SOCKET", None)
+        if spawn_env.get("HERMES_TUI_DASHBOARD") == "1" and not spawn_env.get("HERMES_TUI_GATEWAY_URL"):
+            retirement_dir = tempfile.TemporaryDirectory(prefix="pty-retire-")
+            spawn_env["HERMES_TUI_RETIREMENT_SOCKET"] = str(Path(retirement_dir.name) / "control.sock")
+        try:
+            proc = ptyprocess.PtyProcess.spawn(list(argv), cwd=cwd, env=spawn_env, dimensions=(rows, cols))  # type: ignore[union-attr]
+            bridge = cls(proc)
+        except BaseException:
+            if retirement_dir is not None:
+                retirement_dir.cleanup()
+            raise
+        bridge._retirement_dir = retirement_dir
+        bridge._retirement_socket = spawn_env.get("HERMES_TUI_RETIREMENT_SOCKET")
+        return bridge
 
     @property
     def pid(self) -> int:
         return int(self._proc.pid)
+
+    def retire_if_idle(self) -> bool:
+        """Only the private gateway may authorize reclaiming its process tree."""
+        if not self._retirement_socket or not self.is_alive():
+            return False
+        try:
+            if psutil.Process(self.pid).create_time() != self.process_birth_time:
+                return False
+        except psutil.Error:
+            return False
+        from hermes_cli.pty_retirement import request_idle_retirement
+        return request_idle_retirement(self._retirement_socket, expected_parent_pid=self.pid)
 
     def is_alive(self) -> bool:
         try:
@@ -253,6 +288,9 @@ class PtyBridge:
             self._proc.close(force=True)
         except Exception:
             pass
+        if self._retirement_dir is not None:
+            self._retirement_dir.cleanup()
+            self._retirement_dir = None
 
     def __enter__(self) -> "PtyBridge":
         return self

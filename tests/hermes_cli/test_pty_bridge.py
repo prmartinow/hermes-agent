@@ -288,6 +288,7 @@ class TestPtyBridgeClose:
         bridge._proc = fake
         bridge._fd = -1
         bridge._closed = False
+        bridge._retirement_dir = None
 
         bridge.close()
 

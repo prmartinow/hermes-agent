@@ -33,13 +33,18 @@ def pty_keepalive_harness(monkeypatch):
     class Spawned(list):
         pass
 
+    from threading import Event
     spawned = Spawned()
     spawned.bridges = []
+    spawned.ready = Event()
+    # Fake bridges have no OS process identity; budget accounting has its own real tests.
+    monkeypatch.setattr(_web_server_chat.PTY_REGISTRY, "_memory_usage", lambda sessions: 0)
 
     def fake_spawn(argv, cwd=None, env=None):
         b = FakeBridge()
         spawned.append(argv)
         spawned.bridges.append(b)
+        spawned.ready.set()
         return b
 
     monkeypatch.setattr(_web_server_chat.PtyBridge, "spawn", staticmethod(fake_spawn))
@@ -83,6 +88,7 @@ async def test_stalled_input_closes_only_the_keepalive_socket(
 
     client = TestClient(web_server.app)
     with client.websocket_connect("/api/pty?attach=TOK1") as ws:
+        assert pty_keepalive_harness.ready.wait(5)
         bridge = pty_keepalive_harness.bridges[0]
         bridge.accept_input = False
         ws.send_bytes(b"input")
@@ -90,7 +96,8 @@ async def test_stalled_input_closes_only_the_keepalive_socket(
             ws.receive_bytes()
 
     assert exc_info.value.code == 1013
-    assert web_server.PTY_REGISTRY._sessions["TOK1"].alive is False
+    assert web_server.PTY_REGISTRY._sessions["TOK1"].alive is True
+    assert bridge.alive is True
 
 
 @pytest.mark.asyncio

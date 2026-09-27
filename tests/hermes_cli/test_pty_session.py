@@ -75,6 +75,9 @@ class FakeBridge:
     def resize(self, cols, rows):
         self.resized = (cols, rows)
 
+    def retire_if_idle(self):
+        return True
+
     def close(self):
         self.closed = True
 
@@ -197,6 +200,7 @@ async def test_failed_redraw_marks_session_dead_for_replacement():
     from hermes_cli.pty_session import PtySession
 
     bridge = FakeBridge([b""], write_result=False)
+    bridge.is_alive = lambda: False  # Confirmed exit, not merely input backpressure.
     s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
     await s.start()
     ws = FakeWS()
@@ -328,6 +332,48 @@ def make_registry(ttl=1800.0, max_sessions=16):
                               buffer_cap=1024, read_timeout=0.01)
 
 
+@pytest.mark.asyncio
+async def test_dashboard_retains_detached_terminal_for_one_hour():
+    from hermes_cli.web_server_chat import PTY_REGISTRY
+
+    reg = PtySessionRegistry(
+        ttl=PTY_REGISTRY._ttl, max_sessions=PTY_REGISTRY._max,
+        buffer_cap=PTY_REGISTRY._buffer_cap, read_timeout=0.01)
+    bridge = FakeBridge([])
+    session, _ = await reg.attach_or_spawn("retention", spawn=lambda: bridge)
+    ws = FakeWS()
+    try:
+        await session.attach(ws)
+        reg.detach("retention", ws)
+        detached_at = session.last_detached_at
+        await reg.reap_idle(now=detached_at + 3599)
+        assert reg._sessions["retention"] is session
+        assert not bridge.closed
+        resumed, created = await reg.attach_or_spawn(
+            "retention", spawn=lambda: pytest.fail("warm session must not respawn"))
+        assert resumed is session and not created
+        await reg.reap_idle(now=detached_at + 3601)
+        assert not reg._sessions
+        assert bridge.closed
+    finally:
+        await reg.close_all()
+
+
+def test_dashboard_output_buffer_preserves_history_beyond_old_limit():
+    from hermes_cli.web_server_chat import PTY_REGISTRY
+
+    rb = RingBuffer(PTY_REGISTRY._buffer_cap)
+    block = b"x" * (1024 * 1024)
+    rb.append(b"first-message\n")
+    for _ in range(199):
+        rb.append(block)
+    assert not rb.truncated
+    assert rb.snapshot().startswith(b"first-message\n")
+    rb.append(block)
+    assert rb.truncated
+    assert len(rb.snapshot()) == 200 * 1024 * 1024
+
+
 @pytest.mark.anyio
 async def test_same_key_reattaches_same_session():
     reg = make_registry()
@@ -454,10 +500,11 @@ async def test_concurrent_reap_idle_is_idempotent():
     far_future = time.monotonic() + 10_000    # both idle past ttl → doomed
     first = asyncio.create_task(reg.reap_idle(now=far_future))
     await entered.wait()                      # k0 popped; first reap parked in close()
-    await reg.reap_idle(now=far_future)       # second reap takes k1
-
+    second = asyncio.create_task(reg.reap_idle(now=far_future))
+    await asyncio.sleep(0)
+    assert not second.done()  # Retirement/admission is serialized.
     release.set()
-    await first                               # first reap reaches the taken k1
+    await asyncio.gather(first, second)
     assert not reg._sessions
     assert all(b.closed for b in bridges)
 
@@ -471,9 +518,11 @@ async def test_close_all_survives_key_popped_by_concurrent_reap():
 
     closer = asyncio.create_task(reg.close_all())
     await entered.wait()                      # close_all popped k0, parked in close()
-    await reg.reap_idle(now=time.monotonic() + 10_000)   # pops k1 meanwhile
+    reaper = asyncio.create_task(reg.reap_idle(now=time.monotonic() + 10_000))
+    await asyncio.sleep(0)
+    assert not reaper.done()
     release.set()
-    await closer                              # k1 of the snapshot is already gone
+    await asyncio.gather(closer, reaper)
 
     assert not reg._sessions
     assert all(b.closed for b in bridges)
