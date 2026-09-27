@@ -755,6 +755,10 @@ export class GatewayClient extends EventEmitter {
     this.lastSeenSeq.delete(sid)
   }
 
+  hasEventBarrier(sid: string, owner: string): boolean {
+    return this.eventBarrierOwner.get(sid) === owner && Boolean(this.replayHold?.has(sid))
+  }
+
   activateEventBarrier(sid: string, owner: string): void {
     if (!this.replayHold) {
       this.replayHold = new Map()

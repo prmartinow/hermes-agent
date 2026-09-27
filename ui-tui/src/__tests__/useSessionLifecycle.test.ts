@@ -354,6 +354,10 @@ describe('sessionKey tracking in useSessionLifecycle', () => {
     })
 
     const gw = {
+      hasEventBarrier: vi.fn(() => true),
+      activateEventBarrier: vi.fn(),
+      cancelEventBarrier: vi.fn(),
+      releaseEventBarrier: vi.fn(),
       request: vi.fn(async (method: string) => {
         if (method === 'session.resume') {
           return {

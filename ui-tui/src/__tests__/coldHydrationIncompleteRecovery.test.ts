@@ -118,6 +118,7 @@ describe('cold hydration incomplete recovery & cancellation consistency', () => 
     }
 
     const gw = {
+      hasEventBarrier: vi.fn(() => true),
       activateEventBarrier: vi.fn(),
       cancelEventBarrier,
       releaseEventBarrier: vi.fn(),
@@ -181,6 +182,7 @@ describe('cold hydration incomplete recovery & cancellation consistency', () => 
     let failHistory = true
 
     const gw = {
+      hasEventBarrier: vi.fn(() => true),
       activateEventBarrier: vi.fn(),
       cancelEventBarrier: vi.fn(),
       releaseEventBarrier: vi.fn(),
@@ -245,6 +247,7 @@ describe('cold hydration incomplete recovery & cancellation consistency', () => 
     const releaseEventBarrier = vi.fn()
 
     const gw = {
+      hasEventBarrier: vi.fn(() => true),
       activateEventBarrier: vi.fn(),
       cancelEventBarrier: vi.fn(),
       releaseEventBarrier,

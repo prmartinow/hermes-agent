@@ -21,20 +21,54 @@ import {
   type ColdHistoryOutput
 } from './coldHistoryHydration.js'
 
+export type ColdTransactionPhase =
+  | 'hydrating'
+  | 'commit-pending'
+  | 'finalizing'
+  | 'cancelling'
+  | 'reconstructing'
+  | 'settled'
+
 export type ColdSettlement =
   | { ok: true }
-  | { ok: false; error: unknown }
+  | { ok: false; error: unknown; terminalDisposed?: boolean }
+
+export const isTerminalDisposed = (err: unknown): boolean => {
+  if (!err) return false
+  if (typeof err === 'object' && 'terminalDisposed' in err && Boolean((err as any).terminalDisposed)) {
+    return true
+  }
+  const msg = err instanceof Error ? err.message : String(err)
+  return (
+    msg.includes('Ink instance is unmounted') ||
+    msg.includes('terminal disposed') ||
+    msg.includes('terminal is unmounted')
+  )
+}
+
+export interface ReplayGenerationState {
+  attemptId: string
+  generation: string
+  aborted: boolean
+  ended: boolean
+}
 
 export interface ActiveColdOutputTransaction {
   attemptId: string
+  barrierOwner: string
   sid: string
   durableKey: string
-  lease: MainScreenStaticOutputLease
+  lease: MainScreenStaticOutputLease | null
+  acquisitionPromise?: Promise<MainScreenStaticOutputLease>
   boundaryGeneration: string | null
   staticOutputStarted: boolean
   settlementPromise: Promise<ColdSettlement>
   complete: (result: ColdSettlement) => void
+  phase: ColdTransactionPhase
+  setPhase: (phase: ColdTransactionPhase) => void
   appendedToScrollback?: boolean
+  cleanupPromise?: Promise<void>
+  replayState?: ReplayGenerationState | null
 }
 import { ZERO } from '../domain/usage.js'
 import { type GatewayClient } from '../gatewayClient.js'
@@ -222,6 +256,9 @@ export interface UseSessionLifecycleOptions {
   coldHydrationMaxMounted?: number
 }
 
+// A failed physical cleanup outlives its React hook; reusing that stream requires a PTY restart.
+const terminalQuarantine = new WeakMap<NodeJS.WriteStream, Promise<ColdSettlement>>()
+
 export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   const {
     colsRef,
@@ -256,9 +293,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     [gw, rpc]
   )
 
+  const coldRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const resumeAttemptRef = useRef<string | null>(null)
   const replayGeneration = useRef<string | null>(null)
-  const activeReplayBoundaryRef = useRef<{ attemptId: string; generation: string } | null>(null)
+  const activeReplayBoundaryRef = useRef<ReplayGenerationState | null>(null)
+  const currentReplayStateRef = useRef<ReplayGenerationState | null>(null)
   const [replayCommitted, setReplayCommitted] = useState<{ generation: string; replaceFrame: boolean } | null>(null)
   const activeColdOutputRef = useRef<ActiveColdOutputTransaction | null>(null)
   const pendingColdCommitRef = useRef<ActiveColdOutputTransaction | null>(null)
@@ -274,123 +313,181 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     }
   }, [])
 
-  const supersedeColdHydration = useCallback(async () => {
+  const abortReplayOnce = useCallback(
+    (generationOrTx?: string | ActiveColdOutputTransaction | null) => {
+      let targetState: ReplayGenerationState | null = null
+      let targetGeneration: string | null = null
+
+      if (typeof generationOrTx === 'string') {
+        targetGeneration = generationOrTx
+        if (currentReplayStateRef.current?.generation === generationOrTx) {
+          targetState = currentReplayStateRef.current
+        } else if (activeReplayBoundaryRef.current?.generation === generationOrTx) {
+          targetState = activeReplayBoundaryRef.current
+        }
+      } else if (generationOrTx && typeof generationOrTx === 'object') {
+        targetGeneration = generationOrTx.boundaryGeneration
+        if (generationOrTx.replayState) {
+          targetState = generationOrTx.replayState
+        } else if (
+          activeReplayBoundaryRef.current?.attemptId === generationOrTx.attemptId ||
+          activeReplayBoundaryRef.current?.generation === generationOrTx.boundaryGeneration
+        ) {
+          targetState = activeReplayBoundaryRef.current
+        }
+      } else if (activeReplayBoundaryRef.current) {
+        targetState = activeReplayBoundaryRef.current
+        targetGeneration = targetState.generation
+      }
+
+      if (!targetGeneration) {
+        return
+      }
+
+      if (targetState) {
+        if (targetState.aborted || targetState.ended) {
+          return
+        }
+        targetState.aborted = true
+        if (activeReplayBoundaryRef.current === targetState) {
+          activeReplayBoundaryRef.current = null
+        }
+      }
+
+      stdout.write(`\x1b]777;hermes-replay;abort;${targetGeneration}\x07`)
+    },
+    [stdout]
+  )
+
+  const settleCancelledColdTx = useCallback(
+    async (tx: ActiveColdOutputTransaction, preserveBarrier = false) => {
+      tx.setPhase('reconstructing')
+      if (!preserveBarrier) {
+        clearActiveColdBarrier(tx.barrierOwner, tx.sid)
+        gw.cancelEventBarrier(tx.sid, tx.barrierOwner)
+      }
+
+      if (!tx.cleanupPromise) {
+        tx.cleanupPromise = (async () => {
+          if (!tx.lease && tx.acquisitionPromise) {
+            try {
+              tx.lease = await tx.acquisitionPromise
+            } catch {
+              // Acquisition failed, no physical lease held
+            }
+          }
+          if (tx.lease) {
+            if (tx.staticOutputStarted) {
+              await tx.lease.reconstructAndRelease()
+            } else {
+              await tx.lease.abort()
+            }
+          }
+          abortReplayOnce(tx)
+        })()
+      }
+
+      try {
+        await tx.cleanupPromise
+        // Settlement describes physical ownership, not the abandoned hydration result.
+        tx.complete({ ok: true })
+        if (activeColdOutputRef.current === tx) {
+          activeColdOutputRef.current = null
+        }
+      } catch (cleanupErr) {
+        clearActiveColdBarrier(tx.barrierOwner, tx.sid)
+        gw.cancelEventBarrier(tx.sid, tx.barrierOwner)
+        const terminalDisposed = isTerminalDisposed(cleanupErr)
+        terminalQuarantine.set(stdout, tx.settlementPromise)
+        tx.complete({ ok: false, error: cleanupErr, terminalDisposed })
+        // Failed cleanup: do NOT clear activeColdOutputRef.current so successors stay blocked!
+        throw cleanupErr
+      }
+    },
+    [abortReplayOnce, clearActiveColdBarrier, gw, stdout]
+  )
+
+  const supersedeColdHydration = useCallback(async (preserveBarrier?: { attemptId: string; sid: string }) => {
+    if (coldRetryTimerRef.current) {
+      clearTimeout(coldRetryTimerRef.current)
+      coldRetryTimerRef.current = null
+    }
     resumeAttemptRef.current = null
-    const boundary = activeReplayBoundaryRef.current
-    if (boundary) {
-      activeReplayBoundaryRef.current = null
-      stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
+    const quarantine = terminalQuarantine.get(stdout)
+    if (quarantine) {
+      const result = await quarantine
+      if (!result.ok) {
+        throw new Error(`Terminal recovery required: ${result.error instanceof Error ? result.error.message : String(result.error)}`, { cause: result.error })
+      }
+      if (terminalQuarantine.get(stdout) === quarantine) terminalQuarantine.delete(stdout)
     }
 
     const pending = pendingColdCommitRef.current
     if (pending) {
       // Ownership transferred atomically to superseder
       pendingColdCommitRef.current = null
-      clearActiveColdBarrier(pending.attemptId, pending.sid)
-      gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
-
-      try {
-        if (pending.staticOutputStarted) {
-          await pending.lease.reconstructAndRelease()
-        } else {
-          await pending.lease.abort()
-        }
-        pending.complete({ ok: true })
-      } catch (error) {
-        pending.complete({ ok: false, error })
-        throw error
-      } finally {
-        if (activeColdOutputRef.current === pending) {
-          activeColdOutputRef.current = null
-        }
-      }
+      await settleCancelledColdTx(pending)
       return
     }
 
     const active = activeColdBarrierRef.current
-    if (active) {
+    if (active && active !== preserveBarrier) {
       activeColdBarrierRef.current = null
-      gw?.cancelEventBarrier?.(active.sid, active.attemptId)
+      gw.cancelEventBarrier(active.sid, active.attemptId)
     }
 
     const tx = activeColdOutputRef.current
     if (tx) {
+      tx.setPhase('cancelling')
       const result = await tx.settlementPromise
-      if (activeColdOutputRef.current === tx) {
-        activeColdOutputRef.current = null
-      }
-      if (!result.ok) {
+      if (result.ok) {
+        if (activeColdOutputRef.current === tx) {
+          activeColdOutputRef.current = null
+        }
+      } else {
+        // Failed cleanup / settlement outcome: keep activeColdOutputRef.current to block successors!
         throw result.error
       }
+      return
     }
-  }, [clearActiveColdBarrier, gw, stdout])
+
+    const boundary = activeReplayBoundaryRef.current
+    if (boundary) {
+      abortReplayOnce(boundary.generation)
+    }
+  }, [abortReplayOnce, clearActiveColdBarrier, gw, settleCancelledColdTx, stdout])
 
   useLayoutEffect(() => {
     const pending = pendingColdCommitRef.current
     if (!pending) return
     pendingColdCommitRef.current = null
 
-    if (pending.attemptId !== resumeAttemptRef.current) {
-      clearActiveColdBarrier(pending.attemptId, pending.sid)
-      gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
-      const boundary = activeReplayBoundaryRef.current
-      if (boundary?.attemptId === pending.attemptId) {
-        activeReplayBoundaryRef.current = null
-        stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
-      }
-      void (async () => {
-        try {
-          if (pending.staticOutputStarted) {
-            await pending.lease.reconstructAndRelease()
-          } else {
-            await pending.lease.abort()
-          }
-          pending.complete({ ok: true })
-        } catch (error) {
-          pending.complete({ ok: false, error })
-        } finally {
-          if (activeColdOutputRef.current === pending) {
-            activeColdOutputRef.current = null
-          }
-        }
-      })()
+    if (pending.attemptId !== resumeAttemptRef.current || !gw.hasEventBarrier(pending.sid, pending.barrierOwner)) {
+      void settleCancelledColdTx(pending).catch(() => {})
       return
     }
 
+    pending.setPhase('finalizing')
+
     void (async () => {
       try {
+        const lease = pending.lease
+        if (!lease) throw new Error('Cold commit cannot finalize without an acquired lease')
         if (pending.appendedToScrollback) {
-          pending.lease.prepareAppendHandoff()
+          lease.prepareAppendHandoff()
         }
-        await pending.lease.release()
+        await lease.release()
       } catch (err) {
         console.error('Lease release failed in finalizeColdCommit:', err)
         // Fail-closed invariant: if lease release/handoff fails, abort and do not release event barrier or clear incomplete marker!
-        clearActiveColdBarrier(pending.attemptId, pending.sid)
-        gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
-        const boundary = activeReplayBoundaryRef.current
-        if (boundary?.attemptId === pending.attemptId) {
-          activeReplayBoundaryRef.current = null
-          stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
-        }
-        try {
-          if (pending.staticOutputStarted) {
-            await pending.lease.reconstructAndRelease()
-          } else {
-            await pending.lease.abort()
-          }
-          pending.complete({ ok: false, error: err })
-        } catch (reconstructErr) {
-          pending.complete({ ok: false, error: reconstructErr })
-        } finally {
-          if (activeColdOutputRef.current === pending) {
-            activeColdOutputRef.current = null
-          }
-        }
+        await settleCancelledColdTx(pending).catch(() => {})
         return
       }
 
-      if (pending.attemptId !== resumeAttemptRef.current) {
+      if (pending.attemptId !== resumeAttemptRef.current || !gw.hasEventBarrier(pending.sid, pending.barrierOwner)) {
+        clearActiveColdBarrier(pending.barrierOwner, pending.sid)
+        gw.cancelEventBarrier(pending.sid, pending.barrierOwner)
+        abortReplayOnce(pending)
         if (activeColdOutputRef.current === pending) {
           activeColdOutputRef.current = null
         }
@@ -402,32 +499,43 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         activeColdOutputRef.current = null
       }
 
-      clearActiveColdBarrier(pending.attemptId, pending.sid)
-      gw?.releaseEventBarrier?.(pending.sid, pending.attemptId)
+      clearActiveColdBarrier(pending.barrierOwner, pending.sid)
+      gw.releaseEventBarrier(pending.sid, pending.barrierOwner)
       coldHydrationIncompleteRef.current = null
       if (pending.boundaryGeneration) {
         setReplayCommitted({ generation: pending.boundaryGeneration, replaceFrame: false })
       }
       pending.complete({ ok: true })
     })()
-  }, [clearActiveColdBarrier, coldCommitGeneration, coldHydrationIncompleteRef, gw, stdout])
+  }, [abortReplayOnce, clearActiveColdBarrier, coldCommitGeneration, coldHydrationIncompleteRef, gw, settleCancelledColdTx])
 
   useEffect(() => {
     return () => {
       const tx = activeColdOutputRef.current
-      if (tx) {
-        tx.complete({ ok: true })
-      }
-      void supersedeColdHydration().catch(() => {})
+      // Begin cancellation before publishing the wait, so this owner never awaits itself.
+      const cleanup = supersedeColdHydration()
+      if (tx) terminalQuarantine.set(stdout, tx.settlementPromise)
+      void cleanup.then(() => {
+        if (tx && terminalQuarantine.get(stdout) === tx.settlementPromise) terminalQuarantine.delete(stdout)
+      }).catch(error => {
+        // Production lifecycle is root-owned; component remounts must not bypass a failed owner.
+        console.error('Terminal recovery required; restart the PTY:', error)
+      })
     }
-  }, [supersedeColdHydration])
+  }, [stdout, supersedeColdHydration])
 
   useLayoutEffect(() => {
     if (replayCommitted && replayCommitted.generation === replayGeneration.current) {
-      activeReplayBoundaryRef.current = null
-      writeAfterRender(`\x1b]777;hermes-replay;end;${replayCommitted.generation}\x07`, stdout, replayCommitted.replaceFrame)
+      const state = currentReplayStateRef.current
+      if (state && state.generation === replayCommitted.generation) {
+        if (!state.aborted && !state.ended) {
+          state.ended = true
+          activeReplayBoundaryRef.current = null
+          writeAfterRender(`\x1b]777;hermes-replay;end;${replayCommitted.generation}\x07`, stdout, replayCommitted.replaceFrame)
+        }
+      }
     }
-  }, [replayCommitted])
+  }, [replayCommitted, stdout])
 
   const cancelResumeScrollRef = useRef<null | (() => void)>(null)
   const [viewportMeta, setViewportMeta] = useState<SessionViewportMeta | null>(null)
@@ -693,37 +801,61 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       id: string,
       targetRecoveryRef?: { current: string | null },
       retryAttempt = 0,
-      options?: { gapReason?: string; mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume"; durableKey?: string }
+      options?: {
+        gapReason?: string
+        mode?: "transport-recovery" | "transport-gap-recovery" | "cold-resume"
+        durableKey?: string
+        historyRetryAttempt?: number
+        retryBarrier?: { attemptId: string; sid: string }
+      }
     ): Promise<void> => {
-      await supersedeColdHydration()
+      // Transport invalidation clears the gateway queue independently of the React ref.
+      // Only gateway.ready may start a fresh cold chain after that ownership is lost.
+      const retryBarrierIsCurrent = () => {
+        const barrier = options?.retryBarrier
+        return !barrier || (activeColdBarrierRef.current === barrier && gw.hasEventBarrier(barrier.sid, barrier.attemptId))
+      }
+      if (!retryBarrierIsCurrent()) return
+      await supersedeColdHydration(options?.retryBarrier)
+      if (!retryBarrierIsCurrent()) return
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'resuming…' })
       const attemptId = randomUUID()
+      const historyRetryAttempt = options?.historyRetryAttempt ?? 0
+      const abandonRetryBarrier = () => {
+        const barrier = options?.retryBarrier
+        if (!barrier || activeColdBarrierRef.current !== barrier) return
+        clearActiveColdBarrier(barrier.attemptId, barrier.sid)
+        gw.cancelEventBarrier(barrier.sid, barrier.attemptId)
+      }
       resumeAttemptRef.current = attemptId
       const generation = INLINE_MODE && DASHBOARD_TUI_MODE ? attemptId : null
       replayGeneration.current = generation
       let replayBegun = false
 
+      const replayState: ReplayGenerationState | null = generation
+        ? { attemptId, generation, aborted: false, ended: false }
+        : null
+      currentReplayStateRef.current = replayState
+      activeReplayBoundaryRef.current = replayState
+
       const startReplay = () => {
         if (generation && !replayBegun && resumeAttemptRef.current === attemptId) {
           replayBegun = true
-          activeReplayBoundaryRef.current = { attemptId, generation }
           stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
         }
       }
 
       const abortReplay = () => {
         if (generation) {
-          if (activeReplayBoundaryRef.current?.attemptId === attemptId) {
-            activeReplayBoundaryRef.current = null
-          }
-          stdout.write(`\x1b]777;hermes-replay;abort;${generation}\x07`)
+          abortReplayOnce(generation)
         }
       }
 
       return rpc<SetupStatusResponse>('setup.status', {}).then(setup => {
-        if (resumeAttemptRef.current !== attemptId) return
+        if (resumeAttemptRef.current !== attemptId || !retryBarrierIsCurrent()) return
         if (setup?.provider_configured === false) {
+          abandonRetryBarrier()
           abortReplay()
           panel(SETUP_REQUIRED_TITLE, buildSetupRequiredSections())
           patchUiState({ status: 'setup required' })
@@ -749,10 +881,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
         return gw.request<SessionResumeResult & { viewport?: SessionViewportMeta }>('session.resume', resumeParams)
           .then(raw => {
-            if (resumeAttemptRef.current !== attemptId) return
+            if (resumeAttemptRef.current !== attemptId || !retryBarrierIsCurrent()) return
             const r = asRpcResult<SessionResumeResult & { viewport?: SessionViewportMeta }>(raw)
 
             if (!r) {
+              abandonRetryBarrier()
               abortReplay()
               sys('error: invalid response: session.resume')
 
@@ -777,28 +910,77 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               coldHydrationIncompleteRef.current = durableKeyStr
 
               const previous = activeColdBarrierRef.current
-              if (previous && previous.attemptId !== attemptId) {
-                gw?.cancelEventBarrier?.(previous.sid, previous.attemptId)
+              const continuingBarrier = previous && previous === options?.retryBarrier && previous.sid === r.session_id
+              if (previous && !continuingBarrier) {
+                gw.cancelEventBarrier(previous.sid, previous.attemptId)
                 activeColdBarrierRef.current = null
               }
-              gw?.activateEventBarrier?.(r.session_id, attemptId)
-              activeColdBarrierRef.current = { attemptId, sid: r.session_id }
+              // One event owner spans the retry chain; each physical replay still has a fresh generation.
+              const barrier = continuingBarrier ? previous : { attemptId, sid: r.session_id }
+              if (!continuingBarrier) gw.activateEventBarrier(r.session_id, barrier.attemptId)
+              activeColdBarrierRef.current = barrier
+
+              let currentPhase: ColdTransactionPhase = 'hydrating'
+              let settled = false
+              let resolveSettlement!: (result: ColdSettlement) => void
+              const settlementPromise = new Promise<ColdSettlement>(resolve => {
+                resolveSettlement = resolve
+              })
+
+              const complete = (result: ColdSettlement) => {
+                if (settled) return
+                settled = true
+                currentPhase = 'settled'
+                resolveSettlement(result)
+              }
+
+              const tx: ActiveColdOutputTransaction = {
+                attemptId,
+                barrierOwner: barrier.attemptId,
+                sid: r.session_id,
+                durableKey: durableKeyStr,
+                lease: null,
+                boundaryGeneration: generation,
+                staticOutputStarted: false,
+                settlementPromise,
+                complete,
+                replayState,
+                get phase() {
+                  return currentPhase
+                },
+                setPhase: (phase: ColdTransactionPhase) => {
+                  if (!settled) {
+                    currentPhase = phase
+                  }
+                }
+              }
+              activeColdOutputRef.current = tx
+
+              const acquisitionPromise = acquireMainScreenStaticOutput(stdout)
+              tx.acquisitionPromise = acquisitionPromise
 
               void (async () => {
                 let lease: MainScreenStaticOutputLease
                 try {
-                  lease = await acquireMainScreenStaticOutput(stdout)
+                  lease = await acquisitionPromise
+                  tx.lease = lease
                 } catch (err) {
-                  clearActiveColdBarrier(attemptId, r.session_id)
-                  gw?.cancelEventBarrier?.(r.session_id, attemptId)
+                  clearActiveColdBarrier(tx.barrierOwner, r.session_id)
+                  gw.cancelEventBarrier(r.session_id, tx.barrierOwner)
                   console.error('Failed to acquire main-screen static output lease:', err)
+                  abortReplayOnce(generation)
+                  sys(`error: failed to acquire static output lease: ${err instanceof Error ? err.message : String(err)}`)
+                  patchUiState({ status: 'ready' })
+                  if (activeColdOutputRef.current === tx) {
+                    activeColdOutputRef.current = null
+                  }
+                  tx.complete({ ok: true })
                   return
                 }
 
-                if (resumeAttemptRef.current !== attemptId) {
-                  clearActiveColdBarrier(attemptId, r.session_id)
-                  gw?.cancelEventBarrier?.(r.session_id, attemptId)
-                  void lease.abort()
+                if (resumeAttemptRef.current !== attemptId || tx.phase === 'cancelling' || !gw.hasEventBarrier(tx.sid, tx.barrierOwner)) {
+                  // Cleanup records failures on settlementPromise for every waiting successor.
+                  await settleCancelledColdTx(tx).catch(() => {})
                   return
                 }
 
@@ -816,23 +998,6 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   storedSid,
                   usage: usageFrom(info)
                 })
-
-                let resolveSettlement!: (result: ColdSettlement) => void
-                const settlementPromise = new Promise<ColdSettlement>(resolve => {
-                  resolveSettlement = resolve
-                })
-
-                const tx: ActiveColdOutputTransaction = {
-                  attemptId,
-                  sid: r.session_id,
-                  durableKey: durableKeyStr,
-                  lease,
-                  boundaryGeneration: generation,
-                  staticOutputStarted: false,
-                  settlementPromise,
-                  complete: resolveSettlement
-                }
-                activeColdOutputRef.current = tx
 
                 const coldOutput: ColdHistoryOutput = {
                   getColumns: () => colsRef.current,
@@ -854,29 +1019,15 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                     info,
                     maxMounted,
                     output: coldOutput,
-                    isCancelled: () => resumeAttemptRef.current !== attemptId
+                    isCancelled: () => resumeAttemptRef.current !== attemptId || !gw.hasEventBarrier(tx.sid, tx.barrierOwner)
                   })
 
-                  if (resumeAttemptRef.current !== attemptId) {
-                    clearActiveColdBarrier(attemptId, r.session_id)
-                    gw?.cancelEventBarrier?.(r.session_id, attemptId)
-                    try {
-                      if (tx.staticOutputStarted) {
-                        await lease.reconstructAndRelease()
-                      } else {
-                        await lease.abort()
-                      }
-                      tx.complete({ ok: true })
-                    } catch (cleanupErr) {
-                      tx.complete({ ok: false, error: cleanupErr })
-                    } finally {
-                      if (activeColdOutputRef.current === tx) {
-                        activeColdOutputRef.current = null
-                      }
-                    }
+                  if (resumeAttemptRef.current !== attemptId || !gw.hasEventBarrier(tx.sid, tx.barrierOwner)) {
+                    await settleCancelledColdTx(tx)
                     return
                   }
 
+                  tx.setPhase('commit-pending')
                   tx.appendedToScrollback = hydration.appendedToScrollback
                   const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
                   // 1. Commit live tail to React state first
@@ -886,30 +1037,36 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   pendingColdCommitRef.current = tx
                   setColdCommitGeneration(attemptId)
                 } catch (err) {
-                  clearActiveColdBarrier(attemptId, r.session_id)
-                  gw?.cancelEventBarrier?.(r.session_id, attemptId)
-                  const boundary = activeReplayBoundaryRef.current
-                  if (boundary?.attemptId === attemptId) {
-                    activeReplayBoundaryRef.current = null
-                    stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
-                  }
+                  const failure = classifyResumeFailure(err)
+                  const retryHistory = !(err instanceof ColdHydrationCancelledError) &&
+                    resumeAttemptRef.current === attemptId && gw.hasEventBarrier(tx.sid, tx.barrierOwner) &&
+                    failure.kind !== 'transport' && failure.kind !== 'identity' && historyRetryAttempt < 3
                   try {
-                    if (tx.staticOutputStarted) {
-                      await lease.reconstructAndRelease()
-                    } else {
-                      await lease.abort()
-                    }
-                    if (resumeAttemptRef.current !== attemptId || err instanceof ColdHydrationCancelledError) {
-                      tx.complete({ ok: true })
-                    } else {
-                      tx.complete({ ok: false, error: err })
-                    }
-                  } catch (cleanupErr) {
-                    tx.complete({ ok: false, error: cleanupErr })
-                  } finally {
-                    if (activeColdOutputRef.current === tx) {
-                      activeColdOutputRef.current = null
-                    }
+                    await settleCancelledColdTx(tx, retryHistory)
+                  } catch {
+                    // Physical failure is quarantined; only a fresh PTY can recover ownership.
+                    return
+                  }
+                  if (err instanceof ColdHydrationCancelledError || resumeAttemptRef.current !== attemptId) return
+                  if (failure.kind === 'transport') {
+                    patchUiState({ status: 'disconnected' })
+                    return // gateway.ready consumes the retained incomplete marker.
+                  }
+                  if (retryHistory) {
+                    patchUiState({ status: 'retrying history…' })
+                    coldRetryTimerRef.current = setTimeout(() => {
+                      coldRetryTimerRef.current = null
+                      if (resumeAttemptRef.current !== attemptId) return
+                      void resumeById(id, targetRecoveryRef, 0, {
+                        mode: 'cold-resume', durableKey: durableKeyStr,
+                        historyRetryAttempt: historyRetryAttempt + 1, retryBarrier: barrier
+                      }).catch(error => {
+                        sys(`error: ${error instanceof Error ? error.message : String(error)}`)
+                      })
+                    }, Math.min(1000, 250 * 2 ** historyRetryAttempt))
+                  } else {
+                    sys(`error: history recovery failed: ${err instanceof Error ? err.message : String(err)}`)
+                    patchUiState({ status: 'history incomplete' })
                   }
                 }
               })()
@@ -972,7 +1129,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             }
           })
       }).catch((e: unknown) => {
-        if (resumeAttemptRef.current !== attemptId) return
+        if (resumeAttemptRef.current !== attemptId || !retryBarrierIsCurrent()) return
         const failure = classifyResumeFailure(e)
         if (failure.kind === 'retry-same') {
           const isSettling = failure.reason === 'disconnect_interrupt_settling'
@@ -987,6 +1144,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             return
           }
         }
+        abandonRetryBarrier()
         if (failure.kind === 'identity') {
           const fileFallback = readActiveSessionFile()
           if (fileFallback && fileFallback !== id) {
@@ -1003,7 +1161,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         patchUiState({ status: 'ready' })
       })
     },
-    [closeSession, colsRef, gw, opts.recoverSessionKeyRef, opts.recoverSidRef, panel, recoverSessionKeyRef, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, supersedeColdHydration, sys]
+    [clearActiveColdBarrier, closeSession, colsRef, gw, opts.recoverSessionKeyRef, opts.recoverSidRef, panel, recoverSessionKeyRef, resetSession, rpc, scrollRef, setHistoryItems, setSessionStartedAt, supersedeColdHydration, sys]
   )
 
   const guardBusySessionSwitch = useCallback(

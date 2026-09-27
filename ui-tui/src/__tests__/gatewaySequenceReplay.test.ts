@@ -104,6 +104,24 @@ describe("Gateway Sequence Replay & Gap Recovery (P0)", () => {
     }
   })
 
+  it("reports actual barrier ownership lost on WebSocket disconnect", async () => {
+    client = new GatewayClient()
+    const received: AnyGatewayEvent[] = []
+    client.on("event", ev => received.push(ev))
+    client.drain()
+    await Promise.resolve()
+    client.start()
+    const ws = await server.waitForNextConnection()
+    ws.send(JSON.stringify({ jsonrpc: "2.0", method: "event", params: { type: "gateway.ready", payload: { replay_epoch: "epoch-1" } } }))
+    await vi.waitFor(() => expect(received.some(ev => ev.type === "gateway.ready")).toBe(true))
+    expect(client.hasEventBarrier("s1", "owner")).toBe(false)
+    client.activateEventBarrier("s1", "owner")
+    expect(client.hasEventBarrier("s1", "owner")).toBe(true)
+    expect(client.hasEventBarrier("s1", "wrong-owner")).toBe(false)
+    ws.terminate()
+    await vi.waitFor(() => expect(client!.hasEventBarrier("s1", "owner")).toBe(false))
+  })
+
   it("deduplicates events based on monotonic seq counter", async () => {
     client = new GatewayClient()
     const received: AnyGatewayEvent[] = []
