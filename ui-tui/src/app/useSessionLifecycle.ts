@@ -28,7 +28,8 @@ export interface ActiveColdOutputTransaction {
   lease: MainScreenStaticOutputLease
   boundaryGeneration: string | null
   staticOutputStarted: boolean
-  hydrationPromise: Promise<unknown> | null
+  settlementPromise: Promise<void>
+  settle: () => void
   appendedToScrollback?: boolean
 }
 import { ZERO } from '../domain/usage.js'
@@ -213,6 +214,8 @@ export interface UseSessionLifecycleOptions {
   setVoiceProcessing: StateSetter<boolean>
   setVoiceRecording: StateSetter<boolean>
   sys: (text: string) => void
+  stdout?: NodeJS.WriteStream
+  coldHydrationMaxMounted?: number
 }
 
 export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
@@ -232,6 +235,9 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     setVoiceRecording,
     sys
   } = opts
+
+  const stdout = opts.stdout ?? process.stdout
+  const maxMounted = opts.coldHydrationMaxMounted ?? 120
 
   const recoverSessionKeyRef = opts.recoverSessionKeyRef ?? opts.recoverSidRef
 
@@ -269,21 +275,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     const boundary = activeReplayBoundaryRef.current
     if (boundary) {
       activeReplayBoundaryRef.current = null
-      process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
+      stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
     }
     const pending = pendingColdCommitRef.current
     if (pending) {
       pendingColdCommitRef.current = null
       gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
-      try {
-        if (pending.staticOutputStarted) {
-          await pending.lease.reconstructAndRelease()
-        } else {
-          await pending.lease.abort()
-        }
-      } catch {
-        // Already released/aborted
-      }
     }
     const active = activeColdBarrierRef.current
     if (active) {
@@ -292,25 +289,12 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     }
     const tx = activeColdOutputRef.current
     if (tx) {
-      activeColdOutputRef.current = null
-      if (tx.hydrationPromise) {
-        try {
-          await tx.hydrationPromise
-        } catch {
-          // Ignored during supersession
-        }
-      }
-      try {
-        if (tx.staticOutputStarted) {
-          await tx.lease.reconstructAndRelease()
-        } else {
-          await tx.lease.abort()
-        }
-      } catch {
-        // Already released/aborted
+      await tx.settlementPromise
+      if (activeColdOutputRef.current === tx) {
+        activeColdOutputRef.current = null
       }
     }
-  }, [gw])
+  }, [gw, stdout])
 
   useLayoutEffect(() => {
     const pending = pendingColdCommitRef.current
@@ -323,9 +307,16 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       const boundary = activeReplayBoundaryRef.current
       if (boundary?.attemptId === pending.attemptId) {
         activeReplayBoundaryRef.current = null
-        process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
+        stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
       }
-      void pending.lease.abort()
+      void (async () => {
+        if (pending.staticOutputStarted) {
+          await pending.lease.reconstructAndRelease()
+        } else {
+          await pending.lease.abort()
+        }
+        pending.settle()
+      })()
       return
     }
 
@@ -351,12 +342,14 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         const boundary = activeReplayBoundaryRef.current
         if (boundary?.attemptId === pending.attemptId) {
           activeReplayBoundaryRef.current = null
-          process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
+          stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
         }
+        pending.settle()
         return
       }
 
       if (pending.attemptId !== resumeAttemptRef.current) {
+        pending.settle()
         return
       }
 
@@ -370,6 +363,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       if (pending.boundaryGeneration) {
         setReplayCommitted({ generation: pending.boundaryGeneration, replaceFrame: false })
       }
+      pending.settle()
     })()
   }, [clearActiveColdBarrier, coldCommitGeneration, gw, coldHydrationIncompleteRef])
 
@@ -382,7 +376,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   useLayoutEffect(() => {
     if (replayCommitted && replayCommitted.generation === replayGeneration.current) {
       activeReplayBoundaryRef.current = null
-      writeAfterRender(`\x1b]777;hermes-replay;end;${replayCommitted.generation}\x07`, process.stdout, replayCommitted.replaceFrame)
+      writeAfterRender(`\x1b]777;hermes-replay;end;${replayCommitted.generation}\x07`, stdout, replayCommitted.replaceFrame)
     }
   }, [replayCommitted])
 
@@ -435,7 +429,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
 
   const startNewSession = useCallback(
     async (msg?: string, title?: string, keepCurrent = false) => {
-      supersedeColdHydration()
+      await supersedeColdHydration()
       const setup = await rpc<SetupStatusResponse>('setup.status', {})
 
       if (setup?.provider_configured === false) {
@@ -542,8 +536,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
   )
 
   const activateLiveSession = useCallback(
-    (id: string) => {
-      supersedeColdHydration()
+    async (id: string) => {
+      await supersedeColdHydration()
       patchOverlayState({ sessions: false })
       patchUiState({ status: 'switching session…' })
       // The card belongs to the session being left; the activated one answers with its own.
@@ -662,7 +656,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         if (generation && !replayBegun && resumeAttemptRef.current === attemptId) {
           replayBegun = true
           activeReplayBoundaryRef.current = { attemptId, generation }
-          process.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
+          stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
         }
       }
 
@@ -671,7 +665,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           if (activeReplayBoundaryRef.current?.attemptId === attemptId) {
             activeReplayBoundaryRef.current = null
           }
-          process.stdout.write(`\x1b]777;hermes-replay;abort;${generation}\x07`)
+          stdout.write(`\x1b]777;hermes-replay;abort;${generation}\x07`)
         }
       }
 
@@ -741,7 +735,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               void (async () => {
                 let lease: MainScreenStaticOutputLease
                 try {
-                  lease = await acquireMainScreenStaticOutput(process.stdout)
+                  lease = await acquireMainScreenStaticOutput(stdout)
                 } catch (err) {
                   clearActiveColdBarrier(attemptId, r.session_id)
                   gw?.cancelEventBarrier?.(r.session_id, attemptId)
@@ -771,6 +765,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   usage: usageFrom(info)
                 })
 
+                let settleTransaction!: () => void
+                const settlementPromise = new Promise<void>(resolve => {
+                  settleTransaction = resolve
+                })
+
                 const tx: ActiveColdOutputTransaction = {
                   attemptId,
                   sid: r.session_id,
@@ -778,7 +777,8 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   lease,
                   boundaryGeneration: generation,
                   staticOutputStarted: false,
-                  hydrationPromise: null
+                  settlementPromise,
+                  settle: () => settleTransaction()
                 }
                 activeColdOutputRef.current = tx
 
@@ -794,24 +794,32 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   }
                 }
 
-                const hydrationPromise = performColdHistoryHydration({
-                  gateway: gw,
-                  sessionId: r.session_id,
-                  theme: getUiState().theme,
-                  info,
-                  output: coldOutput,
-                  isCancelled: () => resumeAttemptRef.current !== attemptId
-                })
-                tx.hydrationPromise = hydrationPromise
-
                 try {
-                  const hydration = await hydrationPromise
+                  const hydration = await performColdHistoryHydration({
+                    gateway: gw,
+                    sessionId: r.session_id,
+                    theme: getUiState().theme,
+                    info,
+                    maxMounted,
+                    output: coldOutput,
+                    isCancelled: () => resumeAttemptRef.current !== attemptId
+                  })
+
                   if (resumeAttemptRef.current !== attemptId) {
                     clearActiveColdBarrier(attemptId, r.session_id)
                     gw?.cancelEventBarrier?.(r.session_id, attemptId)
-                    void lease.abort()
+                    if (activeColdOutputRef.current === tx) {
+                      activeColdOutputRef.current = null
+                    }
+                    if (tx.staticOutputStarted) {
+                      await lease.reconstructAndRelease()
+                    } else {
+                      await lease.abort()
+                    }
+                    tx.settle()
                     return
                   }
+
                   tx.appendedToScrollback = hydration.appendedToScrollback
                   const resumed = [...hydration.initialLiveMessages, ...liveSessionInflightMessages(r.inflight, hydration.initialLiveMessages)]
                   // 1. Commit live tail to React state first
@@ -826,26 +834,25 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   if (activeColdOutputRef.current === tx) {
                     activeColdOutputRef.current = null
                   }
-                  try {
-                    if (tx.staticOutputStarted) {
-                      await lease.reconstructAndRelease()
-                    } else {
-                      await lease.abort()
-                    }
-                  } catch {
-                    // Already released/aborted
+                  if (tx.staticOutputStarted) {
+                    await lease.reconstructAndRelease()
+                  } else {
+                    await lease.abort()
                   }
                   if (resumeAttemptRef.current !== attemptId) {
+                    tx.settle()
                     return
                   }
                   if (err instanceof ColdHydrationCancelledError) {
+                    tx.settle()
                     return
                   }
                   const boundary = activeReplayBoundaryRef.current
                   if (boundary?.attemptId === attemptId) {
                     activeReplayBoundaryRef.current = null
-                    process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
+                    stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
                   }
+                  tx.settle()
                 }
               })()
             } else if (!isTransportRecovery) {

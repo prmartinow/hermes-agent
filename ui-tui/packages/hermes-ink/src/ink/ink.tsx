@@ -2958,17 +2958,25 @@ export default class Ink {
     }
 
     // Set initial render mode to clear-terminal to wipe stale dirty output
+    // Fail-closed lease invariant: keep lease held and isPaused = true throughout!
     this.pendingInitialRenderMode = 'clear-terminal'
     this.log.reset()
     this.needsEraseBeforePaint = true
     this.inlineViewportOriginY = 0
-    this.mainScreenLease = null
-    this.isPaused = false
 
     // Flush any pending React reconciler work and render clean initial frame
     reconciler.flushSyncFromReconciler()
     this.onRender('reconstruct-clean')
     await this.writeAndDrain('')
+
+    // ONLY after successful stdout drain: release lease and restore ordinary rendering!
+    this.mainScreenLease = null
+    this.isPaused = false
+
+    if (this.renderRequestedWhilePaused) {
+      this.renderRequestedWhilePaused = false
+      this.scheduleRender()
+    }
   }
 
   async abortMainScreenStaticOutput(token: symbol): Promise<{ requiresReconstruction: boolean }> {
