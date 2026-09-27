@@ -567,6 +567,24 @@ export const api = {
     const qs = params.toString();
     return fetchJSON<GeminiQuotaTimelineResponse>(`/api/gemini/quota-timeline${qs ? `?${qs}` : ""}`);
   },
+  getCodexUsageHistory: (options?: { days?: number; signal?: AbortSignal }) => {
+    const days = options?.days ?? 7;
+    return fetchJSON<CodexUsageHistoryResponse>(`/api/codex/usage-history?days=${days}`, {
+      signal: options?.signal,
+    });
+  },
+  getCodexUsageHistory: (options?: { days?: number; signal?: AbortSignal }) => {
+    const days = options?.days ?? 7;
+    return fetchJSON<CodexUsageHistoryResponse>(`/api/codex/usage-history?days=${days}`, {
+      signal: options?.signal,
+    });
+  },
+  getCodexUsageHistory: (options?: { days?: number; signal?: AbortSignal }) => {
+    const days = options?.days ?? 7;
+    return fetchJSON<CodexUsageHistoryResponse>(`/api/codex/usage-history?days=${days}`, {
+      signal: options?.signal,
+    });
+  },
   exportSessionUrl: (id: string, profile = getManagementProfile()) =>
     appendProfileParam(`/api/sessions/${encodeURIComponent(id)}/export`, profile),
   importSessions: (
@@ -2190,6 +2208,60 @@ export interface GeminiQuotaTimelineResponse {
   generated_at: string;
   accounts_meta: GeminiAccountMeta[];
   intervals: GeminiQuotaInterval[];
+}
+
+export type CodexHistoryStatus = "ok" | "unavailable" | "error" | "invalid_response";
+
+export interface CodexPlanPeriod {
+  starts_at: string;
+  ends_at: string;
+  window_minutes: number | null;
+  plan_type: string | null;
+  used_basis_points: number | null;
+  accounting_complete: boolean | null;
+}
+
+export interface CodexPlanLimitHistory {
+  data_as_of: string | null;
+  coverage_start: string | null;
+  coverage_complete: boolean | null;
+  approximate: boolean | null;
+  periods: CodexPlanPeriod[];
+}
+
+export interface CodexTokenModelUsage {
+  model: string;
+  cached_text_input_tokens: number | null;
+  uncached_text_input_tokens: number | null;
+  text_output_tokens: number | null;
+  total_tokens: number | null;
+}
+
+export interface CodexDailyTokenUsageDay {
+  date: string;
+  models: CodexTokenModelUsage[];
+}
+
+export interface CodexDailyTokenUsageBreakdown {
+  data_freshness_ts: string | null;
+  units: string | null;
+  days: CodexDailyTokenUsageDay[];
+}
+
+export interface CodexUsageHistoryResponse {
+  provider: "openai-codex" | string;
+  fetched_at: string;
+  account_id: string | null;
+  plan_limit_history: {
+    status: CodexHistoryStatus;
+    error: string | null;
+    data: CodexPlanLimitHistory | null;
+  };
+  daily_token_usage_breakdown: {
+    status: CodexHistoryStatus;
+    error: string | null;
+    data: CodexDailyTokenUsageBreakdown | null;
+  };
 }
 
 export interface SessionInfo {

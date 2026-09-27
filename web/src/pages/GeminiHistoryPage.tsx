@@ -12,6 +12,7 @@ import {
   Shield,
 } from "lucide-react";
 import { api, type GeminiSessionAccountHistory } from "../lib/api";
+import CodexUsageHistoryPanel from "../components/CodexUsageHistoryPanel";
 
 type SortField =
   | "title"
@@ -26,6 +27,7 @@ type SortField =
 type SortDirection = "asc" | "desc" | null;
 
 export default function GeminiHistoryPage() {
+  const [selectedProvider, setSelectedProvider] = useState<"gemini" | "codex">("gemini");
   const [sessions, setSessions] = useState<GeminiSessionAccountHistory[]>([]);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
@@ -48,17 +50,20 @@ export default function GeminiHistoryPage() {
   }, []);
 
   useEffect(() => {
-    load();
-  }, [load]);
+    if (selectedProvider === "gemini") {
+      load();
+    }
+  }, [load, selectedProvider]);
 
   useEffect(() => {
+    if (selectedProvider !== "gemini") return;
     const interval = setInterval(() => {
       if (document.visibilityState === "visible") {
         load(true);
       }
     }, 15000);
     return () => clearInterval(interval);
-  }, [load]);
+  }, [load, selectedProvider]);
 
   const toggleExpand = (sid: string) => {
     setExpandedIds((prev) => {
@@ -169,23 +174,54 @@ export default function GeminiHistoryPage() {
         </div>
 
         <div className="flex items-center gap-2.5">
-          <button
-            type="button"
-            onClick={() => setIncludeSubagents((v) => !v)}
-            className={`px-2.5 py-1 text-xs border rounded font-bold uppercase transition-colors ${
-              includeSubagents
-                ? "bg-purple-500/20 text-purple-300 border-purple-500/40"
-                : "bg-transparent text-text-secondary border-midground/20 hover:text-foreground hover:bg-midground/10"
-            }`}
-            title={includeSubagents ? "Hide Subagents" : "Include Subagents"}
-          >
-            SUB
-          </button>
+          {/* Provider Selector: Gemini / OpenAI Codex */}
+          <div className="flex items-center gap-1 p-1 bg-black/50 border border-midground/30 rounded-lg">
+            <button
+              type="button"
+              onClick={() => setSelectedProvider("gemini")}
+              className={`px-3 py-1 text-xs font-bold uppercase tracking-wider rounded-md transition-all ${
+                selectedProvider === "gemini"
+                  ? "bg-teal-500/20 text-teal-300 border border-teal-500/40 shadow-sm"
+                  : "text-text-secondary hover:text-foreground hover:bg-midground/10 border border-transparent"
+              }`}
+            >
+              Gemini
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedProvider("codex")}
+              className={`px-3 py-1 text-xs font-bold uppercase tracking-wider rounded-md transition-all ${
+                selectedProvider === "codex"
+                  ? "bg-purple-500/20 text-purple-300 border border-purple-500/40 shadow-sm"
+                  : "text-text-secondary hover:text-foreground hover:bg-midground/10 border border-transparent"
+              }`}
+            >
+              OpenAI Codex
+            </button>
+          </div>
+
+          {selectedProvider === "gemini" && (
+            <button
+              type="button"
+              onClick={() => setIncludeSubagents((v) => !v)}
+              className={`px-2.5 py-1 text-xs border rounded font-bold uppercase transition-colors ${
+                includeSubagents
+                  ? "bg-purple-500/20 text-purple-300 border-purple-500/40"
+                  : "bg-transparent text-text-secondary border-midground/20 hover:text-foreground hover:bg-midground/10"
+              }`}
+              title={includeSubagents ? "Hide Subagents" : "Include Subagents"}
+            >
+              SUB
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Main Chats & Account History Table */}
-      <div className="border border-midground/20 rounded overflow-hidden bg-black/30">
+      {selectedProvider === "codex" ? (
+        <CodexUsageHistoryPanel mode="history" />
+      ) : (
+        /* Main Chats & Account History Table */
+        <div className="border border-midground/20 rounded overflow-hidden bg-black/30">
         {error && (
           <div className="p-4 text-xs text-rose-400 bg-rose-500/10 border-b border-rose-500/20">
             {error}
@@ -447,6 +483,7 @@ export default function GeminiHistoryPage() {
           </table>
         </div>
       </div>
+      )}
     </div>
   );
 }

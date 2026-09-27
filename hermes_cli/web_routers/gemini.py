@@ -38,3 +38,13 @@ def get_gemini_quota_timeline(
 ):
     from hermes_cli.auth import get_gemini_quota_timeline as _get_timeline
     return _get_timeline(timespan=timespan, model_group=model_group)
+
+
+@router.get("/api/codex/usage-history")
+def get_codex_usage_history(
+    days: int = Query(7, ge=1, le=30),
+    profile: Optional[str] = None,
+):
+    """Retrieve sanitized and normalized Codex subscription telemetry."""
+    from hermes_cli.codex_usage_dashboard import get_codex_usage_dashboard
+    return get_codex_usage_dashboard(days=days, profile=profile)

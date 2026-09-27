@@ -314,6 +314,19 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
         await pending.lease.release()
       } catch (err) {
         console.error('Lease release failed in finalizeColdCommit:', err)
+        // Fail-closed invariant: if lease release/handoff fails, abort and do not release event barrier or clear incomplete marker!
+        clearActiveColdBarrier(pending.attemptId, pending.sid)
+        gw?.cancelEventBarrier?.(pending.sid, pending.attemptId)
+        if (activeColdOutputRef.current === pending) {
+          activeColdOutputRef.current = null
+        }
+        void pending.lease.abort()
+        const boundary = activeReplayBoundaryRef.current
+        if (boundary?.attemptId === pending.attemptId) {
+          activeReplayBoundaryRef.current = null
+          process.stdout.write(`\x1b]777;hermes-replay;abort;${boundary.generation}\x07`)
+        }
+        return
       }
 
       if (pending.attemptId !== resumeAttemptRef.current) {
@@ -673,15 +686,18 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
               return patchUiState({ status: 'ready' })
             }
 
-            // Valid response acquired: begin replay boundary now
-            startReplay()
+            const isColdHydration = !isTransportRecovery && !isGapRecovery && INLINE_MODE
+
+            // For non-cold paths, begin replay boundary immediately;
+            // for cold hydration, startReplay() is deferred until after static lease acquisition.
+            if (!isColdHydration) {
+              startReplay()
+            }
 
             const storedSid = r.info?.stored_session_id || r.stored_session_id || r.resumed || id
             const info = r.info ? { ...r.info, stored_session_id: storedSid } : null
             const running = Boolean(r.running || r.status === 'working' || r.status === 'waiting')
             const durableKey = (r as any).resumed ?? (r as any).session_key ?? (r as any).stored_session_id ?? r.session_id
-
-            const isColdHydration = !isTransportRecovery && !isGapRecovery && INLINE_MODE
 
             if (isColdHydration) {
               const durableKeyStr = String(durableKey || r.session_id || id)
@@ -713,10 +729,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
                   return
                 }
 
-                if (generation) {
-                  process.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
-                  activeReplayBoundaryRef.current = { attemptId, generation }
-                }
+                startReplay()
 
                 resetSession()
                 setSessionStartedAt(r.started_at ? r.started_at * 1000 : Date.now())

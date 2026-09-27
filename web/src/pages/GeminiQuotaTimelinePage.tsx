@@ -11,10 +11,12 @@ import {
   type GeminiQuotaInterval,
   type GeminiQuotaTimelineResponse,
 } from "@/lib/api";
+import CodexUsageHistoryPanel from "@/components/CodexUsageHistoryPanel";
 
 type ModelGroupOption = "gemini" | "claude";
 
 export default function GeminiQuotaTimelinePage() {
+  const [selectedProvider, setSelectedProvider] = useState<"gemini" | "codex">("gemini");
   const [timelineData, setTimelineData] = useState<GeminiQuotaTimelineResponse | null>(null);
   const [modelGroup, setModelGroup] = useState<ModelGroupOption>("gemini");
   const [loading, setLoading] = useState<boolean>(true);
@@ -45,18 +47,21 @@ export default function GeminiQuotaTimelinePage() {
   );
 
   useEffect(() => {
-    loadData(false);
-  }, [loadData]);
+    if (selectedProvider === "gemini") {
+      loadData(false);
+    }
+  }, [loadData, selectedProvider]);
 
   // Auto-refresh every 30s when tab is visible
   useEffect(() => {
+    if (selectedProvider !== "gemini") return;
     const interval = setInterval(() => {
       if (document.visibilityState === "visible") {
         loadData(true);
       }
     }, 30000);
     return () => clearInterval(interval);
-  }, [loadData]);
+  }, [loadData, selectedProvider]);
 
   const defaultAccountAliases = useMemo(() => ["account_1", "account_2", "account_3", "account_4", "account_5"], []);
 
@@ -142,39 +147,71 @@ export default function GeminiQuotaTimelinePage() {
               15-minute interval usage rates (5h capacity, 7d weekly) & DOCI opportunity-cost rankings across all 5 accounts.
             </p>
           </div>
+
+          {/* Provider Selector: Gemini / OpenAI Codex */}
+          <div className="flex items-center gap-1 p-1 bg-black/50 border border-midground/30 rounded-lg w-fit">
+            <button
+              type="button"
+              onClick={() => setSelectedProvider("gemini")}
+              className={`px-3.5 py-1.5 text-xs font-bold uppercase tracking-wider rounded-md transition-all ${
+                selectedProvider === "gemini"
+                  ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shadow-sm"
+                  : "text-text-secondary hover:text-foreground hover:bg-midground/10 border border-transparent"
+              }`}
+            >
+              Gemini
+            </button>
+            <button
+              type="button"
+              onClick={() => setSelectedProvider("codex")}
+              className={`px-3.5 py-1.5 text-xs font-bold uppercase tracking-wider rounded-md transition-all ${
+                selectedProvider === "codex"
+                  ? "bg-purple-500/20 text-purple-300 border border-purple-500/40 shadow-sm"
+                  : "text-text-secondary hover:text-foreground hover:bg-midground/10 border border-transparent"
+              }`}
+            >
+              OpenAI Codex
+            </button>
+          </div>
         </div>
 
-        {/* Segmented Control: Model Group */}
-        <div className="flex items-center gap-1 p-1 bg-black/50 border border-midground/30 rounded-lg w-fit">
-          <button
-            type="button"
-            onClick={() => setModelGroup("gemini")}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold uppercase tracking-wider rounded-md transition-all ${
-              modelGroup === "gemini"
-                ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shadow-sm"
-                : "text-text-secondary hover:text-foreground hover:bg-midground/10 border border-transparent"
-            }`}
-          >
-            <Zap className="w-3.5 h-3.5" />
-            <span>Gemini Quota</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setModelGroup("claude")}
-            className={`flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold uppercase tracking-wider rounded-md transition-all ${
-              modelGroup === "claude"
-                ? "bg-purple-500/20 text-purple-300 border border-purple-500/40 shadow-sm"
-                : "text-text-secondary hover:text-foreground hover:bg-midground/10 border border-transparent"
-            }`}
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            <span>Claude & 3P Quota</span>
-          </button>
-        </div>
+        {/* Segmented Control: Model Group (only in Gemini mode) */}
+        {selectedProvider === "gemini" && (
+          <div className="flex items-center gap-1 p-1 bg-black/50 border border-midground/30 rounded-lg w-fit">
+            <button
+              type="button"
+              onClick={() => setModelGroup("gemini")}
+              className={`flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold uppercase tracking-wider rounded-md transition-all ${
+                modelGroup === "gemini"
+                  ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 shadow-sm"
+                  : "text-text-secondary hover:text-foreground hover:bg-midground/10 border border-transparent"
+              }`}
+            >
+              <Zap className="w-3.5 h-3.5" />
+              <span>Gemini Quota</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setModelGroup("claude")}
+              className={`flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-bold uppercase tracking-wider rounded-md transition-all ${
+                modelGroup === "claude"
+                  ? "bg-purple-500/20 text-purple-300 border border-purple-500/40 shadow-sm"
+                  : "text-text-secondary hover:text-foreground hover:bg-midground/10 border border-transparent"
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Claude & 3P Quota</span>
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Account Overview Cards */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+      {selectedProvider === "codex" ? (
+        <CodexUsageHistoryPanel mode="timeline" />
+      ) : (
+        <>
+          {/* Account Overview Cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
         {accountsMeta.map((acc) => {
           return (
             <div
@@ -343,6 +380,8 @@ export default function GeminiQuotaTimelinePage() {
           </table>
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 }
