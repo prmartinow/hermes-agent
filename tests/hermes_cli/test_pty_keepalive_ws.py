@@ -101,9 +101,15 @@ async def test_attach_token_reuses_same_session(pty_keepalive_harness):
     with client.websocket_connect("/api/pty?attach=TOK1") as ws1:
         ws1.send_bytes(b"hi")
     with client.websocket_connect("/api/pty?attach=TOK1") as ws2:
+        ctrl = ws2.receive_json()
+        assert ctrl["type"] == "replay-start"
+        gen = ctrl["generation"]
         ws2.send_bytes(b"again")
     assert len(pty_keepalive_harness) == 1                # reattached, did not respawn
-    assert bytes(pty_keepalive_harness.bridges[0].written) in (b"hiagain", b"hi\x0cagain")
+    expected_request = f"\x1b]777;hermes-replay;request;{gen}\x07".encode("ascii")
+    written = bytes(pty_keepalive_harness.bridges[0].written)
+    assert written == b"hi" + expected_request + b"again"
+    assert b"\x0c" not in written
 
 
 @pytest.mark.asyncio
@@ -149,8 +155,15 @@ async def test_attach_token_reuses_canonical_resume(pty_keepalive_harness):
     with client.websocket_connect("/api/pty?attach=TOK1&resume=parent") as ws1:
         ws1.send_bytes(b"hi")
     with client.websocket_connect("/api/pty?attach=TOK1&resume=child") as ws2:
+        ctrl = ws2.receive_json()
+        assert ctrl["type"] == "replay-start"
+        gen = ctrl["generation"]
         ws2.send_bytes(b"again")
     assert pty_keepalive_harness == [["x", "child"]]
+    expected_request = f"\x1b]777;hermes-replay;request;{gen}\x07".encode("ascii")
+    written = bytes(pty_keepalive_harness.bridges[0].written)
+    assert written == b"hi" + expected_request + b"again"
+    assert b"\x0c" not in written
 
 
 
@@ -182,7 +195,7 @@ async def test_attach_token_reuses_default_chat_after_active_session_fallback(
 
 @pytest.mark.anyio
 async def test_attach_token_suppresses_redraw_when_buffer_large(pty_keepalive_harness):
-    """Reattaching to a session with >256 bytes in the ring buffer must NOT send TUI_FORCE_REDRAW."""
+    """Reattaching to a session with >256 bytes in the ring buffer emits OSC 777 request and retains userdata, not \x0c."""
     from starlette.testclient import TestClient
 
     client = TestClient(web_server.app)
@@ -195,8 +208,127 @@ async def test_attach_token_suppresses_redraw_when_buffer_large(pty_keepalive_ha
     session.buffer.append(b"X" * 300)
 
     with client.websocket_connect("/api/pty?attach=TOK_BUF") as ws2:
+        ctrl = ws2.receive_json()
+        assert ctrl["type"] == "replay-start"
+        gen = ctrl["generation"]
+        snap = ws2.receive_bytes()
+        assert snap == b"X" * 300
         ws2.send_bytes(b"after")
 
-    # Bridge written should NOT have \x0c between init and after because buffer > 256
-    assert bytes(pty_keepalive_harness.bridges[0].written) == b"initafter"
+    expected_request = f"\x1b]777;hermes-replay;request;{gen}\x07".encode("ascii")
+    written = bytes(pty_keepalive_harness.bridges[0].written)
+    assert written == b"init" + expected_request + b"after"
+    assert b"\x0c" not in written
+
+
+@pytest.mark.anyio
+async def test_compaction_tip_reuses_retained_owner(pty_keepalive_harness, monkeypatch):
+    from starlette.testclient import TestClient
+
+    tip = ["child"]
+    async def argv(**kwargs):
+        return ["x", tip[0]], "/tmp", {"HERMES_TUI_RESUME": tip[0]}
+
+    monkeypatch.setattr(_web_server_chat, "_resolve_chat_argv_async", argv)
+    client = TestClient(web_server.app)
+    with client.websocket_connect("/api/pty?attach=DEVICE&resume=parent") as ws:
+        ws.send_bytes(b"before")
+    key = "resume\0\0child\0DEVICE"
+    session = _web_server_chat.PTY_REGISTRY._sessions[key]
+    file = web_server.app.state.pty_active_session_files[key]
+    file.write_text(json.dumps({"session_id": "next-child"}))
+    tip[0] = "next-child"
+    for resume in ["parent", "child", "next-child"]:
+        with client.websocket_connect(f"/api/pty?attach=DEVICE&resume={resume}") as ws:
+            assert ws.receive_json()["type"] == "replay-start"
+            ws.send_bytes(b"after")
+    assert len(pty_keepalive_harness) == 1
+    assert _web_server_chat.PTY_REGISTRY._sessions[key] is session
+    assert web_server.app.state.pty_active_session_files[key] == file
+
+
+def test_effective_pty_key_formats():
+    from hermes_cli.web_routers.chat_ws import _effective_pty_key
+
+    # None cases
+    assert _effective_pty_key(None, None, None) is None
+    assert _effective_pty_key(None, "work", None) is None
+
+    # Attach only
+    assert _effective_pty_key("TOK1", None, None) == "TOK1"
+
+    # Attach + profile
+    assert _effective_pty_key("TOK1", "work", None) == "TOK1\0work\0"
+
+    # Resume only / Attach + resume
+    assert _effective_pty_key(None, None, "sess1") == "resume\0\0sess1\0"
+    assert _effective_pty_key("TOK1", None, "sess1") == "resume\0\0sess1\0TOK1"
+    assert _effective_pty_key("TOK1", "work", "sess1") == "resume\0work\0sess1\0TOK1"
+
+
+@pytest.mark.anyio
+async def test_forced_fresh_with_rotated_token_preserves_prior_work(pty_keepalive_harness):
+    from starlette.testclient import TestClient
+
+    client = TestClient(web_server.app)
+    with client.websocket_connect("/api/pty?attach=TOK1") as ws1:
+        ws1.send_bytes(b"hi")
+    assert len(pty_keepalive_harness) == 1
+    bridge0 = pty_keepalive_harness.bridges[0]
+    assert bridge0.alive is True
+
+    # The frontend rotates its token for fresh starts; the old owner stays alive.
+    with client.websocket_connect("/api/pty?attach=TOK_NEW&fresh=1") as ws2:
+        ws2.send_bytes(b"fresh")
+    assert len(pty_keepalive_harness) == 2
+    assert bridge0.alive is True
+
+
+@pytest.mark.anyio
+async def test_tab_isolation_preserves_per_device_identity(pty_keepalive_harness):
+    from starlette.testclient import TestClient
+
+    client = TestClient(web_server.app)
+    with client.websocket_connect("/api/pty?attach=DEVICE_A&resume=child") as ws1:
+        ws1.send_bytes(b"a")
+    with client.websocket_connect("/api/pty?attach=DEVICE_B&resume=child") as ws2:
+        ws2.send_bytes(b"b")
+    # Separate bridges spawned per device
+    assert len(pty_keepalive_harness) == 2
+
+
+@pytest.mark.anyio
+async def test_profile_isolation_preserves_independent_sessions(pty_keepalive_harness):
+    from starlette.testclient import TestClient
+
+    client = TestClient(web_server.app)
+    with client.websocket_connect("/api/pty?attach=TOK1&profile=prof_a&resume=child") as ws1:
+        ws1.send_bytes(b"a")
+    with client.websocket_connect("/api/pty?attach=TOK1&profile=prof_b&resume=child") as ws2:
+        ws2.send_bytes(b"b")
+    # Separate bridges spawned per profile
+    assert len(pty_keepalive_harness) == 2
+
+
+@pytest.mark.anyio
+async def test_canonical_resume_preserves_active_session_file_ownership(
+    pty_keepalive_harness,
+):
+    from starlette.testclient import TestClient
+
+    client = TestClient(web_server.app)
+    with client.websocket_connect("/api/pty?attach=TOK1&resume=parent") as ws1:
+        ws1.send_bytes(b"hi")
+
+    # The canonical key is resume\0\0child\0TOK1
+    files = web_server.app.state.pty_active_session_files
+    canonical_key = "resume\0\0child\0TOK1"
+    assert canonical_key in files
+    assert "resume\0\0parent\0TOK1" not in files
+    active_file = files[canonical_key]
+
+    with client.websocket_connect("/api/pty?attach=TOK1&resume=child") as ws2:
+        ws2.send_bytes(b"again")
+
+    assert files[canonical_key] == active_file
 

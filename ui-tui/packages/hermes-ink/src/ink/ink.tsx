@@ -196,6 +196,7 @@ export default class Ink {
   // Ignore last render after unmounting a tree to prevent empty output before exit
   private isUnmounted = false
   private isPaused = false
+  private deferredWarmReplays = new Set<string>()
   private readonly container: FiberRoot
   private rootNode: dom.DOMElement
   readonly focusManager: FocusManager
@@ -1306,6 +1307,9 @@ export default class Ink {
 
     // Completion markers must follow this frame's bytes, but append handoff
     // must not consume unrelated queued boundaries (belongs to post-handoff frame)
+    if (!isAppendHandoff) {
+      this.settleDeferredWarmReplays(forceAuthorizedMode === 'reconstruct-clean' ? 'abort' : 'end')
+    }
     const boundary = isAppendHandoff ? null : takeRenderBoundary(this.options.stdout)
     if (boundary) optimized.push({ type: 'stdout', content: boundary })
     const tWrite = performance.now()
@@ -1479,22 +1483,39 @@ export default class Ink {
     this.onRender()
   }
 
+  private settleDeferredWarmReplays(phase: 'end' | 'abort'): void {
+    for (const generation of this.deferredWarmReplays) {
+      enqueueRenderBoundary(this.options.stdout,
+        `\x1b]777;hermes-replay;begin;${generation}\x07` +
+        `\x1b]777;hermes-replay;${phase};${generation}\x07`)
+    }
+    this.deferredWarmReplays.clear()
+  }
+
   requestRedraw(generation: string): void {
-    if (this.isUnmounted || this.isPaused) {
+    if (this.isUnmounted) {
+      return
+    }
+
+    const begin = `\x1b]777;hermes-replay;begin;${generation}\x07`
+    const end = `\x1b]777;hermes-replay;end;${generation}\x07`
+    if (this.isPaused) {
+      // The static owner may still be writing the archive. Keep its output
+      // exclusive and acknowledge this reconnect after handoff, not mid-history.
+      this.deferredWarmReplays.add(generation)
+      this.renderRequestedWhilePaused = true
       return
     }
 
     if (this.altScreenActive) {
       this.options.stdout.write(ERASE_SCREEN + CURSOR_HOME)
       this.resetFramesForAltScreen()
-    } else {
-      this.options.stdout.write(clearTerminal)
-      this.repaint()
-      this.prevFrameContaminated = true
     }
-
-    this.options.stdout.write(`\x1b]777;hermes-replay;begin;${generation}\x07`)
-    enqueueRenderBoundary(this.options.stdout, `\x1b]777;hermes-replay;end;${generation}\x07`)
+    // Main-screen reconnect has already replayed the retained terminal bytes.
+    // Clearing/repainting here erases static history and duplicates the live
+    // tail. Keep the existing frame/cursor mapping and emit only pending diffs.
+    this.options.stdout.write(begin)
+    enqueueRenderBoundary(this.options.stdout, end)
 
     this.onRender()
   }
@@ -2985,6 +3006,7 @@ export default class Ink {
     }
 
     const dirty = this.mainScreenLease.dirty
+    this.settleDeferredWarmReplays('abort')
     this.mainScreenLease = null
 
     if (dirty) {

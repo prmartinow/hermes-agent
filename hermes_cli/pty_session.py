@@ -7,9 +7,12 @@ opaque token replays the buffer and resumes live.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from typing import Any, Callable, Dict, Optional, Set, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 WS_CLOSE_PROCESS_EXITED = 4410
 WS_CLOSE_SUPERSEDED = 4409
@@ -71,6 +74,7 @@ class PtySession:
         self.alive = True
         self.attached = False
         self._retiring = False
+        self._busy_probed_logged = False
         self.last_detached_at: Optional[float] = None
         self._read_timeout = read_timeout
         self._viewers: Set[Any] = set()
@@ -138,6 +142,7 @@ class PtySession:
         """Attach a browser terminal viewer and replay buffered PTY output without kicking out peers."""
         if self._retiring:
             return False
+        self._busy_probed_logged = False
         self._viewers.add(ws)
         self._leader_ws = ws
         self._attach_generation += 1
@@ -165,6 +170,7 @@ class PtySession:
         if not self._viewers:
             self.attached = False
             self.last_detached_at = time.monotonic()
+            self._busy_probed_logged = False
 
     async def close(self) -> None:
         self.alive = False
@@ -192,8 +198,14 @@ class RegistryFull(Exception):
 class MemoryBudgetFull(RegistryFull):
     """A new terminal cannot be admitted under the process-tree memory budget."""
 
-    def __init__(self) -> None:
-        super().__init__("Terminal memory budget reached or unavailable; existing work is protected.")
+    def __init__(
+        self,
+        message: str = "Terminal memory budget reached or unavailable; existing work is protected.",
+        *,
+        reason: str = "memory",
+    ) -> None:
+        super().__init__(message)
+        self.rejection_reason = reason
 
 
 async def run_reaper(registry: "PtySessionRegistry", *, interval: float = 30.0) -> None:
@@ -243,16 +255,55 @@ class PtySessionRegistry:
                 self._standby_session = None
 
     @staticmethod
+    def _safe_pid(session: PtySession) -> Optional[int]:
+        bridge = getattr(session, "bridge", None)
+        pid = getattr(bridge, "pid", None) if bridge is not None else None
+        if pid is None:
+            pid = getattr(session, "pid", None)
+        return pid
+
+    @staticmethod
     def _dead(session: PtySession) -> bool:
         probe = getattr(session.bridge, "is_alive", None)
         return not session.alive or (probe is not None and not probe())
 
-    async def _remove(self, session: PtySession) -> None:
+    async def _remove(
+        self,
+        session: PtySession,
+        *,
+        reason: Optional[str] = None,
+        now: Optional[float] = None,
+        rss: Optional[int] = None,
+        budget: Optional[int] = None,
+    ) -> None:
         session._retiring = True
         self._sessions.pop(session.key, None)
         await session.close()
+        if reason is not None:
+            now_ts = time.monotonic() if now is None else now
+            idle_duration = max(0.0, now_ts - session.last_detached_at) if session.last_detached_at is not None else 0.0
+            pid = self._safe_pid(session)
+            budget_val = budget if budget is not None else self._memory_budget_bytes
+            logger.info(
+                "PTY session evicted: reason=%s, pid=%s, idle_seconds=%.1f, "
+                "registry_count=%d, rss_bytes=%s, budget_bytes=%s",
+                reason,
+                pid,
+                idle_duration,
+                len(self._sessions),
+                rss,
+                budget_val,
+            )
 
-    async def _retire(self, session: PtySession, now: float) -> bool:
+    async def _retire(
+        self,
+        session: PtySession,
+        now: float,
+        *,
+        reason: str = "ttl",
+        rss: Optional[int] = None,
+        budget: Optional[int] = None,
+    ) -> bool:
         if session.attached or session.last_detached_at is None:
             return False
         probe = getattr(session.bridge, "retire_if_idle", None)
@@ -266,10 +317,19 @@ class PtySessionRegistry:
             except Exception:
                 approved = False
             if approved is True:
-                await self._remove(session)
+                await self._remove(session, reason=reason, now=now, rss=rss, budget=budget)
                 return True
             # Busy/unknown must not be killed as soon as a long turn finishes.
+            idle_duration = max(0.0, now - session.last_detached_at)
             session.last_detached_at = now
+            if not getattr(session, "_busy_probed_logged", False):
+                session._busy_probed_logged = True
+                pid = self._safe_pid(session)
+                logger.debug(
+                    "PTY session busy probe: pid=%s busy_or_unknown, retaining; idle_seconds=%.1f",
+                    pid,
+                    idle_duration,
+                )
             return False
 
         # Shield the entire prepare/commit/close transaction, not just the probe.
@@ -298,20 +358,26 @@ class PtySessionRegistry:
         except Exception:
             return None
 
-    async def _reclaim_memory(self, now: float) -> bool:
+    async def _check_memory_budget(self, now: float) -> Tuple[bool, Optional[str], Optional[int]]:
         if self._memory_budget_bytes is None:
-            return True
+            return True, None, None
         usage = await self._usage()
         if usage is None:
-            return False
+            return False, "memory_unknown", None
         for session in self._idle_candidates():
             if usage < self._memory_budget_bytes:
-                return True
-            if await self._retire(session, now):
+                return True, None, usage
+            if await self._retire(session, now, reason="memory", rss=usage, budget=self._memory_budget_bytes):
                 usage = await self._usage()
                 if usage is None:
-                    return False
-        return usage < self._memory_budget_bytes
+                    return False, "memory_unknown", None
+        if usage < self._memory_budget_bytes:
+            return True, None, usage
+        return False, "memory", usage
+
+    async def _reclaim_memory(self, now: float) -> bool:
+        admitted, _, _ = await self._check_memory_budget(now)
+        return admitted
 
     async def _reap_locked(self, now: float) -> None:
         if self._standby_session is not None and self._dead(self._standby_session):
@@ -319,10 +385,10 @@ class PtySessionRegistry:
             self._standby_session = None
         for session in list(self._sessions.values()):
             if self._dead(session):
-                await self._remove(session)
+                await self._remove(session, reason="dead", now=now)
             elif (not session.attached and session.last_detached_at is not None
                   and now - session.last_detached_at > self._ttl):
-                await self._retire(session, now)
+                await self._retire(session, now, reason="ttl")
 
     async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object],
                               allow_standby: bool = True) -> Tuple[PtySession, bool]:
@@ -335,12 +401,25 @@ class PtySessionRegistry:
             await self._reap_locked(now)
             if len(self._sessions) >= self._max:
                 for victim in self._idle_candidates():
-                    if await self._retire(victim, now):
+                    if await self._retire(victim, now, reason="capacity"):
                         break
                 if len(self._sessions) >= self._max:
+                    logger.warning(
+                        "Terminal admission rejected: reason=capacity, registry_count=%d, max_sessions=%d",
+                        len(self._sessions),
+                        self._max,
+                    )
                     raise RegistryFull("Terminal capacity reached; attached or working sessions are protected.")
-            if not await self._reclaim_memory(now):
-                raise MemoryBudgetFull()
+            admitted, mem_rejection_reason, usage = await self._check_memory_budget(now)
+            if not admitted:
+                logger.warning(
+                    "Terminal admission rejected: reason=%s, registry_count=%d, rss_bytes=%s, budget_bytes=%s",
+                    mem_rejection_reason,
+                    len(self._sessions),
+                    usage,
+                    self._memory_budget_bytes,
+                )
+                raise MemoryBudgetFull(reason=mem_rejection_reason or "memory")
             if allow_standby and self._standby_session is not None and self._standby_session.alive:
                 async with self._standby_lock:
                     session = self._standby_session

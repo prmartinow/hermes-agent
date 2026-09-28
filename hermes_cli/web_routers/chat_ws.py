@@ -513,6 +513,50 @@ async def pty_ws(ws: WebSocket) -> None:
         await _pty_fail(ws, exc)
         return
 
+    canonical_resume: Optional[str] = None
+    if raw_resume and not force_fresh:
+        canonical_resume = (env.get("HERMES_TUI_RESUME") if env else None) or resume
+
+    if force_fresh:
+        canonical_pty_key = _effective_pty_key(raw_attach, profile, None)
+    elif canonical_resume:
+        canonical_pty_key = _effective_pty_key(raw_attach, profile, canonical_resume)
+    else:
+        canonical_pty_key = _effective_pty_key(raw_attach, profile, None)
+
+    # A retained owner can advance its durable ID after compaction. Prefer that
+    # owner over spawning another backend merely because its canonical tip moved.
+    if raw_resume and not force_fresh:
+        if pty_file_key in PTY_REGISTRY._sessions:
+            canonical_pty_key = pty_file_key
+        elif canonical_pty_key not in PTY_REGISTRY._sessions:
+            files = getattr(ws.app.state, "pty_active_session_files", {})
+            for candidate_key in list(PTY_REGISTRY._sessions):
+                parts = candidate_key.split("\0")
+                if (len(parts) == 4 and parts[0] == "resume"
+                        and parts[1] == (profile or "") and parts[3] == (raw_attach or "")):
+                    candidate_file = files.get(candidate_key)
+                    if candidate_file and _read_active_session_file(candidate_file) == canonical_resume:
+                        canonical_pty_key = candidate_key
+                        break
+
+    # Re-key active session file to the canonical session identity if resolved differently
+    if canonical_pty_key and canonical_pty_key != pty_file_key:
+        canonical_file = _active_session_file_for_pty(ws.app, canonical_pty_key)
+        if (active_session_file is not None and active_session_file != canonical_file
+                and pty_file_key not in PTY_REGISTRY._sessions):
+            try:
+                if active_session_file.exists() and active_session_file.stat().st_size == 0:
+                    active_session_file.unlink(missing_ok=True)
+            except OSError:
+                pass
+            files = getattr(ws.app.state, "pty_active_session_files", None)
+            if isinstance(files, dict):
+                files.pop(pty_file_key, None)
+        active_session_file = canonical_file
+        if env is not None:
+            env["HERMES_TUI_ACTIVE_SESSION_FILE"] = str(active_session_file)
+
     # Use consistent canonical pty_key computed from logical target and device attach token
     # If neither attach nor resume was requested, attach_token remains None for the legacy 1:1 path.
     attach_token = canonical_pty_key
