@@ -1092,6 +1092,65 @@ class SessionMessagesMixin:
             repair_alternation=repair_alternation, include_row_ids=include_row_ids,
             include_summary_markers=repair_alternation)
 
+    def get_compaction_recovery_messages(self, session_id: str) -> Dict[str, Any]:
+        """Fetch detached archived and active conversation messages for one session in a single query.
+
+        Uses one SQL statement to provide an atomic DB boundary:
+        WHERE session_id = ? AND (active = 1 OR (active = 0 AND compacted = 1)) ORDER BY id.
+        Separates archived (active=0, compacted=1) and active (active=1) rows.
+        Does not apply display deduplication.
+        Returns:
+            {
+                "archived_messages": List[Dict[str, Any]],
+                "active_messages": List[Dict[str, Any]],
+                "observed_watermark": Optional[int],
+            }
+        """
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id must be a non-empty string")
+        sql = (
+            f"SELECT compacted, {self._CONVERSATION_ROW_COLUMNS} "
+            f"FROM messages WHERE session_id = ? "
+            f"AND (active = 1 OR (active = 0 AND compacted = 1)) "
+            f"ORDER BY id"
+        )
+        rows = self._read_all(sql, (session_id,))
+        archived_rows = []
+        active_rows = []
+        max_id: Optional[int] = None
+        for row in rows:
+            rid = row["id"]
+            if rid is not None:
+                rid_int = int(rid)
+                if max_id is None or rid_int > max_id:
+                    max_id = rid_int
+            if row["active"] == 1:
+                active_rows.append(row)
+            elif row["active"] == 0 and row["compacted"] == 1:
+                archived_rows.append(row)
+
+        archived_messages = self._rows_to_conversation(
+            archived_rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+            include_row_ids=True,
+            include_summary_markers=True,
+        )
+        active_messages = self._rows_to_conversation(
+            active_rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+            include_row_ids=True,
+            include_summary_markers=True,
+        )
+        return {
+            "archived_messages": archived_messages,
+            "active_messages": active_messages,
+            "observed_watermark": max_id,
+        }
+
     def _dedupe_replayed_user(self, messages, msg, exact_user_clones) -> Tuple[bool, Any]:
         """Ancestor-lineage dedupe of one decoded user *msg* -> ``(skip, exact_clone_key)``. Rotation
         column-clones the concurrent tail into the child, so copies need not be adjacent: the exact

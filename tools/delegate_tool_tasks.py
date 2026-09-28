@@ -232,3 +232,28 @@ def _coerce_task_inherit_context_mode(
         else:
             result.append("full")
     return result, None
+
+
+def _coerce_task_inherit_compacted_history(
+    task_list: List[Dict[str, Any]],
+    task_inherit_contexts: List[bool],
+) -> tuple[List[bool], Optional[str]]:
+    """Per-task validated inherit_compacted_history booleans (default False).
+    Validates type strictly (bool only).
+    Requires inherit_context: true when field supplied (including explicit false).
+    """
+    result: List[bool] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        inherit_ctx = task_inherit_contexts[i] if i < len(task_inherit_contexts) else False
+        if "inherit_compacted_history" in task:
+            if not inherit_ctx:
+                return [], f"Task {i} 'inherit_compacted_history' is only valid when 'inherit_context' is true."
+            val = task["inherit_compacted_history"]
+            if not isinstance(val, bool):
+                return [], f"Task {i} 'inherit_compacted_history' must be a boolean."
+            result.append(val)
+        else:
+            result.append(False)
+    return result, None

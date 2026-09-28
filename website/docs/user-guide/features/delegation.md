@@ -161,12 +161,28 @@ When subagents are configured to use a different provider or model than the pare
    - **Efficiency Is Workload-Dependent**: A smaller seed is not automatically cheaper overall: each retrieval round replays accumulated context. Start with a task-scoped budget (for example, 8,192 tokens), then compare total provider input, answer quality and retrieval rounds against a full-context baseline. The global default is unchanged.
    - **Heuristic Limits**: Lexical term matching scores explicit ASCII word/identifier overlap. It does not perform semantic reasoning or embedding search; omission from the initial seed reflects budget prioritization rather than absolute irrelevance. The subagent should query `session_search(session_id="snapshot", ...)` when additional background is required.
 
+10. **Opt-in Compaction History Recovery (`inherit_compacted_history: true`)**: By default, context inheritance reads only the active conversation generation. When a long session has undergone in-place compaction and earlier details are needed by a subagent, tasks can opt in with `inherit_compacted_history: true` (requires `inherit_context: true`).
+    - **Detached Same-Session Recovery**: Queries locally archived messages (`active = 0 AND compacted = 1`) and active messages in a single atomic SQL statement against the parent's attached `_session_db`. Archived turns are stitched in id order before the active generation.
+    - **Active Generation Alignment & Summary Guard**: Recovery executes only if the live active generation contains a recognized plaintext compaction summary marker and aligns as a persisted prefix of the live conversation list. Unexplained archive rows without a visible summary marker in the active generation do not resurrect reset or cleared contexts. If the database active generation differs from live conversation turns or a concurrent race occurs, delegation fails closed with `ContextRecoveryError`.
+    - **Honest Coverage Receipts**: Task manifests explicitly report:
+      - `inherit_compacted_history`: whether recovery was requested.
+      - `compaction_recovery_coverage`: `"available_readable"` (archives recovered and stitched), `"active_only"` (uncompacted session or unexplained archives), or `"unavailable"` (no database attached to parent).
+      - `available_archived_messages_count`: number of archive messages fetched from the database.
+      - `retained_archived_records_count`: number of archive turns that survived sanitization as portable snapshot records.
+      - `observed_db_row_watermark`: highest message row id observed during the atomic query.
+    - **Rotated Lineage Limit**: Recovery queries only rows within the parent's exact session. Rotated ancestor lineages across session rotation boundaries are not traversed.
+    - **Opaque Checkpoint Limit**: Opaque native compaction checkpoints (such as encrypted or non-portable provider checkpoints) fail closed immediately; Hermes never attempts to blindly bypass or decrypt opaque state.
+    - **Legacy Tail Deduplication Limit**: Legacy compactions created with `tail_count=0` may retain duplicate representations of carried turns in both archive and active sets. To protect legitimate repeated turns, identical queries, and completed tool pairing, Hermes avoids heuristic timestamp or ID deduplication.
+    - **Derivative Summaries Retained**: Summaries are preserved and labeled as derivative context rather than dropped.
+    - **Privacy Boundary**: Opting in can send retained historical text no longer visible in the active generation to the configured child provider. Structural filtering does not redact secrets from ordinary text. Rewound and superseded rows (`active=0, compacted=0`) are excluded. Available readable coverage is not a guarantee of complete conversation recovery.
+
 ```python
 delegate_task(tasks=[{
-    "goal": "Implement cache_key according to the latest specifications discussed above",
+    "goal": "Audit early design decisions and compare with current implementation",
     "inherit_context": True,
+    "inherit_compacted_history": True,
     "inherit_context_mode": "bounded",
-    "inherit_max_tokens": 4000,
+    "inherit_max_tokens": 8000,
 }])
 ```
 

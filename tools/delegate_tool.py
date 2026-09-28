@@ -46,7 +46,7 @@ from tools.delegate_tool_registry import (  # noqa: F401
     steer_subagent,
 )
 from tools.delegate_tool_tasks import (  # noqa: F401
-    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_inherit_context, _coerce_task_inherit_context_mode, _coerce_task_inherit_max_tokens, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
+    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_inherit_compacted_history, _coerce_task_inherit_context, _coerce_task_inherit_context_mode, _coerce_task_inherit_max_tokens, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
 )
 from tools.delegation_context import (  # noqa: F401
     ContextInheritanceError, build_batch_context_snapshots, build_delegation_context_snapshot,
@@ -547,6 +547,8 @@ def delegate_task(
         task_inherit_max_tokens, err = _coerce_task_inherit_max_tokens(task_list, task_inherit_contexts)
     if not err:
         task_inherit_context_modes, err = _coerce_task_inherit_context_mode(task_list, task_inherit_contexts)
+    if not err:
+        task_inherit_compacted_history, err = _coerce_task_inherit_compacted_history(task_list, task_inherit_contexts)
     if err:
         return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
@@ -563,12 +565,17 @@ def delegate_task(
             child_api_key = creds.get("api_key") or getattr(parent_agent, "api_key", None)
             task_goals = [t.get("goal", "") for t in task_list]
             task_contexts = [t.get("context") for t in task_list]
-            if any(tok is not None for tok in task_inherit_max_tokens) or any(m == "bounded" for m in task_inherit_context_modes):
+            if (
+                any(tok is not None for tok in task_inherit_max_tokens)
+                or any(m == "bounded" for m in task_inherit_context_modes)
+                or any(task_inherit_compacted_history)
+            ):
                 batch_snapshots = build_batch_context_snapshots(
                     parent_agent,
                     task_inherit_contexts,
                     task_inherit_max_tokens,
                     task_inherit_context_modes=task_inherit_context_modes,
+                    task_inherit_compacted_histories=task_inherit_compacted_history,
                     task_goals=task_goals,
                     task_contexts=task_contexts,
                     child_model=child_model,
@@ -583,6 +590,7 @@ def delegate_task(
                     child_base_url=child_base_url,
                     child_api_key=child_api_key,
                     child_provider=child_provider,
+                    inherit_compacted_history=task_inherit_compacted_history[0] if task_inherit_compacted_history else False,
                 )
         except ContextInheritanceError as exc:
             from agent.oneshot_footprint import is_single_query_session
@@ -804,6 +812,14 @@ DELEGATE_TASK_SCHEMA = {
                             "'bounded' seeds a prioritized subset within token budget (always preserving the latest user prompt in full "
                             "and attaching full underlying records accessible via session_search). Requires inherit_context: true.",
                             enum=["full", "bounded"],
+                        ),
+                        "inherit_compacted_history": _p(
+                            "boolean",
+                            "Optional opt-in flag (default false; requires inherit_context: true). When true, attempts to recover "
+                            "and stitch locally archived conversation turns (compacted in-place within the same session) before "
+                            "the visible active generation. Coverage is limited to retained readable archive rows in that exact session. "
+                            "Rewound/superseded rows and rotated lineages are excluded; opaque checkpoints still fail closed. "
+                            "Archived ordinary text may contain sensitive data and may cross provider boundaries.",
                         ),
                     },
                     "required": ["goal"],
