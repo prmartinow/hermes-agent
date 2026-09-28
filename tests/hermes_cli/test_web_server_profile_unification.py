@@ -715,6 +715,21 @@ class TestProfileScopedTelegramOnboarding:
 
 
 class TestProfileScopedChatPty:
+    def test_explicit_serving_profile_uses_shared_gateway(self, isolated_profiles, monkeypatch):
+        monkeypatch.setattr("hermes_cli.main_tui_launch._make_tui_argv",
+                            lambda root, tui_dev=False: (["cat"], None))
+        monkeypatch.setattr(_web_server_chat, "_build_gateway_ws_url",
+                            lambda: "ws://127.0.0.1:12345/api/ws")
+        monkeypatch.setattr(_web_server_profiles, "get_process_hermes_home",
+                            lambda: isolated_profiles["default"])
+        monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "ws://127.0.0.1:11111/api/ws")
+        for profile in (None, "current", "default"):
+            _, _, env = _web_server_chat._resolve_chat_argv(profile=profile)
+            assert env["HERMES_TUI_GATEWAY_URL"] == "ws://127.0.0.1:12345/api/ws"
+        _, _, other = _web_server_chat._resolve_chat_argv(profile="worker_beta")
+        assert "HERMES_TUI_GATEWAY_URL" not in other
+        assert other["HERMES_HOME"] == str(isolated_profiles["worker_beta"])
+
     def test_chat_argv_scopes_hermes_home(self, isolated_profiles, monkeypatch):
         import hermes_cli.web_server as web_server
 

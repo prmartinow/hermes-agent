@@ -72,24 +72,23 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
         monkeypatch.setattr(server.threading, "Timer", _Timer)
         server._schedule_ws_orphan_reap(sid)
         server._pending_ws_reaps[sid].callback()
-        assert bool(session.get("_client_gone_interrupt_requested")) is (mode != "fresh")
-        assert server._pending_ws_reaps[sid].delay == (
-            20.0 if mode == "fresh" else server._WS_ORPHAN_INTERRUPT_REAP_POLL_S)
+        # Under the new user contract: actively running agents must NEVER be interrupted
+        # by tab focus / disconnect / autocleanup; work continues in the background.
+        assert not session.get("_client_gone_interrupt_requested")
+        assert server._pending_ws_reaps[sid].delay == 20.0
         assert not any(m.get("method") == "compute_host.activity" for m in forwarded)
-        if mode != "fresh":
-            deadline = time.monotonic() + 5
-            while session["running"] and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert not session["running"], "stale child must receive and settle the real interrupt"
+        assert session["running"], "running detached turn must not be interrupted"
+
+        old_token = session["_compute_host_turn_id"]
+        old_request = next(iter(supervisor._pending_turns))
+        (tmp_path / "release").touch()
+        deadline = time.monotonic() + 5
+        while session["running"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not session["running"], "child completes cleanly when released"
+        assert "_compute_host_activity_ns" not in session
+
         if mode == "fresh":
-            old_token = session["_compute_host_turn_id"]
-            old_request = next(iter(supervisor._pending_turns))
-            (tmp_path / "release").touch()
-            deadline = time.monotonic() + 5
-            while session["running"] and time.monotonic() < deadline:
-                time.sleep(0.02)
-            assert not session["running"]
-            assert "_compute_host_activity_ns" not in session
             (tmp_path / "release").unlink()
             (tmp_path / "provider-started").unlink()
             session["running"] = True
@@ -114,7 +113,19 @@ def test_real_child_detached_turn_activity(tmp_path, monkeypatch, mode):
             assert "_compute_host_activity_ns" in session
             assert not server._ws_orphan_turn_activity_is_fresh(session)
             server._pending_ws_reaps[sid].callback()
-            assert session["_client_gone_interrupt_requested"]
+            # Stale previous activity still must not interrupt a running turn
+            assert not session.get("_client_gone_interrupt_requested")
+            assert session["running"]
+            assert server._pending_ws_reaps[sid].delay == 20.0
+            (tmp_path / "release").touch()
+            deadline = time.monotonic() + 5
+            while session["running"] and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert not session["running"]
+
+        # Idle detached turn is reaped on next callback
+        server._pending_ws_reaps[sid].callback()
+        assert sid not in server._sessions
     finally:
         supervisor.shutdown()
 

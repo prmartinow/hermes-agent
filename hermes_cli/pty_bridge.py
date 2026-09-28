@@ -78,6 +78,7 @@ class PtyBridge:
         self._closed = False
         self._retirement_dir = None
         self._retirement_socket = None
+        self._viewer_only = False
         try:
             self.process_birth_time = psutil.Process(proc.pid).create_time()
         except psutil.Error:
@@ -126,6 +127,10 @@ class PtyBridge:
             raise
         bridge._retirement_dir = retirement_dir
         bridge._retirement_socket = spawn_env.get("HERMES_TUI_RETIREMENT_SOCKET")
+        # Attached GatewayClient never spawns a private Python agent. Closing
+        # this Node process disconnects a viewer, not the shared compute owner.
+        bridge._viewer_only = (spawn_env.get("HERMES_TUI_DASHBOARD") == "1"
+                               and bool(spawn_env.get("HERMES_TUI_GATEWAY_URL", "").strip()))
         return bridge
 
     @property
@@ -133,13 +138,17 @@ class PtyBridge:
         return int(self._proc.pid)
 
     def retire_if_idle(self) -> bool:
-        """Only the private gateway may authorize reclaiming its process tree."""
-        if not self._retirement_socket or not self.is_alive():
+        """Retire a viewer, or ask its private compute owner for idle admission."""
+        if not self.is_alive():
             return False
         try:
             if psutil.Process(self.pid).create_time() != self.process_birth_time:
                 return False
         except psutil.Error:
+            return False
+        if self._viewer_only:
+            return True
+        if not self._retirement_socket:
             return False
         from hermes_cli.pty_retirement import request_idle_retirement
         return request_idle_retirement(self._retirement_socket, expected_parent_pid=self.pid)

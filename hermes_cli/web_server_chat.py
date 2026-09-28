@@ -306,12 +306,13 @@ def _resolve_chat_argv(
     Tests monkeypatch this with a tiny fake command.  Env contract: resume goes
     through ``HERMES_TUI_RESUME`` (``ui-tui`` does not parse argv), resolved to
     the newest descendant; ``HERMES_TUI_GATEWAY_URL`` attaches to this process's
-    in-memory gateway but is SKIPPED for profile-scoped chats (that gateway runs
-    under the dashboard's own profile, so a scoped chat spawns its own);
+    in-memory gateway whenever the requested profile is the serving profile.
+    Only OTHER profiles spawn a private gateway; an explicit name for this
+    process's profile must not create a competing writer;
     ``profile`` scopes the ENTIRE chat by pointing ``HERMES_HOME`` at the profile
     dir, the same propagation ``hermes -p <name>`` performs.
     """
-    from hermes_cli.web_server_profiles import _config_profile_scope, _resolve_profile_dir
+    from hermes_cli.web_server_profiles import _config_profile_scope, _is_other_profile, _resolve_profile_dir
     from hermes_cli.web_server_sessions import _open_session_db_for_profile, _session_latest_descendant
     from hermes_cli.main import PROJECT_ROOT
     from hermes_cli.main_tui_launch import _apply_tui_python_env, _make_tui_argv
@@ -378,7 +379,8 @@ def _resolve_chat_argv(
 
     # Without the attach URL, gatewayClient spawns its own `tui_gateway.entry`,
     # which inherits the profile HERMES_HOME set above.
-    if profile_dir is None and (gateway_ws_url := _build_gateway_ws_url()):
+    env.pop("HERMES_TUI_GATEWAY_URL", None)
+    if not _is_other_profile(profile) and (gateway_ws_url := _build_gateway_ws_url()):
         env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
 
     return list(argv), str(cwd) if cwd else None, env
