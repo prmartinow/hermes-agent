@@ -547,9 +547,10 @@ def test_build_gemini_request_raises_max_output_when_thinking_is_enabled():
         build_gemini_request,
     )
 
+    # When max_tokens is omitted (None), full thinking headroom ceiling is preserved
     request = build_gemini_request(
         messages=[{"role": "user", "content": "hi"}],
-        max_tokens=4096,
+        max_tokens=None,
         thinking_config={"includeThoughts": True, "thinkingLevel": "high"},
     )
 
@@ -568,6 +569,108 @@ def test_build_gemini_request_does_not_raise_when_thinking_is_disabled():
 
     assert request["generationConfig"]["maxOutputTokens"] == 4096
     assert request["generationConfig"]["thinkingConfig"]["includeThoughts"] is False
+
+
+def test_build_gemini_request_honors_explicit_max_tokens_under_thinking():
+    from agent.gemini_native_adapter import build_gemini_request, is_native_gemini_base_url
+
+    # Low explicit bound 1500 (matches compaction requests)
+    request_1500 = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=1500,
+        thinking_config={"includeThoughts": True, "thinkingLevel": "high"},
+        model="gemini-3.8-flash-high",
+    )
+    assert request_1500["generationConfig"]["maxOutputTokens"] == 1500
+    assert request_1500["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "high"
+    assert request_1500["generationConfig"]["thinkingConfig"]["includeThoughts"] is True
+
+    # Low explicit bound 800
+    request_800 = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=800,
+        thinking_config={"includeThoughts": True, "thinkingLevel": "high"},
+        model="gemini-3.8-flash-high",
+    )
+    assert request_800["generationConfig"]["maxOutputTokens"] == 800
+
+    # Explicit bound 4096 (must NOT elevate to ceiling)
+    request_4096 = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=4096,
+        thinking_config={"includeThoughts": True, "thinkingLevel": "high"},
+        model="gemini-3.8-flash-high",
+    )
+    assert request_4096["generationConfig"]["maxOutputTokens"] == 4096
+
+    # Explicit bound 8000 (must NOT elevate to ceiling)
+    request_8000 = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=8000,
+        thinking_config={"includeThoughts": True, "thinkingLevel": "high"},
+        model="gemini-3.8-flash-high",
+    )
+    assert request_8000["generationConfig"]["maxOutputTokens"] == 8000
+
+    # Low explicit bound 32 (probe prompt)
+    request_32 = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=32,
+        thinking_config={"includeThoughts": True, "thinkingLevel": "low"},
+        model="gemini-3.7-flash-low",
+    )
+    assert request_32["generationConfig"]["maxOutputTokens"] == 32
+    assert request_32["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"
+
+    # Default None preserves full thinking headroom ceiling
+    request_none = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=None,
+        thinking_config={"includeThoughts": True, "thinkingLevel": "high"},
+        model="gemini-3.8-flash-high",
+    )
+    assert request_none["generationConfig"]["maxOutputTokens"] == 65536
+
+    # Claude partner model under build_gemini_request: clamps thinkingBudget to fit explicit bounds
+    request_claude_1500 = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=1500,
+        thinking_config={"includeThoughts": True, "thinkingBudget": 16384},
+        model="claude-sonnet-4-6",
+    )
+    assert request_claude_1500["generationConfig"]["maxOutputTokens"] == 1500
+    assert request_claude_1500["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 1244  # 1500 - 256
+
+    request_claude_4096 = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=4096,
+        thinking_config={"includeThoughts": True, "thinkingBudget": 16384},
+        model="claude-sonnet-4-6",
+    )
+    assert request_claude_4096["generationConfig"]["maxOutputTokens"] == 4096
+    assert request_claude_4096["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 3840  # 4096 - 256
+
+    request_claude_8000 = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=8000,
+        thinking_config={"includeThoughts": True, "thinkingBudget": 16384},
+        model="claude-sonnet-4-6",
+    )
+    assert request_claude_8000["generationConfig"]["maxOutputTokens"] == 8000
+    assert request_claude_8000["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 7744  # 8000 - 256
+
+    request_claude_none = build_gemini_request(
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=None,
+        thinking_config={"includeThoughts": True, "thinkingBudget": 16384},
+        model="claude-sonnet-4-6",
+    )
+    assert request_claude_none["generationConfig"]["maxOutputTokens"] == 64000
+    assert request_claude_none["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 16384
+
+    # CloudCode base URL is NOT native Gemini base URL
+    assert not is_native_gemini_base_url("https://cloudcode-pa.googleapis.com/v1internal")
+    assert not is_native_gemini_base_url("https://cloudcode-pa.googleapis.com")
 
 
 

@@ -532,6 +532,110 @@ def _salvage_reduce_todo_snapshot(out: List[Dict[str, Any]]) -> None:
         return
 
 
+_SALVAGE_PROTECTED_HEADINGS = (
+    HISTORICAL_TASK_HEADING,
+    "## Active Task",
+    "## Goal",
+    "## Constraints & Preferences",
+    "## Constraints",
+    "## Key Decisions",
+    "## Active State",
+    "## Blocked",
+    "## Critical Context",
+    "## Pruned Skills",
+)
+
+
+def _is_salvage_protected_heading(title: str) -> bool:
+    norm = title.rstrip(":").strip().casefold()
+    for protected in _SALVAGE_PROTECTED_HEADINGS:
+        prot_title = protected.lstrip("#").strip().rstrip(":").casefold()
+        if (
+            norm == prot_title
+            or norm.startswith(prot_title + " ")
+            or norm.startswith(prot_title + ":")
+            or norm.startswith(prot_title + "(")
+        ):
+            return True
+    return False
+
+
+def _salvage_trim_summary(content: str, max_chars: int = _SALVAGE_SUMMARY_MAX_CHARS) -> Optional[str]:
+    """Safely shrink a compaction summary to *max_chars*, preserving defined protected sections
+    (task snapshot, goal, constraints, active state, blocked, key decisions, critical context,
+    pruned skills) and verbatim user turns in original order. Returns ``None`` if protected sections
+    cannot be preserved within *max_chars* or if the structure cannot establish a safe slice,
+    refusing a lossy candidate rather than blindly truncating."""
+    if len(content) <= max_chars:
+        return content
+
+    trunc_marker = "\n…[summary truncated so compaction can shrink]\n\n"
+
+    # User directive tail detection (verbatim user messages heading through end of content)
+    user_match = re.search(r"(?m)^##[ \t]+User Messages.*$", content)
+    if user_match:
+        user_pos = user_match.start()
+        user_tail = content[user_pos:]
+        search_bound = user_pos
+    else:
+        user_tail = ""
+        if _SUMMARY_END_MARKER in content:
+            marker_pos = content.rfind(_SUMMARY_END_MARKER)
+            search_bound = marker_pos
+        else:
+            search_bound = len(content)
+
+    heading_matches = list(re.finditer(r"(?m)^##[ \t]+([^\r\n]+)", content[:search_bound]))
+    if not heading_matches:
+        # Unstructured summary with no parseable sections; cannot establish a safe slice.
+        return None
+
+    wrapper = content[:heading_matches[0].start()]
+
+    sections = []
+    for i, match in enumerate(heading_matches):
+        start = match.start()
+        end = heading_matches[i + 1].start() if i + 1 < len(heading_matches) else search_bound
+        title = match.group(1).strip()
+        sec_text = content[start:end]
+        sections.append((title, sec_text))
+
+    protected_sections = []
+    dropped_sections = []
+    for title, sec_text in sections:
+        if _is_salvage_protected_heading(title):
+            protected_sections.append(sec_text)
+        else:
+            dropped_sections.append(sec_text)
+
+    if not protected_sections or not dropped_sections:
+        # Either no protected content to anchor a safe slice, or all sections are protected
+        # (refuse trim rather than cutting protected bodies).
+        return None
+
+    assembled_parts = []
+    if wrapper.strip():
+        assembled_parts.append(wrapper.rstrip())
+    for sec in protected_sections:
+        assembled_parts.append(sec.strip())
+
+    assembled_head = "\n\n".join(assembled_parts)
+
+    if user_tail:
+        assembled = assembled_head.rstrip() + trunc_marker + user_tail.lstrip()
+    else:
+        if _SUMMARY_END_MARKER in content:
+            assembled = assembled_head.rstrip() + trunc_marker + _SUMMARY_END_MARKER
+        else:
+            assembled = assembled_head.rstrip() + trunc_marker.rstrip()
+
+    if len(assembled) > max_chars:
+        # Protected sections plus markers exceed the budget cap; refuse lossy candidate.
+        return None
+
+    return assembled
+
+
 def salvage_grown_transcript(
     original: List[Dict[str, Any]], candidate: List[Dict[str, Any]], budget: Optional[int] = None,
 ) -> Optional[List[Dict[str, Any]]]:
@@ -564,8 +668,9 @@ def salvage_grown_transcript(
             and len(content) > _SALVAGE_SUMMARY_MAX_CHARS
             and _looks_like_compaction_summary(msg, content)
         ):
-            msg["content"] = (content[:_SALVAGE_SUMMARY_MAX_CHARS].rstrip()
-                              + "\n…[summary truncated so compaction can shrink]\n\n" + _SUMMARY_END_MARKER)
+            trimmed = _salvage_trim_summary(content, _SALVAGE_SUMMARY_MAX_CHARS)
+            if trimmed is not None:
+                msg["content"] = trimmed
     _prune_stale_reasoning_replay(out)
     if estimate_messages_tokens_rough(out) >= budget:
         _salvage_reduce_todo_snapshot(out)

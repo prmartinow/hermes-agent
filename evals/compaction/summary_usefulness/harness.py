@@ -146,6 +146,23 @@ def execute_production_growth_guard_offline(
     )
 
 
+def evaluate_production_accepted_state(
+    transcript_messages: List[Dict[str, Any]],
+    guard: ProductionCompactionGuardResult,
+    ground_truth: Dict[str, Any],
+) -> SummaryUsefulnessScore:
+    """Evaluate the actual accepted final messages (not merely raw builder or candidate).
+
+    If growth guard refused the candidate, the accepted state is the preserved original transcript.
+    If accepted or salvaged, the accepted state is guard.accepted_messages.
+    """
+    accepted = guard.accepted_messages if guard.accepted_messages is not None else transcript_messages
+    raw_transcript_text = chr(10).join(f"[{m.get('role')}]: {m.get('content')}" for m in transcript_messages)
+    accepted_text = chr(10).join(f"[{m.get('role')}]: {m.get('content')}" for m in accepted)
+    rubric = SummaryUsefulnessRubric(ground_truth)
+    return rubric.evaluate(accepted_text, raw_transcript_text)
+
+
 def format_score_report(label: str, score: SummaryUsefulnessScore) -> str:
     """Format evaluation result for readable output with explicit proxy labeling."""
     lines = [

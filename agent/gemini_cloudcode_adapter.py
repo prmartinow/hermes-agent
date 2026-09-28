@@ -20,6 +20,7 @@ from agent.bounded_response import read_streaming_error_body
 from agent.gemini_native_adapter import (
     DEFAULT_GEMINI_BASE_URL,
     GEMINI_DEFAULT_MAX_OUTPUT_TOKENS,
+    _effective_gemini_max_output_tokens,
     GeminiAPIError,
     _GeminiChatNamespace,
     _GeminiStreamChunk,
@@ -263,21 +264,23 @@ class GeminiCloudCodeClient:
 
         mapped_model = self._map_model_id(model, extra_body)
         bare_mapped = bare_gemini_model_id(mapped_model).strip().lower()
-        if "gpt-oss" in bare_mapped:
-            target_ceiling = 8192
-        elif "claude" in bare_mapped:
-            target_ceiling = 64000
-        else:
-            target_ceiling = GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
+
+        effective_max_tokens = _effective_gemini_max_output_tokens(
+            max_tokens, thinking_config, model=mapped_model
+        )
 
         if thinking_config and isinstance(thinking_config, dict):
-            tb = thinking_config.get("thinkingBudget", 0)
-            if isinstance(tb, (int, float)) and tb > 0:
-                effective_max_tokens = max(max_tokens or 0, int(tb) + 8192, target_ceiling)
-            else:
-                effective_max_tokens = max(max_tokens or 0, target_ceiling) if max_tokens else target_ceiling
-        else:
-            effective_max_tokens = max_tokens if max_tokens and max_tokens > 0 else target_ceiling
+            tb = thinking_config.get("thinkingBudget")
+            if isinstance(tb, (int, float)) and tb > 0 and effective_max_tokens is not None:
+                if "claude" in bare_mapped:
+                    if effective_max_tokens <= 1024:
+                        thinking_config = {"includeThoughts": False}
+                    else:
+                        max_tb = max(1024, effective_max_tokens - 256) if effective_max_tokens >= 1024 + 256 else (effective_max_tokens - 1)
+                        if int(tb) > max_tb:
+                            thinking_config = {**thinking_config, "thinkingBudget": max_tb}
+                elif int(tb) >= effective_max_tokens:
+                    thinking_config = {**thinking_config, "thinkingBudget": max(0, effective_max_tokens - 256)}
 
         request = build_gemini_request(
             messages=messages or [],

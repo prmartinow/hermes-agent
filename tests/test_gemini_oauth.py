@@ -1398,32 +1398,48 @@ def test_gemini_thinking_headroom_management():
     from agent.gemini_native_adapter import _effective_gemini_max_output_tokens
     from agent.transports.chat_completions import _raise_gemini_thinking_max_tokens
 
-    # Gemini with high thinking level elevates low max_tokens to full ceiling
+    # Gemini with high thinking level elevates omitted max_tokens (None) to full ceiling
     thinking_cfg = {"includeThoughts": True, "thinkingLevel": "high"}
-    assert _effective_gemini_max_output_tokens(4096, thinking_cfg, model="gemini-3.7-flash") == 65536
+    assert _effective_gemini_max_output_tokens(None, thinking_cfg, model="gemini-3.7-flash") == 65536
 
-    # Claude partner model with explicit thinkingBudget guarantees headroom: max(requested, budget + 8192, 64000)
+    # Claude partner model with explicit thinkingBudget guarantees headroom when omitted: max(budget + 8192, 64000)
     claude_thinking = {"includeThoughts": True, "thinkingBudget": 16384}
-    assert _effective_gemini_max_output_tokens(4096, claude_thinking, model="claude-sonnet-4-6") == 64000
+    assert _effective_gemini_max_output_tokens(None, claude_thinking, model="claude-sonnet-4-6") == 64000
 
-    # Very large budget extends output ceiling accordingly
+    # Very large budget extends output ceiling accordingly when omitted
     claude_large_thinking = {"includeThoughts": True, "thinkingBudget": 60000}
-    assert _effective_gemini_max_output_tokens(4096, claude_large_thinking, model="claude-sonnet-4-6") == 68192
+    assert _effective_gemini_max_output_tokens(None, claude_large_thinking, model="claude-sonnet-4-6") == 68192
 
-    # Transport helper passes model through
+    # Transport helper passes model through when omitted
     raised_gemini = _raise_gemini_thinking_max_tokens(
         "gemini-3.7-flash",
         {"enabled": True, "effort": "high"},
-        4096,
+        None,
     )
     assert raised_gemini == 65536
 
     raised_claude = _raise_gemini_thinking_max_tokens(
         "claude-sonnet-4-6",
         {"enabled": True, "effort": "high"},
-        4096,
+        None,
     )
     assert raised_claude == 64000
+
+    # Explicit bounds (1500, 4096, 8000, 800, 64) are strictly honored, preserving caller limits
+    assert _effective_gemini_max_output_tokens(1500, thinking_cfg, model="gemini-3.8-flash-high") == 1500
+    assert _effective_gemini_max_output_tokens(4096, thinking_cfg, model="gemini-3.8-flash-high") == 4096
+    assert _effective_gemini_max_output_tokens(8000, thinking_cfg, model="gemini-3.8-flash-high") == 8000
+    assert _effective_gemini_max_output_tokens(800, thinking_cfg, model="gemini-3.8-flash-high") == 800
+    assert _effective_gemini_max_output_tokens(64, thinking_cfg, model="gemini-3.8-flash-high") == 64
+    assert _effective_gemini_max_output_tokens(1500, claude_thinking, model="claude-sonnet-4-6") == 1500
+    assert _effective_gemini_max_output_tokens(4096, claude_thinking, model="claude-sonnet-4-6") == 4096
+    assert _effective_gemini_max_output_tokens(8000, claude_thinking, model="claude-sonnet-4-6") == 8000
+    assert _raise_gemini_thinking_max_tokens("gemini-3.8-flash-high", {"enabled": True, "effort": "high"}, 1500) == 1500
+    assert _raise_gemini_thinking_max_tokens("gemini-3.8-flash-high", {"enabled": True, "effort": "high"}, 4096) == 4096
+    assert _raise_gemini_thinking_max_tokens("gemini-3.8-flash-high", {"enabled": True, "effort": "high"}, 8000) == 8000
+    assert _raise_gemini_thinking_max_tokens("claude-sonnet-4-6", {"enabled": True, "effort": "high"}, 1500) == 1500
+    assert _raise_gemini_thinking_max_tokens("claude-sonnet-4-6", {"enabled": True, "effort": "high"}, 4096) == 4096
+    assert _raise_gemini_thinking_max_tokens("claude-sonnet-4-6", {"enabled": True, "effort": "high"}, 8000) == 8000
 
 
 def test_gemini_cloudcode_adapter_model_aware_ceilings():
@@ -1441,12 +1457,12 @@ def test_gemini_cloudcode_adapter_model_aware_ceilings():
     }
     client._http.post.return_value = mock_resp
 
-    # Claude model with thinking
+    # Claude model with thinking and omitted max_tokens uses full ceiling
     client._create_chat_completion(
         model="claude-sonnet-4-6",
         messages=[{"role": "user", "content": "hi"}],
         reasoning_effort="high",
-        max_tokens=4096,
+        max_tokens=None,
     )
     req = client._http.post.call_args.kwargs["json"]["request"]
     assert req["generationConfig"]["maxOutputTokens"] == 64000
@@ -1458,6 +1474,170 @@ def test_gemini_cloudcode_adapter_model_aware_ceilings():
     )
     req = client._http.post.call_args.kwargs["json"]["request"]
     assert req["generationConfig"]["maxOutputTokens"] == 8192
+
+
+def test_gemini_cloudcode_adapter_explicit_max_tokens_and_defaults():
+    import asyncio
+    from unittest.mock import MagicMock, patch
+    from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient, AsyncGeminiCloudCodeClient
+    from agent.gemini_native_adapter import is_native_gemini_base_url
+    from agent.auxiliary_client import _forwards_max_tokens
+
+    client = GeminiCloudCodeClient(access_token="test_token")
+    client._http = MagicMock()
+    mock_resp = MagicMock(status_code=200)
+    mock_resp.json.return_value = {
+        "response": {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}]
+        }
+    }
+    client._http.post.return_value = mock_resp
+
+    # 1. Low explicit bound 1500 on dynamic Gemini (matches live compaction check)
+    client._create_chat_completion(
+        model="gemini-3.8-flash-high",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=1500,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 1500
+    assert req["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "high"
+    assert req["generationConfig"]["thinkingConfig"]["includeThoughts"] is True
+
+    # 2. Low explicit bound 800
+    client._create_chat_completion(
+        model="gemini-3.8-flash-high",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=800,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 800
+
+    # 3. Explicit bound 4096 (must be strictly bounded, NOT elevated to ceiling)
+    client._create_chat_completion(
+        model="gemini-3.8-flash-high",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=4096,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 4096
+
+    # 4. Explicit bound 8000 (must be strictly bounded, NOT elevated to ceiling)
+    client._create_chat_completion(
+        model="gemini-3.8-flash-high",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=8000,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 8000
+
+    # 5. Low explicit bound 32 (probe prompt)
+    client._create_chat_completion(
+        model="gemini-3.7-flash-low",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=32,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 32
+    assert req["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"
+
+    # 6. Default unconstrained (max_tokens=None) uses full ceiling
+    client._create_chat_completion(
+        model="gemini-3.8-flash-high",
+        messages=[{"role": "user", "content": "hi"}],
+        max_tokens=None,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 65536
+
+    # 7. Claude partner route with explicit max_tokens=1500: clamps thinkingBudget to fit with headroom
+    client._create_chat_completion(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="high",
+        max_tokens=1500,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 1500
+    assert req["generationConfig"]["thinkingConfig"]["includeThoughts"] is True
+    tb = req["generationConfig"]["thinkingConfig"]["thinkingBudget"]
+    assert 1024 <= tb < 1500
+    assert tb == 1244  # 1500 - 256
+
+    # 8. Claude partner route with explicit max_tokens=4096: clamps thinkingBudget to 4096 - 256 = 3840
+    client._create_chat_completion(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="high",
+        max_tokens=4096,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 4096
+    assert req["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 3840
+
+    # 9. Claude partner route with explicit max_tokens=8000: clamps thinkingBudget to 8000 - 256 = 7744
+    client._create_chat_completion(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="high",
+        max_tokens=8000,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 8000
+    assert req["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 7744
+
+    # 10. Claude partner route with explicit max_tokens=800: <= 1024 disables thinking safely
+    client._create_chat_completion(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="high",
+        max_tokens=800,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 800
+    assert req["generationConfig"]["thinkingConfig"] == {"includeThoughts": False}
+
+    # 11. Claude partner route with default ceiling when max_tokens is None
+    client._create_chat_completion(
+        model="claude-sonnet-4-6",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="high",
+        max_tokens=None,
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 64000
+    assert req["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 16384
+
+    # 12. Streaming path honors explicit max_tokens
+    with patch.object(client, "_stream_completion") as mock_stream:
+        client._create_chat_completion(
+            model="gemini-3.8-flash-high",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1500,
+            stream=True,
+        )
+        assert mock_stream.called
+        stream_body = mock_stream.call_args.kwargs["cloudcode_body"]
+        assert stream_body["request"]["generationConfig"]["maxOutputTokens"] == 1500
+
+    # 13. Async client honors explicit max_tokens
+    async_client = AsyncGeminiCloudCodeClient(client)
+    res = asyncio.run(
+        async_client.chat.completions.create(
+            model="gemini-3.8-flash-high",
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1500,
+        )
+    )
+    req = client._http.post.call_args.kwargs["json"]["request"]
+    assert req["generationConfig"]["maxOutputTokens"] == 1500
+
+    # 14. CloudCode auth route and transport isolation unchanged
+    assert not is_native_gemini_base_url("https://cloudcode-pa.googleapis.com/v1internal")
+    assert not is_native_gemini_base_url("https://cloudcode-pa.googleapis.com")
+    assert _forwards_max_tokens("gemini-oauth", "gemini-oauth", "gemini-3.8-flash-high", "https://cloudcode-pa.googleapis.com/v1internal", None)
+    assert _forwards_max_tokens("gemini", "gemini", "gemini-3.8-flash-high", "https://generativelanguage.googleapis.com/v1beta", None)
+    assert not _forwards_max_tokens("random_provider", "random_provider", "some-model", "https://example.com/v1", None)
 
 
 def test_context_compressor_gemini_output_headroom_invariant():

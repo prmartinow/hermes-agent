@@ -215,3 +215,24 @@ def test_production_compaction_growth_guard_offline():
     assert guard.rejected_would_grow is True
     assert guard.original_preserved is True
     assert guard.accepted_messages is None
+
+
+def test_production_accepted_state_evaluation_refused():
+    """Verify evaluation of the true accepted state when growth guard refuses compaction."""
+    from evals.compaction.summary_usefulness.harness import (
+        execute_production_growth_guard_offline,
+        evaluate_production_accepted_state,
+    )
+    transcript = SYNTHETIC_MIGRATION_TRANSCRIPT
+    gt = MIGRATION_CASE_GROUND_TRUTH
+
+    guard = execute_production_growth_guard_offline(transcript)
+    assert guard.rejected_would_grow is True
+    assert guard.original_preserved is True
+
+    # True final accepted state is the preserved original transcript
+    score = evaluate_production_accepted_state(transcript, guard, gt)
+    assert score.matched_required_facts == score.total_required_facts
+    assert score.unfinished_intent_retained is True
+    assert score.decisions_retained == score.decisions_total
+    assert score.usefulness_score >= 0.6

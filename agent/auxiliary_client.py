@@ -6486,14 +6486,25 @@ def _is_gemini_native_route(provider_norm: str, effective_base: str) -> bool:
         return False
 
 
+def _is_cloudcode_route(provider_norm: str, effective_base: str) -> bool:
+    """Cloud Code PA (Gemini OAuth) route by provider name or base URL host."""
+    if provider_norm in {"gemini-oauth", "gemini_oauth"} or bool(re.match(r"^gemini(?:-oauth)?-[1-5]$", provider_norm)):
+        return True
+    if not effective_base:
+        return False
+    from agent.gemini_cloudcode_adapter import is_cloudcode_pa_base_url
+    return is_cloudcode_pa_base_url(effective_base)
+
+
 def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str]) -> bool:
     """Whether an explicit max_tokens is forwarded on this route.
 
     No default cap elsewhere (omitted = provider default; avoids max_completion_tokens / ZAI-vision
     quirks). Forward only where mandatory or honored: Anthropic Messages wire (400 without it);
     NVIDIA NIM (empty choices[] when omitted); MoA reference slots; Gemini native (fixed 65,535
-    ceiling otherwise); OpenRouter (budgets the FULL window when omitted → 402 on low credit);
-    managed local llama-server (uncapped decode with no EOS burns the GPU to the context window).
+    ceiling otherwise); Cloud Code PA (gemini-oauth); OpenRouter (budgets the FULL window
+    when omitted → 402 on low credit); managed local llama-server (uncapped decode with no
+    EOS burns the GPU to the context window).
     """
     return (
         _is_anthropic_compat_endpoint(provider, effective_base)
@@ -6502,6 +6513,7 @@ def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effectiv
         or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
         or str(task) == "moa_reference"
         or _is_gemini_native_route(provider_norm, effective_base)
+        or _is_cloudcode_route(provider_norm, effective_base)
         or provider_norm == "openrouter"
         or base_url_host_matches(effective_base, "openrouter.ai")
         or _is_managed_local_endpoint(effective_base)

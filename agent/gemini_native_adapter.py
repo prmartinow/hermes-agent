@@ -994,9 +994,10 @@ def _effective_gemini_max_output_tokens(
 
     Gemini's generateContent API does not treat an omitted cap as
     unlimited — it applies a low internal default and truncates. When
-    thinking is enabled, also raise a too-small explicit cap to the
-    published ceiling (or thinkingBudget + 8192 headroom) so thought tokens
-    do not starve the answer.
+    an explicit cap is provided (e.g. 1500, 4096, 8000), honor it as
+    a strict bound capped by the model ceiling. When omitted (None),
+    preserve headroom for thinking up to the model ceiling (or
+    thinkingBudget + 8192 headroom) so thought tokens do not starve output.
     """
     bare = bare_gemini_model_id(model).lower() if model else ""
     default_ceiling = GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
@@ -1005,23 +1006,25 @@ def _effective_gemini_max_output_tokens(
     elif "claude" in bare:
         default_ceiling = 64000
 
-    if max_tokens is None:
-        requested = default_ceiling
-    else:
+    requested: Optional[int] = None
+    if max_tokens is not None:
         try:
             requested = int(max_tokens)
         except (TypeError, ValueError):
-            requested = default_ceiling
-    if requested <= 0:
-        requested = default_ceiling
+            requested = None
+    if requested is not None and requested <= 0:
+        requested = None
+
+    if requested is not None:
+        return min(requested, default_ceiling)
 
     normalized = _normalize_thinking_config(thinking_config)
     if _thinking_requests_output_headroom(thinking_config):
         budget = normalized.get("thinkingBudget", 0) if normalized else 0
         if isinstance(budget, (int, float)) and budget > 0:
-            return max(requested, int(budget) + 8192, default_ceiling)
-        return max(requested, default_ceiling)
-    return min(requested, default_ceiling)
+            return max(int(budget) + 8192, default_ceiling)
+        return default_ceiling
+    return default_ceiling
 
 
 def _normalize_media_resolution(media_resolution: Any) -> Optional[str]:
@@ -1076,15 +1079,28 @@ def build_gemini_request(
     generation_config: Dict[str, Any] = {}
     if temperature is not None:
         generation_config["temperature"] = temperature
-    generation_config["maxOutputTokens"] = _effective_gemini_max_output_tokens(
+    effective_max = _effective_gemini_max_output_tokens(
         max_tokens, thinking_config, model=model
     )
+    generation_config["maxOutputTokens"] = effective_max
     if top_p is not None:
         generation_config["topP"] = top_p
     if stop:
         generation_config["stopSequences"] = stop if isinstance(stop, list) else [str(stop)]
     normalized_thinking = _normalize_thinking_config(thinking_config)
     if normalized_thinking:
+        tb = normalized_thinking.get("thinkingBudget")
+        if isinstance(tb, (int, float)) and tb > 0 and effective_max is not None:
+            bare = bare_gemini_model_id(model).lower() if model else ""
+            if "claude" in bare:
+                if effective_max <= 1024:
+                    normalized_thinking = {"includeThoughts": False}
+                else:
+                    max_tb = max(1024, effective_max - 256) if effective_max >= 1024 + 256 else (effective_max - 1)
+                    if int(tb) > max_tb:
+                        normalized_thinking = {**normalized_thinking, "thinkingBudget": max_tb}
+            elif int(tb) >= effective_max:
+                normalized_thinking = {**normalized_thinking, "thinkingBudget": max(0, effective_max - 256)}
         generation_config["thinkingConfig"] = normalized_thinking
     normalized_resolution = _normalize_media_resolution(media_resolution)
     if normalized_resolution:

@@ -26,6 +26,39 @@ from evals.compaction.summary_usefulness.live_runner import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_configured_auxiliary(monkeypatch: pytest.MonkeyPatch):
+    """Ensure test isolation for live runner unit tests.
+
+    Under pytest suites with tests/conftest.py, HERMES_HOME is sandboxed and env vars cleared.
+    This fixture provides deterministic configuration and mock OAuth credential resolution
+    for offline unit tests, preventing contamination from prior test runs or host environment drift.
+    """
+    from agent.auxiliary_client import _client_cache, _reset_aux_unhealthy_cache
+
+    test_cfg = {
+        "model": {
+            "default": "gemini-3.8-flash-high",
+            "provider": "gemini-oauth",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: test_cfg)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: test_cfg)
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_gemini_oauth_runtime_credentials",
+        lambda *args, **kwargs: {
+            "access_token": "ya29.test-mock-token",
+            "api_key": "ya29.test-mock-token",
+            "base_url": "https://cloudcode-pa.googleapis.com/v1internal",
+        },
+    )
+    _client_cache.clear()
+    _reset_aux_unhealthy_cache()
+    yield
+    _client_cache.clear()
+    _reset_aux_unhealthy_cache()
+
+
 def test_resolve_actual_configured_auxiliary_sanitized():
     aux = resolve_actual_configured_auxiliary()
     assert "resolved_model" in aux
