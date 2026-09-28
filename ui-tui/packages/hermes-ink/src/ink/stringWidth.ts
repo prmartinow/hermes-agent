@@ -25,6 +25,16 @@ function stringWidthJavaScript(str: string): number {
     return 0
   }
 
+  if (str.length === 1) {
+    const code = str.charCodeAt(0)
+    if (code >= 0x20 && code <= 0x7e) {
+      return 1
+    }
+    if (code <= 0x1f || code === 0x7f) {
+      return 0
+    }
+  }
+
   // Fast path: pure ASCII string (no ANSI codes, no wide chars)
   let isPureAscii = true
 
@@ -290,6 +300,16 @@ const WIDTH_CACHE_LIMIT = 8192
 export const stringWidth: (str: string) => number = str => {
   if (!str) {
     return 0
+  }
+
+  if (str.length === 1) {
+    const code = str.charCodeAt(0)
+    if (code >= 0x20 && code <= 0x7e) {
+      return 1
+    }
+    if (code <= 0x1f || code === 0x7f) {
+      return 0
+    }
   }
 
   // ASCII fast-path detection — for short ASCII, skip the cache.

@@ -206,14 +206,41 @@ def _scan_quoted(text: str) -> Iterator[tuple[int, str, bool]]:
             yield i, ch, False
 
 
+_RE_REDIRECT_TARGET = re.compile(r"^\d*(?:>>?|<)$")
+_RE_REDIRECT = re.compile(r"^\d*(?:>&|<&)\d+$")
+_RE_VAR_ASSIGN = re.compile(r"^[A-Za-z_]\w*=")
+_RE_BOUNDARY_ECHO = re.compile(r"-{2,}|_exit=|(?:^|\s|=)\$[?{]|PIPESTATUS")
+
+
 def _split_shell_words(segment: str) -> list[str]:
-    parts: list[list[str]] = [[]]
-    for _, ch, quoted in _scan_quoted(segment):
-        if not quoted and ch.isspace():
-            parts.append([])
+    words: list[str] = []
+    quote: str | None = None
+    start = -1
+    n = len(segment)
+    i = 0
+    while i < n:
+        ch = segment[i]
+        if quote:
+            if ch == quote and segment[i - 1] != "\\":
+                quote = None
+            i += 1
+        elif ch == "'" or ch == '"':
+            if start == -1:
+                start = i
+            quote = ch
+            i += 1
+        elif ch.isspace():
+            if start != -1:
+                words.append(segment[start:i])
+                start = -1
+            i += 1
         else:
-            parts[-1].append(ch)
-    return ["".join(p) for p in parts if p]
+            if start == -1:
+                start = i
+            i += 1
+    if start != -1:
+        words.append(segment[start:n])
+    return words
 
 
 def _strip_shell_pipe_tail(segment: str) -> str:
@@ -228,26 +255,51 @@ def _strip_shell_pipe_tail(segment: str) -> str:
 
 def _split_shell_compound(command: str) -> list[str]:
     """Split on unquoted ``&&`` / ``||`` / ``;`` / newline, dropping pipe tails per segment."""
-    raw: list[list[str]] = [[]]
-    skip = False
-    for i, ch, quoted in _scan_quoted(command):
-        if skip:
-            skip = False
-        elif not quoted and (command.startswith("&&", i) or command.startswith("||", i)):
-            raw.append([])
-            skip = True
-        elif not quoted and ch in {";", "\n"}:
-            raw.append([])
+    raw_segments: list[str] = []
+    quote: str | None = None
+    start = 0
+    n = len(command)
+    i = 0
+    while i < n:
+        ch = command[i]
+        if quote:
+            if ch == quote and command[i - 1] != "\\":
+                quote = None
+            i += 1
+        elif ch == "'" or ch == '"':
+            quote = ch
+            i += 1
+        elif ch == "&" and i + 1 < n and command[i + 1] == "&":
+            raw_segments.append(command[start:i])
+            i += 2
+            start = i
+        elif ch == "|" and i + 1 < n and command[i + 1] == "|":
+            raw_segments.append(command[start:i])
+            i += 2
+            start = i
+        elif ch == ";" or ch == "\n":
+            raw_segments.append(command[start:i])
+            i += 1
+            start = i
         else:
-            raw[-1].append(ch)
-    segments = (_strip_shell_pipe_tail("".join(buf).strip()) for buf in raw)
-    return [s for s in segments if s]
+            i += 1
+    if start < n:
+        raw_segments.append(command[start:n])
+    elif start == n and not raw_segments:
+        raw_segments.append("")
+
+    segments: list[str] = []
+    for raw in raw_segments:
+        s = _strip_shell_pipe_tail(raw.strip())
+        if s:
+            segments.append(s)
+    return segments
 
 
 def _shell_head_word(segment: str) -> str:
     """Command name of a segment, skipping leading ``VAR=value`` assignments."""
     words = _split_shell_words(segment)
-    while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
+    while words and _RE_VAR_ASSIGN.match(words[0]):
         words.pop(0)
     return _shell_basename(words[0] if words else "")
 
@@ -259,9 +311,9 @@ def _clean_shell_segment(segment: str) -> str:
     i = 0
     while i < len(words):
         word = words[i]
-        if re.match(r"^\d*(?:>>?|<)$", word):
+        if _RE_REDIRECT_TARGET.match(word):
             i += 2  # operator + target
-        elif re.match(r"^\d*(?:>&|<&)\d+$", word):
+        elif _RE_REDIRECT.match(word):
             i += 1
         else:
             out.append(word)
@@ -273,7 +325,7 @@ def _is_shell_boundary_echo(segment: str) -> bool:
     words = _split_shell_words(segment)
     if _shell_basename(words[0] if words else "") != "echo":
         return False
-    return bool(re.search(r"-{2,}|_exit=|(?:^|\s|=)\$[?{]|PIPESTATUS", " ".join(words[1:])))
+    return bool(_RE_BOUNDARY_ECHO.search(" ".join(words[1:])))
 
 
 def summarize_shell_command(command: str) -> str:
