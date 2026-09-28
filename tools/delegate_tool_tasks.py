@@ -204,3 +204,31 @@ def _coerce_task_inherit_max_tokens(
         else:
             result.append(None)
     return result, None
+
+
+_VALID_INHERIT_CONTEXT_MODES = frozenset({"full", "bounded"})
+
+
+def _coerce_task_inherit_context_mode(
+    task_list: List[Dict[str, Any]],
+    task_inherit_contexts: List[bool],
+) -> tuple[List[str], Optional[str]]:
+    """Per-task validated inherit_context_mode enum (full | bounded, default full).
+    Strict validation: rejects non-string types, non-exact values (no case normalization or whitespace stripping).
+    Only valid when inherit_context is True.
+    """
+    result: List[str] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        inherit_ctx = task_inherit_contexts[i] if i < len(task_inherit_contexts) else False
+        if "inherit_context_mode" in task:
+            if not inherit_ctx:
+                return [], f"Task {i} 'inherit_context_mode' is only valid when 'inherit_context' is true."
+            val = task["inherit_context_mode"]
+            if not isinstance(val, str) or val not in _VALID_INHERIT_CONTEXT_MODES:
+                return [], f"Task {i} 'inherit_context_mode' must be 'full' or 'bounded'."
+            result.append(val)
+        else:
+            result.append("full")
+    return result, None

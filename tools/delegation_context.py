@@ -85,15 +85,42 @@ class SnapshotManifest:
     omissions_detail: Tuple[str, ...] = ()
     requested_budget: Optional[int] = None
     effective_budget: Optional[int] = None
+    mode: str = "full"
+    source_hash_sha256: Optional[str] = None
+    source_records_count: Optional[int] = None
+    selected_record_ids: Tuple[int, ...] = ()
+    omitted_records_count: int = 0
+    selection_policy: str = "full"
+    seed_estimated_tokens: Optional[int] = None
+    seed_content_hash_sha256: Optional[str] = None
+
+    @property
+    def source_digest(self) -> str:
+        h = self.source_hash_sha256 or self.content_hash_sha256
+        return f"sha256:{h[:16]}" if h else ""
 
     def to_dict(self) -> Dict[str, Any]:
         """Parent-safe summary dict. Excludes raw transcripts or sensitive prompt leakage."""
         eff = self.effective_budget if self.effective_budget is not None else self.token_budget
         req = self.requested_budget if self.requested_budget is not None else self.token_budget
+        src_hash = self.source_hash_sha256 or self.content_hash_sha256
+        src_digest = f"sha256:{src_hash[:16]}" if src_hash else ""
+        src_count = self.source_records_count if self.source_records_count is not None else self.retained_messages_count
+        seed_tok = self.seed_estimated_tokens if self.seed_estimated_tokens is not None else self.estimated_tokens
+        seed_hash = self.seed_content_hash_sha256 or self.content_hash_sha256
         return {
             "snapshot_id": self.snapshot_id,
             "source_type": self.source_type,
-            "snapshot_digest": f"sha256:{self.content_hash_sha256[:16]}",
+            "snapshot_digest": src_digest,
+            "source_digest": src_digest,
+            "source_hash_sha256": src_hash,
+            "source_records_count": src_count,
+            "mode": self.mode,
+            "selection_policy": self.selection_policy,
+            "selected_record_ids": list(self.selected_record_ids),
+            "omitted_records_count": self.omitted_records_count,
+            "seed_estimated_tokens": seed_tok,
+            "seed_content_hash_sha256": seed_hash,
             "content_hash_sha256": self.content_hash_sha256,
             "char_count": self.char_count,
             "estimated_tokens": self.estimated_tokens,
@@ -162,6 +189,7 @@ class RenderedTranscriptResult:
     omitted_unsupported_blocks_count: int
     omissions_detail: Tuple[str, ...]
     records: Tuple[SnapshotRecord, ...] = ()
+    source_hash_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -534,6 +562,10 @@ def _render_parent_transcript(parent_agent: Any) -> RenderedTranscriptResult:
         omitted_unsupported_blocks_count=omissions["unsupported"],
         omissions_detail=tuple(omissions_detail),
         records=frozen_records,
+        source_hash_sha256=hashlib.sha256(json.dumps(
+            [record.to_dict() for record in frozen_records],
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")).hexdigest(),
     )
 
 
@@ -588,6 +620,67 @@ def _build_manifest_for_budget(
         omitted_unsupported_blocks_count=rendered.omitted_unsupported_blocks_count,
         omitted_orphan_tool_results_count=rendered.omitted_orphan_tool_results_count,
         omissions_detail=rendered.omissions_detail,
+        mode="full",
+        source_hash_sha256=rendered.source_hash_sha256 or rendered.content_hash_sha256,
+        source_records_count=len(rendered.records),
+        selected_record_ids=tuple(r.record_id for r in rendered.records),
+        omitted_records_count=0,
+        selection_policy="full",
+        seed_estimated_tokens=rendered.estimated_tokens,
+        seed_content_hash_sha256=rendered.content_hash_sha256,
+    )
+
+
+def _build_bounded_snapshot(
+    rendered: RenderedTranscriptResult,
+    *,
+    goal: Optional[str] = None,
+    context: Optional[str] = None,
+    configured_ceiling: int,
+    effective_budget: int,
+) -> ContextSnapshot:
+    """Build a bounded initial seed snapshot within budget, preserving full backing records."""
+    from tools.delegation_context_selection import select_bounded_context_records
+
+    selection = select_bounded_context_records(
+        rendered.records,
+        goal=goal,
+        context=context,
+        effective_budget=effective_budget,
+        source_type=rendered.source_type,
+    )
+    snapshot_id = f"snap-{uuid.uuid4().hex[:12]}"
+    manifest = SnapshotManifest(
+        snapshot_id=snapshot_id,
+        source_type=rendered.source_type,
+        content_hash_sha256=selection.content_hash_sha256,
+        char_count=selection.char_count,
+        estimated_tokens=selection.estimated_tokens,
+        token_budget=effective_budget,
+        requested_budget=configured_ceiling,
+        effective_budget=effective_budget,
+        retained_messages_count=len(selection.selected_records),
+        retained_tool_events_count=sum(1 for r in selection.selected_records if r.role == "tool"),
+        omitted_system_messages_count=rendered.omitted_system_messages_count,
+        omitted_sidecars_count=rendered.omitted_sidecars_count,
+        omitted_scaffolding_count=rendered.omitted_scaffolding_count,
+        omitted_images_count=rendered.omitted_images_count,
+        omitted_unsupported_blocks_count=rendered.omitted_unsupported_blocks_count,
+        omitted_orphan_tool_results_count=rendered.omitted_orphan_tool_results_count,
+        omissions_detail=rendered.omissions_detail,
+        mode="bounded",
+        source_hash_sha256=rendered.source_hash_sha256 or rendered.content_hash_sha256,
+        source_records_count=len(rendered.records),
+        selected_record_ids=selection.selected_record_ids,
+        omitted_records_count=selection.omitted_records_count,
+        selection_policy=selection.selection_policy,
+        seed_estimated_tokens=selection.estimated_tokens,
+        seed_content_hash_sha256=selection.content_hash_sha256,
+    )
+    return ContextSnapshot(
+        manifest=manifest,
+        rendered_transcript=selection.rendered_transcript,
+        records=rendered.records,
     )
 
 
@@ -599,6 +692,9 @@ def build_delegation_context_snapshot(
     child_api_key: Optional[str] = None,
     child_provider: Optional[str] = None,
     config_override_tokens: Optional[int] = None,
+    inherit_context_mode: str = "full",
+    goal: Optional[str] = None,
+    context: Optional[str] = None,
 ) -> ContextSnapshot:
     """Build an immutable, detached, provenance-labeled historical context snapshot.
 
@@ -607,6 +703,30 @@ def build_delegation_context_snapshot(
     and returns a ContextSnapshot ready to seed child execution.
     """
     rendered = _render_parent_transcript(parent_agent)
+
+    if inherit_context_mode == "bounded":
+        from agent.model_metadata import get_model_context_length
+        from tools.delegate_tool_config import _get_inherit_max_tokens
+
+        child_context_window = get_model_context_length(
+            model=child_model or "",
+            base_url=child_base_url or "",
+            api_key=child_api_key or "",
+            provider=child_provider or "",
+        )
+        reserve = min(child_context_window, max(2048, int(child_context_window * 0.25)))
+        window_available = max(0, child_context_window - reserve)
+        configured_ceiling = config_override_tokens if config_override_tokens is not None else _get_inherit_max_tokens()
+        effective_budget = min(configured_ceiling, window_available)
+
+        return _build_bounded_snapshot(
+            rendered,
+            goal=goal,
+            context=context,
+            configured_ceiling=configured_ceiling,
+            effective_budget=effective_budget,
+        )
+
     manifest = _build_manifest_for_budget(
         rendered,
         child_model=child_model,
@@ -627,6 +747,9 @@ def build_batch_context_snapshots(
     task_inherit_contexts: List[bool],
     task_inherit_max_tokens: List[Optional[int]],
     *,
+    task_inherit_context_modes: Optional[List[str]] = None,
+    task_goals: Optional[List[str]] = None,
+    task_contexts: Optional[List[Optional[str]]] = None,
     child_model: Optional[str] = None,
     child_base_url: Optional[str] = None,
     child_api_key: Optional[str] = None,
@@ -637,43 +760,68 @@ def build_batch_context_snapshots(
     If any task opting in to inheritance cannot fit its effective budget, raises
     BudgetExceededError so the entire batch fails closed before spawning.
     Tasks with inherit_context=False get None.
-    All inheriting tasks share the exact same immutable rendered_transcript string in memory.
+    All inheriting tasks share the exact same underlying immutable records tuple.
     """
     if not any(task_inherit_contexts):
         return [None] * len(task_inherit_contexts)
 
+    from agent.model_metadata import get_model_context_length
+    from tools.delegate_tool_config import _get_inherit_max_tokens
+
+    child_context_window = get_model_context_length(
+        model=child_model or "",
+        base_url=child_base_url or "",
+        api_key=child_api_key or "",
+        provider=child_provider or "",
+    )
+    reserve = min(child_context_window, max(2048, int(child_context_window * 0.25)))
+    window_available = max(0, child_context_window - reserve)
+
     # 1. Render parent transcript ONCE for the entire batch
     rendered = _render_parent_transcript(parent_agent)
 
-    # 2. Check each task's budget against the single rendered transcript.
-    # If ANY task fails budget, fail the whole batch!
-    task_manifests: List[Optional[SnapshotManifest]] = []
+    # 2. Check each task's budget and build ContextSnapshot (full or bounded)
+    snapshots: List[Optional[ContextSnapshot]] = []
     for i, should_inherit in enumerate(task_inherit_contexts):
         if not should_inherit:
-            task_manifests.append(None)
+            snapshots.append(None)
             continue
         override_tok = task_inherit_max_tokens[i] if i < len(task_inherit_max_tokens) else None
-        manifest = _build_manifest_for_budget(
-            rendered,
-            child_model=child_model,
-            child_base_url=child_base_url,
-            child_api_key=child_api_key,
-            child_provider=child_provider,
-            task_override_tokens=override_tok,
+        mode = (
+            task_inherit_context_modes[i]
+            if task_inherit_context_modes and i < len(task_inherit_context_modes)
+            else "full"
         )
-        task_manifests.append(manifest)
+        goal = task_goals[i] if task_goals and i < len(task_goals) else ""
+        ctx = task_contexts[i] if task_contexts and i < len(task_contexts) else None
 
-    # 3. Create ContextSnapshot for each inheriting task sharing the rendered transcript text
-    snapshots: List[Optional[ContextSnapshot]] = []
-    for m in task_manifests:
-        if m is not None:
+        configured_ceiling = override_tok if override_tok is not None else _get_inherit_max_tokens()
+        effective_budget = min(configured_ceiling, window_available)
+
+        if mode == "bounded":
+            snap = _build_bounded_snapshot(
+                rendered,
+                goal=goal,
+                context=ctx,
+                configured_ceiling=configured_ceiling,
+                effective_budget=effective_budget,
+            )
+            snapshots.append(snap)
+        else:
+            manifest = _build_manifest_for_budget(
+                rendered,
+                child_model=child_model,
+                child_base_url=child_base_url,
+                child_api_key=child_api_key,
+                child_provider=child_provider,
+                task_override_tokens=override_tok,
+            )
             snapshots.append(
                 ContextSnapshot(
-                    manifest=m,
+                    manifest=manifest,
                     rendered_transcript=rendered.transcript_text,
                     records=rendered.records,
                 )
             )
-        else:
-            snapshots.append(None)
+
     return snapshots

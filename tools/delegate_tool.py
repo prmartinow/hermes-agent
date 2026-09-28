@@ -46,7 +46,7 @@ from tools.delegate_tool_registry import (  # noqa: F401
     steer_subagent,
 )
 from tools.delegate_tool_tasks import (  # noqa: F401
-    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_inherit_context, _coerce_task_inherit_max_tokens, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
+    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_inherit_context, _coerce_task_inherit_context_mode, _coerce_task_inherit_max_tokens, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
 )
 from tools.delegation_context import (  # noqa: F401
     ContextInheritanceError, build_batch_context_snapshots, build_delegation_context_snapshot,
@@ -545,6 +545,8 @@ def delegate_task(
         task_inherit_contexts, err = _coerce_task_inherit_context(task_list)
     if not err:
         task_inherit_max_tokens, err = _coerce_task_inherit_max_tokens(task_list, task_inherit_contexts)
+    if not err:
+        task_inherit_context_modes, err = _coerce_task_inherit_context_mode(task_list, task_inherit_contexts)
     if err:
         return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
@@ -559,11 +561,16 @@ def delegate_task(
             child_provider = creds.get("provider") or getattr(parent_agent, "provider", None)
             child_base_url = creds.get("base_url") or getattr(parent_agent, "base_url", None)
             child_api_key = creds.get("api_key") or getattr(parent_agent, "api_key", None)
-            if any(tok is not None for tok in task_inherit_max_tokens):
+            task_goals = [t.get("goal", "") for t in task_list]
+            task_contexts = [t.get("context") for t in task_list]
+            if any(tok is not None for tok in task_inherit_max_tokens) or any(m == "bounded" for m in task_inherit_context_modes):
                 batch_snapshots = build_batch_context_snapshots(
                     parent_agent,
                     task_inherit_contexts,
                     task_inherit_max_tokens,
+                    task_inherit_context_modes=task_inherit_context_modes,
+                    task_goals=task_goals,
+                    task_contexts=task_contexts,
                     child_model=child_model,
                     child_base_url=child_base_url,
                     child_api_key=child_api_key,
@@ -790,6 +797,13 @@ DELEGATE_TASK_SCHEMA = {
                             "Optional per-task token budget ceiling for inherited context (positive integer; requires inherit_context: true). "
                             "When omitted, defaults to delegation.inherit_max_tokens (64,000) clamped to the child model's context window. "
                             "Allows requesting a larger ceiling for subagents running on large-context models without changing global configuration.",
+                        ),
+                        "inherit_context_mode": _p(
+                            "string",
+                            "Optional context inheritance mode: 'full' (default) seeds the complete historical transcript; "
+                            "'bounded' seeds a prioritized subset within token budget (always preserving the latest user prompt in full "
+                            "and attaching full underlying records accessible via session_search). Requires inherit_context: true.",
+                            enum=["full", "bounded"],
                         ),
                     },
                     "required": ["goal"],

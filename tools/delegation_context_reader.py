@@ -51,6 +51,17 @@ def extract_snapshot_id(session_id: str) -> Optional[str]:
     return None
 
 
+def _manifest_digest(manifest: Any) -> str:
+    """Return the source digest identifying full backing records, with fallback for legacy manifests."""
+    if hasattr(manifest, "source_digest") and manifest.source_digest:
+        return str(manifest.source_digest)
+    source_hash = getattr(manifest, "source_hash_sha256", None)
+    if source_hash:
+        return f"sha256:{source_hash[:16]}"
+    content_hash = getattr(manifest, "content_hash_sha256", "")
+    return f"sha256:{content_hash[:16]}" if content_hash else ""
+
+
 def validate_snapshot_route(
     session_id: str,
     snapshot: Optional[Any],
@@ -312,7 +323,7 @@ def _paginate_record(
         "mode": "snapshot_record",
         "session_id": session_id,
         "snapshot_id": manifest.snapshot_id,
-        "snapshot_digest": f"sha256:{manifest.content_hash_sha256[:16]}",
+        "snapshot_digest": _manifest_digest(manifest),
         "source": manifest.source_type,
         "around_message_id": rec.record_id,
         "window": 0,
@@ -439,7 +450,7 @@ def _paginate_scroll(
         "mode": "snapshot_scroll",
         "session_id": session_id,
         "snapshot_id": manifest.snapshot_id,
-        "snapshot_digest": f"sha256:{manifest.content_hash_sha256[:16]}",
+        "snapshot_digest": _manifest_digest(manifest),
         "source": manifest.source_type,
         "around_message_id": anchor_id,
         "window": window_val,
@@ -575,7 +586,7 @@ def _paginate_search(
         "mode": "snapshot_search",
         "session_id": session_id,
         "snapshot_id": manifest.snapshot_id,
-        "snapshot_digest": f"sha256:{manifest.content_hash_sha256[:16]}",
+        "snapshot_digest": _manifest_digest(manifest),
         "source": manifest.source_type,
         "query": query_str,
         "total_matches": total_matches,
@@ -631,7 +642,7 @@ def _paginate_browse(
     payload = {
         "success": True, "mode": "snapshot_browse", "session_id": session_id,
         "snapshot_id": snap.manifest.snapshot_id,
-        "snapshot_digest": f"sha256:{snap.manifest.content_hash_sha256[:16]}",
+        "snapshot_digest": _manifest_digest(snap.manifest),
         "source": snap.manifest.source_type, "total_records": len(records),
         "matching_records": len(eligible), "count": len(messages),
         "content_char_budget": max_chars_val,

@@ -150,11 +150,23 @@ When subagents are configured to use a different provider or model than the pare
    - **Complete Paginated Recovery**: With `around_message_id`, `window=0`, and `content_offset` paired with bounded `max_chars` (default 8,000, max 32,000), long messages can be retrieved page-by-page and reassembled exactly without permanent cutoffs.
    - **Multi-Record Window Scrolling**: Passing `around_message_id` with `window > 0` returns neighboring message turns with aggregate character budgeting and continuation positions (`has_more`, `next_around_message_id`, `next_content_offset`, `next_call`). When character budget boundaries hit zero, records are cleanly unconsumed without empty skipped placeholders.
 
+9. **Opt-in Bounded Context Inheritance (`inherit_context_mode: "bounded"`)**: By default, `inherit_context_mode` is `"full"`, which attempts to seed the complete sanitized conversation history into the child's initial prompt (failing closed if history exceeds the token ceiling). When conversation history is long or a tight initial seed budget is preferred:
+   - Setting `inherit_context_mode: "bounded"` renders a deterministic, prioritized initial seed within the `inherit_max_tokens` budget without discarding any underlying history.
+   - **Latest User Prompt Invariant**: The latest user-role record is always preserved in full. If the latest prompt alone plus required framing exceeds the effective budget, delegation fails closed explicitly with `BudgetExceededError`.
+   - **Deterministic Lexical Selection**: Whole candidate turns are selected using a transparent deterministic scoring policy based on task goal and context term matches, latest user prompt terms, adjacency to the latest user request, and turn recency, discounted by the square root of record size so large keyword-heavy dumps do not crowd out concise decisions. Selected records are emitted in strictly preserved chronological order.
+   - **Clear Partial Coverage Hint**: The initial seed transcript carries an explicit, compact guidance hint noting partial coverage and instructing the model how to retrieve unseeded historical records on-demand via `session_search(session_id="snapshot", ...)`.
+   - **Full Immutable Backing**: Underlying frozen snapshot records remain complete and queryable. Sibling tasks in a batch share the exact same backing records tuple while receiving distinct seeds tailored to their specific goals.
+   - **Reader Availability Gating**: Bounded mode requires `session_search` to be callable by the child (either directly or via the deferred `tool_call` bridge). Hermes verifies reader reachability before child inference begins and cleans up constructed children if the reader is unavailable. Full mode remains functional without `session_search`.
+   - **Honest Coverage Receipts**: Task manifests report `mode: "bounded"`, `source_records_count`, `source_digest`, `selected_record_ids`, `omitted_records_count`, `selection_policy: "deterministic_terms_density_and_recency"`, and `seed_estimated_tokens`.
+   - **Efficiency Is Workload-Dependent**: A smaller seed is not automatically cheaper overall: each retrieval round replays accumulated context. Start with a task-scoped budget (for example, 8,192 tokens), then compare total provider input, answer quality and retrieval rounds against a full-context baseline. The global default is unchanged.
+   - **Heuristic Limits**: Lexical term matching scores explicit ASCII word/identifier overlap. It does not perform semantic reasoning or embedding search; omission from the initial seed reflects budget prioritization rather than absolute irrelevance. The subagent should query `session_search(session_id="snapshot", ...)` when additional background is required.
+
 ```python
 delegate_task(tasks=[{
     "goal": "Implement cache_key according to the latest specifications discussed above",
     "inherit_context": True,
-    "inherit_max_tokens": 120000,
+    "inherit_context_mode": "bounded",
+    "inherit_max_tokens": 4000,
 }])
 ```
 

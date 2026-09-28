@@ -52,6 +52,36 @@ def calculate_task_inheritance_budget(
     return configured_ceiling, effective_budget, child_context_window, reserve
 
 
+def is_session_search_callable(child: Any) -> bool:
+    """Check if session_search is callable by the child, directly or via deferred tool_call bridge.
+
+    Preserves process-global model_tools._last_resolved_tool_names if resolution is invoked.
+    """
+    valid_names = getattr(child, "valid_tool_names", None)
+    if valid_names is None:
+        tools = getattr(child, "tools", None) or []
+        valid_names = {t.get("function", {}).get("name") for t in tools if isinstance(t, dict)}
+
+    if "session_search" in valid_names:
+        return True
+
+    if "tool_call" in valid_names:
+        import model_tools
+        from agent.tool_executor import _tool_search_scoped_names
+        from tools.delegate_tool_results import _CHILD_CONSTRUCTION_LOCK
+
+        with _CHILD_CONSTRUCTION_LOCK:
+            saved = list(getattr(model_tools, "_last_resolved_tool_names", []))
+            try:
+                scoped = _tool_search_scoped_names(child)
+                if "session_search" in scoped:
+                    return True
+            finally:
+                model_tools._last_resolved_tool_names = saved
+
+    return False
+
+
 def preflight_child_initial_request(
     task_index: int,
     task_dict: Dict[str, Any],
@@ -79,6 +109,28 @@ def preflight_child_initial_request(
     rendered_transcript = getattr(snapshot, "rendered_transcript", None)
     if not isinstance(rendered_transcript, str):
         return f"Task {task_index} requires an inherited snapshot but none is available; fails closed."
+
+    manifest = getattr(child, "_inherited_context_manifest", None)
+    mode = "full"
+    if isinstance(manifest, dict):
+        mode = manifest.get("mode", "full")
+    elif hasattr(snapshot, "manifest"):
+        mode = getattr(snapshot.manifest, "mode", "full")
+
+    if mode == "bounded":
+        try:
+            reader_available = is_session_search_callable(child)
+        except Exception as exc:
+            return (
+                f"Task {task_index} cannot verify its scoped history reader "
+                f"({type(exc).__name__}); fails closed."
+            )
+        if not reader_available:
+            return (
+                f"Task {task_index} requested bounded context inheritance (mode='bounded'), "
+                f"but session_search is not available to the child (neither directly nor via deferred tool_call). "
+                f"Bounded mode requires session_search for on-demand history retrieval; fails closed."
+            )
 
     # 1. Assemble the initial user turn exactly as SubagentRun / run_conversation will
     goal = task_dict.get("goal", "")
