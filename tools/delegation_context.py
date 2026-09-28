@@ -113,6 +113,37 @@ class SnapshotManifest:
 
 
 @dataclass(frozen=True)
+class SnapshotRecord:
+    """Immutable, detached record of a sanitized historical conversation turn."""
+
+    record_id: int
+    role: str
+    text: str
+    tool_name: Optional[str] = None
+    tool_call_id: Optional[str] = None
+
+    @property
+    def id(self) -> int:
+        return self.record_id
+
+    @property
+    def content(self) -> str:
+        return self.text
+
+    def to_dict(self) -> Dict[str, Any]:
+        d: Dict[str, Any] = {
+            "record_id": self.record_id,
+            "role": self.role,
+            "text": self.text,
+        }
+        if self.tool_name is not None:
+            d["tool_name"] = self.tool_name
+        if self.tool_call_id is not None:
+            d["tool_call_id"] = self.tool_call_id
+        return d
+
+
+@dataclass(frozen=True)
 class RenderedTranscriptResult:
     """Internal immutable result of rendering the parent's portable historical transcript once."""
 
@@ -130,6 +161,7 @@ class RenderedTranscriptResult:
     omitted_images_count: int
     omitted_unsupported_blocks_count: int
     omissions_detail: Tuple[str, ...]
+    records: Tuple[SnapshotRecord, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -138,11 +170,13 @@ class ContextSnapshot:
 
     manifest: SnapshotManifest
     rendered_transcript: str
+    records: Tuple[SnapshotRecord, ...] = ()
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "manifest": self.manifest.to_dict(),
             "rendered_transcript": self.rendered_transcript,
+            "records": [r.to_dict() for r in self.records],
         }
 
 
@@ -398,7 +432,7 @@ def _render_parent_transcript(parent_agent: Any) -> RenderedTranscriptResult:
     # Render provenance-labeled transcript
     transcript_lines: List[str] = [
         "=== INHERITED HISTORICAL CONTEXT (PROVENANCE-LABELED TRANSCRIPT) ===",
-        f"Snapshot ID: {snapshot_id}",
+        f"Source capture ID: {snapshot_id}",
         f"Source: {source_type}",
         f"Retained Messages: {retained_messages_count}",
         f"Retained Completed Tool Events: {retained_tool_events_count}",
@@ -449,6 +483,41 @@ def _render_parent_transcript(parent_agent: Any) -> RenderedTranscriptResult:
     from agent.model_metadata import estimate_tokens_rough
     estimated_tokens = estimate_tokens_rough(rendered_transcript)
 
+    records_list: List[SnapshotRecord] = []
+    for rec_id, m in enumerate(sanitized_messages, start=1):
+        r = m.get("role", "")
+        t_name = None
+        t_call_id = None
+        if r == "user":
+            txt = m.get("content") or ""
+        elif r == "assistant":
+            parts = []
+            if m.get("content"):
+                parts.append(str(m.get("content")))
+            for tc in m.get("tool_calls") or []:
+                fn = tc.get("function") or {}
+                fn_name = fn.get("name", "")
+                fn_args = fn.get("arguments", "")
+                tc_id = tc.get("id", "")
+                parts.append(f"[Completed tool call: {fn_name} | ID: {tc_id} | Arguments: {fn_args}]")
+            txt = "\n".join(parts)
+        elif r == "tool":
+            txt = m.get("content") or ""
+            t_name = m.get("name")
+            t_call_id = m.get("tool_call_id")
+        else:
+            txt = m.get("content") or ""
+        records_list.append(
+            SnapshotRecord(
+                record_id=rec_id,
+                role=r,
+                text=str(txt),
+                tool_name=str(t_name) if t_name else None,
+                tool_call_id=str(t_call_id) if t_call_id else None,
+            )
+        )
+    frozen_records: Tuple[SnapshotRecord, ...] = tuple(records_list)
+
     return RenderedTranscriptResult(
         transcript_text=rendered_transcript,
         source_type=source_type,
@@ -464,6 +533,7 @@ def _render_parent_transcript(parent_agent: Any) -> RenderedTranscriptResult:
         omitted_images_count=omissions["images"],
         omitted_unsupported_blocks_count=omissions["unsupported"],
         omissions_detail=tuple(omissions_detail),
+        records=frozen_records,
     )
 
 
@@ -548,6 +618,7 @@ def build_delegation_context_snapshot(
     return ContextSnapshot(
         manifest=manifest,
         rendered_transcript=rendered.transcript_text,
+        records=rendered.records,
     )
 
 
@@ -596,7 +667,13 @@ def build_batch_context_snapshots(
     snapshots: List[Optional[ContextSnapshot]] = []
     for m in task_manifests:
         if m is not None:
-            snapshots.append(ContextSnapshot(manifest=m, rendered_transcript=rendered.transcript_text))
+            snapshots.append(
+                ContextSnapshot(
+                    manifest=m,
+                    rendered_transcript=rendered.transcript_text,
+                    records=rendered.records,
+                )
+            )
         else:
             snapshots.append(None)
     return snapshots

@@ -105,6 +105,10 @@ class TestSchema:
             "after",
             "before",
             "exclude_session_ids",
+            "content_offset",
+            "max_chars",
+            "snapshot",
+            "start_message_id",
         ]
 
 

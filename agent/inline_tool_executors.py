@@ -119,6 +119,25 @@ def _callback_tool(module: str, func: str, callback_attr: str, *arg_specs: _ArgS
 
 
 def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
+    from tools.delegation_context_reader import is_snapshot_session_id
+
+    sid = args.get("session_id")
+    if is_snapshot_session_id(sid) or any(args.get(k) is not None for k in ("content_offset", "max_chars", "start_message_id")):
+        snapshot = getattr(agent, "_inherited_context_snapshot", None)
+        return _call_tool(
+            "tools.session_search_tool", "session_search", args,
+            (
+                ("query", "query", ""), ("role_filter", "role_filter"), ("limit", "limit", 3),
+                ("session_id", "session_id"), ("around_message_id", "around_message_id"),
+                ("window", "window", 5), ("sort", "sort"), ("profile", "profile"),
+                ("detail", "detail", "adaptive"), ("after", "after"), ("before", "before"),
+                ("exclude_session_ids", "exclude_session_ids"),
+                ("content_offset", "content_offset"), ("max_chars", "max_chars"),
+                ("start_message_id", "start_message_id"),
+            ),
+            snapshot=snapshot, db=None, current_session_id=agent.session_id,
+        )
+
     session_db = agent._get_session_db_for_recall()
     if not session_db:
         from hermes_state import format_session_db_unavailable
@@ -132,6 +151,8 @@ def _session_search(agent, args: dict, ctx: InlineToolContext) -> Any:
             ("window", "window", 5), ("sort", "sort"), ("profile", "profile"),
             ("detail", "detail", "adaptive"), ("after", "after"), ("before", "before"),
             ("exclude_session_ids", "exclude_session_ids"),
+            ("content_offset", "content_offset"), ("max_chars", "max_chars"),
+                ("start_message_id", "start_message_id"),
         ),
         db=session_db, current_session_id=agent.session_id,
     )

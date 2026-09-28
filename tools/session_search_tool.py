@@ -618,9 +618,33 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
 def session_search(query: str = "", role_filter: str = None, limit: int = 3, db=None,
                    current_session_id: str = None, session_id: str = None, around_message_id: int = None,
                    window: int = 5, sort: str = None, profile: str = None, detail: str = "adaptive",
-                   after: str = None, before: str = None, exclude_session_ids: Optional[List[str]] = None) -> str:
+                   after: str = None, before: str = None, exclude_session_ids: Optional[List[str]] = None,
+                   content_offset: Optional[int] = None, max_chars: Optional[int] = None,
+                   snapshot: Optional[Any] = None, start_message_id: Optional[int] = None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
+    from tools.delegation_context_reader import is_snapshot_session_id, dispatch_snapshot_search
+    if is_snapshot_session_id(session_id):
+        return dispatch_snapshot_search(
+            snapshot=snapshot,
+            session_id=session_id,
+            query=query,
+            around_message_id=around_message_id,
+            window=window,
+            role_filter=role_filter,
+            limit=limit,
+            content_offset=content_offset,
+            max_chars=max_chars,
+            sort=sort,
+            profile=profile,
+            after=after,
+            before=before,
+            exclude_session_ids=exclude_session_ids,
+            start_message_id=start_message_id,
+        )
+    if any(v is not None for v in (content_offset, max_chars, start_message_id)):
+        return tool_error("Snapshot pagination parameters require a snapshot session_id", success=False)
+
     from hermes_state import format_session_db_unavailable
     from hermes_state_registry import acquire, release_or_close
     owned_dbs: List[Any] = []
@@ -735,9 +759,10 @@ SESSION_SEARCH_SCHEMA = {
             "session_id": {
                 "type": "string",
                 "description": (
-                    "Scroll shape. Session to read inside. Use the session_id returned "
-                    "from a prior discovery call. Must be paired with "
-                    "around_message_id."
+                    "For your attached inherited context, use 'snapshot' or its exact "
+                    "'snapshot:<id>' reference; query searches that frozen snapshot. "
+                    "Source capture IDs quoted in historical text are not authorization references. "
+                    "For ordinary sessions, use an ID returned by discovery with around_message_id."
                 ),
             },
             "around_message_id": {
@@ -774,6 +799,25 @@ SESSION_SEARCH_SCHEMA = {
                     "Omit to use the current profile."
                 ),
             },
+            "start_message_id": {
+                "type": "integer",
+                "description": "Snapshot-only sequential page start. Use next_call from a prior page; do not combine with query or around_message_id.",
+            },
+            "content_offset": {
+                "type": "integer",
+                "description": (
+                    "Snapshot text offset (default 0). Use with an exact record (around_message_id, window=0) "
+                    "or with start_message_id for sequential pages. Follow next_call to preserve traversal state."
+                ),
+            },
+            "max_chars": {
+                "type": "integer",
+                "description": (
+                    "Snapshot retrieval only. Maximum characters to return in message "
+                    "content (default 8000, max 32000). Use with content_offset to "
+                    "reassemble long messages across pages without truncation."
+                ),
+            },
         },
         "required": [],
     },
@@ -789,6 +833,9 @@ registry.register(
     handler=lambda args, **kw: session_search(
         query=args.get("query") or "", limit=args.get("limit", 3), window=args.get("window", 5),
         detail=args.get("detail", "adaptive"), db=kw.get("db"), current_session_id=kw.get("current_session_id"),
+        content_offset=args.get("content_offset"), max_chars=args.get("max_chars"),
+        snapshot=kw.get("snapshot"),
+        start_message_id=args.get("start_message_id"),
         **{k: args.get(k) for k in ("role_filter", "session_id", "around_message_id", "sort", "profile",
                                     "after", "before", "exclude_session_ids")}),
     check_fn=check_session_search_requirements,
