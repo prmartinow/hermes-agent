@@ -156,6 +156,30 @@ def _preamble(evt: dict, title: str, intro: str, completed_at: float, *, with_go
     return lines
 
 
+def format_continuation_metadata(entry: dict | None) -> list[str]:
+    """Format continuation metadata lines ahead of summaries.
+
+    Preserves exact valid child_session_id and renders explicit true/false
+    only from actual bool continuation_available. Never infers availability
+    from status or ID; omits absent or malformed metadata without repair.
+    """
+    if not isinstance(entry, dict):
+        return []
+    lines: list[str] = []
+    sid = entry.get("child_session_id")
+    if (
+        isinstance(sid, str)
+        and sid
+        and sid.strip() == sid
+        and not any(ch.isspace() for ch in sid)
+    ):
+        lines.append(f"Child session ID: {sid}")
+    avail = entry.get("continuation_available")
+    if type(avail) is bool:
+        lines.append(f"Continuation available: {'true' if avail else 'false'}")
+    return lines
+
+
 def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
     """One child of a still-running fan-out failed: say which, why, and that the batch goes on."""
     (r,) = (evt.get("results") or [{}])[:1] or [{}]
@@ -170,6 +194,9 @@ def _format_task_failure_notice(evt: dict, deleg_id: str) -> str:
         f"Task: {goal}" if goal else "",
         f"Status: {r.get('status', '?')}   Duration: {r.get('duration_seconds', '?')}s" + (f"\nError: {err}" if err else ""),
     ]
+    # A per-task result owns its metadata, even when its fields are absent.
+    meta_src = r if evt.get("results") else evt
+    lines += format_continuation_metadata(meta_src)
     if r.get("live_transcript"):
         lines.append(f"Live transcript: {r['live_transcript']}")
     return "\n".join(line for line in lines if line)
@@ -225,6 +252,7 @@ def _format_batch_delegation(evt: dict, deleg_id: str, completed_at: float) -> s
                   + (f", {r['duration_seconds']}s" if r.get("duration_seconds") is not None else "")
                   + (", TRUNCATED: hit max_iterations — work may be incomplete" if r_truncated else ""))
         lines += ["", header + ") ---"]
+        lines += format_continuation_metadata(r)
         if r_status in _DONE and r_summary:
             if r_truncated:
                 lines.append(_TRUNCATED_SUMMARY_NOTE)
@@ -281,8 +309,9 @@ def _format_async_delegation(evt: dict) -> str:
         completed_at, with_goal=True)
     lines += _notice_lines([evt]) + [
         f"Status: {status}   API calls: {evt.get('api_calls', 0)}   Duration: {evt.get('duration_seconds', '?')}s"
-        + (" [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else ""),
-        "--- RESULT ---"]
+        + (" [TRUNCATED: hit max_iterations — work may be incomplete]" if truncated else "")]
+    lines += format_continuation_metadata(evt)
+    lines += ["--- RESULT ---"]
     if status in _DONE and summary:
         if truncated:
             lines.append(_TRUNCATED_SUMMARY_NOTE)
