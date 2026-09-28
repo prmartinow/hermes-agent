@@ -81,6 +81,30 @@ async def test_budget_or_unknown_blocks_new_not_existing(usage):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("usage_gib, reclaimed", [(8, False), (16, False), (31, False), (32, True)])
+async def test_dashboard_budget_preserves_recent_idle_chats_until_32_gib(usage_gib, reclaimed):
+    from hermes_cli.web_server_chat import PTY_REGISTRY
+
+    usage = [0]
+    reg = PtySessionRegistry(
+        ttl=PTY_REGISTRY._ttl, max_sessions=PTY_REGISTRY._max,
+        buffer_cap=PTY_REGISTRY._buffer_cap, read_timeout=.01,
+        memory_budget_bytes=PTY_REGISTRY._memory_budget_bytes,
+        memory_usage=lambda _: usage[0],
+    )
+    session = await terminal(reg, "recent")
+    try:
+        usage[0] = usage_gib * 1024 ** 3
+        await reg.reap_idle(now=session.last_detached_at + 600)
+        assert session.bridge.closed is reclaimed
+        if not reclaimed:
+            same, created = await reg.attach_or_spawn("recent", spawn=lambda: pytest.fail("cold replacement"))
+            assert same is session and not created
+    finally:
+        await reg.close_all()
+
+
+@pytest.mark.asyncio
 async def test_no_speculative_standby_with_budget():
     reg = registry()
     reg.configure_standby_spawn(lambda: pytest.fail("unaccounted standby"))

@@ -49,7 +49,7 @@ _PTY_IDLE_BACKOFF = 0.05
 PTY_REGISTRY = PtySessionRegistry(
     ttl=60 * 60, max_sessions=16, buffer_cap=200 * 1024 * 1024,
     read_timeout=_PTY_READ_CHUNK_TIMEOUT,
-    memory_budget_bytes=8 * 1024 * 1024 * 1024, memory_usage=pty_memory_usage)
+    memory_budget_bytes=32 * 1024 * 1024 * 1024, memory_usage=pty_memory_usage)
 
 
 async def _close_stalled_pty_input(ws: "WebSocket", *, path: str) -> None:
