@@ -46,7 +46,7 @@ from tools.delegate_tool_registry import (  # noqa: F401
     steer_subagent,
 )
 from tools.delegate_tool_tasks import (  # noqa: F401
-    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_inherit_compacted_history, _coerce_task_inherit_context, _coerce_task_inherit_context_mode, _coerce_task_inherit_max_tokens, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
+    _MAX_TASK_IMAGES, _coerce_task_continue_from, _coerce_task_images, _coerce_task_inherit_compacted_history, _coerce_task_inherit_context, _coerce_task_inherit_context_mode, _coerce_task_inherit_max_tokens, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
 )
 from tools.delegation_context import (  # noqa: F401
     ContextInheritanceError, build_batch_context_snapshots, build_delegation_context_snapshot,
@@ -328,13 +328,16 @@ def _run_single_child(
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
+    entry = None
     try:
         heartbeat.start()
         _safe_progress(child_progress_cb, "subagent.start", preview=goal)
         run.seed_workspace()
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
-            return failure_entry
+            entry = failure_entry
+            entry["continuation_available"] = False
+            return entry
 
         schema = _validate_child_output_schema(child, result, task_index, run.child_task_id, run.relay_text)
         _merge_late_steer(result, _subagent_id, child)
@@ -345,6 +348,10 @@ def _run_single_child(
 
         duration = run.elapsed()
         entry = _build_result_entry(child, result, task_index, duration, schema)
+        entry["continuation_available"] = False
+        if not _child_close_deferred:
+            from tools.delegation_context_continuation import stamp_child_terminal_state
+            stamp_child_terminal_state(child, entry)
         run.append_sibling_write_reminder(entry)
         run.emit_complete(result, entry, duration)
         return run.attach_worktree(entry)
@@ -353,12 +360,27 @@ def _run_single_child(
         _late_pending_steer = run.close_steering()
         logging.exception(f"[subagent-{task_index}] failed")
         # Entry status "error" (contract), progress event status "failed" (UI vocabulary).
-        return run.finish_failed(
+        entry = run.finish_failed(
             _fabricated_entry(task_index, "error", str(exc), child, run.elapsed()), _late_pending_steer,
             preview=str(exc), summary=str(exc), status="failed",
         )
+        entry["continuation_available"] = False
+        return entry
     finally:
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
+        if (
+            entry is not None
+            and not _child_close_deferred
+            and entry.get("status") in {"completed", "failed", "interrupted"}
+        ):
+            from tools.delegation_context_continuation import verify_child_terminal_readback
+            child_sid = entry.get("child_session_id") or getattr(child, "session_id", None)
+            target_db = getattr(parent_agent, "_session_db", None) or getattr(child, "_session_db", None)
+            parent_sid = getattr(parent_agent, "session_id", None)
+            if child_sid and target_db:
+                entry["continuation_available"] = verify_child_terminal_readback(
+                    target_db, child_sid, expected_parent_id=parent_sid
+                )
 
 
 def _cleanup_constructed_children(parent_agent: Any, children: List[tuple]) -> None:
@@ -549,6 +571,8 @@ def delegate_task(
         task_inherit_context_modes, err = _coerce_task_inherit_context_mode(task_list, task_inherit_contexts)
     if not err:
         task_inherit_compacted_history, err = _coerce_task_inherit_compacted_history(task_list, task_inherit_contexts)
+    if not err:
+        task_continue_from, err = _coerce_task_continue_from(task_list, task_inherit_contexts)
     if err:
         return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
@@ -569,6 +593,7 @@ def delegate_task(
                 any(tok is not None for tok in task_inherit_max_tokens)
                 or any(m == "bounded" for m in task_inherit_context_modes)
                 or any(task_inherit_compacted_history)
+                or any(cf is not None for cf in task_continue_from)
             ):
                 batch_snapshots = build_batch_context_snapshots(
                     parent_agent,
@@ -576,6 +601,7 @@ def delegate_task(
                     task_inherit_max_tokens,
                     task_inherit_context_modes=task_inherit_context_modes,
                     task_inherit_compacted_histories=task_inherit_compacted_history,
+                    task_continue_from=task_continue_from,
                     task_goals=task_goals,
                     task_contexts=task_contexts,
                     child_model=child_model,
@@ -591,6 +617,7 @@ def delegate_task(
                     child_api_key=child_api_key,
                     child_provider=child_provider,
                     inherit_compacted_history=task_inherit_compacted_history[0] if task_inherit_compacted_history else False,
+                    continue_from=task_continue_from[0] if task_continue_from else None,
                 )
         except ContextInheritanceError as exc:
             from agent.oneshot_footprint import is_single_query_session
@@ -820,6 +847,12 @@ DELEGATE_TASK_SCHEMA = {
                             "the visible active generation. Coverage is limited to retained readable archive rows in that exact session. "
                             "Rewound/superseded rows and rotated lineages are excluded; opaque checkpoints still fail closed. "
                             "Archived ordinary text may contain sensitive data and may cross provider boundaries.",
+                        ),
+                        "continue_from": _p(
+                            "string",
+                            "Optional exact prior child session ID string (requires inherit_context: true). "
+                            "When specified, captures the prior owned terminal worker's transcript as evidence "
+                            "alongside fresh parent context into a combined snapshot.",
                         ),
                     },
                     "required": ["goal"],

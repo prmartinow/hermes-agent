@@ -1151,6 +1151,66 @@ class SessionMessagesMixin:
             "observed_watermark": max_id,
         }
 
+    def capture_terminal_child_session(
+        self, session_id: str, expected_parent_id: str, *, include_compacted: bool = False,
+    ) -> Dict[str, Any]:
+        """Capture owned child metadata, lease and transcript in ONE read-only SQL statement.
+
+        No explicit transaction is opened on a pooled connection. Ownership gates
+        the message join, so foreign/non-delegated transcripts are never loaded.
+        """
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id must be a non-empty string")
+        if not isinstance(expected_parent_id, str) or not expected_parent_id:
+            raise ValueError("expected_parent_id must be a non-empty string")
+        if type(include_compacted) is not bool:
+            raise ValueError("include_compacted must be a boolean")
+        columns = ", ".join(f"m.{col.strip()}" for col in self._CONVERSATION_ROW_COLUMNS.split(","))
+        archived = " OR (m.active = 0 AND m.compacted = 1)" if include_compacted else ""
+        sql = (
+            "SELECT s.id AS _source_id, s.parent_session_id AS _source_parent, "
+            "s.source AS _source_kind, s.model_config AS _source_config, "
+            "s.ended_at AS _source_ended, s.end_reason AS _source_end_reason, "
+            "l.holder AS _lease_holder, l.expires_at AS _lease_expiry, "
+            f"m.compacted, {columns} FROM sessions s "
+            "LEFT JOIN session_turn_leases l ON l.conversation_id = s.id "
+            "LEFT JOIN messages m ON m.session_id = s.id "
+            f"AND (m.active = 1{archived}) AND s.parent_session_id = ? "
+            "AND CASE WHEN json_valid(s.model_config) THEN "
+            "json_type(s.model_config, '$._delegate_from') = 'text' "
+            "AND json_extract(s.model_config, '$._delegate_from') = ? ELSE 0 END "
+            "WHERE s.id = ? ORDER BY m.id"
+        )
+        with self._read_ctx() as conn:
+            if conn.in_transaction:
+                raise sqlite3.OperationalError("Cannot capture child session inside an existing transaction")
+            rows = conn.execute(sql, (expected_parent_id, expected_parent_id, session_id)).fetchall()
+        if not rows:
+            return {"found": False, "error": f"Session {session_id!r} not found"}
+        first = rows[0]
+        session = {
+            "id": first["_source_id"], "parent_session_id": first["_source_parent"],
+            "source": first["_source_kind"], "model_config": first["_source_config"],
+            "ended_at": first["_source_ended"], "end_reason": first["_source_end_reason"],
+        }
+        lease = None
+        if first["_lease_holder"] is not None or first["_lease_expiry"] is not None:
+            lease = {"holder": first["_lease_holder"], "expires_at": first["_lease_expiry"]}
+        active_rows = [row for row in rows if row["id"] is not None and row["active"] == 1]
+        archived_rows = [row for row in rows if row["id"] is not None
+                         and row["active"] == 0 and row["compacted"] == 1]
+        from tools.delegation_context_continuation import compute_active_transcript_digest
+        decode = dict(session_id=session_id, include_ancestors=False, repair_alternation=False,
+                      include_row_ids=True, include_summary_markers=True)
+        return {
+            "found": True, "session": session, "lease": lease,
+            "active_messages": self._rows_to_conversation(active_rows, **decode),
+            "archived_messages": self._rows_to_conversation(archived_rows, **decode),
+            "active_count": len(active_rows),
+            "max_active_row_id": max((row["id"] for row in active_rows), default=None),
+            "active_transcript_digest": compute_active_transcript_digest(active_rows),
+        }
+
     def _dedupe_replayed_user(self, messages, msg, exact_user_clones) -> Tuple[bool, Any]:
         """Ancestor-lineage dedupe of one decoded user *msg* -> ``(skip, exact_clone_key)``. Rotation
         column-clones the concurrent tail into the child, so copies need not be adjacent: the exact

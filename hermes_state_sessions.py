@@ -733,6 +733,41 @@ class SessionSessionsMixin:
             return
         self._write_model_config_patch(session_id, patch)
 
+    def stamp_child_terminal_session(self, session_id: str, status: str, exit_reason: str) -> Optional[Dict[str, Any]]:
+        """Atomically capture active transcript watermark, compute canonical digest, and merge _delegate_terminal marker."""
+        from tools.delegation_context_continuation import is_terminal_outcome
+        if not isinstance(session_id, str) or not session_id or not is_terminal_outcome(status, exit_reason):
+            return None
+
+        def _do(conn):
+            rows = conn.execute(
+                f"SELECT {self._CONVERSATION_ROW_COLUMNS} FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+            active_rows = [dict(r) for r in rows]
+            count = len(active_rows)
+            if count == 0:
+                return None
+            max_id = max((int(r["id"]) for r in active_rows if r.get("id") is not None), default=None)
+            from tools.delegation_context_continuation import compute_active_transcript_digest
+            digest = compute_active_transcript_digest(active_rows)
+            terminal_marker = {
+                "version": 1,
+                "status": str(status),
+                "exit_reason": str(exit_reason),
+                "message_count": count,
+                "max_row_id": max_id,
+                "active_transcript_digest": digest,
+                "completed_at": time.time(),
+            }
+            merged = self._merge_model_config_json(conn, session_id, {"_delegate_terminal": terminal_marker})
+            if merged is _MODEL_CONFIG_ROW_MISSING:
+                return None
+            conn.execute("UPDATE sessions SET model_config = ? WHERE id = ?", (merged, session_id))
+            return terminal_marker
+
+        return self._execute_write(_do)
+
     def get_session_model_config_value(self, session_id: str, key: str, default: Any = None) -> Any:
         """Read one key out of a session's model_config JSON (tolerant parse)."""
         session = self.get_session(session_id) or {}

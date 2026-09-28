@@ -34,10 +34,14 @@ def _str_or_none(value: Any) -> Optional[str]:
 
 def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: float = 0) -> Dict[str, Any]:
     """Result entry for a child that raised, never finished, or was abandoned."""
-    return {
+    entry: Dict[str, Any] = {
         "task_index": idx, "status": status, "summary": None, "error": error, "api_calls": 0,
         "duration_seconds": duration, "_child_role": getattr(child, "_delegate_role", None),
     }
+    child_sid = getattr(child, "session_id", None)
+    if isinstance(child_sid, str) and child_sid:
+        entry["child_session_id"] = child_sid
+    return entry
 
 def _append_missed_steer(entry: Dict[str, Any], late_steer: Optional[str]) -> None:
     """Record steer text that won the race with the child's failure/timeout."""
@@ -618,6 +622,9 @@ def _build_result_entry(
     # Model-visible per-delegation spend (unlike _child_cost_usd above).
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
+    child_sid = getattr(child, "session_id", None)
+    if isinstance(child_sid, str) and child_sid:
+        entry["child_session_id"] = child_sid
     _manifest = getattr(child, "_inherited_context_manifest", None)
     if isinstance(_manifest, dict):
         entry["inherited_context"] = _manifest
@@ -947,6 +954,9 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
+        child_sid = getattr(child, "session_id", None)
+        if isinstance(child_sid, str) and child_sid:
+            _error_entry["child_session_id"] = child_sid
         self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()
         if close_deferred:

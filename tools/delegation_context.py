@@ -102,6 +102,14 @@ class SnapshotManifest:
     available_archived_messages_count: int = 0
     retained_archived_records_count: int = 0
     observed_db_row_watermark: Optional[int] = None
+    prior_worker_session_id: Optional[str] = None
+    prior_worker_status: Optional[str] = None
+    prior_worker_exit_reason: Optional[str] = None
+    prior_worker_available_records_count: int = 0
+    prior_worker_retained_records_count: int = 0
+    prior_worker_coverage: Optional[str] = None
+    prior_worker_available_archived_count: int = 0
+    prior_worker_retained_archived_count: int = 0
 
     @property
     def source_digest(self) -> str:
@@ -117,7 +125,7 @@ class SnapshotManifest:
         src_count = self.source_records_count if self.source_records_count is not None else self.retained_messages_count
         seed_tok = self.seed_estimated_tokens if self.seed_estimated_tokens is not None else self.estimated_tokens
         seed_hash = self.seed_content_hash_sha256 or self.content_hash_sha256
-        return {
+        d: Dict[str, Any] = {
             "snapshot_id": self.snapshot_id,
             "source_type": self.source_type,
             "snapshot_digest": src_digest,
@@ -151,6 +159,16 @@ class SnapshotManifest:
             "retained_archived_records_count": self.retained_archived_records_count,
             "observed_db_row_watermark": self.observed_db_row_watermark,
         }
+        if self.prior_worker_session_id is not None:
+            d["prior_worker_session_id"] = self.prior_worker_session_id
+            d["prior_worker_status"] = self.prior_worker_status
+            d["prior_worker_exit_reason"] = self.prior_worker_exit_reason
+            d["prior_worker_available_records_count"] = self.prior_worker_available_records_count
+            d["prior_worker_retained_records_count"] = self.prior_worker_retained_records_count
+            d["prior_worker_coverage"] = self.prior_worker_coverage
+            d["prior_worker_available_archived_count"] = self.prior_worker_available_archived_count
+            d["prior_worker_retained_archived_count"] = self.prior_worker_retained_archived_count
+        return d
 
 
 @dataclass(frozen=True)
@@ -336,45 +354,22 @@ def _sanitize_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _render_parent_transcript(parent_agent: Any, *, inherit_compacted_history: bool = False) -> RenderedTranscriptResult:
-    """Extract, sanitize, and render the parent conversation context once."""
-    if inherit_compacted_history:
-        from tools.delegation_context_recovery import recover_parent_messages_with_compaction
-        outcome = recover_parent_messages_with_compaction(parent_agent)
-        raw_history = outcome.raw_history
-        source_type = outcome.source_type
-        available_archived_count = outcome.available_archived_messages_count
-        coverage_status = outcome.compaction_recovery_coverage
-        observed_watermark = outcome.observed_db_row_watermark
-    else:
-        raw_history, source_type = resolve_parent_messages(parent_agent)
-        available_archived_count = 0
-        coverage_status = None
-        observed_watermark = None
-
-    if not raw_history:
-        raise RequiredContextError(
-            f"Parent conversation history from '{source_type}' is empty; cannot inherit context (fails closed)."
-        )
-
-    # Check for actual opaque compaction checkpoints using native compaction verification
-    from agent.native_compaction import has_compaction_checkpoint
-
-    for idx, msg in enumerate(raw_history):
-        if not isinstance(msg, dict):
-            continue
-        items = msg.get("codex_reasoning_items")
-        if isinstance(items, str):
-            try:
-                items = json.loads(items)
-            except json.JSONDecodeError as exc:
-                raise RequiredContextError("Parent compaction metadata is unreadable; cannot verify portable context.") from exc
-        if has_compaction_checkpoint(items):
-            raise RequiredContextError(
-                f"Parent conversation contains unsupported opaque compaction checkpoint at index {idx}; "
-                "cannot inherit non-portable compacted state (fails closed)."
-            )
-
+def _sanitize_raw_conversation_messages(
+    raw_history: List[Dict[str, Any]],
+    *,
+    inherit_compacted_history: bool = False,
+) -> Tuple[
+    List[Dict[str, Any]],
+    int,
+    int,
+    int,
+    int,
+    Dict[str, int],
+    List[str],
+    List[int],
+    int,
+]:
+    """Sanitize raw messages into portable records using canonical rules."""
     omitted_system_count = 0
     omitted_sidecars_count = 0
     omitted_scaffolding_count = 0
@@ -487,6 +482,73 @@ def _render_parent_transcript(parent_agent: Any, *, inherit_compacted_history: b
                 omitted_orphan_tool_results_count += 1
                 omissions_detail.append(f"Omitted orphan tool result at index {idx}.")
             continue
+
+    return (
+        sanitized_messages,
+        omitted_system_count,
+        omitted_sidecars_count,
+        omitted_scaffolding_count,
+        omitted_orphan_tool_results_count,
+        omissions,
+        omissions_detail,
+        retained_orig_indices,
+        user_message_count,
+    )
+
+
+def _render_parent_transcript(parent_agent: Any, *, inherit_compacted_history: bool = False) -> RenderedTranscriptResult:
+    """Extract, sanitize, and render the parent conversation context once."""
+    if inherit_compacted_history:
+        from tools.delegation_context_recovery import recover_parent_messages_with_compaction
+        outcome = recover_parent_messages_with_compaction(parent_agent)
+        raw_history = outcome.raw_history
+        source_type = outcome.source_type
+        available_archived_count = outcome.available_archived_messages_count
+        coverage_status = outcome.compaction_recovery_coverage
+        observed_watermark = outcome.observed_db_row_watermark
+    else:
+        raw_history, source_type = resolve_parent_messages(parent_agent)
+        available_archived_count = 0
+        coverage_status = None
+        observed_watermark = None
+
+    if not raw_history:
+        raise RequiredContextError(
+            f"Parent conversation history from '{source_type}' is empty; cannot inherit context (fails closed)."
+        )
+
+    # Check for actual opaque compaction checkpoints using native compaction verification
+    from agent.native_compaction import has_compaction_checkpoint
+
+    for idx, msg in enumerate(raw_history):
+        if not isinstance(msg, dict):
+            continue
+        items = msg.get("codex_reasoning_items")
+        if isinstance(items, str):
+            try:
+                items = json.loads(items)
+            except json.JSONDecodeError as exc:
+                raise RequiredContextError("Parent compaction metadata is unreadable; cannot verify portable context.") from exc
+        if has_compaction_checkpoint(items):
+            raise RequiredContextError(
+                f"Parent conversation contains unsupported opaque compaction checkpoint at index {idx}; "
+                "cannot inherit non-portable compacted state (fails closed)."
+            )
+
+    (
+        sanitized_messages,
+        omitted_system_count,
+        omitted_sidecars_count,
+        omitted_scaffolding_count,
+        omitted_orphan_tool_results_count,
+        omissions,
+        omissions_detail,
+        retained_orig_indices,
+        user_message_count,
+    ) = _sanitize_raw_conversation_messages(
+        raw_history,
+        inherit_compacted_history=inherit_compacted_history,
+    )
 
     if user_message_count == 0:
         raise RequiredContextError(
@@ -781,6 +843,35 @@ def _build_bounded_snapshot(
     )
 
 
+def _guard_continuation_parent(builder):
+    """Keep all sources in a continuation build bound to one unchanged live parent."""
+    from functools import wraps
+
+    def capture(parent):
+        live = getattr(parent, "_session_messages", None)
+        name = "_session_messages"
+        if live is None:
+            name = "conversation_history"
+            live = getattr(parent, name, None)
+        return (getattr(parent, "session_id", None), getattr(parent, "_session_db", None),
+                name, live, copy.deepcopy(live))
+
+    @wraps(builder)
+    def guarded(parent_agent, *args, **kwargs):
+        requested = kwargs.get("continue_from") or any(kwargs.get("task_continue_from") or [])
+        if not requested:
+            return builder(parent_agent, *args, **kwargs)
+        before = capture(parent_agent)
+        result = builder(parent_agent, *args, **kwargs)
+        after = capture(parent_agent)
+        if (before[0] != after[0] or before[1] is not after[1] or before[2] != after[2]
+                or before[3] is not after[3] or before[4] != after[4]):
+            raise ContextInheritanceError("Parent context changed while building continuation snapshot; fails closed.")
+        return result
+    return guarded
+
+
+@_guard_continuation_parent
 def build_delegation_context_snapshot(
     parent_agent: Any,
     *,
@@ -791,6 +882,7 @@ def build_delegation_context_snapshot(
     config_override_tokens: Optional[int] = None,
     inherit_context_mode: str = "full",
     inherit_compacted_history: bool = False,
+    continue_from: Optional[str] = None,
     goal: Optional[str] = None,
     context: Optional[str] = None,
 ) -> ContextSnapshot:
@@ -801,6 +893,41 @@ def build_delegation_context_snapshot(
     and returns a ContextSnapshot ready to seed child execution.
     """
     rendered = _render_parent_transcript(parent_agent, inherit_compacted_history=inherit_compacted_history)
+
+    if continue_from:
+        from tools.delegation_context_continuation import validate_and_capture_prior_worker, compose_continuation_snapshot
+        prior_capture = validate_and_capture_prior_worker(
+            parent_agent, continue_from, inherit_compacted_history=inherit_compacted_history
+        )
+        from agent.model_metadata import get_model_context_length
+        from tools.delegate_tool_config import _get_inherit_max_tokens
+
+        child_context_window = get_model_context_length(
+            model=child_model or "",
+            base_url=child_base_url or "",
+            api_key=child_api_key or "",
+            provider=child_provider or "",
+        )
+        reserve = min(child_context_window, max(2048, int(child_context_window * 0.25)))
+        window_available = max(0, child_context_window - reserve)
+        configured_ceiling = config_override_tokens if config_override_tokens is not None else _get_inherit_max_tokens()
+        effective_budget = min(configured_ceiling, window_available)
+
+        return compose_continuation_snapshot(
+            parent_agent=parent_agent,
+            parent_rendered=rendered,
+            prior_capture=prior_capture,
+            goal=goal,
+            context=context,
+            configured_ceiling=configured_ceiling,
+            effective_budget=effective_budget,
+            mode=inherit_context_mode,
+            child_model=child_model,
+            child_base_url=child_base_url,
+            child_api_key=child_api_key,
+            child_provider=child_provider,
+            task_override_tokens=config_override_tokens,
+        )
 
     if inherit_context_mode == "bounded":
         from agent.model_metadata import get_model_context_length
@@ -840,6 +967,7 @@ def build_delegation_context_snapshot(
     )
 
 
+@_guard_continuation_parent
 def build_batch_context_snapshots(
     parent_agent: Any,
     task_inherit_contexts: List[bool],
@@ -847,6 +975,7 @@ def build_batch_context_snapshots(
     *,
     task_inherit_context_modes: Optional[List[str]] = None,
     task_inherit_compacted_histories: Optional[List[bool]] = None,
+    task_continue_from: Optional[List[Optional[str]]] = None,
     task_goals: Optional[List[str]] = None,
     task_contexts: Optional[List[Optional[str]]] = None,
     child_model: Optional[str] = None,
@@ -864,6 +993,24 @@ def build_batch_context_snapshots(
     """
     if not any(task_inherit_contexts):
         return [None] * len(task_inherit_contexts)
+
+    # 0. Validate and capture prior worker sources before building any snapshots
+    prior_captures_by_task: Dict[int, Any] = {}
+    if task_continue_from:
+        for i, should_inherit in enumerate(task_inherit_contexts):
+            if not should_inherit:
+                continue
+            cf = task_continue_from[i] if i < len(task_continue_from) else None
+            if cf:
+                want_compacted = (
+                    task_inherit_compacted_histories[i]
+                    if task_inherit_compacted_histories and i < len(task_inherit_compacted_histories)
+                    else False
+                )
+                from tools.delegation_context_continuation import validate_and_capture_prior_worker
+                prior_captures_by_task[i] = validate_and_capture_prior_worker(
+                    parent_agent, cf, inherit_compacted_history=want_compacted
+                )
 
     from agent.model_metadata import get_model_context_length
     from tools.delegate_tool_config import _get_inherit_max_tokens
@@ -927,7 +1074,26 @@ def build_batch_context_snapshots(
         configured_ceiling = override_tok if override_tok is not None else _get_inherit_max_tokens()
         effective_budget = min(configured_ceiling, window_available)
 
-        if mode == "bounded":
+        if i in prior_captures_by_task:
+            from tools.delegation_context_continuation import compose_continuation_snapshot
+            snap = compose_continuation_snapshot(
+                parent_agent=parent_agent,
+                parent_rendered=rendered,
+                prior_capture=prior_captures_by_task[i],
+                task_index=i,
+                goal=goal,
+                context=ctx,
+                configured_ceiling=configured_ceiling,
+                effective_budget=effective_budget,
+                mode=mode,
+                child_model=child_model,
+                child_base_url=child_base_url,
+                child_api_key=child_api_key,
+                child_provider=child_provider,
+                task_override_tokens=override_tok,
+            )
+            snapshots.append(snap)
+        elif mode == "bounded":
             snap = _build_bounded_snapshot(
                 rendered,
                 goal=goal,

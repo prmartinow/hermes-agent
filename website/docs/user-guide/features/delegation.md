@@ -186,6 +186,26 @@ delegate_task(tasks=[{
 }])
 ```
 
+11. **Opt-in Bounded Worker Follow-up Continuity (`continue_from: "<child_session_id>"`)**: A new child can use an owned terminal prior worker's saved evidence together with current parent context (`requires inherit_context: true`). This does not revive the old agent, process, tool resources, or in-memory snapshot.
+    - **Exact Ownership & Source State Gates**: Tasks must reference an exact child session ID string (`no leading or trailing whitespace, no self-reference`). The prior worker must be owned by the current parent session (`parent_session_id == parent.session_id` and `model_config._delegate_from == parent.session_id`), have a durable terminal marker (`_delegate_terminal`), and have completed orderly execution (not active in-process or holding an unexpired turn lease). Unrun/empty sources and active transcripts whose count, row boundary or canonical digest changed after terminal stamping fail closed immediately. A terminal outcome may represent success, failure, interruption or iteration exhaustion; it is not proof that the previous task succeeded.
+    - **Result Identity & Eligibility**: Use the exact `child_session_id` returned by the previous result. `continuation_available` is verified after teardown through the same atomic source gate used by follow-up; it is rechecked on each request. Older workers without a verifiable terminal marker are unsupported.
+    - **Strict Parent Ownership Across Legacy Rotation**: Lineage checks verify exact equality against the current parent session ID; rotated ancestor chains across session rotation boundaries are excluded.
+    - **Composition**: Previous worker messages are sanitized first using the standard portable renderer (system prompts omitted, provider sidecars stripped, completed tool calls paired, unresolved scaffolding and orphan results omitted). Each resulting portable record is converted into provenance-labeled assistant evidence text before fresh parent context. Original worker role and tool call details are included as quoted data (not native `tool_calls` scaffolding) to prevent cross-session repeated tool ID pairing.
+    - **Authority & Historical Framing**: Prior worker instructions never expand permissions; the latest parent task scope and corrections strictly control actions. Transcript headers explicitly warn that old snapshot references are historical and prior filesystem/tool observations may be stale.
+    - **Saved Evidence, Not Hidden State**: Continuation uses the persisted worker transcript and current parent context. It cannot restore omitted records from the old worker's discarded in-memory snapshot. `inherit_compacted_history` can separately opt into available readable archives; opaque checkpoints remain unsupported. Ordinary historical text may contain sensitive data, including previous tool observations.
+    - **Complete Backing Accessible via Session Search**: In bounded mode, the latest parent user prompt is mandatory in the initial seed transcript; all underlying prior-worker evidence records and parent turns remain accessible on-demand via `session_search(session_id="snapshot", ...)`.
+    - **Honest Coverage Receipts**: Task manifests report `prior_worker_session_id`, `prior_worker_status`, `prior_worker_exit_reason`, `prior_worker_available_records_count`, `prior_worker_retained_records_count`, and `prior_worker_coverage`.
+
+```python
+delegate_task(tasks=[{
+    "goal": "Verify the findings from prior worker run and finalize audit",
+    "inherit_context": True,
+    "continue_from": "20260928_153000_a1b2c3",
+    "inherit_context_mode": "bounded",
+    "inherit_max_tokens": 8000,
+}])
+```
+
 
 ## Practical Examples
 

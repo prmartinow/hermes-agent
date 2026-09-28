@@ -257,3 +257,31 @@ def _coerce_task_inherit_compacted_history(
         else:
             result.append(False)
     return result, None
+
+
+def _coerce_task_continue_from(
+    task_list: List[Dict[str, Any]],
+    task_inherit_contexts: List[bool],
+) -> tuple[List[Optional[str]], Optional[str]]:
+    """Per-task validated continue_from session IDs (default None).
+    Strict string validation: rejects non-string types, boolean, empty, whitespace, or whitespace-wrapped refs.
+    Never strips or repairs IDs.
+    Requires inherit_context: true when field supplied.
+    """
+    result: List[Optional[str]] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        inherit_ctx = task_inherit_contexts[i] if i < len(task_inherit_contexts) else False
+        if "continue_from" in task:
+            if not inherit_ctx:
+                return [], f"Task {i} 'continue_from' is only valid when 'inherit_context' is true."
+            val = task["continue_from"]
+            if isinstance(val, bool) or not isinstance(val, str):
+                return [], f"Task {i} 'continue_from' must be a string."
+            if not val or val.strip() != val or not val.strip():
+                return [], f"Task {i} 'continue_from' must be a non-empty string without leading or trailing whitespace."
+            result.append(val)
+        else:
+            result.append(None)
+    return result, None
