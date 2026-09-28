@@ -1772,8 +1772,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // non-loopback client). `ev.reason` is a machine identifier — it went
       // to the console above; the user gets a sentence and, where a reload
       // fixes it, a Reload button.
-      const rejection = ptyRejectionBanner(ev.code);
+      const rejection = ptyRejectionBanner(ev.code, ev.reason);
       if (rejection) {
+        clearResumeLoadingTimers();
+        isReplayActive = false;
+        setResumeHydrating(false);
         setPtyState("closed");
         setBanner(rejection.text);
         setBannerAction(rejection.action);

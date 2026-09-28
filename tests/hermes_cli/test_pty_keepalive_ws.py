@@ -65,6 +65,33 @@ def pty_keepalive_harness(monkeypatch):
         _web_server_chat.PTY_REGISTRY._sessions.clear()
 
 
+@pytest.mark.parametrize("kind", ["memory", "capacity"])
+def test_resource_refusal_preserves_resume_for_reload(pty_keepalive_harness, monkeypatch, kind):
+    from starlette.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+    from hermes_cli.pty_session import MemoryBudgetFull, RegistryFull
+
+    seen = []
+
+    async def refuse(key, **kwargs):
+        seen.append(key)
+        raise MemoryBudgetFull() if kind == "memory" else RegistryFull()
+
+    monkeypatch.setattr(_web_server_chat.PTY_REGISTRY, "attach_or_spawn", refuse)
+    with TestClient(web_server.app).websocket_connect("/api/pty?attach=same-tab&resume=kept-chat") as ws:
+        text = ws.receive_text()
+        assert "Start new session" not in text
+        assert "same chat" in text
+        if kind == "memory":
+            assert "memory" in text.lower() and "too many" not in text.lower()
+        with pytest.raises(WebSocketDisconnect) as error:
+            ws.receive_text()
+        assert error.value.code == 4429
+        assert error.value.reason == "terminal-" + kind
+    assert len(seen) == 1 and "kept-chat" in seen[0] and "same-tab" in seen[0]
+    assert not pty_keepalive_harness.bridges
+
+
 @pytest.mark.anyio
 async def test_attach_token_reuses_same_session(pty_keepalive_harness):
     """Two connects with the same ?attach= token hit one spawned bridge."""

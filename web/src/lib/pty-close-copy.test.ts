@@ -48,6 +48,21 @@ describe('pty close copy', () => {
   })
 })
 
+describe('resource admission refusals', () => {
+  it('offers same-page reload and distinguishes memory from terminal count', () => {
+    const memory = ptyRejectionBanner(4429, 'terminal-memory')
+    const capacity = ptyRejectionBanner(4429, 'terminal-capacity')
+    expect(memory?.action).toBe('reload')
+    expect(memory?.text).toMatch(/memory/i)
+    expect(memory?.text).not.toMatch(/too many|new session/i)
+    expect(capacity?.action).toBe('reload')
+    expect(capacity?.text).toMatch(/capacity/i)
+    expect(capacity?.text).not.toMatch(/new session/i)
+    expect(ptyRejectionBanner(4429)?.action).toBe('reload')
+    expect(ptyRejectionBanner(4429, 'untrusted arbitrary reason')?.text).not.toContain('untrusted')
+  })
+})
+
 describe('start-failed overlay copy', () => {
   it('stays neutral: close 1011 also means "no terminal support here", where retrying cannot help', () => {
     expect(PTY_START_FAILED_MESSAGE).toMatch(/printed above/)

@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
 from agent.interrupt_scope import InterruptScope, bind_interrupt_scope
-from hermes_cli.pty_session import RegistryFull
+from hermes_cli.pty_session import MemoryBudgetFull, RegistryFull
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_routers.chat_ws_errors import chat_start_failure_message
 from hermes_cli.web_server_chat import (
@@ -438,10 +438,16 @@ async def console_ws(ws: WebSocket) -> None:
 
 
 async def _pty_fail(ws: WebSocket, exc: BaseException) -> None:
-    """Tell the user why chat could not start, then close 1011 so the SPA renders
-    "Start new session". The raw exception goes to the server log only."""
+    """Describe failure; resource refusals retry the same chat, other failures use 1011.
+    The raw exception goes to the server log only.
+    """
     _log.warning("pty start failed: %s: %s", type(exc).__name__, exc)
     await ws.send_text(f"\r\n\x1b[31m{chat_start_failure_message(exc)}\x1b[0m\r\n")
+    if isinstance(exc, RegistryFull):
+        # Admission refusal is retryable; do not offer a fresh conversation.
+        reason = "terminal-memory" if isinstance(exc, MemoryBudgetFull) else "terminal-capacity"
+        await ws.close(code=4429, reason=reason)
+        return
     await ws.close(code=1011)
 
 

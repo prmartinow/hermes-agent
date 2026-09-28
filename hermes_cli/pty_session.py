@@ -183,10 +183,17 @@ class PtySession:
 
 
 class RegistryFull(Exception):
-    """Every keep-alive slot holds a PTY that some tab is still attached to."""
+    """Admission refused because retained terminals cannot be safely reclaimed."""
 
     def __init__(self, message: str = "Too many chat terminals are open in other tabs; close one and try again.") -> None:
         super().__init__(message)
+
+
+class MemoryBudgetFull(RegistryFull):
+    """A new terminal cannot be admitted under the process-tree memory budget."""
+
+    def __init__(self) -> None:
+        super().__init__("Terminal memory budget reached or unavailable; existing work is protected.")
 
 
 async def run_reaper(registry: "PtySessionRegistry", *, interval: float = 30.0) -> None:
@@ -333,7 +340,7 @@ class PtySessionRegistry:
                 if len(self._sessions) >= self._max:
                     raise RegistryFull("Terminal capacity reached; attached or working sessions are protected.")
             if not await self._reclaim_memory(now):
-                raise RegistryFull("Terminal memory budget reached or unavailable; existing work is protected.")
+                raise MemoryBudgetFull()
             if allow_standby and self._standby_session is not None and self._standby_session.alive:
                 async with self._standby_lock:
                     session = self._standby_session

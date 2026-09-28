@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull
+from hermes_cli.pty_session import MemoryBudgetFull, PtySessionRegistry, RegistryFull
 from tests.hermes_cli.test_pty_session import FakeBridge, FakeWS
 
 
@@ -73,7 +73,7 @@ async def test_budget_or_unknown_blocks_new_not_existing(usage):
         measured[0] = usage
         same, created = await reg.attach_or_spawn("existing", spawn=lambda: pytest.fail("respawn"))
         assert same is s and not created
-        with pytest.raises(RegistryFull):
+        with pytest.raises(MemoryBudgetFull):
             await reg.attach_or_spawn("new", spawn=lambda: pytest.fail("overbudget spawn"))
         assert not s.bridge.closed
     finally:
