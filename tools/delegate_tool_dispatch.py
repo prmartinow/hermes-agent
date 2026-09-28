@@ -362,6 +362,13 @@ def _dispatched_payload(batch: _Batch, units: List[tuple[_Batch, str]]) -> dict:
     if batch.live_paths:
         payload["live_transcripts"] = list(batch.live_paths)
         payload["live_transcripts_hint"] = _BACKGROUND_NOTES["live_transcripts_hint"]
+    inherited_manifests = [
+        getattr(c, "_inherited_context_manifest", None)
+        for (_, _, c) in batch.children
+        if isinstance(getattr(c, "_inherited_context_manifest", None), dict)
+    ]
+    if inherited_manifests:
+        payload["inherited_context"] = inherited_manifests[0]
     return payload
 
 def _units_of(batch: _Batch) -> List[_Batch]:

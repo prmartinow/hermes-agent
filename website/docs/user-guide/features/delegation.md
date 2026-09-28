@@ -124,6 +124,30 @@ Delivery follows the same routing as user-attached images (`agent.image_input_mo
 
 Forwarding is best-effort: unreadable paths are skipped with a log line, and any failure in the image plumbing falls back to the plain text goal — it can never break a spawn. Images are for things the child must *see*; put text file paths in `context` as usual.
 
+### Opt-in Context Inheritance (`inherit_context`)
+
+By default, subagents are isolated and receive only the explicit `goal` and `context` passed in `delegate_task`. When a task requires deep awareness of earlier conversation history, parent decisions, or recently gathered tool evidence, each task can opt in with `inherit_context: true` (default `false`).
+
+:::warning Cross-Provider Transmission Warning
+When subagents are configured to use a different provider or model than the parent (via `delegation.provider` or `delegation.model`), enabling `inherit_context: true` transmits sanitized historical conversation context across provider boundaries. Only enable `inherit_context` when cross-provider data transmission is intended and authorized. Structural sanitization is not secret redaction: sensitive data in ordinary message text or completed tool output is still part of the transferred context.
+:::
+
+#### How It Works
+
+1. **Current-Turn Preservation**: Unlike simple message-tail pruning, context inheritance preserves the user's instructions and completed tool evidence from the in-flight turn, while cleanly stripping unresolved tool scaffolding (such as the in-flight `delegate_task` invocation itself) and orphan tool results.
+2. **Sanitized Historical Evidence**: System prompts, developer instructions, provider-specific reasoning sidecars (e.g. `codex_reasoning_items`, `thought`), and internal metadata are stripped. The context is rendered as an immutable, provenance-labeled historical transcript (`[HISTORICAL CONTEXT: USER PROMPT]`, `[HISTORICAL CONTEXT: COMPLETED TOOL CALL]`, etc.) and seeded into the subagent's initial user message alongside the assigned task.
+3. **Multimodal Block Extraction**: Multimodal messages extract text parts while explicitly tracking omitted images and unsupported blocks with visible counters.
+4. **Token Budgeting & Fail-Closed Safety**: The transcript token count is estimated using `estimate_tokens_rough`. The configured token ceiling (`delegation.inherit_max_tokens`, default 64,000) is clamped against the child model's verified context window with conservative headroom (reserving at least 2,048 tokens or 25% of the window for system prompts, tools, and child outputs, clamping the inherited-history allowance to the available window; this approximate allowance does not prove the full child request fits). If context is empty, missing, or exceeds the effective budget, delegation **fails closed** immediately before any subagent is spawned or dispatched.
+5. **Metadata Receipts**: Task receipts and dispatch payloads report snapshot metadata (snapshot ID digest, token counts, retained/omitted tallies) without echoing the full transcript back into parent results.
+
+```python
+delegate_task(tasks=[{
+    "goal": "Implement cache_key according to the latest specifications discussed above",
+    "inherit_context": True,
+}])
+```
+
+
 ## Practical Examples
 
 ### Parallel Research

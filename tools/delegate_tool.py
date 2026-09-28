@@ -46,7 +46,10 @@ from tools.delegate_tool_registry import (  # noqa: F401
     steer_subagent,
 )
 from tools.delegate_tool_tasks import (  # noqa: F401
-    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
+    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_inherit_context, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
+)
+from tools.delegation_context import (  # noqa: F401
+    ContextInheritanceError, build_delegation_context_snapshot,
 )
 from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
@@ -359,6 +362,7 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent,
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    batch_snapshot: Optional[Any] = None, task_inherit_contexts: Optional[List[bool]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -394,6 +398,14 @@ def _build_children(
         if _t_images:
             with _quiet("Could not attach images to child %d", i):
                 child._delegate_images = _t_images
+        if (
+            task_inherit_contexts
+            and i < len(task_inherit_contexts)
+            and task_inherit_contexts[i] is True
+            and batch_snapshot is not None
+        ):
+            child._inherited_context_snapshot = batch_snapshot
+            child._inherited_context_manifest = batch_snapshot.manifest.to_dict()
         # Tee progress events into the live transcript (wrapper keeps the
         # _flush contract and swallows writer failures).
         _writer = live_writers[i] if i < len(live_writers) else None
@@ -493,11 +505,30 @@ def delegate_task(
         task_schemas, err = _coerce_task_schemas(task_list, output_schema)
     if not err:
         task_images, err = _coerce_task_images(task_list, images)
+    if not err:
+        task_inherit_contexts, err = _coerce_task_inherit_context(task_list)
     if err:
         return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
     if err:
         return tool_error(err)
+
+    batch_snapshot = None
+    if any(task_inherit_contexts):
+        try:
+            child_model = creds.get("model") or getattr(parent_agent, "model", None)
+            child_provider = creds.get("provider") or getattr(parent_agent, "provider", None)
+            child_base_url = creds.get("base_url") or getattr(parent_agent, "base_url", None)
+            child_api_key = creds.get("api_key") or getattr(parent_agent, "api_key", None)
+            batch_snapshot = build_delegation_context_snapshot(
+                parent_agent,
+                child_model=child_model,
+                child_base_url=child_base_url,
+                child_api_key=child_api_key,
+                child_provider=child_provider,
+            )
+        except ContextInheritanceError as exc:
+            return tool_error(str(exc))
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
@@ -512,6 +543,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        batch_snapshot=batch_snapshot, task_inherit_contexts=task_inherit_contexts,
     )
     if err:
         return tool_error(err)
@@ -676,6 +708,15 @@ DELEGATE_TASK_SCHEMA = {
                             "Omit when each result is useful to act on separately: it arrives as soon as that task "
                             "finishes. Different groups report independently. This does not order execution; if B "
                             "needs A's output, dispatch B after A returns.",
+                        ),
+                        "inherit_context": _p(
+                            "boolean",
+                            "Optional opt-in flag (default false). When true, provides the subagent with an "
+                            "immutable, provenance-labeled historical transcript of parent conversation context, "
+                            "including current-turn user instructions and completed tool evidence (excluding "
+                            "system prompts, provider reasoning sidecars, and unresolved tool scaffolding). "
+                            "WARNING: When subagents use a different model or provider, enabling this transmits "
+                            "sanitized historical context across provider boundaries.",
                         ),
                     },
                     "required": ["goal"],

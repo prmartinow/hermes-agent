@@ -160,3 +160,22 @@ def _coerce_task_images(
             return [], err
         task_images.append(cleaned)
     return task_images, None
+
+
+def _coerce_task_inherit_context(
+    task_list: List[Dict[str, Any]],
+) -> tuple[List[bool], Optional[str]]:
+    """Per-task validated inherit_context booleans (default False). Validates type strictly (bool only).
+    A non-boolean value (including None when explicitly specified) fails the whole call before any child spawns."""
+    result: List[bool] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        if "inherit_context" in task:
+            val = task["inherit_context"]
+            if not isinstance(val, bool):
+                return [], f"Task {i} 'inherit_context' must be a boolean."
+            result.append(val)
+        else:
+            result.append(False)
+    return result, None

@@ -3,6 +3,7 @@ timeout/failure handling, result-entry assembly and cleanup (``_ChildRun``)."""
 
 from __future__ import annotations
 
+import copy
 import logging
 import contextvars
 import json
@@ -500,6 +501,7 @@ def _validate_child_output_schema(
         with delegated_child_context(str(getattr(child, "session_id", "") or "")):
             _retry_result = child.run_conversation(
                 user_message=build_retry_message(_schema_errors), task_id=child_task_id,
+                conversation_history=copy.deepcopy(result.get("messages") or []),
                 stream_callback=relay_child_text,
             )
     except Exception as _retry_exc:
@@ -513,8 +515,10 @@ def _validate_child_output_schema(
         except (TypeError, ValueError):
             pass
         _retry_messages = _retry_result.get("messages")
-        if isinstance(_retry_messages, list) and isinstance(result.get("messages"), list):
-            result["messages"] = result["messages"] + _retry_messages
+        if isinstance(_retry_messages, list):
+            # run_conversation returns the complete continued history, including the
+            # first attempt. Appending it would duplicate context and tool traces.
+            result["messages"] = _retry_messages
         _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
     return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1)
 
@@ -614,6 +618,9 @@ def _build_result_entry(
     # Model-visible per-delegation spend (unlike _child_cost_usd above).
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
+    _manifest = getattr(child, "_inherited_context_manifest", None)
+    if isinstance(_manifest, dict):
+        entry["inherited_context"] = _manifest
     if status == "failed":
         entry["error"] = result.get("error", "Subagent did not produce a response.")
         # Classified reason from the child loop (e.g. "rate_limit", "billing")
@@ -848,8 +855,13 @@ class _ChildRun:
         # Worker thread handle so the timeout diagnostic can dump its stack.
         worker_thread_holder: Dict[str, Optional[threading.Thread]] = {"t": None}
         # Resolved after seed_workspace so a multimodal goal's text part carries the worktree note too.
+        _snapshot = getattr(child, "_inherited_context_snapshot", None)
+        if _snapshot is not None and hasattr(_snapshot, "rendered_transcript") and isinstance(_snapshot.rendered_transcript, str):
+            effective_goal = f"{_snapshot.rendered_transcript}\n\n=== DELEGATED TASK ===\n{self.goal}"
+        else:
+            effective_goal = self.goal
         _images = list(getattr(child, "_delegate_images", None) or [])
-        user_message: Any = _build_child_goal_message(self.goal, _images, child) if _images else self.goal
+        user_message: Any = _build_child_goal_message(effective_goal, _images, child) if _images else effective_goal
 
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()

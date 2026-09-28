@@ -176,6 +176,13 @@ def _get_inherit_mcp_toolsets() -> bool:
     """Whether narrowed child toolsets should keep the parent's MCP toolsets."""
     return is_truthy_value(_cfg().get("inherit_mcp_toolsets"), default=True)
 
+def _get_inherit_max_tokens() -> int:
+    """delegation.inherit_max_tokens (token ceiling for inherited parent context; default 64,000)."""
+    return _knob(
+        "inherit_max_tokens", None, lambda v: max(100, int(v)), 64000,
+        "delegation.inherit_max_tokens=%r is not a valid integer; using default 64000",
+    )
+
 def _normalized_runtime_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
