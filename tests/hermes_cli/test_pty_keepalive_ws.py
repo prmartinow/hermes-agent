@@ -1,4 +1,5 @@
 import json
+from threading import Event
 
 import pytest
 
@@ -11,6 +12,7 @@ class FakeBridge:
         self.alive = True
         self.accept_input = True
         self.written = bytearray()
+        self.input_written = Event()
 
     def read(self, timeout):
         return b""        # idle forever
@@ -19,6 +21,7 @@ class FakeBridge:
         if not self.accept_input:
             return False
         self.written.extend(data)
+        self.input_written.set()
         return True
 
     def resize(self, cols, rows):
@@ -33,7 +36,6 @@ def pty_keepalive_harness(monkeypatch):
     class Spawned(list):
         pass
 
-    from threading import Event
     spawned = Spawned()
     spawned.bridges = []
     spawned.ready = Event()
@@ -272,14 +274,20 @@ async def test_forced_fresh_with_rotated_token_preserves_prior_work(pty_keepaliv
 
     client = TestClient(web_server.app)
     with client.websocket_connect("/api/pty?attach=TOK1") as ws1:
+        assert pty_keepalive_harness.ready.wait(5)
+        bridge0 = pty_keepalive_harness.bridges[0]
         ws1.send_bytes(b"hi")
+        assert bridge0.input_written.wait(5)
     assert len(pty_keepalive_harness) == 1
-    bridge0 = pty_keepalive_harness.bridges[0]
     assert bridge0.alive is True
 
-    # The frontend rotates its token for fresh starts; the old owner stays alive.
+    # Wait for the async fork and input dispatch, not merely WebSocket accept.
+    # Closing immediately after accept can cancel a fork still in progress.
+    pty_keepalive_harness.ready.clear()
     with client.websocket_connect("/api/pty?attach=TOK_NEW&fresh=1") as ws2:
+        assert pty_keepalive_harness.ready.wait(5)
         ws2.send_bytes(b"fresh")
+        assert pty_keepalive_harness.bridges[1].input_written.wait(5)
     assert len(pty_keepalive_harness) == 2
     assert bridge0.alive is True
 
