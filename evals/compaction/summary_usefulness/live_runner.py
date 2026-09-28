@@ -45,10 +45,12 @@ from agent.context_compressor import (
     _reinject_pruned_skill_markers,
 )
 from agent.conversation_compression import _salvage_or_refuse_grown_transcript
+from agent.message_content import flatten_message_text
 from agent.model_metadata import estimate_messages_tokens_rough
 from evals.compaction.summary_usefulness.fixtures import (
     MIGRATION_CASE_GROUND_TRUTH,
     SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+    SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER,
 )
 from evals.compaction.summary_usefulness.harness import transcript_to_text
 from evals.compaction.summary_usefulness.rubric import (
@@ -67,16 +69,205 @@ def get_default_scratch_dir() -> Path:
     """Resolve dynamic scratch directory via TMPDIR runtime or canonical get_scratch_dir()."""
     tmpdir = os.environ.get("TMPDIR")
     if tmpdir:
-        return Path(tmpdir) / "compaction-eval-fidelity-fix"
+        return Path(tmpdir) / "compaction-stream-eval-fix"
     try:
         from hermes_constants import get_scratch_dir
-        return get_scratch_dir() / "compaction-eval-fidelity-fix"
+        return get_scratch_dir() / "compaction-stream-eval-fix"
     except Exception:
         from hermes_constants import get_hermes_home
-        return get_hermes_home() / "cache" / "scratch" / "compaction-eval-fidelity-fix"
+        return get_hermes_home() / "cache" / "scratch" / "compaction-stream-eval-fix"
 
 
 DEFAULT_SCRATCH_DIR = get_default_scratch_dir()
+
+
+def _extract_usage_tokens(usage: Any) -> Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """Extract (prompt, completion, total, reasoning) token counts from provider usage object.
+
+    Guarantees:
+    - Returns None (never false 0) when usage or individual token fields are missing.
+    - Inspects completion_tokens_details and direct reasoning_tokens fields across providers.
+    """
+    if usage is None:
+        return None, None, None, None
+
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    total_tokens = getattr(usage, "total_tokens", None)
+
+    reasoning_tokens = None
+    comp_details = getattr(usage, "completion_tokens_details", None)
+    if comp_details is not None:
+        reasoning_tokens = getattr(comp_details, "reasoning_tokens", None)
+    if reasoning_tokens is None:
+        output_details = getattr(usage, "output_tokens_details", None)
+        if output_details is not None:
+            reasoning_tokens = getattr(output_details, "reasoning_tokens", None)
+    if reasoning_tokens is None:
+        reasoning_tokens = getattr(usage, "reasoning_tokens", None)
+    if reasoning_tokens is None:
+        reasoning_tokens = getattr(usage, "thoughts_tokens", None)
+    if reasoning_tokens is None:
+        reasoning_tokens = getattr(usage, "thoughts_token_count", None)
+
+    # Handle dictionary representation if returned by adapter
+    if isinstance(usage, dict):
+        prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+        completion_tokens = usage.get("completion_tokens", completion_tokens)
+        total_tokens = usage.get("total_tokens", total_tokens)
+        if reasoning_tokens is None:
+            comp_dict = usage.get("completion_tokens_details")
+            if isinstance(comp_dict, dict):
+                reasoning_tokens = comp_dict.get("reasoning_tokens")
+        if reasoning_tokens is None:
+            reasoning_tokens = (
+                usage.get("reasoning_tokens")
+                or usage.get("thoughtsTokenCount")
+                or usage.get("thoughts_token_count")
+            )
+
+    def _coerce_int(val: Any) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+
+    return (
+        _coerce_int(prompt_tokens),
+        _coerce_int(completion_tokens),
+        _coerce_int(total_tokens),
+        _coerce_int(reasoning_tokens),
+    )
+
+
+def _clean_visible_text(text: str) -> str:
+    """Strip think blocks from visible text while preserving visible prose."""
+    if not text:
+        return ""
+    try:
+        return strip_think_blocks(None, text)
+    except Exception:
+        import re
+        return re.sub(
+            r"<(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>.*?</(?:think|thinking|reasoning|thought|REASONING_SCRATCHPAD)>",
+            "",
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        ).strip()
+
+
+class TransparentStreamObserver:
+    """Transparent stream observer wrapping an auxiliary chat stream iterator.
+
+    Guarantees:
+    - Exact passthrough: yields exact chunks once with zero drift, mutation, or reordering.
+    - Preserves close and error propagation: .close() triggers underlying .close();
+      underlying exceptions are raised without being swallowed.
+    - Zero eager exhaustion: chunks are fetched strictly on downstream demand.
+    - Telemetry capture:
+      * Visible delta content only (never captures raw reasoning/thinking).
+      * Finish reason from choice.finish_reason if emitted.
+      * Provider usage from chunk.usage (prompt_tokens, completion_tokens, total_tokens).
+      * Provider reasoning/thinking tokens (completion_tokens_details.reasoning_tokens or usage.reasoning_tokens).
+      * If usage/thinking are not returned by the provider, records None (never false 0).
+      * Elapsed seconds includes full stream consumption duration (not just generator creation).
+    """
+
+    def __init__(self, stream: Any, call_record: Dict[str, Any], call_start: float):
+        self._raw_stream = stream
+        self._iter = iter(stream)
+        self._call_record = call_record
+        self._call_start = call_start
+        self._visible_parts: List[str] = []
+        self._finish_reason: Optional[str] = None
+        self._usage: Optional[Any] = None
+        self._finalized = False
+        self._closed = False
+        self._chunks_yielded = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            chunk = next(self._iter)
+        except StopIteration:
+            self._finalize()
+            raise
+        except BaseException:
+            self._finalize()
+            raise
+
+        self._chunks_yielded += 1
+        self._observe_chunk(chunk)
+        return chunk
+
+    def _observe_chunk(self, chunk: Any) -> None:
+        # 1. Provider usage
+        u = getattr(chunk, "usage", None)
+        if u is not None:
+            self._usage = u
+
+        # 2. Choices, finish_reason, and VISIBLE delta content ONLY
+        choices = getattr(chunk, "choices", None) or []
+        if choices:
+            ch = choices[0]
+            fr = getattr(ch, "finish_reason", None)
+            if fr:
+                self._finish_reason = str(fr)
+            delta = getattr(ch, "delta", None)
+            if delta is not None:
+                # Capture visible delta content ONLY - NEVER raw reasoning / reasoning_content / details
+                content = getattr(delta, "content", None)
+                if content:
+                    piece = flatten_message_text(content, sep="")
+                    if piece:
+                        self._visible_parts.append(piece)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            close_fn = getattr(self._raw_stream, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+            self._finalize()
+
+    def _finalize(self) -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+        elapsed = time.monotonic() - self._call_start
+
+        prompt_tokens, completion_tokens, total_tokens, reasoning_tokens = _extract_usage_tokens(self._usage)
+
+        raw_visible = "".join(self._visible_parts)
+        if "<think" in raw_visible:
+            raw_visible = _clean_visible_text(raw_visible)
+
+        if self._finish_reason:
+            fr = self._finish_reason
+        elif self._chunks_yielded > 0:
+            fr = "stop"
+        else:
+            fr = "not_called"
+
+        self._call_record["elapsed_seconds"] = elapsed
+        self._call_record["finish_reason"] = fr
+        self._call_record["raw_content"] = raw_visible
+        self._call_record["prompt_tokens"] = prompt_tokens
+        self._call_record["completion_tokens"] = completion_tokens
+        self._call_record["total_tokens"] = total_tokens
+        self._call_record["reasoning_tokens"] = reasoning_tokens
+        self._call_record["is_closed"] = self._closed
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw_stream, name)
+
 
 
 def resolve_actual_configured_auxiliary() -> Dict[str, Any]:
@@ -198,7 +389,7 @@ def execute_live_compaction_request(
         )
 
     if transcript is None:
-        transcript = SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED
+        transcript = SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER
     if ground_truth is None:
         ground_truth = MIGRATION_CASE_GROUND_TRUTH
     if scratch_dir is None:
@@ -317,16 +508,61 @@ def execute_live_compaction_request(
                     resp = mock_response
             else:
                 resp = original_create(*args, **kwargs)
-            elapsed = time.monotonic() - call_start
 
-            intercepted_calls.append({
-                "prompt_content": actual_prompt,
-                "exact_input_tokens": actual_input_tokens,
-                "max_tokens_passed": kwargs.get("max_tokens"),
-                "elapsed_seconds": elapsed,
-                "response": resp,
-            })
-            return resp
+            # Check if resp is a streaming chunk iterator or non-streaming completion
+            is_stream = not hasattr(resp, "choices") and (hasattr(resp, "__iter__") or hasattr(resp, "__next__"))
+            if not is_stream:
+                elapsed = time.monotonic() - call_start
+                raw_content = ""
+                finish_reason = "not_called"
+
+                choices = getattr(resp, "choices", [])
+                if choices:
+                    ch = choices[0]
+                    finish_reason = getattr(ch, "finish_reason", "unknown")
+                    m = getattr(ch, "message", None)
+                    if m is not None:
+                        content = getattr(m, "content", "")
+                        raw_content = _clean_visible_text(content) if content else ""
+
+                prompt_tokens, completion_tokens, total_tokens, reasoning_tokens = _extract_usage_tokens(
+                    getattr(resp, "usage", None)
+                )
+
+                call_record = {
+                    "prompt_content": actual_prompt,
+                    "exact_input_tokens": actual_input_tokens,
+                    "max_tokens_passed": kwargs.get("max_tokens"),
+                    "elapsed_seconds": elapsed,
+                    "finish_reason": finish_reason,
+                    "raw_content": raw_content,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "reasoning_tokens": reasoning_tokens,
+                    "is_streaming": False,
+                    "response": resp,
+                }
+                intercepted_calls.append(call_record)
+                return resp
+            else:
+                call_record = {
+                    "prompt_content": actual_prompt,
+                    "exact_input_tokens": actual_input_tokens,
+                    "max_tokens_passed": kwargs.get("max_tokens"),
+                    "elapsed_seconds": 0.0,
+                    "finish_reason": "not_called",
+                    "raw_content": "",
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                    "reasoning_tokens": None,
+                    "is_streaming": True,
+                    "response": resp,
+                }
+                intercepted_calls.append(call_record)
+                return TransparentStreamObserver(resp, call_record, call_start)
+
         return physical_send_interceptor
 
     clients_to_patch = set()
@@ -365,30 +601,25 @@ def execute_live_compaction_request(
     prompt_tokens = None
     completion_tokens = None
     total_tokens = None
+    reasoning_tokens = None
     elapsed_seconds = 0.0
 
     if intercepted_calls:
-        rec = intercepted_calls[0]
-        elapsed_seconds = rec["elapsed_seconds"]
-        resp = rec["response"]
-        choices = getattr(resp, "choices", [])
-        if choices:
-            ch = choices[0]
-            finish_reason = getattr(ch, "finish_reason", "unknown")
-            m = getattr(ch, "message", None)
-            raw_content = getattr(m, "content", "") if m else ""
-        usage = getattr(resp, "usage", None)
-        if usage:
-            prompt_tokens = getattr(usage, "prompt_tokens", None)
-            completion_tokens = getattr(usage, "completion_tokens", None)
-            total_tokens = getattr(usage, "total_tokens", None)
+        rec = intercepted_calls[-1]
+        elapsed_seconds = rec.get("elapsed_seconds", 0.0)
+        raw_content = rec.get("raw_content", "")
+        finish_reason = rec.get("finish_reason", "not_called")
+        prompt_tokens = rec.get("prompt_tokens")
+        completion_tokens = rec.get("completion_tokens")
+        total_tokens = rec.get("total_tokens")
+        reasoning_tokens = rec.get("reasoning_tokens")
 
     # 7. Execute actual production growth guard
     rough_in = estimate_messages_tokens_rough(transcript)
     rough_cand = estimate_messages_tokens_rough(candidate_messages)
 
     mock_agent = MagicMock()
-    mock_agent.session_id = "compaction-eval-fidelity-fix"
+    mock_agent.session_id = "compaction-stream-eval-fix"
     mock_agent.context_compressor = compressor
 
     accepted_messages, refused_sp = _salvage_or_refuse_grown_transcript(
@@ -495,6 +726,7 @@ def execute_live_compaction_request(
         "finish_reason": finish_reason,
         "elapsed_seconds": round(elapsed_seconds, 3),
         "physical_auxiliary_calls": physical_calls_count,
+        "sdk_auxiliary_attempts": physical_calls_count,
         "max_output_tokens_configured": max_output_tokens if max_output_tokens is not None else DEFAULT_MAX_OUTPUT_TOKENS,
         "max_output_tokens_budget": max_output_tokens if max_output_tokens is not None else "production_default_honest",
         "usage": {
@@ -502,7 +734,9 @@ def execute_live_compaction_request(
             "provider_prompt_tokens": prompt_tokens,
             "provider_completion_tokens": completion_tokens,
             "provider_total_tokens": total_tokens,
+            "provider_reasoning_tokens": reasoning_tokens,
         },
+        "thoughts_token_count": reasoning_tokens,
         "tokens": {
             "original_tokens_rough": rough_in,
             "candidate_tokens_rough": rough_cand,
@@ -530,6 +764,7 @@ def execute_live_compaction_request(
         "eval_score_final": eval_score_final,
         "eval_score_raw": eval_score_raw,
         "raw_content": raw_content,
+        "candidate_summary": raw_content,
         "original_messages": transcript,
         "candidate_messages": candidate_messages,
         "final_accepted_messages": final_accepted_messages,

@@ -472,3 +472,294 @@ Hit some network issues earlier.
 ## Key Decisions
 Decided to use a better tool.
 """
+
+
+# -------------------------------------------------------------------------
+# Synthetic Multi-Turn Case 1 (Longer Realistic Multi-Turn Fixture):
+# Designed for realistic compaction scale (29 turns, meaningful compressible middle)
+# under UNCHANGED production window and tail settings (protect_first_n=3, protect_last_n=20).
+#
+# Selected compression window under production ContextCompressor:
+# - Head: turns 0-3 (system + CLI tool check)
+# - Compressible Middle: turns 4-20 (17 turns) spanning:
+#   * Corrections: decommissioned pg-legacy-01:5432 -> active target aurora-pg-prod:5439,
+#     role migrator_worker_v2, db billing_ledger_prod, policy SEC-9941, verify-full SSL
+#   * Failed approach: direct pg_dump | psql pipe broken by MTU packet mismatch (socket error 104)
+#   * Key decisions: abandon direct pipe streaming, adopt chunked batch cursor export with RocksDB
+#   * Tool results: RocksDB checkpoint sha256 checksum, row count 1,420,500, staging disk check
+#   * Unfinished instructions: extract first 100,000 records, verify >=15GB free, hold index creation
+# - Protected Tail: turns 21-28 (subsequent parallel batch execution, status checks, memory telemetry)
+#
+# Actual summary prompt token count: ~3,100 tokens (<= 8,000 token limit).
+# -------------------------------------------------------------------------
+
+SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER: List[Dict[str, Any]] = [
+    {
+        "role": "system",
+        "content": "You are an operations and migration agent for data platform services.",
+    },
+    {
+        "role": "user",
+        "content": "Initialize migration environment, verify CLI tooling versions and database connectivity status.",
+    },
+    {
+        "role": "assistant",
+        "content": "Checking tooling versions.",
+        "tool_calls": [
+            {
+                "id": "call_tool_check_longer",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "pg_dump --version && psql --version"}',
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_tool_check_longer",
+        "content": "pg_dump (PostgreSQL) 14.9, psql (PostgreSQL) 14.9",
+    },
+    # Compressible Middle starts at index 4
+    {
+        "role": "user",
+        "content": (
+            "We need to migrate our account records. Initially we planned to use the "
+            "legacy database cluster at `pg-legacy-01.internal` on port 5432 with user `pg_legacy_admin`."
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": "I will probe the connection to pg-legacy-01.internal:5432 and inspect cluster and schema status.",
+        "tool_calls": [
+            {
+                "id": "call_probe_legacy_longer",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "nc -zv pg-legacy-01.internal 5432"}',
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_probe_legacy_longer",
+        "content": (
+            "Connection to pg-legacy-01.internal 5432 port [tcp/postgresql] succeeded!\n"
+            "PostgreSQL cluster status:\n"
+            "  Version: PostgreSQL 14.9 on x86_64-pc-linux-gnu\n"
+            "  Cluster State: READ-ONLY (Decommissioning in progress - scheduled shutdown in 7 days)\n"
+            "  Primary Database: billing_ledger_prod\n"
+            "  Current User: pg_legacy_admin\n"
+            "Table catalog inspect for accounts_v2 on pg-legacy-01.internal:5432:\n"
+            "Relation summary: 1,420,500 total estimated tuples, 682 MB data size, 314 MB index size."
+        ),
+    },
+    {
+        "role": "user",
+        "content": (
+            "WAIT! Stop. Do not touch `pg-legacy-01.internal:5432` or `pg_legacy_admin`! "
+            "That cluster is frozen and decommissioning. We have migrated to active target host "
+            "`aurora-pg-prod.vpc-east.internal` on port `5439`. The new connection role is "
+            "`migrator_worker_v2`, and the target database is `billing_ledger_prod`. Also, under "
+            "security policy SEC-9941, you MUST NEVER use the `--no-owner` flag and MUST set SSL "
+            "mode to `verify-full` using CA certificate `/etc/ssl/certs/internal-root-ca-2026.crt`."
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": "Understood. Switching to aurora-pg-prod.vpc-east.internal:5439 with role migrator_worker_v2. I will attempt direct pipe migration using pg_dump | psql for table accounts_v2.",
+        "tool_calls": [
+            {
+                "id": "call_pipe_stream_longer",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "pg_dump -h aurora-pg-prod.vpc-east.internal -p 5439 -U migrator_worker_v2 -d billing_ledger_prod --table=accounts_v2 --sslmode=verify-full --sslrootcert=/etc/ssl/certs/internal-root-ca-2026.crt | psql -h aurora-pg-prod.vpc-east.internal -p 5439 -U migrator_worker_v2 -d billing_ledger_prod"}',
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_pipe_stream_longer",
+        "content": (
+            "pg_dump: [archiver (db)] connection to database \"billing_ledger_prod\" on host \"aurora-pg-prod.vpc-east.internal\" port 5439\n"
+            "pg_dump: SSL connection (protocol: TLSv1.3, cipher: TLS_AES_256_GCM_SHA384, bits: 256, compression: off)\n"
+            "pg_dump: CA certificate: /etc/ssl/certs/internal-root-ca-2026.crt verified with verify-full\n"
+            "pg_dump: user: migrator_worker_v2 authenticated\n"
+            "pg_dump: saving search_path = \"\"\n"
+            "pg_dump: reading schemas\n"
+            "pg_dump: reading user-defined tables\n"
+            "pg_dump: dumping contents of table public.accounts_v2\n"
+            "pg_dump: streaming data block 0: 65536 bytes\n"
+            "ERROR: MTU packet frame mismatch on bridge br-prod-0 (mtu=1420 vs 9000). Connection reset by peer: socket write error 104 in pg_dump pipeline. FATAL: streaming pipe aborted after 124,000 bytes. Transaction rollback executed.\n"
+            "Network diagnostics on failure:\n"
+            "  Bridge br-prod-0 configured MTU: 1420\n"
+            "  VPC interface ens5 configured MTU: 9000 (jumbo frame mismatch)\n"
+            "  TCP MSS negotiated: 8960 -> packet dropped on bridge egress\n"
+            "  Kernel: [412948.102914] br-prod-0: packet too big for DF bit (len 8960, mtu 1420)\n"
+            "  Socket state: ECONNRESET (104), pipe broken."
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": (
+            "The direct `pg_dump | psql` pipe failed due to MTU network fragmentation (socket error 104 on br-prod-0).\n"
+            "Key Decision: Abandon network pipe streaming (`pg_dump | psql`). Instead, use chunked batch cursor export with batch_size=500 and write temporary Parquet files to `/var/scratch/batch_staging/` using local RocksDB checkpointing (`/var/data/migration_checkpoint.db`) to ensure restartability without hitting network socket limits."
+        ),
+        "tool_calls": [
+            {
+                "id": "call_init_checkpoint_longer",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "python3 -c \\"import hashlib; print(\'INIT_CHECKPOINT:\', hashlib.sha256(b\'migration_init\').hexdigest())\\" && df -h /var/scratch/batch_staging/"}',
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_init_checkpoint_longer",
+        "content": (
+            "INIT_CHECKPOINT: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
+            "Total row count to migrate: 1,420,500 records verified.\n"
+            "Staging environment audit:\n"
+            "  Staging path: /var/scratch/batch_staging/\n"
+            "  Filesystem: /dev/nvme0n1p3 mounted on /var/scratch (ext4, rw, relatime)\n"
+            "  Disk total: 500.0 GB, Used: 214.3 GB, Available: 260.2 GB (free > 15GB required)\n"
+            "RocksDB checkpoint initialization:\n"
+            "  Checkpoint path: /var/data/migration_checkpoint.db\n"
+            "  Status: OK. Ready for chunked batch cursor export with batch_size=500."
+        ),
+    },
+    {
+        "role": "user",
+        "content": (
+            "The decision to use chunked batch cursor export with RocksDB checkpointing is approved.\n"
+            "Now, please execute phase 1 of the migration for table `accounts_v2`: verify that the local "
+            "staging dir `/var/scratch/batch_staging/` has at least 15GB free, then begin extracting the "
+            "first 100,000 records from `aurora-pg-prod.vpc-east.internal:5439` database `billing_ledger_prod`, "
+            "and do NOT start index creation until all batches pass row verification against checksum "
+            "`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`."
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": "Beginning phase 1 execution: validating disk space in /var/scratch/batch_staging/.",
+        "tool_calls": [
+            {
+                "id": "call_check_space_longer",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "df -m /var/scratch/batch_staging/"}',
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_check_space_longer",
+        "content": (
+            "Filesystem 1M-blocks Used Available Use% Mounted on\n"
+            "/dev/nvme0n1p3 512000 219443 266400 46% /var/scratch\n"
+            "Free: 266,400 MB (260.1 GB > 15 GB threshold verified)."
+        ),
+    },
+    {
+        "role": "assistant",
+        "content": "Free disk space confirmed (260.1 GB > 15 GB). Initiating batch 1 cursor extraction (records 0-500).",
+        "tool_calls": [
+            {
+                "id": "call_batch1_longer",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "python3 extract_cursor.py --table accounts_v2 --offset 0 --limit 500 --out /var/scratch/batch_staging/batch_00001.parquet"}',
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_batch1_longer",
+        "content": "Batch 1 extracted: 500 records written to /var/scratch/batch_staging/batch_00001.parquet. Checkpoint state updated in /var/data/migration_checkpoint.db.",
+    },
+    # Tail messages: subsequent ongoing operational turns
+    {
+        "role": "user",
+        "content": "Please verify batch 1 row checksum against RocksDB before proceeding with subsequent batches.",
+    },
+    {
+        "role": "assistant",
+        "content": "Verifying batch 1 records against RocksDB checksum ledger.",
+        "tool_calls": [
+            {
+                "id": "call_verify_b1_longer",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "python3 verify_batch.py --batch /var/scratch/batch_staging/batch_00001.parquet"}',
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_verify_b1_longer",
+        "content": "Verification success: 500 of 500 records match sha256 checksum in /var/data/migration_checkpoint.db.",
+    },
+    {
+        "role": "user",
+        "content": "Proceed with extraction batches 2 through 10 in parallel worker mode.",
+    },
+    {
+        "role": "assistant",
+        "content": "Launching parallel extraction workers for batches 2 through 10.",
+        "tool_calls": [
+            {
+                "id": "call_parallel_longer",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "python3 launch_parallel_workers.py --start-batch 2 --end-batch 10 --workers 4"}',
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_parallel_longer",
+        "content": "Workers launched: PIDs [41021, 41022, 41023, 41024] active. Batches 2-10 processing.",
+    },
+    {
+        "role": "user",
+        "content": "What is the current memory and CPU overhead of the parallel workers?",
+    },
+    {
+        "role": "assistant",
+        "content": "Inspecting process resource utilization.",
+        "tool_calls": [
+            {
+                "id": "call_proc_stat_longer",
+                "function": {
+                    "name": "terminal",
+                    "arguments": '{"command": "ps -o pid,rss,%cpu -p 41021,41022,41023,41024"}',
+                },
+            }
+        ],
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_proc_stat_longer",
+        "content": "  PID   RSS %CPU\n41021 98304  5.2\n41022 96120  4.8\n41023 97440  5.1\n41024 95800  4.9\nTotal RSS: ~387 MB. Resource utilization nominal.",
+    },
+    {
+        "role": "user",
+        "content": "Keep monitoring worker execution until batch 10 is completed.",
+    },
+    {
+        "role": "assistant",
+        "content": "Monitoring active. Batches 2 through 10 are at approximately 65% progress.",
+    },
+    {
+        "role": "user",
+        "content": "Awaiting batch completion notification.",
+    },
+]

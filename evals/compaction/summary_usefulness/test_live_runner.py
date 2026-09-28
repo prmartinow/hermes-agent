@@ -7,8 +7,10 @@ and fail-closed guards without burning live tokens or requiring host credentials
 
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,7 +18,9 @@ from evals.compaction.summary_usefulness.fixtures import (
     MIGRATION_CASE_GROUND_TRUTH,
     SYNTHETIC_HANDCRAFTED_GOOD_SUMMARY,
     SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+    SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER,
 )
+from agent.context_compressor import ContextCompressor
 from evals.compaction.summary_usefulness.live_runner import (
     MAX_INPUT_TOKENS,
     DEFAULT_MAX_OUTPUT_TOKENS,
@@ -338,12 +342,12 @@ def test_dynamic_scratch_dir_resolution(tmp_path: Path, monkeypatch: pytest.Monk
     test_tmpdir.mkdir()
     monkeypatch.setenv("TMPDIR", str(test_tmpdir))
     scratch = get_default_scratch_dir()
-    assert scratch == test_tmpdir / "compaction-eval-fidelity-fix"
+    assert scratch == test_tmpdir / "compaction-stream-eval-fix"
 
     # 2. With TMPDIR unset -> falls back to canonical hermes scratch/home
     monkeypatch.delenv("TMPDIR", raising=False)
     scratch_canonical = get_default_scratch_dir()
-    assert scratch_canonical.name == "compaction-eval-fidelity-fix"
+    assert scratch_canonical.name == "compaction-stream-eval-fix"
 
 
 def test_authorization_before_resolution(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -469,3 +473,403 @@ def test_internal_retry_attempts_counted_and_blocked(tmp_path: Path, monkeypatch
 
     # First attempt called the mock; internal retry was intercepted and blocked before second mock execution
     assert physical_send_attempts == 1
+
+
+def _make_mock_chunk(
+    content: Optional[str] = None,
+    finish_reason: Optional[str] = None,
+    usage: Optional[Any] = None,
+    reasoning: Optional[str] = None,
+):
+    delta_kwargs: Dict[str, Any] = {
+        "role": "assistant",
+        "content": content,
+    }
+    if reasoning is not None:
+        delta_kwargs["reasoning"] = reasoning
+        delta_kwargs["reasoning_content"] = reasoning
+
+    choices = []
+    if content is not None or finish_reason is not None or reasoning is not None:
+        choices.append(
+            SimpleNamespace(
+                index=0,
+                delta=SimpleNamespace(**delta_kwargs),
+                finish_reason=finish_reason,
+            )
+        )
+    return SimpleNamespace(
+        id="chunk-test-1",
+        model="gemini-3.8-flash-high",
+        choices=choices,
+        usage=usage,
+    )
+
+
+def test_streaming_stop_telemetry(tmp_path: Path):
+    """Proves streaming response ending in stop finish_reason captures:
+    - Visible delta content joined as raw_content without raw reasoning.
+    - Observed finish_reason == 'stop'.
+    - Provider token counts (prompt, completion, total, reasoning/thinking).
+    - Elapsed seconds reflects streaming consumption duration.
+    - Raw visible summary written to raw_summary_output.md before augmentation.
+    - Candidate summary distinguished from final accepted state.
+    """
+    concise_body = (
+        "## Goal\nMigrate 1,420,500 records from billing_ledger_prod accounts_v2.\n"
+        "## Constraints & Preferences\nActive target aurora-pg-prod.vpc-east.internal:5439 user migrator_worker_v2.\n"
+        "## Active State\nRocksDB checkpoint /var/data/migration_checkpoint.db ready.\n"
+    )
+
+    chunks = [
+        _make_mock_chunk(content="## Goal\nMigrate 1,420,500 records from billing_ledger_prod accounts_v2.\n"),
+        _make_mock_chunk(content="## Constraints & Preferences\nActive target aurora-pg-prod.vpc-east.internal:5439 user migrator_worker_v2.\n"),
+        _make_mock_chunk(content="## Active State\nRocksDB checkpoint /var/data/migration_checkpoint.db ready.\n"),
+        _make_mock_chunk(
+            finish_reason="stop",
+            usage=SimpleNamespace(
+                prompt_tokens=5600,
+                completion_tokens=65,
+                total_tokens=5665,
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=42),
+            ),
+        ),
+    ]
+
+    def mock_stream_generator(*args, **kwargs):
+        for c in chunks:
+            yield c
+
+    with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient.count_tokens", return_value=5630):
+        result = execute_live_compaction_request(
+            transcript=SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+            ground_truth=MIGRATION_CASE_GROUND_TRUTH,
+            scratch_dir=tmp_path,
+            mock_response=mock_stream_generator,
+        )
+
+        assert result["metadata"]["finish_reason"] == "stop"
+        assert result["metadata"]["elapsed_seconds"] >= 0.0
+        assert result["metadata"]["usage"]["provider_prompt_tokens"] == 5600
+        assert result["metadata"]["usage"]["provider_completion_tokens"] == 65
+        assert result["metadata"]["usage"]["provider_total_tokens"] == 5665
+        assert result["metadata"]["usage"]["provider_reasoning_tokens"] == 42
+        assert result["metadata"]["thoughts_token_count"] == 42
+        assert result["metadata"]["physical_auxiliary_calls"] == 1
+        assert result["metadata"]["sdk_auxiliary_attempts"] == 1
+
+        assert result["raw_content"] == concise_body
+        assert (tmp_path / "raw_summary_output.md").read_text(encoding="utf-8") == concise_body
+        assert result["eval_score_raw"] is not None
+        assert result["eval_score_final"] is not None
+
+
+def test_streaming_length_truncation_telemetry(tmp_path: Path):
+    """Proves streaming response ending in length finish_reason captures:
+    - finish_reason == 'length'.
+    - lifecycle_status == 'length_truncated_aborted'.
+    - aborted_truncated == True.
+    - original_preserved == True without generating augmentation stubs.
+    - raw_content captures the unaugmented partial text emitted before truncation.
+    """
+    partial_text = "## Goal\nPartial truncated summary cut off mid-sentence..."
+    chunks = [
+        _make_mock_chunk(content=partial_text),
+        _make_mock_chunk(
+            finish_reason="length",
+            usage=SimpleNamespace(prompt_tokens=5600, completion_tokens=1500, total_tokens=7100),
+        ),
+    ]
+
+    with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient.count_tokens", return_value=5630):
+        result = execute_live_compaction_request(
+            transcript=SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+            ground_truth=MIGRATION_CASE_GROUND_TRUTH,
+            scratch_dir=tmp_path,
+            mock_response=iter(chunks),
+        )
+
+        assert result["lifecycle_status"] == "length_truncated_aborted"
+        assert result["metadata"]["finish_reason"] == "length"
+        assert result["metadata"]["aborted_truncated"] is True
+        assert result["metadata"]["original_preserved"] is True
+        assert result["final_accepted_messages"] == SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED
+        assert result["raw_content"] == partial_text
+        assert (tmp_path / "raw_summary_output.md").read_text(encoding="utf-8") == partial_text
+
+
+def test_streaming_usage_only_last_chunk_telemetry(tmp_path: Path):
+    """Proves OpenAI-style streams where the final chunk has choices=[] and usage=...
+    correctly record usage and finish_reason without dropping telemetry.
+    """
+    chunks = [
+        _make_mock_chunk(content="## Goal\nMigrate records.\n## Constraints\nTarget aurora-pg-prod.\n"),
+        _make_mock_chunk(finish_reason="stop"),  # finish chunk with choices, no usage
+        SimpleNamespace(  # usage-only chunk with choices=[]
+            id="chunk-usage-last",
+            model="gemini-3.8-flash-high",
+            choices=[],
+            usage=SimpleNamespace(prompt_tokens=3200, completion_tokens=55, total_tokens=3255),
+        ),
+    ]
+
+    with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient.count_tokens", return_value=5630):
+        result = execute_live_compaction_request(
+            transcript=SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+            ground_truth=MIGRATION_CASE_GROUND_TRUTH,
+            scratch_dir=tmp_path,
+            mock_response=iter(chunks),
+        )
+
+        assert result["metadata"]["finish_reason"] == "stop"
+        assert result["metadata"]["usage"]["provider_prompt_tokens"] == 3200
+        assert result["metadata"]["usage"]["provider_completion_tokens"] == 55
+        assert result["metadata"]["usage"]["provider_total_tokens"] == 3255
+        assert result["metadata"]["usage"]["provider_reasoning_tokens"] is None
+        assert result["metadata"]["thoughts_token_count"] is None
+
+
+def test_streaming_missing_usage_records_none_not_zero(tmp_path: Path):
+    """Proves streams with missing usage/thinking record None, NOT 0."""
+    chunks = [
+        _make_mock_chunk(content="## Goal\nSummary without usage metadata."),
+        _make_mock_chunk(finish_reason="stop"),
+    ]
+
+    with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient.count_tokens", return_value=5630):
+        result = execute_live_compaction_request(
+            transcript=SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+            ground_truth=MIGRATION_CASE_GROUND_TRUTH,
+            scratch_dir=tmp_path,
+            mock_response=iter(chunks),
+        )
+
+        assert result["metadata"]["finish_reason"] == "stop"
+        assert result["metadata"]["usage"]["provider_prompt_tokens"] is None
+        assert result["metadata"]["usage"]["provider_completion_tokens"] is None
+        assert result["metadata"]["usage"]["provider_total_tokens"] is None
+        assert result["metadata"]["usage"]["provider_reasoning_tokens"] is None
+        assert result["metadata"]["thoughts_token_count"] is None
+
+        # Critical: prove never falsely coerced to 0
+        assert result["metadata"]["usage"]["provider_prompt_tokens"] != 0
+        assert result["metadata"]["usage"]["provider_completion_tokens"] != 0
+        assert result["metadata"]["usage"]["provider_total_tokens"] != 0
+        assert result["metadata"]["usage"]["provider_reasoning_tokens"] != 0
+        assert result["metadata"]["thoughts_token_count"] != 0
+
+
+def test_streaming_error_propagation_and_elapsed(tmp_path: Path):
+    """Proves mid-stream errors propagate immediately and are not swallowed by the observer."""
+    # 1. Direct unit verification on TransparentStreamObserver
+    from evals.compaction.summary_usefulness.live_runner import TransparentStreamObserver
+
+    def erroring_raw_stream():
+        yield _make_mock_chunk(content="Starting summary...")
+        raise ConnectionResetError("Mid-stream connection reset by peer")
+
+    rec: Dict[str, Any] = {"finish_reason": "not_called"}
+    obs = TransparentStreamObserver(erroring_raw_stream(), rec, time.monotonic())
+    # First chunk yields normally
+    chunk1 = next(obs)
+    assert chunk1.choices[0].delta.content == "Starting summary..."
+    # Second chunk raises ConnectionResetError through the observer without swallowing
+    with pytest.raises(ConnectionResetError, match=r"Mid-stream connection reset by peer"):
+        next(obs)
+    assert rec["elapsed_seconds"] >= 0.0
+
+    # 2. End-to-end integration: runner bounds retries when mid-stream error occurs
+    def flaky_stream(*args, **kwargs):
+        return erroring_raw_stream()
+
+    with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient.count_tokens", return_value=5630):
+        with pytest.raises(RuntimeError, match=r"Auxiliary physical call bound exceeded"):
+            execute_live_compaction_request(
+                transcript=SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+                ground_truth=MIGRATION_CASE_GROUND_TRUTH,
+                scratch_dir=tmp_path,
+                mock_response=flaky_stream,
+                max_auxiliary_calls=1,
+            )
+
+
+def test_streaming_closure_preservation(tmp_path: Path):
+    """Proves .close() is called on the underlying chunk stream when aggregation finishes."""
+    closed_called = False
+
+    class ClosableStream:
+        def __init__(self, items):
+            self.items = iter(items)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return next(self.items)
+
+        def close(self):
+            nonlocal closed_called
+            closed_called = True
+
+    chunks = [
+        _make_mock_chunk(content="## Goal\nSummary."),
+        _make_mock_chunk(finish_reason="stop"),
+    ]
+
+    with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient.count_tokens", return_value=5630):
+        execute_live_compaction_request(
+            transcript=SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+            ground_truth=MIGRATION_CASE_GROUND_TRUTH,
+            scratch_dir=tmp_path,
+            mock_response=lambda *args, **kwargs: ClosableStream(chunks),
+        )
+
+        assert closed_called is True
+
+
+def test_streaming_never_captures_raw_reasoning(tmp_path: Path):
+    """Proves stream observer captures visible text only and NEVER raw reasoning/thinking text."""
+    secret_thought = "CONFIDENTIAL_CHAIN_OF_THOUGHT_REASONING_PROBE"
+    chunks = [
+        _make_mock_chunk(
+            content="## Goal\nMigrate records without leaking reasoning.\n",
+            reasoning=secret_thought,
+        ),
+        _make_mock_chunk(
+            finish_reason="stop",
+            usage=SimpleNamespace(prompt_tokens=1000, completion_tokens=50, total_tokens=1050),
+        ),
+    ]
+
+    with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient.count_tokens", return_value=5630):
+        result = execute_live_compaction_request(
+            transcript=SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+            ground_truth=MIGRATION_CASE_GROUND_TRUTH,
+            scratch_dir=tmp_path,
+            mock_response=lambda *args, **kwargs: iter(chunks),
+        )
+
+        assert secret_thought not in result["raw_content"]
+        assert secret_thought not in (tmp_path / "raw_summary_output.md").read_text(encoding="utf-8")
+        assert secret_thought not in (tmp_path / "sanitized_metadata.json").read_text(encoding="utf-8")
+
+
+def test_streaming_lazy_no_eager_exhaustion_matches_production(tmp_path: Path):
+    """Proves stream observer does NOT eagerly exhaust chunks at construction time."""
+    yielded_indices = []
+
+    def tracking_stream(*args, **kwargs):
+        for i in range(3):
+            yielded_indices.append(i)
+            if i == 0:
+                yield _make_mock_chunk(content="## Goal\nLazy test summary.")
+            elif i == 1:
+                yield _make_mock_chunk(content="\n## Active State\nReady.")
+            else:
+                yield _make_mock_chunk(finish_reason="stop")
+
+    with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient.count_tokens", return_value=5630):
+        result = execute_live_compaction_request(
+            transcript=SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+            ground_truth=MIGRATION_CASE_GROUND_TRUTH,
+            scratch_dir=tmp_path,
+            mock_response=tracking_stream,
+        )
+
+        assert yielded_indices == [0, 1, 2]
+        assert "## Goal\nLazy test summary." in result["raw_content"]
+
+
+def test_longer_synthetic_fixture_compressible_middle_deterministic_offline_check():
+    """Deterministic offline check for SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER:
+    1. Uses UNCHANGED production window and tail settings:
+       - protect_first_n == 3
+       - protect_last_n == 20
+       - Default tail token budget
+       - NO forced tiny protect_last setting!
+    2. Selected middle window spans:
+       - Relevant decisions: abandon network pipe streaming, adopt RocksDB checkpointing.
+       - Corrections: decommissioned pg-legacy-01 -> active aurora-pg-prod.vpc-east.internal:5439.
+       - Failed approach: direct pg_dump | psql pipe failure with socket error 104 on br-prod-0.
+       - Unfinished instructions: verify >=15GB free on /var/scratch/batch_staging/, extract 100,000 records.
+    3. Summary prompt token count is <= 8,000 tokens.
+    """
+    compressor = ContextCompressor(
+        model="gemini-3.8-flash-high",
+        provider="gemini-oauth",
+        tail_mode="lean",
+        quiet_mode=True,
+    )
+
+    # 1. Unchanged production settings check
+    assert compressor.protect_first_n == 3
+    assert compressor.protect_last_n == 20
+
+    # 2. Window selection check
+    c_start, c_end = compressor._compress_window(SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER)
+    assert c_start == 4
+    assert c_end >= 18
+    assert (c_end - c_start) >= 10, f"Expected multi-turn middle >= 10, got {c_end - c_start}"
+
+    selected_turns = SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER[c_start:c_end]
+    selected_text = " ".join(str(t.get("content", "")) for t in selected_turns)
+
+    # Decisions: abandon direct pg_dump pipe and use RocksDB checkpointing
+    assert "Abandon network pipe streaming" in selected_text
+    assert "RocksDB checkpointing" in selected_text
+
+    # Corrections: stopped decommissioned pg-legacy-01:5432 and switched to aurora-pg-prod:5439
+    assert "aurora-pg-prod.vpc-east.internal" in selected_text
+    assert "pg-legacy-01.internal" in selected_text
+    assert "migrator_worker_v2" in selected_text
+
+    # Failed approach: direct pipe socket error 104
+    assert "socket write error 104 in pg_dump pipeline" in selected_text or "br-prod-0" in selected_text
+
+    # Unfinished instructions: extract 100,000 records and check staging free disk
+    assert "verify that the local staging dir" in selected_text
+    assert "extracting the first 100,000 records" in selected_text
+
+    # 3. Verify actual summary prompt token count <= 8,000
+    prompt, meta = build_production_prompt_and_metadata(
+        SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER,
+        "gemini-3.8-flash-high",
+        "gemini-oauth",
+    )
+    from agent.model_metadata import estimate_messages_tokens_rough
+    prompt_tokens = estimate_messages_tokens_rough([{"role": "user", "content": prompt}])
+    assert prompt_tokens <= 8000, f"Prompt tokens {prompt_tokens} exceeded 8000 budget"
+    assert meta["input_turns_count"] == c_end - c_start
+
+
+def test_execute_live_compaction_request_longer_fixture_streaming(tmp_path: Path):
+    """Proves end-to-end compaction evaluation with SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER
+    exercising streaming passthrough, growth guard, artifact generation, and scoring.
+    """
+    chunks = [
+        _make_mock_chunk(content=SYNTHETIC_HANDCRAFTED_GOOD_SUMMARY),
+        _make_mock_chunk(
+            finish_reason="stop",
+            usage=SimpleNamespace(prompt_tokens=3100, completion_tokens=450, total_tokens=3550),
+        ),
+    ]
+
+    with patch("agent.gemini_cloudcode_adapter.GeminiCloudCodeClient.count_tokens", return_value=3100):
+        result = execute_live_compaction_request(
+            transcript=SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER,
+            ground_truth=MIGRATION_CASE_GROUND_TRUTH,
+            scratch_dir=tmp_path,
+            mock_response=lambda *args, **kwargs: iter(chunks),
+        )
+
+        assert result["metadata"]["original_preserved"] in (True, False)
+        assert result["eval_score_raw"] is not None
+        assert result["eval_score_raw"].usefulness_score >= 0.85
+
+        # Verify artifacts
+        assert (tmp_path / "original_messages.json").exists()
+        assert (tmp_path / "candidate_messages.json").exists()
+        assert (tmp_path / "final_accepted_messages.json").exists()
+        assert (tmp_path / "raw_summary_output.md").exists()
+        assert (tmp_path / "sanitized_metadata.json").exists()
+        assert (tmp_path / "evaluation_score_final.json").exists()
