@@ -46,10 +46,13 @@ from tools.delegate_tool_registry import (  # noqa: F401
     steer_subagent,
 )
 from tools.delegate_tool_tasks import (  # noqa: F401
-    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_inherit_context, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
+    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_inherit_context, _coerce_task_inherit_max_tokens, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
 )
 from tools.delegation_context import (  # noqa: F401
-    ContextInheritanceError, build_delegation_context_snapshot,
+    ContextInheritanceError, build_batch_context_snapshots, build_delegation_context_snapshot,
+)
+from tools.delegation_context_budget import (  # noqa: F401
+    preflight_children_budget,
 )
 from tools.delegate_tool_toolsets import (  # noqa: F401
     DELEGATE_BLOCKED_TOOLS, _expand_parent_toolsets, _resolve_child_toolsets, _strip_blocked_tools,
@@ -358,11 +361,37 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
+def _cleanup_constructed_children(parent_agent: Any, children: List[tuple]) -> None:
+    """Clean up and close any constructed child agents after a preflight or build error."""
+    from tools.delegate_tool_child_run import _close_child, _detach_child
+    parent_sid = getattr(parent_agent, "session_id", None) if parent_agent else None
+    for item in children:
+        child = item[2] if len(item) > 2 else None
+        if child is not None:
+            if parent_agent is not None:
+                _detach_child(parent_agent, child)
+            _close_child(child, "Cleaning up unrun child after preflight failure")
+            with _quiet("subagent_stop hook invocation failed during preflight cleanup", exc_info=True):
+                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "subagent_stop",
+                    parent_session_id=parent_sid,
+                    parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                    parent_subagent_id=getattr(parent_agent, "_subagent_id", None),
+                    child_session_id=getattr(child, "session_id", None),
+                    child_subagent_id=getattr(child, "_subagent_id", None),
+                    child_role=getattr(child, "_delegate_role", None),
+                    child_goal=getattr(child, "_goal", "") or "",
+                    child_status="failed",
+                )
+
+
 def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent,
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
     batch_snapshot: Optional[Any] = None, task_inherit_contexts: Optional[List[bool]] = None,
+    batch_snapshots: Optional[List[Optional[Any]]] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -389,6 +418,7 @@ def _build_children(
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
             )
         except ValueError as exc:
+            _cleanup_constructed_children(parent_agent, children)
             return [], str(exc)
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
@@ -398,14 +428,20 @@ def _build_children(
         if _t_images:
             with _quiet("Could not attach images to child %d", i):
                 child._delegate_images = _t_images
+        snap = None
+        if batch_snapshots and i < len(batch_snapshots):
+            snap = batch_snapshots[i]
+        elif batch_snapshot is not None:
+            snap = batch_snapshot
+
         if (
             task_inherit_contexts
             and i < len(task_inherit_contexts)
             and task_inherit_contexts[i] is True
-            and batch_snapshot is not None
+            and snap is not None
         ):
-            child._inherited_context_snapshot = batch_snapshot
-            child._inherited_context_manifest = batch_snapshot.manifest.to_dict()
+            child._inherited_context_snapshot = snap
+            child._inherited_context_manifest = snap.manifest.to_dict()
         # Tee progress events into the live transcript (wrapper keeps the
         # _flush contract and swallows writer failures).
         _writer = live_writers[i] if i < len(live_writers) else None
@@ -507,6 +543,8 @@ def delegate_task(
         task_images, err = _coerce_task_images(task_list, images)
     if not err:
         task_inherit_contexts, err = _coerce_task_inherit_context(task_list)
+    if not err:
+        task_inherit_max_tokens, err = _coerce_task_inherit_max_tokens(task_list, task_inherit_contexts)
     if err:
         return tool_error(err)
     err = _oneshot_spawn_budget(parent_agent, len(task_list))
@@ -514,20 +552,36 @@ def delegate_task(
         return tool_error(err)
 
     batch_snapshot = None
+    batch_snapshots = None
     if any(task_inherit_contexts):
         try:
             child_model = creds.get("model") or getattr(parent_agent, "model", None)
             child_provider = creds.get("provider") or getattr(parent_agent, "provider", None)
             child_base_url = creds.get("base_url") or getattr(parent_agent, "base_url", None)
             child_api_key = creds.get("api_key") or getattr(parent_agent, "api_key", None)
-            batch_snapshot = build_delegation_context_snapshot(
-                parent_agent,
-                child_model=child_model,
-                child_base_url=child_base_url,
-                child_api_key=child_api_key,
-                child_provider=child_provider,
-            )
+            if any(tok is not None for tok in task_inherit_max_tokens):
+                batch_snapshots = build_batch_context_snapshots(
+                    parent_agent,
+                    task_inherit_contexts,
+                    task_inherit_max_tokens,
+                    child_model=child_model,
+                    child_base_url=child_base_url,
+                    child_api_key=child_api_key,
+                    child_provider=child_provider,
+                )
+            else:
+                batch_snapshot = build_delegation_context_snapshot(
+                    parent_agent,
+                    child_model=child_model,
+                    child_base_url=child_base_url,
+                    child_api_key=child_api_key,
+                    child_provider=child_provider,
+                )
         except ContextInheritanceError as exc:
+            from agent.oneshot_footprint import is_single_query_session
+            if is_single_query_session():
+                spent = getattr(parent_agent, "_oneshot_children_spawned", 0)
+                parent_agent._oneshot_children_spawned = max(0, spent - len(task_list))
             return tool_error(str(exc))
 
     overall_start = time.monotonic()
@@ -543,10 +597,23 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
-        batch_snapshot=batch_snapshot, task_inherit_contexts=task_inherit_contexts,
+        batch_snapshot=batch_snapshot, batch_snapshots=batch_snapshots, task_inherit_contexts=task_inherit_contexts,
     )
     if err:
+        from agent.oneshot_footprint import is_single_query_session
+        if is_single_query_session():
+            spent = getattr(parent_agent, "_oneshot_children_spawned", 0)
+            parent_agent._oneshot_children_spawned = max(0, spent - len(task_list))
         return tool_error(err)
+
+    preflight_err = preflight_children_budget(children, parent_agent=parent_agent)
+    if preflight_err:
+        _cleanup_constructed_children(parent_agent, children)
+        from agent.oneshot_footprint import is_single_query_session
+        if is_single_query_session():
+            spent = getattr(parent_agent, "_oneshot_children_spawned", 0)
+            parent_agent._oneshot_children_spawned = max(0, spent - len(task_list))
+        return tool_error(preflight_err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
@@ -717,6 +784,12 @@ DELEGATE_TASK_SCHEMA = {
                             "system prompts, provider reasoning sidecars, and unresolved tool scaffolding). "
                             "WARNING: When subagents use a different model or provider, enabling this transmits "
                             "sanitized historical context across provider boundaries.",
+                        ),
+                        "inherit_max_tokens": _p(
+                            "integer",
+                            "Optional per-task token budget ceiling for inherited context (positive integer; requires inherit_context: true). "
+                            "When omitted, defaults to delegation.inherit_max_tokens (64,000) clamped to the child model's context window. "
+                            "Allows requesting a larger ceiling for subagents running on large-context models without changing global configuration.",
                         ),
                     },
                     "required": ["goal"],

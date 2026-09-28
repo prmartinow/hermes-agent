@@ -179,3 +179,28 @@ def _coerce_task_inherit_context(
         else:
             result.append(False)
     return result, None
+
+
+def _coerce_task_inherit_max_tokens(
+    task_list: List[Dict[str, Any]],
+    task_inherit_contexts: List[bool],
+) -> tuple[List[Optional[int]], Optional[str]]:
+    """Per-task validated inherit_max_tokens integers (default None).
+    Validates type strictly (positive integer only, rejects bool, float, string, None).
+    Only valid when inherit_context is True.
+    """
+    result: List[Optional[int]] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        if "inherit_max_tokens" in task:
+            inherit_ctx = task_inherit_contexts[i] if i < len(task_inherit_contexts) else False
+            if not inherit_ctx:
+                return [], f"Task {i} 'inherit_max_tokens' is only valid when 'inherit_context' is true."
+            val = task["inherit_max_tokens"]
+            if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+                return [], f"Task {i} 'inherit_max_tokens' must be a positive integer."
+            result.append(val)
+        else:
+            result.append(None)
+    return result, None

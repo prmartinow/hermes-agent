@@ -83,9 +83,13 @@ class SnapshotManifest:
     omitted_unsupported_blocks_count: int
     omitted_orphan_tool_results_count: int
     omissions_detail: Tuple[str, ...] = ()
+    requested_budget: Optional[int] = None
+    effective_budget: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Parent-safe summary dict. Excludes raw transcripts or sensitive prompt leakage."""
+        eff = self.effective_budget if self.effective_budget is not None else self.token_budget
+        req = self.requested_budget if self.requested_budget is not None else self.token_budget
         return {
             "snapshot_id": self.snapshot_id,
             "source_type": self.source_type,
@@ -94,6 +98,8 @@ class SnapshotManifest:
             "char_count": self.char_count,
             "estimated_tokens": self.estimated_tokens,
             "token_budget": self.token_budget,
+            "requested_budget": req,
+            "effective_budget": eff,
             "retained_messages_count": self.retained_messages_count,
             "retained_tool_events_count": self.retained_tool_events_count,
             "omitted_system_messages_count": self.omitted_system_messages_count,
@@ -104,6 +110,26 @@ class SnapshotManifest:
             "omitted_orphan_tool_results_count": self.omitted_orphan_tool_results_count,
             "omissions_detail": list(self.omissions_detail),
         }
+
+
+@dataclass(frozen=True)
+class RenderedTranscriptResult:
+    """Internal immutable result of rendering the parent's portable historical transcript once."""
+
+    transcript_text: str
+    source_type: str
+    content_hash_sha256: str
+    char_count: int
+    estimated_tokens: int
+    retained_messages_count: int
+    retained_tool_events_count: int
+    omitted_system_messages_count: int
+    omitted_sidecars_count: int
+    omitted_scaffolding_count: int
+    omitted_orphan_tool_results_count: int
+    omitted_images_count: int
+    omitted_unsupported_blocks_count: int
+    omissions_detail: Tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -228,21 +254,8 @@ def _sanitize_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def build_delegation_context_snapshot(
-    parent_agent: Any,
-    *,
-    child_model: Optional[str] = None,
-    child_base_url: Optional[str] = None,
-    child_api_key: Optional[str] = None,
-    child_provider: Optional[str] = None,
-    config_override_tokens: Optional[int] = None,
-) -> ContextSnapshot:
-    """Build an immutable, detached, provenance-labeled historical context snapshot.
-
-    Validates context presence, filters unresolved scaffolding, strips provider reasoning
-    sidecars and system prompts, computes token budgets with model context clamping,
-    and returns a ContextSnapshot ready to seed child execution.
-    """
+def _render_parent_transcript(parent_agent: Any) -> RenderedTranscriptResult:
+    """Extract, sanitize, and render the parent conversation context once."""
     raw_history, source_type = resolve_parent_messages(parent_agent)
 
     if not raw_history:
@@ -275,10 +288,6 @@ def build_delegation_context_snapshot(
     omissions: Dict[str, int] = {"images": 0, "unsupported": 0}
     omissions_detail: List[str] = []
 
-    # Chronological matching pass:
-    # A tool result can ONLY complete a tool call declared chronologically PRIOR to it.
-    # Each declared tool call can be completed by at most ONE result (FIFO queue per call_id).
-    # Results before calls, duplicate results, or results with unknown/missing IDs are orphans.
     pending_calls_by_id: Dict[str, List[str]] = {}
     call_instance_to_name: Dict[str, str] = {}
     completed_call_instances: Set[str] = set()
@@ -332,7 +341,6 @@ def build_delegation_context_snapshot(
             continue
 
         if role == "assistant":
-            # Detect and strip provider sidecars
             found_sidecars = [k for k in PROVIDER_SIDECAR_KEYS if k in msg]
             if found_sidecars:
                 omitted_sidecars_count += len(found_sidecars)
@@ -438,11 +446,39 @@ def build_delegation_context_snapshot(
     char_count = len(rendered_transcript)
     content_hash = hashlib.sha256(rendered_transcript.encode("utf-8")).hexdigest()
 
-    # Token budgeting and context window clamping
-    from agent.model_metadata import estimate_tokens_rough, get_model_context_length
-    from tools.delegate_tool_config import _get_inherit_max_tokens
-
+    from agent.model_metadata import estimate_tokens_rough
     estimated_tokens = estimate_tokens_rough(rendered_transcript)
+
+    return RenderedTranscriptResult(
+        transcript_text=rendered_transcript,
+        source_type=source_type,
+        content_hash_sha256=content_hash,
+        char_count=char_count,
+        estimated_tokens=estimated_tokens,
+        retained_messages_count=retained_messages_count,
+        retained_tool_events_count=retained_tool_events_count,
+        omitted_system_messages_count=omitted_system_count,
+        omitted_sidecars_count=omitted_sidecars_count,
+        omitted_scaffolding_count=omitted_scaffolding_count,
+        omitted_orphan_tool_results_count=omitted_orphan_tool_results_count,
+        omitted_images_count=omissions["images"],
+        omitted_unsupported_blocks_count=omissions["unsupported"],
+        omissions_detail=tuple(omissions_detail),
+    )
+
+
+def _build_manifest_for_budget(
+    rendered: RenderedTranscriptResult,
+    *,
+    child_model: Optional[str] = None,
+    child_base_url: Optional[str] = None,
+    child_api_key: Optional[str] = None,
+    child_provider: Optional[str] = None,
+    task_override_tokens: Optional[int] = None,
+) -> SnapshotManifest:
+    """Build a SnapshotManifest checking the rendered transcript against task and window budget."""
+    from agent.model_metadata import get_model_context_length
+    from tools.delegate_tool_config import _get_inherit_max_tokens
 
     child_context_window = get_model_context_length(
         model=child_model or "",
@@ -451,40 +487,116 @@ def build_delegation_context_snapshot(
         provider=child_provider or "",
     )
 
-    # Reserve headroom for child system prompt, delegated task goal, tool schemas, and output generation.
-    # Reserve at least 25% of the window or 2,048 tokens, clamped so reserve never exceeds context window.
     reserve = min(child_context_window, max(2048, int(child_context_window * 0.25)))
-    # Window available for inherited context cannot exceed the window itself
     window_available = max(0, child_context_window - reserve)
 
-    configured_ceiling = config_override_tokens if config_override_tokens is not None else _get_inherit_max_tokens()
+    configured_ceiling = task_override_tokens if task_override_tokens is not None else _get_inherit_max_tokens()
     effective_budget = min(configured_ceiling, window_available)
 
-    if estimated_tokens > effective_budget:
+    if rendered.estimated_tokens > effective_budget:
         raise BudgetExceededError(
-            f"Inherited context approximate token estimate ({estimated_tokens}) exceeds effective token budget ({effective_budget} tokens; "
+            f"Inherited context approximate token estimate ({rendered.estimated_tokens}) exceeds effective token budget ({effective_budget} tokens; "
             f"configured ceiling={configured_ceiling}, child context window={child_context_window}, reserve={reserve}). Fails closed."
         )
 
-    manifest = SnapshotManifest(
+    snapshot_id = f"snap-{uuid.uuid4().hex[:12]}"
+    return SnapshotManifest(
         snapshot_id=snapshot_id,
-        source_type=source_type,
-        content_hash_sha256=content_hash,
-        char_count=char_count,
-        estimated_tokens=estimated_tokens,
+        source_type=rendered.source_type,
+        content_hash_sha256=rendered.content_hash_sha256,
+        char_count=rendered.char_count,
+        estimated_tokens=rendered.estimated_tokens,
         token_budget=effective_budget,
-        retained_messages_count=retained_messages_count,
-        retained_tool_events_count=retained_tool_events_count,
-        omitted_system_messages_count=omitted_system_count,
-        omitted_sidecars_count=omitted_sidecars_count,
-        omitted_scaffolding_count=omitted_scaffolding_count,
-        omitted_images_count=omissions["images"],
-        omitted_unsupported_blocks_count=omissions["unsupported"],
-        omitted_orphan_tool_results_count=omitted_orphan_tool_results_count,
-        omissions_detail=tuple(omissions_detail),
+        requested_budget=configured_ceiling,
+        effective_budget=effective_budget,
+        retained_messages_count=rendered.retained_messages_count,
+        retained_tool_events_count=rendered.retained_tool_events_count,
+        omitted_system_messages_count=rendered.omitted_system_messages_count,
+        omitted_sidecars_count=rendered.omitted_sidecars_count,
+        omitted_scaffolding_count=rendered.omitted_scaffolding_count,
+        omitted_images_count=rendered.omitted_images_count,
+        omitted_unsupported_blocks_count=rendered.omitted_unsupported_blocks_count,
+        omitted_orphan_tool_results_count=rendered.omitted_orphan_tool_results_count,
+        omissions_detail=rendered.omissions_detail,
     )
 
+
+def build_delegation_context_snapshot(
+    parent_agent: Any,
+    *,
+    child_model: Optional[str] = None,
+    child_base_url: Optional[str] = None,
+    child_api_key: Optional[str] = None,
+    child_provider: Optional[str] = None,
+    config_override_tokens: Optional[int] = None,
+) -> ContextSnapshot:
+    """Build an immutable, detached, provenance-labeled historical context snapshot.
+
+    Validates context presence, filters unresolved scaffolding, strips provider reasoning
+    sidecars and system prompts, computes token budgets with model context clamping,
+    and returns a ContextSnapshot ready to seed child execution.
+    """
+    rendered = _render_parent_transcript(parent_agent)
+    manifest = _build_manifest_for_budget(
+        rendered,
+        child_model=child_model,
+        child_base_url=child_base_url,
+        child_api_key=child_api_key,
+        child_provider=child_provider,
+        task_override_tokens=config_override_tokens,
+    )
     return ContextSnapshot(
         manifest=manifest,
-        rendered_transcript=rendered_transcript,
+        rendered_transcript=rendered.transcript_text,
     )
+
+
+def build_batch_context_snapshots(
+    parent_agent: Any,
+    task_inherit_contexts: List[bool],
+    task_inherit_max_tokens: List[Optional[int]],
+    *,
+    child_model: Optional[str] = None,
+    child_base_url: Optional[str] = None,
+    child_api_key: Optional[str] = None,
+    child_provider: Optional[str] = None,
+) -> List[Optional[ContextSnapshot]]:
+    """Build snapshots for every task in a batch, rendering the parent transcript ONCE.
+
+    If any task opting in to inheritance cannot fit its effective budget, raises
+    BudgetExceededError so the entire batch fails closed before spawning.
+    Tasks with inherit_context=False get None.
+    All inheriting tasks share the exact same immutable rendered_transcript string in memory.
+    """
+    if not any(task_inherit_contexts):
+        return [None] * len(task_inherit_contexts)
+
+    # 1. Render parent transcript ONCE for the entire batch
+    rendered = _render_parent_transcript(parent_agent)
+
+    # 2. Check each task's budget against the single rendered transcript.
+    # If ANY task fails budget, fail the whole batch!
+    task_manifests: List[Optional[SnapshotManifest]] = []
+    for i, should_inherit in enumerate(task_inherit_contexts):
+        if not should_inherit:
+            task_manifests.append(None)
+            continue
+        override_tok = task_inherit_max_tokens[i] if i < len(task_inherit_max_tokens) else None
+        manifest = _build_manifest_for_budget(
+            rendered,
+            child_model=child_model,
+            child_base_url=child_base_url,
+            child_api_key=child_api_key,
+            child_provider=child_provider,
+            task_override_tokens=override_tok,
+        )
+        task_manifests.append(manifest)
+
+    # 3. Create ContextSnapshot for each inheriting task sharing the rendered transcript text
+    snapshots: List[Optional[ContextSnapshot]] = []
+    for m in task_manifests:
+        if m is not None:
+            snapshots.append(ContextSnapshot(manifest=m, rendered_transcript=rendered.transcript_text))
+        else:
+            snapshots.append(None)
+    return snapshots
