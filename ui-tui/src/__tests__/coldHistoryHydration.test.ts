@@ -167,4 +167,52 @@ describe('Cold History Hydration Pipeline', () => {
     // Only called once, does not request page 2
     expect(request).toHaveBeenCalledTimes(1)
   })
+  it('hydrates complete multi-page conversation through mock RPC fixture and renders cleanly', async () => {
+    const stdout = new PassThrough()
+    let written = ''
+    stdout.on('data', chunk => { written += chunk.toString() })
+
+    const totalCount = 200
+    const allMessages = Array.from({ length: totalCount }, (_, i) => ({
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      text: `Message ${i + 1}: Content with emojis 🚀 and \`code_snippet_${i + 1}\``,
+      row_id: i + 1
+    }))
+
+    const request = vi.fn().mockImplementation((method, params) => {
+      const cursor = params.cursor ?? 0
+      const limit = params.limit ?? 100
+      const slice = allMessages.slice(cursor, cursor + limit)
+      return Promise.resolve({
+        messages: slice,
+        count: slice.length,
+        cursor,
+        next_cursor: cursor + slice.length,
+        total: totalCount,
+        snapshot_token: 'snap-complete-999',
+        has_more: cursor + slice.length < totalCount
+      })
+    })
+
+    const result = await performColdHistoryHydration({
+      gateway: { request },
+      sessionId: 'test-sess',
+      cols: 80,
+      theme: DEFAULT_THEME,
+      info: mockInfo,
+      stdout: stdout as any,
+      maxMounted: 100
+    })
+
+    expect(result.appendedToScrollback).toBe(true)
+    expect(result.materializedCount).toBe(100)
+    expect(result.initialLiveMessages.length).toBe(100)
+
+    // Banner and intro rendered at the start of static scrollback
+    expect(written).toContain('Message 1')
+    expect(written).toContain('Message 100')
+    expect(written).not.toContain('Message 101')
+    expect(result.initialLiveMessages[0]?.text).toContain('Message 101')
+    expect(result.initialLiveMessages[99]?.text).toContain('Message 200')
+  })
 })

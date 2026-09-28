@@ -239,43 +239,101 @@ export function applyPositionedHighlight(
   return true
 }
 
+const STYLE_SHIFT = 17
+const HYPERLINK_SHIFT = 2
+const HYPERLINK_MASK = 0x7fff
+const WIDTH_MASK = 3
+
 /**
  * Serialize a rendered Screen into ANSI-styled lines for static terminal output.
  */
 export function serializeScreenToAnsi(screen: Screen, pool?: StylePool): string {
   const p = pool || stylePool
   const lines: string[] = []
+
+  const cells = screen.cells
+  const charPool = screen.charPool
+  const hyperlinkPool = screen.hyperlinkPool
+  const hasDirectCells = Boolean(cells && charPool && hyperlinkPool)
+  const width = screen.width
+  const height = screen.height
+
   let currentStyles: AnsiCode[] = []
+  let currentStyleId: number = p ? p.none : -1
   let currentHyperlink: Hyperlink = undefined
 
-  for (let y = 0; y < screen.height; y++) {
+  for (let y = 0; y < height; y++) {
     let line = ''
-    for (let x = 0; x < screen.width; x++) {
-      const cell = cellAtIndex(screen, y * screen.width + x)
-      if (cell && cell.width !== CellWidth.SpacerTail) {
-        if (cell.hyperlink !== currentHyperlink) {
-          if (currentHyperlink !== undefined) line += LINK_END
-          if (cell.hyperlink !== undefined) line += oscLink(cell.hyperlink)
-          currentHyperlink = cell.hyperlink
+    const rowOffset = y * width
+
+    for (let x = 0; x < width; x++) {
+      let char: string
+      let styleId: number
+      let cellWidth: number
+      let hyperlink: Hyperlink
+
+      if (hasDirectCells) {
+        const ci = (rowOffset + x) << 1
+        const word1 = cells[ci + 1]!
+        cellWidth = word1 & WIDTH_MASK
+        if (cellWidth === CellWidth.SpacerTail) {
+          continue
         }
-        const cellStyles = p ? p.get(cell.styleId) : []
+        const hid = (word1 >>> HYPERLINK_SHIFT) & HYPERLINK_MASK
+        styleId = word1 >>> STYLE_SHIFT
+        char = charPool.get(cells[ci]!)
+        hyperlink = hid === 0 ? undefined : hyperlinkPool.get(hid)
+      } else {
+        const cell = cellAtIndex(screen, rowOffset + x)
+        if (!cell || cell.width === CellWidth.SpacerTail) {
+          continue
+        }
+        cellWidth = cell.width
+        styleId = cell.styleId
+        char = cell.char
+        hyperlink = cell.hyperlink
+      }
+
+      if (hyperlink !== currentHyperlink) {
+        if (currentHyperlink !== undefined) line += LINK_END
+        if (hyperlink !== undefined) line += oscLink(hyperlink)
+        currentHyperlink = hyperlink
+      }
+
+      if (p) {
+        if (styleId !== currentStyleId) {
+          line += p.transition(currentStyleId, styleId)
+          currentStyleId = styleId
+        }
+      } else {
+        const cellStyles = p ? (p as StylePool).get(styleId) : []
         const styleDiff = transitionAnsiCodes(currentStyles, cellStyles)
         if (styleDiff.length > 0) {
           line += ansiCodesToString(styleDiff)
           currentStyles = cellStyles
         }
-        line += cell.char
       }
+      line += char
     }
+
     if (currentHyperlink !== undefined) {
       line += LINK_END
       currentHyperlink = undefined
     }
-    const resetCodes = transitionAnsiCodes(currentStyles, [])
-    if (resetCodes.length > 0) {
-      line += ansiCodesToString(resetCodes)
-      currentStyles = []
+
+    if (p) {
+      if (currentStyleId !== p.none) {
+        line += p.transition(currentStyleId, p.none)
+        currentStyleId = p.none
+      }
+    } else {
+      const resetCodes = transitionAnsiCodes(currentStyles, [])
+      if (resetCodes.length > 0) {
+        line += ansiCodesToString(resetCodes)
+        currentStyles = []
+      }
     }
+
     lines.push(line.trimEnd())
   }
   return lines.join('\n')
