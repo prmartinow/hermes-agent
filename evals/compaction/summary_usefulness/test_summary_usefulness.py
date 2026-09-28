@@ -236,3 +236,63 @@ def test_production_accepted_state_evaluation_refused():
     assert score.unfinished_intent_retained is True
     assert score.decisions_retained == score.decisions_total
     assert score.usefulness_score >= 0.6
+
+
+def test_rubric_first_match_failed_approach_bug_fixed():
+    """Verify first-match failed approach bug fix: searches all occurrences so that a
+    non-failing initial mention does not mask a subsequent failure marker, and ambiguous
+    mentions without failure markers are flagged review_required with no semantic guarantee.
+    """
+    gt = MIGRATION_CASE_GROUND_TRUTH
+
+    # Case A: First occurrence has no failure marker, second occurrence has failure markers
+    summary_multi = (
+        "## Goal\n"
+        "Attempted pg_dump | psql pipeline streaming for accounts_v2.\n"
+        "## Blocked\n"
+        "pg_dump | psql was abandoned and failed due to bridge MTU socket error 104.\n"
+    )
+    score_multi = evaluate_summary(summary_multi, gt)
+    assert score_multi.failed_approaches_retained == 1
+    assert score_multi.failed_approach_score == 1.0
+
+    # Case B: Mentioned in ambiguous history with no failure markers -> flagged review_required
+    summary_ambig = (
+        "## Completed Actions\n"
+        "1. ran command involving pg_dump | psql.\n"
+    )
+    score_ambig = evaluate_summary(summary_ambig, gt)
+    assert score_ambig.failed_approaches_retained == 0
+    assert any("ambiguous history, review_required; no semantic guarantee" in n for n in score_ambig.diagnostic_notes)
+
+
+def test_rubric_ambiguous_historical_mention_no_active_contradiction_overclaim():
+    """Verify superseded historical mention active contradiction overclaim fix:
+    superseded facts in historical framing or with past-tense/historical cues (even containing
+    phrases like 'connect to') are marked review_required, NOT active contradictions.
+    """
+    gt = MIGRATION_CASE_GROUND_TRUTH
+
+    # Mentions superseded host and port with directive-like phrase 'connect to database server at'
+    # but framed in historical context with past cue 'initially planned to'
+    summary_historical = (
+        "## Background\n"
+        "Initially planned to connect to database server at pg-legacy-01.internal on port 5432.\n"
+        "## Constraints & Preferences\n"
+        "- ACTIVE TARGET: aurora-pg-prod.vpc-east.internal:5439\n"
+    )
+    score = evaluate_summary(summary_historical, gt)
+
+    # Must NOT be overclaimed as an active contradiction
+    assert score.contradiction_count == 0
+    assert score.contradiction_penalty == 0.0
+
+    # Must be marked review_required with explicit no semantic guarantee note
+    res_map = {c.superseded_fact: c for c in score.contradiction_results}
+    assert res_map["pg-legacy-01.internal"].verdict == "review_required"
+    assert res_map["pg-legacy-01.internal"].asserted_as_active is False
+    assert res_map["pg-legacy-01.internal"].review_required is True
+    assert res_map["5432"].verdict == "review_required"
+    assert res_map["5432"].asserted_as_active is False
+
+    assert any("mark ambiguous histories review_required, no semantic guarantee" in n for n in score.diagnostic_notes)

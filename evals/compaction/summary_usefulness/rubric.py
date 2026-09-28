@@ -8,10 +8,10 @@ Core principles:
 3. Metric scores are explicitly labeled as HEURISTIC PROXIES, NOT general semantic
    usefulness claims. Deterministic pattern checks cannot prove comprehension.
 4. Historical references to superseded parameters (e.g. in tool logs like
-   '[terminal] ran old-host...', dropped turns, or completed action logs) are marked
-   as `review_required`, NOT active contradictions, unless supported by an explicit
-   synthetic assertion directing active usage. The general semantic contradiction
-   verdict remains manual/LLM unknown.
+   '[terminal] ran old-host...', dropped turns, completed action logs, or past-tense/ambiguous
+   descriptions) are marked as `review_required`, NOT active contradictions, unless supported
+   by an explicit synthetic assertion directing active usage. The general semantic contradiction
+   verdict remains manual/LLM unknown with no semantic guarantee.
 """
 
 from __future__ import annotations
@@ -101,6 +101,54 @@ HISTORICAL_SECTIONS: List[str] = [
     "user messages",
     "previous summary snapshot",
     "errors & fixes",
+    "history",
+    "historical context",
+    "background",
+    "context",
+    "earlier turns",
+    "prior actions",
+    "execution log",
+]
+
+HISTORICAL_SECTION_KEYWORDS: List[str] = [
+    "historical",
+    "history",
+    "completed",
+    "dropped",
+    "previous",
+    "prior",
+    "earlier",
+    "past",
+    "log",
+    "logs",
+    "error",
+    "fix",
+    "background",
+    "context",
+    "archive",
+]
+
+HISTORICAL_CUES: List[str] = [
+    r"\binitially\b",
+    r"\bearlier\b",
+    r"\bpreviously\b",
+    r"\bprior\b",
+    r"\bformerly\b",
+    r"\bformer\b",
+    r"\bhistorical\b",
+    r"\bhistorically\b",
+    r"\battempted\b",
+    r"\bprobed\b",
+    r"\bwas\b",
+    r"\bwere\b",
+    r"\bold\b",
+    r"\bdeprecated\b",
+    r"\babandoned\b",
+    r"\bswitched\b",
+    r"\bcorrected\b",
+    r"\bpast\b",
+    r"\boriginal\b",
+    r"\boriginally\b",
 ]
 
 EXPLICIT_ASSERTION_PATTERNS: List[str] = [
@@ -115,8 +163,8 @@ EXPLICIT_ASSERTION_PATTERNS: List[str] = [
 
 
 def _get_current_markdown_section(text: str, pos: int) -> str:
-    """Find the markdown H2 heading preceding the given character index."""
-    matches = list(re.finditer(r"(?m)^##\s+(.+)$", text[:pos]))
+    """Find the markdown heading (H1-H6) preceding the given character index."""
+    matches = list(re.finditer(r"(?m)^#{1,6}\s+(.+)$", text[:pos]))
     if matches:
         return matches[-1].group(1).lower().strip()
     return ""
@@ -162,8 +210,9 @@ class SummaryUsefulnessRubric:
         # A superseded fact is penalizing ONLY IF it is explicitly asserted as an active instruction/target.
         #
         # If it is referenced in historical logs (e.g. "[terminal] ran old-host...", completed actions,
-        # dropped turns, quotes) without active assertion, it is labeled review_required (NOT an active
-        # contradiction). The general semantic contradiction verdict remains manual/LLM unknown.
+        # dropped turns, quotes) or with historical cues (initially, earlier, probed, legacy, etc.)
+        # without active assertion, it is labeled review_required (NOT an active contradiction).
+        # The general semantic contradiction verdict remains manual/LLM unknown (no semantic guarantee).
         contradiction_results: List[ContradictionResult] = []
         contradiction_count = 0
         review_required_count = 0
@@ -208,7 +257,8 @@ class SummaryUsefulnessRubric:
                 line = summary_lower[line_start:line_end].strip()
 
                 is_historical = (
-                    any(hs in section for hs in HISTORICAL_SECTIONS)
+                    any(kw in section for kw in HISTORICAL_SECTION_KEYWORDS)
+                    or any(hs in section for hs in HISTORICAL_SECTIONS)
                     or line.startswith(">")
                     or line.startswith("- user:")
                     or line.startswith("- assistant:")
@@ -218,6 +268,8 @@ class SummaryUsefulnessRubric:
                     or bool(re.search(r"^\d+\.\s*\[", line))
                     or bool(re.search(r"\bran\s+`", line))
                     or bool(re.search(r"\[terminal\]\s+ran\b", line))
+                    or any(re.search(pat, line) for pat in HISTORICAL_CUES)
+                    or any(re.search(pat, window) for pat in HISTORICAL_CUES)
                 )
 
                 # Check for explicit synthetic active directive
@@ -246,7 +298,8 @@ class SummaryUsefulnessRubric:
                 review_required_count += 1
                 notes.append(
                     f"Review required: Superseded fact '{s_fact}' referenced in historical/ambiguous context "
-                    f"without explicit active assertion or negation. Semantic contradiction verdict remains manual/LLM unknown."
+                    f"without explicit active assertion or negation. Semantic contradiction verdict remains manual/LLM unknown "
+                    f"(mark ambiguous histories review_required, no semantic guarantee)."
                 )
                 contradiction_results.append(ContradictionResult(
                     superseded_fact=s_fact,
@@ -300,18 +353,31 @@ class SummaryUsefulnessRubric:
             decision_score = dec_matches / len(self.key_decisions) if self.key_decisions else 1.0
 
         # 5. Failed approaches retention
+        # Searches all occurrences: if any occurrence is marked with failure markers,
+        # it is counted as captured. If mentioned without failure markers, it is noted
+        # as review_required (ambiguous history, no semantic guarantee).
         fail_matches = 0
         failure_markers = ["fail", "error", "blocked", "abandon", "rollback", "abort"]
         for fa in self.failed_approaches:
-            pos = summary_lower.find(fa.lower())
-            if pos != -1:
+            fa_lower = fa.lower()
+            positions = [m.start() for m in re.finditer(re.escape(fa_lower), summary_lower)]
+            if not positions:
+                continue
+            found_failure = False
+            for pos in positions:
                 w_start = max(0, pos - 100)
-                w_end = min(len(summary_text), pos + len(fa) + 100)
+                w_end = min(len(summary_text), pos + len(fa_lower) + 100)
                 w = summary_lower[w_start:w_end]
                 if any(m in w for m in failure_markers):
-                    fail_matches += 1
-                else:
-                    notes.append(f"Failed approach '{fa}' mentioned but NOT marked as failed/abandoned!")
+                    found_failure = True
+                    break
+            if found_failure:
+                fail_matches += 1
+            else:
+                notes.append(
+                    f"Failed approach '{fa}' mentioned but NOT marked as failed/abandoned "
+                    f"(ambiguous history, review_required; no semantic guarantee)."
+                )
         failed_approach_score = fail_matches / len(self.failed_approaches) if self.failed_approaches else 1.0
 
         # 6. Shrink ratio (tracked independently as an orthogonal metric!)
