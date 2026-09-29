@@ -297,3 +297,20 @@ def test_projection_sqlite_restored_json_string_representation():
     # CRITICAL INVARIANT: source message must remain 100% byte-identical
     assert messages == orig
     assert isinstance(messages[1]["reasoning_details"], str)  # Untouched JSON string
+def test_projection_gemini_openai_compat_does_not_receive_native_replay():
+    transport = get_transport("chat_completions")
+    profile = get_provider_profile("gemini")
+    messages = _make_fixture_messages()
+    original = copy.deepcopy(messages)
+
+    wire = transport.convert_messages(
+        messages,
+        model="gemini-3.8-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        provider_profile=profile,
+    )
+
+    assistant = wire[1]
+    assert "extra_content" not in assistant["tool_calls"][0]
+    assert "reasoning_details" not in assistant
+    assert messages == original

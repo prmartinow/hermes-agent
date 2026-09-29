@@ -305,11 +305,28 @@ def _destination_accepts_google_thought_replay(
         return False, False
 
     native_type = getattr(provider_profile, "native_reasoning_details_type", None)
-    is_gemini_profile = (native_type == "google.native_assistant")
+    if native_type == "google.native_assistant":
+        profile_name = getattr(provider_profile, "name", "")
+        route = base_url or getattr(provider_profile, "base_url", "")
 
-    if is_gemini_profile:
-        # Direct Gemini or Gemini OAuth route with verified circulation capability
-        return True, True
+        if profile_name in ("gemini-oauth", "gemini_oauth"):
+            from agent.gemini_cloudcode_adapter import is_cloudcode_pa_base_url
+            if is_cloudcode_pa_base_url(route):
+                return True, True
+            return False, False
+
+        if profile_name == "gemini":
+            from agent.gemini_native_adapter import is_native_gemini_base_url
+            if is_native_gemini_base_url(route):
+                return True, True
+            # Google /openai compatibility endpoint is NOT verified native replay
+            return False, False
+
+        from agent.gemini_cloudcode_adapter import is_cloudcode_pa_base_url
+        from agent.gemini_native_adapter import is_native_gemini_base_url
+        if is_cloudcode_pa_base_url(route) or is_native_gemini_base_url(route):
+            return True, True
+        return False, False
 
     if _route_replays_reasoning_details(base_url):
         # OpenRouter / Nous aggregator route: allows tool-call signature sidecar,
@@ -529,13 +546,11 @@ class ChatCompletionsTransport(ProviderTransport):
         )
         strip_extra_content = not allow_sig
 
-        profile_native_type = getattr(provider_profile, "native_reasoning_details_type", None) or None
+        authorized_native_type = "google.native_assistant" if allow_carrier else None
         replays_reasoning = _route_replays_reasoning_details(base_url)
 
-        strip_reasoning_details = not (profile_native_type or replays_reasoning)
-        effective_native_type = "google.native_assistant" if allow_carrier else (
-            profile_native_type if not (profile_native_type and profile_native_type == "google.native_assistant") else None
-        )
+        strip_reasoning_details = not (authorized_native_type or replays_reasoning)
+        effective_native_type = authorized_native_type
 
         sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning_details, effective_native_type))
                            for m in messages]
