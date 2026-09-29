@@ -387,6 +387,7 @@ def test_build_gemini_contents_non_destructive_invariant():
 # ============================================================================
 
 def test_native_id_association_with_function_response():
+    # Case 1: native FC has ID -> functionResponse echoes native ID
     carrier = build_google_native_carrier(
         [{"functionCall": {"name": "calc", "args": {"x": 1}, "id": "native_fc_id_999"}, "thoughtSignature": "sig"}],
         source_model="gemini-3.8-flash-tiered",
@@ -407,12 +408,77 @@ def test_native_id_association_with_function_response():
         },
     ]
 
+    orig = copy.deepcopy(messages)
     contents, _ = _build_gemini_contents(messages, include_tool_call_ids=True, model="gemini-3.8-flash-tiered")
     assert len(contents) == 3
     tool_resp_part = contents[2]["parts"][0]
     assert "functionResponse" in tool_resp_part
     assert tool_resp_part["functionResponse"]["name"] == "calc"
     assert tool_resp_part["functionResponse"]["id"] == "native_fc_id_999"
+    assert messages == orig
+
+
+def test_native_fc_lacks_id_function_response_omits_id():
+    # Case 2: native FC has NO ID, generic tool call has synthetic ID
+    # Invariant: native functionCall remains ID-less, and functionResponse deliberately OMITS id!
+    carrier = build_google_native_carrier(
+        [{"functionCall": {"name": "calc", "args": {"x": 1}}, "thoughtSignature": "sig"}],
+        source_model="gemini-3.8-flash-tiered",
+    )
+    messages = [
+        {"role": "user", "content": "calc"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call_synthetic_123", "type": "function", "function": {"name": "calc", "arguments": '{"x": 1}'}}],
+            "reasoning_details": [carrier],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_synthetic_123",
+            "name": "calc",
+            "content": '{"result": 2}',
+        },
+    ]
+
+    orig = copy.deepcopy(messages)
+    contents, _ = _build_gemini_contents(messages, include_tool_call_ids=True, model="gemini-3.8-flash-tiered")
+    assert len(contents) == 3
+
+    # Model part remains ID-less (exact native replay)
+    model_part = contents[1]["parts"][0]
+    assert "id" not in model_part["functionCall"]
+
+    # Tool response part deliberately omits id (no invented id!)
+    tool_resp_part = contents[2]["parts"][0]
+    assert "functionResponse" in tool_resp_part
+    assert tool_resp_part["functionResponse"]["name"] == "calc"
+    assert "id" not in tool_resp_part["functionResponse"]
+
+    # Source messages remain completely unchanged
+    assert messages == orig
+
+
+def test_generic_fallback_without_carrier_preserves_generic_ids():
+    # Case 3: generic fallback (no carrier) preserves generic IDs
+    messages = [
+        {"role": "user", "content": "calc"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call_gen_777", "type": "function", "function": {"name": "calc", "arguments": '{"x": 1}'}}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_gen_777",
+            "name": "calc",
+            "content": '{"result": 2}',
+        },
+    ]
+
+    contents, _ = _build_gemini_contents(messages, include_tool_call_ids=True, model="gemini-3.8-flash-tiered")
+    assert contents[1]["parts"][0]["functionCall"]["id"] == "call_gen_777"
+    assert contents[2]["parts"][0]["functionResponse"]["id"] == "call_gen_777"
 
 
 # ============================================================================

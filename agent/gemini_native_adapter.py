@@ -759,7 +759,12 @@ def _looks_like_json_schema(node: Any) -> bool:
 
 
 def _translate_tool_result_to_gemini(
-    message: Dict[str, Any], tool_name_by_call_id: Optional[Dict[str, str]] = None, include_ids: bool = False, *, is_gemini3: bool = False,
+    message: Dict[str, Any],
+    tool_name_by_call_id: Optional[Dict[str, str]] = None,
+    include_ids: bool = False,
+    *,
+    is_gemini3: bool = False,
+    tool_response_id_by_call_id: Optional[Dict[str, Optional[str]]] = None,
 ) -> Dict[str, Any]:
     tool_call_id = str(message.get("tool_call_id") or "")
     # functionResponse.name must echo the matching functionCall.name, so the call-id
@@ -777,7 +782,12 @@ def _translate_tool_result_to_gemini(
     # output for an MCP tool) must therefore be forwarded as opaque text, not as a structured response.
     structured = isinstance(parsed, dict) and not _looks_like_json_schema(parsed)
     function_response: Dict[str, Any] = {"name": name, "response": parsed if structured else {"output": content}}
-    if include_ids and tool_call_id:
+    if tool_response_id_by_call_id is not None and tool_call_id in tool_response_id_by_call_id:
+        override_id = tool_response_id_by_call_id[tool_call_id]
+        if override_id:
+            function_response["id"] = override_id
+        # When override_id is None (native FC had no ID), deliberately omit function_response["id"]!
+    elif include_ids and tool_call_id:
         function_response["id"] = tool_call_id
     # Gemini 3.x accepts images inside functionResponse.parts; 2.x rejects the field.
     if image_parts := [p for p in _extract_multimodal_parts(raw_content) if "inlineData" in p] if is_gemini3 else []:
@@ -793,6 +803,7 @@ def _build_gemini_contents(
     system_text_parts: List[str] = []
     contents: List[Dict[str, Any]] = []
     tool_name_by_call_id: Dict[str, str] = {}
+    tool_response_id_by_call_id: Dict[str, Optional[str]] = {}
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -813,6 +824,7 @@ def _build_gemini_contents(
                             tool_name_by_call_id=tool_name_by_call_id,
                             include_ids=include_tool_call_ids,
                             is_gemini3=gemini_requires_tool_call_ids(model),
+                            tool_response_id_by_call_id=tool_response_id_by_call_id,
                         )
                     ],
                 }
@@ -830,21 +842,18 @@ def _build_gemini_contents(
             if carrier:
                 # 4.1 Exact Native Replay Path: authoritative ordered native Parts
                 native_parts = copy.deepcopy(carrier["content"]["parts"])
+                native_fc_parts = [p["functionCall"] for p in native_parts if isinstance(p, dict) and "functionCall" in p]
                 generic_tool_calls = msg.get("tool_calls") or []
                 if isinstance(generic_tool_calls, list):
-                    for tc in generic_tool_calls:
+                    for tc, native_fc in zip(generic_tool_calls, native_fc_parts):
                         if isinstance(tc, dict):
-                            tc_id = str(tc.get("id") or tc.get("call_id") or "")
+                            tc_id = str(tc.get("id") or tc.get("call_id") or "").strip()
                             tc_name = str(((tc.get("function") or {}).get("name") or tc.get("name") or ""))
                             if tc_id and tc_name:
                                 tool_name_by_call_id[tc_id] = tc_name
-                for p in native_parts:
-                    fc = p.get("functionCall")
-                    if isinstance(fc, dict):
-                        fc_id = str(fc.get("id") or "")
-                        fc_name = str(fc.get("name") or "")
-                        if fc_id and fc_name:
-                            tool_name_by_call_id[fc_id] = fc_name
+                            if tc_id and isinstance(native_fc, dict):
+                                native_id = str(native_fc.get("id") or "").strip()
+                                tool_response_id_by_call_id[tc_id] = native_id if native_id else None
                 if native_parts:
                     contents.append({"role": "model", "parts": native_parts})
                 continue
