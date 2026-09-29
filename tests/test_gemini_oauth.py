@@ -540,6 +540,7 @@ def test_fetch_gemini_available_models_and_caching():
     from hermes_cli.auth import (
         fetch_gemini_available_models,
         get_gemini_model_display_names,
+        get_gemini_model_efforts,
         _GEMINI_MODELS_CACHE,
     )
 
@@ -560,6 +561,7 @@ def test_fetch_gemini_available_models_and_caching():
         "models": {
             "gemini-3.6-flash-high": {"displayName": "Gemini 3.6 Flash (High)"},
             "gemini-3.6-flash-medium": {"displayName": "Gemini 3.6 Flash (Medium)"},
+            "gemini-3.6-flash-low": {"displayName": "Gemini 3.6 Flash (Low)"},
             "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6 (Thinking)"},
             "chat_internal": {"displayName": None},
             "tab_helper": {},
@@ -573,15 +575,25 @@ def test_fetch_gemini_available_models_and_caching():
 
         _GEMINI_MODELS_CACHE.clear()
         models = fetch_gemini_available_models(account=1, force=True)
-        assert "gemini-3.6-flash-high" in models
+        # Deduplicates multiple wire tiers into single canonical base model
+        assert models.count("gemini-3.6-flash") == 1
         assert "claude-sonnet-4-6" in models
         assert "chat_internal" not in models
         assert "tab_helper" not in models
 
         # Check display names
         dnames = get_gemini_model_display_names(account=1)
-        assert dnames["gemini-3.6-flash-high"] == "Gemini 3.6 Flash (High)"
+        assert dnames["gemini-3.6-flash"] == "Gemini 3.6 Flash"
         assert dnames["claude-sonnet-4-6"] == "Claude Sonnet 4.6 (Thinking)"
+
+        # Check efforts
+        efforts = get_gemini_model_efforts(account=1)
+        assert efforts["gemini-3.6-flash"] == ("low", "medium", "high")
+
+        # Two non-forced calls should perform exactly 1 HTTP fetch
+        models_cached = fetch_gemini_available_models(account=1, force=False)
+        assert models_cached == models
+        assert mock_post.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -589,11 +601,12 @@ def test_fetch_gemini_available_models_and_caching():
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_gemini_38_flash_tiered_dynamic_expansion():
-    """Verify gemini-3.8-flash-tiered with supportsThinking=True is dynamically expanded into 3 virtual tiers."""
+def test_fetch_gemini_canonical_base_normalization_and_efforts():
+    """Verify discovery normalizes wire tiers into canonical base models with aggregated effort envelopes."""
     from hermes_cli.auth import (
         fetch_gemini_available_models,
         get_gemini_model_display_names,
+        get_gemini_model_efforts,
         _GEMINI_MODELS_CACHE,
     )
 
@@ -624,10 +637,40 @@ def test_fetch_gemini_38_flash_tiered_dynamic_expansion():
                 "thinkingBudget": -1,
                 "maxOutputTokens": 65536,
             },
+            "gemini-3.6-flash-high": {
+                "displayName": "Gemini 3.6 Flash (High)",
+                "supportsThinking": True,
+                "thinkingBudget": -1,
+            },
+            "gemini-3.6-flash-medium": {
+                "displayName": "Gemini 3.6 Flash (Medium)",
+                "supportsThinking": True,
+                "thinkingBudget": 4000,
+            },
+            "gemini-3.6-flash-low": {
+                "displayName": "Gemini 3.6 Flash (Low)",
+                "supportsThinking": True,
+                "thinkingBudget": 1000,
+            },
+            "gemini-3.1-pro-high": {
+                "displayName": "Gemini 3.1 Pro (High)",
+                "supportsThinking": True,
+                "thinkingBudget": 10001,
+            },
+            "gemini-3.1-pro-low": {
+                "displayName": "Gemini 3.1 Pro (Low)",
+                "supportsThinking": True,
+                "thinkingBudget": 1001,
+            },
             "claude-opus-4-6-thinking": {
                 "displayName": "Claude Opus 4.6 (Thinking)",
                 "supportsThinking": True,
                 "thinkingBudget": 4096,
+            },
+            "gpt-oss-120b-medium": {
+                "displayName": "GPT-OSS 120B (Medium)",
+                "supportsThinking": True,
+                "thinkingBudget": 8192,
             },
             "chat_internal": {"displayName": None},
         },
@@ -641,26 +684,45 @@ def test_fetch_gemini_38_flash_tiered_dynamic_expansion():
         _GEMINI_MODELS_CACHE.clear()
         models = fetch_gemini_available_models(account=1, force=True)
 
-        # Assert 3.8 virtual tiers are generated
-        assert "gemini-3.8-flash-high" in models
-        assert "gemini-3.8-flash-medium" in models
-        assert "gemini-3.8-flash-low" in models
+        # 1. Canonical base models present exactly once
+        assert models.count("gemini-3.8-flash") == 1
+        assert models.count("gemini-3.7-flash") == 1
+        assert models.count("gemini-3.6-flash") == 1
+        assert models.count("gemini-3.1-pro") == 1
+        assert models.count("gpt-oss-120b-medium") == 1
+        assert models.count("claude-opus-4-6-thinking") == 1
 
-        # Assert 3.7 virtual tiers are generated
-        assert "gemini-3.7-flash-high" in models
-        assert "gemini-3.7-flash-medium" in models
-        assert "gemini-3.7-flash-low" in models
+        # 2. Virtual and wire tiers must NOT be present
+        for uncanonical in [
+            "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low", "gemini-3.8-flash-tiered",
+            "gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low", "gemini-3.7-flash-tiered",
+            "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low",
+            "gemini-3.1-pro-high", "gemini-3.1-pro-low",
+            "chat_internal",
+        ]:
+            assert uncanonical not in models
 
-        assert "claude-opus-4-6-thinking" in models
-        assert "chat_internal" not in models
+        # 3. Preserves agentModelSorts recommended order at prefix
+        assert models[:3] == ["gemini-3.8-flash", "gemini-3.7-flash", "claude-opus-4-6-thinking"]
 
-        # Check display names
+        # 4. Canonical display names (effort removed from base labels)
         dnames = get_gemini_model_display_names(account=1)
-        assert dnames["gemini-3.8-flash-high"] == "Gemini 3.8 Flash (High)"
-        assert dnames["gemini-3.8-flash-medium"] == "Gemini 3.8 Flash (Medium)"
-        assert dnames["gemini-3.8-flash-low"] == "Gemini 3.8 Flash (Low)"
-        assert dnames["gemini-3.7-flash-high"] == "Gemini 3.7 Flash (High)"
+        assert dnames["gemini-3.8-flash"] == "Gemini 3.8 Flash"
+        assert dnames["gemini-3.7-flash"] == "Gemini 3.7 Flash"
+        assert dnames["gemini-3.6-flash"] == "Gemini 3.6 Flash"
+        assert dnames["gemini-3.1-pro"] == "Gemini 3.1 Pro"
         assert dnames["claude-opus-4-6-thinking"] == "Claude Opus 4.6 (Thinking)"
+        assert dnames["gpt-oss-120b-medium"] == "GPT-OSS 120B (Medium)"
+
+        # 5. Model effort capabilities
+        efforts = get_gemini_model_efforts(account=1)
+        assert efforts["gemini-3.8-flash"] == ("low", "medium", "high")
+        assert efforts["gemini-3.7-flash"] == ("low", "medium", "high")
+        assert efforts["gemini-3.6-flash"] == ("low", "medium", "high")
+        assert efforts["gemini-3.1-pro"] == ("low", "high")
+        assert efforts["gpt-oss-120b-medium"] == ()
+        assert efforts["claude-opus-4-6-thinking"] == ()
+
 
 
 def test_resolve_cloudcode_model_and_effort_gemini_38():

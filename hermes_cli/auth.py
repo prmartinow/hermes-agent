@@ -1101,7 +1101,7 @@ _GEMINI_QUOTA_CACHE: Dict[str, tuple[float, Dict[str, Any]]] = {}
 _GEMINI_QUOTA_CACHE_TTL = 30.0  # seconds
 _GEMINI_QUOTA_CACHE_LOCK = threading.Lock()
 
-_GEMINI_MODELS_CACHE: Dict[str, tuple[float, list[str], Dict[str, str]]] = {}
+_GEMINI_MODELS_CACHE: Dict[str, tuple[float, list[str], Dict[str, str], Dict[str, tuple[str, ...]]]] = {}
 _GEMINI_MODELS_CACHE_TTL = 600.0  # 10 minutes cache TTL for live models
 _GEMINI_MODELS_CACHE_LOCK = threading.Lock()
 
@@ -1359,24 +1359,6 @@ def format_gemini_user_facing_slug(model_id: str, raw_display_name: str = "") ->
     return (" ".join(cap_words) + tier_str).strip()
 
 
-def _expand_model_tier_slugs(mid_str: str, minfo: dict) -> list[tuple[str, str]]:
-    """Return list of (slug, display_name) for a model entry, expanding tiered models matching FetchTieredModels in agy."""
-    supports_thinking = bool(minfo.get("supportsThinking", False))
-    budget = minfo.get("thinkingBudget", 0)
-    dname = minfo.get("displayName") or ""
-
-    if supports_thinking and budget == -1 and mid_str.endswith("-tiered"):
-        base_slug = mid_str[:-7]
-        results = []
-        for eff in ("high", "medium", "low"):
-            v_slug = f"{base_slug}-{eff}"
-            v_dname = format_gemini_user_facing_slug(v_slug)
-            results.append((v_slug, v_dname))
-        return results
-
-    return [(mid_str, dname or format_gemini_user_facing_slug(mid_str, dname))]
-
-
 def fetch_gemini_available_models(
     account: Any = 1,
     *,
@@ -1391,15 +1373,17 @@ def fetch_gemini_available_models(
     if not force:
         with _GEMINI_MODELS_CACHE_LOCK:
             if cache_key in _GEMINI_MODELS_CACHE:
-                cached_time, model_ids, _ = _GEMINI_MODELS_CACHE[cache_key]
-                if now - cached_time < _GEMINI_MODELS_CACHE_TTL:
-                    return list(model_ids)
+                cached_entry = _GEMINI_MODELS_CACHE[cache_key]
+                if now - cached_entry[0] < _GEMINI_MODELS_CACHE_TTL:
+                    return list(cached_entry[1])
 
     try:
         creds = resolve_gemini_oauth_runtime_credentials(acc_idx, refresh_if_expiring=True)
         access_token = creds.get("api_key") or creds.get("access_token")
         if access_token:
             from agent.gemini_cloudcode_adapter import get_antigravity_user_agent
+            from agent.gemini_cloudcode_models import normalize_discovered_model, get_model_capability
+
             resp = httpx.post(
                 f"{DEFAULT_GEMINI_OAUTH_BASE_URL}:fetchAvailableModels",
                 headers={
@@ -1418,16 +1402,39 @@ def fetch_gemini_available_models(
                 ordered_ids: list[str] = []
                 seen_ids: set[str] = set()
                 display_names: Dict[str, str] = {}
+                efforts_by_model: Dict[str, set[str]] = {}
 
                 def _add_model_entry(mid_raw: str, minfo: dict) -> None:
                     mid_clean = str(mid_raw).strip()
-                    if not mid_clean or mid_clean.startswith(("tab_", "chat_", "models/")) or "image" in mid_clean:
+                    mid_lower = mid_clean.lower()
+                    if not mid_clean or mid_lower.startswith(("tab_", "chat_", "models/")) or "image" in mid_lower:
                         return
-                    for slug, dname in _expand_model_tier_slugs(mid_clean, minfo):
-                        if slug not in seen_ids:
-                            ordered_ids.append(slug)
-                            seen_ids.add(slug)
-                            display_names[slug] = dname
+
+                    discovered = normalize_discovered_model(mid_clean, minfo)
+                    base = discovered.base_model
+                    if not base:
+                        return
+
+                    # Aggregate discovered effort capabilities
+                    if base not in efforts_by_model:
+                        efforts_by_model[base] = set()
+                    efforts_by_model[base].update(discovered.available_efforts)
+
+                    # Deduplicate into ordered_ids: first occurrence establishes rank/order
+                    if base not in seen_ids:
+                        ordered_ids.append(base)
+                        seen_ids.add(base)
+
+                        if discovered.canonicalized:
+                            cap = get_model_capability(base)
+                            display_names[base] = cap.display_name if cap else format_gemini_user_facing_slug(base)
+                        else:
+                            dname = minfo.get("displayName") or ""
+                            display_names[base] = (
+                                dname.strip()
+                                if (dname and dname.strip() != mid_clean)
+                                else format_gemini_user_facing_slug(mid_clean, dname)
+                            )
 
                 # 1. Prioritize recommended/agent sort models in order directly from Google API
                 for sort_group in sorts:
@@ -1442,9 +1449,18 @@ def fetch_gemini_available_models(
                     if isinstance(minfo, dict):
                         _add_model_entry(str(mid).strip(), minfo)
 
+                # Sort efforts according to canonical capability order, fallback to sorted
+                final_efforts: Dict[str, tuple[str, ...]] = {}
+                for base, eff_set in efforts_by_model.items():
+                    cap = get_model_capability(base)
+                    if cap and cap.efforts:
+                        final_efforts[base] = tuple(e for e in cap.efforts if e in eff_set)
+                    else:
+                        final_efforts[base] = tuple(sorted(eff_set))
+
                 if ordered_ids:
                     with _GEMINI_MODELS_CACHE_LOCK:
-                        _GEMINI_MODELS_CACHE[cache_key] = (now, ordered_ids, display_names)
+                        _GEMINI_MODELS_CACHE[cache_key] = (now, ordered_ids, display_names, final_efforts)
                     return list(ordered_ids)
     except Exception as exc:
         logger.debug("Failed to fetch available Gemini models for account %s: %s", acc_idx, exc)
@@ -1466,6 +1482,20 @@ def get_gemini_model_display_names(account: Any = 1) -> Dict[str, str]:
     with _GEMINI_MODELS_CACHE_LOCK:
         if cache_key in _GEMINI_MODELS_CACHE:
             return dict(_GEMINI_MODELS_CACHE[cache_key][2])
+    return {}
+
+
+def get_gemini_model_efforts(account: Any = 1) -> Dict[str, tuple[str, ...]]:
+    """Return dictionary mapping base model_id -> supported efforts tuple."""
+    acc_idx = _normalize_gemini_account_id(account)
+    cache_key = f"acc_{acc_idx}"
+    with _GEMINI_MODELS_CACHE_LOCK:
+        if cache_key in _GEMINI_MODELS_CACHE:
+            return dict(_GEMINI_MODELS_CACHE[cache_key][3])
+    fetch_gemini_available_models(acc_idx)
+    with _GEMINI_MODELS_CACHE_LOCK:
+        if cache_key in _GEMINI_MODELS_CACHE:
+            return dict(_GEMINI_MODELS_CACHE[cache_key][3])
     return {}
 
 

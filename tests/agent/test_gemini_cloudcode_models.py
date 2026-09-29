@@ -286,3 +286,93 @@ def test_model_for_base_effort_fails_closed_on_missing_route():
         with pytest.raises(RuntimeError) as exc_info:
             model_for_base_effort("broken-model", "high")
         assert "Cloud Code model registry has no route for 'broken-model' effort 'high'" in str(exc_info.value)
+# ============================================================================
+# I. Milestone 2: Catalog Discovery Normalization Tests
+# ============================================================================
+
+from agent.gemini_cloudcode_models import DiscoveredModel, normalize_discovered_model
+
+
+def test_normalize_discovered_model_dynamic_tiered():
+    meta = {"supportsThinking": True, "thinkingBudget": -1}
+    res_38 = normalize_discovered_model("gemini-3.8-flash-tiered", meta)
+    assert res_38 == DiscoveredModel(
+        raw_model="gemini-3.8-flash-tiered",
+        base_model="gemini-3.8-flash",
+        available_efforts=("low", "medium", "high"),
+        canonicalized=True,
+    )
+
+    res_37 = normalize_discovered_model("gemini-3.7-flash-tiered", meta)
+    assert res_37 == DiscoveredModel(
+        raw_model="gemini-3.7-flash-tiered",
+        base_model="gemini-3.7-flash",
+        available_efforts=("low", "medium", "high"),
+        canonicalized=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "model_id, expected_base, expected_eff",
+    [
+        ("gemini-3.6-flash-high", "gemini-3.6-flash", "high"),
+        ("gemini-3.6-flash-medium", "gemini-3.6-flash", "medium"),
+        ("gemini-3.6-flash-low", "gemini-3.6-flash", "low"),
+        ("gemini-3.1-pro-high", "gemini-3.1-pro", "high"),
+        ("gemini-3.1-pro-low", "gemini-3.1-pro", "low"),
+    ],
+)
+def test_normalize_discovered_model_static_tiers(model_id, expected_base, expected_eff):
+    res = normalize_discovered_model(model_id, {})
+    assert res == DiscoveredModel(
+        raw_model=model_id,
+        base_model=expected_base,
+        available_efforts=(expected_eff,),
+        canonicalized=True,
+    )
+
+
+def test_normalize_discovered_model_passthroughs_and_future_models():
+    # Known partner models remain uncanonicalized
+    res_claude = normalize_discovered_model("claude-sonnet-4-6", {})
+    assert res_claude == DiscoveredModel(
+        raw_model="claude-sonnet-4-6",
+        base_model="claude-sonnet-4-6",
+        available_efforts=(),
+        canonicalized=False,
+    )
+
+    res_gpt = normalize_discovered_model("gpt-oss-120b-medium", {"supportsThinking": True})
+    assert res_gpt == DiscoveredModel(
+        raw_model="gpt-oss-120b-medium",
+        base_model="gpt-oss-120b-medium",
+        available_efforts=(),
+        canonicalized=False,
+    )
+
+    # Unverified legacy strings pass through verbatim
+    res_35 = normalize_discovered_model("gemini-3.5-flash-extra-low", {})
+    assert res_35 == DiscoveredModel(
+        raw_model="gemini-3.5-flash-extra-low",
+        base_model="gemini-3.5-flash-extra-low",
+        available_efforts=(),
+        canonicalized=False,
+    )
+
+    # Vendor models with slashes pass through verbatim
+    res_vendor = normalize_discovered_model("vendor/model-high", {})
+    assert res_vendor == DiscoveredModel(
+        raw_model="vendor/model-high",
+        base_model="vendor/model-high",
+        available_efforts=(),
+        canonicalized=False,
+    )
+
+    # Fail-closed future-tiered model: must NOT strip -tiered if base is not in capability registry
+    res_future = normalize_discovered_model("gemini-4.2-ultra-tiered", {"supportsThinking": True, "thinkingBudget": -1})
+    assert res_future == DiscoveredModel(
+        raw_model="gemini-4.2-ultra-tiered",
+        base_model="gemini-4.2-ultra-tiered",
+        available_efforts=(),
+        canonicalized=False,
+    )

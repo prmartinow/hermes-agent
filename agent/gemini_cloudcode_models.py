@@ -419,3 +419,78 @@ def resolve_model_selection(
         selected_effort,
         explicit=is_explicit,
     )
+@dataclass(frozen=True)
+class DiscoveredModel:
+    """Normalized result of an upstream Google Cloud Code PA catalog discovery record."""
+    raw_model: str
+    base_model: str
+    available_efforts: tuple[str, ...]
+    canonicalized: bool
+
+
+def normalize_discovered_model(
+    model_id: str,
+    metadata: Mapping[str, Any] | None = None,
+) -> DiscoveredModel:
+    """Normalize raw upstream Google Cloud Code PA model record into canonical base model and efforts.
+
+    Enforces the closure invariant: discovery must never emit a canonical base that
+    model_for_base_effort() cannot resolve.
+    """
+    minfo = metadata or {}
+    mid_clean = _strip_model_prefix(model_id)
+    if not mid_clean:
+        return DiscoveredModel(raw_model="", base_model="", available_efforts=(), canonicalized=False)
+
+    supports_thinking = bool(minfo.get("supportsThinking", False))
+    thinking_budget = minfo.get("thinkingBudget", 0)
+
+    # 1. Dynamic Tiered Models (e.g. gemini-3.8-flash-tiered, gemini-3.7-flash-tiered)
+    # Fail-closed future-model rule: do NOT strip -tiered unless the resulting base exists in registry
+    if mid_clean.endswith("-tiered") and supports_thinking and thinking_budget == -1:
+        base_candidate = mid_clean[:-7]
+        cap = get_model_capability(base_candidate)
+        if cap is not None:
+            return DiscoveredModel(
+                raw_model=mid_clean,
+                base_model=base_candidate,
+                available_efforts=cap.efforts,
+                canonicalized=True,
+            )
+        # Unregistered tiered model (e.g. gemini-4.2-ultra-tiered): fail-closed passthrough
+        return DiscoveredModel(
+            raw_model=mid_clean,
+            base_model=mid_clean,
+            available_efforts=(),
+            canonicalized=False,
+        )
+
+    # 2. Static Tiered Models (e.g. gemini-3.6-flash-high, gemini-3.1-pro-high)
+    if mid_clean in LEGACY_MODEL_ALIASES:
+        base, eff = LEGACY_MODEL_ALIASES[mid_clean]
+        cap = get_model_capability(base)
+        if cap is not None and eff in cap.efforts:
+            return DiscoveredModel(
+                raw_model=mid_clean,
+                base_model=base,
+                available_efforts=(eff,),
+                canonicalized=True,
+            )
+
+    # 3. Known Base Models (e.g. claude-sonnet-4-6, gpt-oss-120b-medium, gemini-3.1-flash-lite)
+    cap = get_model_capability(mid_clean)
+    if cap is not None:
+        return DiscoveredModel(
+            raw_model=mid_clean,
+            base_model=mid_clean,
+            available_efforts=cap.efforts,
+            canonicalized=False,
+        )
+
+    # 4. Unknown, custom vendor models (e.g. vendor/custom-model, unverified legacy strings)
+    return DiscoveredModel(
+        raw_model=mid_clean,
+        base_model=mid_clean,
+        available_efforts=(),
+        canonicalized=False,
+    )
