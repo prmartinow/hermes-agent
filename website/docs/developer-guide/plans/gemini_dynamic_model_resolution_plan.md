@@ -102,19 +102,19 @@ The system enforces strict decoupling between **Model Identity** and **Reasoning
 
 The test suite enforces mathematical closure across all four layers:
 
-1. **Resolver Unit Suite** (`tests/agent/test_gemini_cloudcode_models.py` — 83 tests):
+1. **Resolver Unit Suite** (`tests/agent/test_gemini_cloudcode_models.py`):
    - Contract verification for `parse_model_slug`, `model_for_base_effort`, and `efforts_for_base`.
    - Backward compatibility for every entry in `LEGACY_MODEL_ALIASES`.
    - Prefix stripping across Gemini vendor namespaces (`gemini/`, `google/`, `gemini-oauth/`), while intentionally preserving unrelated vendor-qualified namespaces (such as `anthropic/`) without mutation.
    - Fallback catalog canonical invariant: asserts no legacy aliases exist in `profile.fallback_models`.
    - Static wire route uniqueness invariant: guarantees injective wire mapping.
 
-2. **Discovery & Provider Suite** (`tests/test_gemini_oauth.py` — 53 tests):
+2. **Discovery & Provider Suite** (`tests/test_gemini_oauth.py`):
    - Discovery aggregation of dynamic and static wire tiers into base models.
    - Discovery-to-resolver closure property: verifies that every discovered base and effort resolves to a valid upstream wire model.
    - Provider catalog fallthrough on network error and empty discovery responses.
 
-3. **Adapter & Integration Suite** (`tests/agent/test_gemini_cloudcode_adapter.py` — 72 tests):
+3. **Adapter & Integration Suite** (`tests/agent/test_gemini_cloudcode_adapter.py`):
    - 11-case generation and `count_tokens` route parity matrix (`3.8`, `3.7`, `3.6`, `3.1-pro`).
    - Full wire equivalence closure across all legacy aliases.
    - End-to-end transport seam tests verifying `ChatCompletionsTransport` + `GeminiOAuthProfile` interaction.
