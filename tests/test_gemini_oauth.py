@@ -1115,10 +1115,16 @@ def test_thought_signature_attachment_and_stripping():
         },
     }
 
-    # Case A: Gemini target model without explicit thought signature -> attaches skip sentinel
+    # Case A: Gemini target model without explicit thought signature -> remains unsigned (no blanket sentinel)
     gemini_part = _translate_tool_call_to_gemini(tool_call, model="gemini-3.7-flash-tiered")
-    assert gemini_part.get("thoughtSignature") == "skip_thought_signature_validator"
+    assert gemini_part.get("thoughtSignature") is None
     assert "thoughtSignature" not in gemini_part.get("functionCall", {})
+
+    # Case A2: Explicit thought_signature passed from turn-level projection policy
+    gemini_part_explicit = _translate_tool_call_to_gemini(
+        tool_call, model="gemini-3.7-flash-tiered", thought_signature="skip_thought_signature_validator"
+    )
+    assert gemini_part_explicit.get("thoughtSignature") == "skip_thought_signature_validator"
 
     # Case B: Gemini target with explicit signature in extra_content -> preserves signature
     tool_call_with_sig = dict(tool_call)

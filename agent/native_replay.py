@@ -199,3 +199,143 @@ class GoogleNativeStreamAccumulator:
             source_model=source_model,
             role=self.role,
         )
+from enum import Enum
+
+
+class GoogleSignatureKind(str, Enum):
+    REAL = "real"
+    BYPASS = "bypass"
+    MISSING = "missing"
+
+
+GOOGLE_SIGNATURE_BYPASS = "skip_thought_signature_validator"
+
+
+def classify_google_signature(sig: Any) -> GoogleSignatureKind:
+    """Classify a thought signature string into REAL, BYPASS, or MISSING.
+
+    None, empty string, or whitespace-only is MISSING.
+    The exact literal 'skip_thought_signature_validator' is BYPASS.
+    Any other non-empty opaque string is REAL.
+    """
+    if not isinstance(sig, str):
+        return GoogleSignatureKind.MISSING
+    s = sig.strip()
+    if not s:
+        return GoogleSignatureKind.MISSING
+    if s == GOOGLE_SIGNATURE_BYPASS:
+        return GoogleSignatureKind.BYPASS
+    return GoogleSignatureKind.REAL
+
+
+def usable_google_native_carrier(
+    message: Dict[str, Any],
+    *,
+    target_model: str,
+) -> Optional[Dict[str, Any]]:
+    """Determine whether an assistant message carries an applicable Google native carrier.
+
+    Fails closed (returns None) unless:
+    1. A carrier with type='google.native_assistant' and version=1 exists.
+    2. content is a dict with role='model' and parts is a list of dicts.
+    3. The carrier's source_model has thought_circulation_support == True.
+    4. The target_model has thought_circulation_support == True.
+    5. Semantic applicability guard passes:
+       - Visible text in carrier parts (ignoring thought=True, functionCall, signature-only)
+         matches message['content'].
+       - Function calls in carrier parts match message['tool_calls'] in count, order,
+         function name, deserialized JSON arguments, and non-empty IDs.
+    """
+    if not isinstance(message, dict):
+        return None
+
+    from agent.gemini_cloudcode_models import thought_circulation_support
+
+    # Target model must support thought circulation
+    if thought_circulation_support(target_model) is not True:
+        return None
+
+    raw_details = message.get("reasoning_details")
+    carrier = find_native_assistant_detail(raw_details, GOOGLE_NATIVE_ASSISTANT_TYPE)
+    if not carrier or not isinstance(carrier, dict):
+        return None
+
+    if carrier.get("version") != CURRENT_NATIVE_CARRIER_VERSION:
+        return None
+
+    source_model = carrier.get("source_model")
+    if not source_model or thought_circulation_support(str(source_model)) is not True:
+        return None
+
+    content_obj = carrier.get("content")
+    if not isinstance(content_obj, dict) or content_obj.get("role") != "model":
+        return None
+
+    parts = content_obj.get("parts")
+    if not isinstance(parts, list):
+        return None
+
+    # Semantic applicability guard:
+    # 1. Compare visible text
+    carrier_visible_pieces = []
+    carrier_fc_parts = []
+    for p in parts:
+        if not isinstance(p, dict):
+            return None
+        if "functionCall" in p:
+            carrier_fc_parts.append(p["functionCall"])
+            continue
+        if p.get("thought") is True:
+            continue
+        text_val = p.get("text")
+        if isinstance(text_val, str) and text_val:
+            carrier_visible_pieces.append(text_val)
+
+    carrier_visible_text = "".join(carrier_visible_pieces)
+    msg_content = message.get("content")
+    msg_visible_text = str(msg_content or "") if msg_content is not None else ""
+
+    if carrier_visible_text.strip() != msg_visible_text.strip():
+        # Visible content mismatch -> carrier is stale
+        return None
+
+    # 2. Compare tool calls
+    msg_tool_calls = message.get("tool_calls") or []
+    if not isinstance(msg_tool_calls, list):
+        msg_tool_calls = []
+
+    if len(carrier_fc_parts) != len(msg_tool_calls):
+        return None
+
+    for idx, (carrier_fc, generic_tc) in enumerate(zip(carrier_fc_parts, msg_tool_calls)):
+        if not isinstance(carrier_fc, dict) or not isinstance(generic_tc, dict):
+            return None
+
+        # Compare function name
+        c_name = str(carrier_fc.get("name") or "")
+        g_fn = generic_tc.get("function") if isinstance(generic_tc.get("function"), dict) else {}
+        g_name = str(g_fn.get("name") or generic_tc.get("name") or "")
+        if c_name != g_name:
+            return None
+
+        # Compare arguments structurally (deserialized JSON)
+        c_args = carrier_fc.get("args") or {}
+        g_args_raw = g_fn.get("arguments") or generic_tc.get("arguments") or "{}"
+        if isinstance(g_args_raw, str):
+            try:
+                g_args = json.loads(g_args_raw)
+            except Exception:
+                g_args = g_args_raw
+        else:
+            g_args = g_args_raw
+
+        if c_args != g_args:
+            return None
+
+        # Compare non-empty IDs if both present
+        c_id = str(carrier_fc.get("id") or "").strip()
+        g_id = str(generic_tc.get("id") or generic_tc.get("call_id") or "").strip()
+        if c_id and g_id and c_id != g_id:
+            return None
+
+    return carrier

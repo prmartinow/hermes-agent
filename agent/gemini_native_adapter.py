@@ -15,6 +15,7 @@ OpenAI-compat layer entirely.
 """
 
 from __future__ import annotations
+import copy
 
 import asyncio
 import base64
@@ -714,6 +715,7 @@ def _translate_tool_call_to_gemini(
     tool_call: Dict[str, Any],
     include_ids: bool = False,
     model: str = "",
+    thought_signature: Optional[str] = None,
 ) -> Dict[str, Any]:
     fn = tool_call.get("function") or {}
     args_raw = fn.get("arguments") or {}
@@ -731,21 +733,17 @@ def _translate_tool_call_to_gemini(
         }
     }
     if include_ids:
-        # Gemini 3+ requires explicit tool call IDs so replayed parallel tool
-        # calls pair with their functionResponses (earendil-works/pi#7494).
         tool_call_id = str(tool_call.get("id") or tool_call.get("call_id") or "")
         if tool_call_id:
             part["functionCall"]["id"] = tool_call_id
 
-    # Cryptographic thought signature handling:
-    # 1. Non-Gemini partner models (claude-sonnet-4-6, claude-opus-4-6-thinking, gpt-oss-120b-medium):
-    #    Strictly STRIP thoughtSignature to prevent HTTP 400 rejection by Google's Cloud Code PA proxy.
-    # 2. Gemini models:
-    #    Attach thoughtSignature if present in extra_content/tool_call; if missing or compacted,
-    #    attach fallback "skip_thought_signature_validator".
     if is_gemini_model(model):
-        thought_signature = _tool_call_extra_signature(tool_call) or "skip_thought_signature_validator"
-        part["thoughtSignature"] = thought_signature
+        if thought_signature is not None:
+            part["thoughtSignature"] = thought_signature
+        else:
+            sig = _tool_call_extra_signature(tool_call)
+            if sig:
+                part["thoughtSignature"] = sig
 
     return part
 
@@ -819,6 +817,80 @@ def _build_gemini_contents(
                     ],
                 }
             )
+            continue
+
+        if role == "assistant" and is_gemini_model(model):
+            from agent.native_replay import (
+                usable_google_native_carrier,
+                classify_google_signature,
+                GoogleSignatureKind,
+                GOOGLE_SIGNATURE_BYPASS,
+            )
+            carrier = usable_google_native_carrier(msg, target_model=model)
+            if carrier:
+                # 4.1 Exact Native Replay Path: authoritative ordered native Parts
+                native_parts = copy.deepcopy(carrier["content"]["parts"])
+                generic_tool_calls = msg.get("tool_calls") or []
+                if isinstance(generic_tool_calls, list):
+                    for tc in generic_tool_calls:
+                        if isinstance(tc, dict):
+                            tc_id = str(tc.get("id") or tc.get("call_id") or "")
+                            tc_name = str(((tc.get("function") or {}).get("name") or tc.get("name") or ""))
+                            if tc_id and tc_name:
+                                tool_name_by_call_id[tc_id] = tc_name
+                for p in native_parts:
+                    fc = p.get("functionCall")
+                    if isinstance(fc, dict):
+                        fc_id = str(fc.get("id") or "")
+                        fc_name = str(fc.get("name") or "")
+                        if fc_id and fc_name:
+                            tool_name_by_call_id[fc_id] = fc_name
+                if native_parts:
+                    contents.append({"role": "model", "parts": native_parts})
+                continue
+
+            # Generic Gemini Fallback Path (carrier absent or stale)
+            parts: List[Dict[str, Any]] = []
+            content_parts = _extract_multimodal_parts(msg.get("content"))
+            parts.extend(content_parts)
+
+            tool_calls = msg.get("tool_calls") or []
+            if isinstance(tool_calls, list) and tool_calls:
+                classified = []
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        sig_val = _tool_call_extra_signature(tc)
+                        kind = classify_google_signature(sig_val)
+                        classified.append((tc, sig_val, kind))
+
+                group_has_real = any(kind == GoogleSignatureKind.REAL for _, _, kind in classified)
+
+                for tc, sig_val, kind in classified:
+                    tool_call_id = str(tc.get("id") or tc.get("call_id") or "")
+                    tool_name = str(((tc.get("function") or {}).get("name") or tc.get("name") or ""))
+                    if tool_call_id and tool_name:
+                        tool_name_by_call_id[tool_call_id] = tool_name
+
+                    if group_has_real:
+                        # Gemini native parallel group where carrier was lost (e.g. compaction):
+                        # REAL -> emit exact signature; BYPASS -> emit bypass; MISSING -> remain unsigned!
+                        sig_to_emit = sig_val if kind in (GoogleSignatureKind.REAL, GoogleSignatureKind.BYPASS) else None
+                    else:
+                        # Foreign unsigned tool group (Claude / GPT-OSS or completely unsigned history):
+                        # MISSING -> synthesize bypass sentinel on wire copy only!
+                        # BYPASS -> emit existing bypass sentinel.
+                        sig_to_emit = GOOGLE_SIGNATURE_BYPASS if kind == GoogleSignatureKind.MISSING else sig_val
+
+                    parts.append(
+                        _translate_tool_call_to_gemini(
+                            tc,
+                            include_ids=include_tool_call_ids,
+                            model=model,
+                            thought_signature=sig_to_emit,
+                        )
+                    )
+            if parts:
+                contents.append({"role": "model", "parts": parts})
             continue
 
         gemini_role = "model" if role == "assistant" else "user"
