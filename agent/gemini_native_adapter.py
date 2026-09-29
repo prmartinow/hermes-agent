@@ -1220,13 +1220,23 @@ def translate_gemini_response(resp: Dict[str, Any], model: str) -> SimpleNamespa
         ),
     )
     reasoning = "".join(reasoning_pieces) or None
+    native_carrier = None
+    if isinstance(parts, list) and parts:
+        from agent.native_replay import build_google_native_carrier
+        native_carrier = build_google_native_carrier(
+            parts=parts,
+            source_model=model,
+            role=str(content_obj.get("role") or "model"),
+        )
+    reasoning_details = [native_carrier] if native_carrier else None
+
     message = SimpleNamespace(
         role="assistant",
         content="".join(text_pieces) if text_pieces else None,
         tool_calls=tool_calls or None,
         reasoning=reasoning,
         reasoning_content=reasoning,
-        reasoning_details=None,
+        reasoning_details=reasoning_details,
     )
     choice = SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
     return SimpleNamespace(

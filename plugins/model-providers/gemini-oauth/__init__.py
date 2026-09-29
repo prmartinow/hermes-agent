@@ -65,6 +65,7 @@ gemini_oauth = GeminiOAuthProfile(
     supports_health_check=False,
     default_max_tokens=65536,
     default_aux_model="gemini-3.6-flash-low",
+    native_reasoning_details_type="google.native_assistant",
     fallback_models=(
         "gemini-3.8-flash",
         "gemini-3.7-flash",
