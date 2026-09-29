@@ -85,48 +85,11 @@ def is_cloudcode_pa_base_url(base_url: str) -> bool:
 
 
 def resolve_cloudcode_model_and_effort(model: str, effort: Optional[str] = None) -> str:
-    """Resolve model slug and reasoning effort matching Antigravity CLI logic."""
-    bare = bare_gemini_model_id(model).strip()
-    if not bare:
-        return "gemini-3.7-flash-tiered"
-
-    import re
-    # Dynamic tiered models (Gemini 3.7, 3.8, and future >= 3.7) route to -tiered on the wire
-    m_dynamic = re.match(r"^gemini-(?:3\.(?:[7-9]|\d{2,})|[4-9]\.\d+)-flash(?:-(high|medium|low|tiered))?$", bare)
-    if m_dynamic:
-        v_match = re.search(r"gemini-(\d+\.\d+)-flash", bare)
-        v = v_match.group(1) if v_match else "3.7"
-        return f"gemini-{v}-flash-tiered"
-
-    if bare in ("gemini-3.7", "gemini-3.7-thinking"):
-        return "gemini-3.7-flash-tiered"
-    if bare in ("gemini-3.8", "gemini-3.8-thinking"):
-        return "gemini-3.8-flash-tiered"
-
-    # If the slug already has an explicit effort tier or specific model ID, preserve as-is
-    if any(bare.endswith(f"-{eff}") for eff in ("high", "medium", "low", "extra-low", "tiered")):
-        return bare
-    if bare in (
-        "claude-sonnet-4-6",
-        "claude-opus-4-6-thinking",
-        "gemini-3-flash-agent",
-        "gemini-pro-agent",
-        "gpt-oss-120b-medium",
-    ):
-        return bare
-
-    eff = (effort or "").strip().lower() or "high"
-    if eff not in ("high", "medium", "low"):
-        eff = "high"
-
-    if bare in ("gemini-3.6-flash", "gemini-3.6-flash-thinking", "gemini-3.6"):
-        return f"gemini-3.6-flash-{eff}"
-    if bare in ("gemini-3.5-flash", "gemini-3.5"):
-        return f"gemini-3.5-flash-{eff}"
-    if bare in ("gemini-3.1-pro", "gemini-3.1"):
-        return "gemini-3.1-pro-low" if eff == "low" else "gemini-3.1-pro-high"
-
-    return bare
+    """Resolve model slug and reasoning effort matching canonical Cloud Code resolver."""
+    from agent.gemini_cloudcode_models import resolve_model_selection
+    bare = bare_gemini_model_id(model).strip() or "gemini-3.7-flash"
+    resolved = resolve_model_selection(bare, effort)
+    return resolved.wire_model
 
 
 class GeminiCloudCodeClient:
@@ -194,10 +157,95 @@ class GeminiCloudCodeClient:
         except StopIteration:
             return True, None
 
-    def _map_model_id(self, model: str, extra_body: Optional[Dict[str, Any]] = None) -> str:
-        """Extract and resolve wire model ID from model string and optional effort."""
-        effort = extra_body.get("effort") if isinstance(extra_body, dict) else None
-        return resolve_cloudcode_model_and_effort(model, effort=effort)
+    def _extract_cloudcode_reasoning_inputs(
+        self,
+        extra_body: Optional[Dict[str, Any]],
+        kwargs: Dict[str, Any],
+    ) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
+        """Extract normalized effort and optional caller-specified thinking_config."""
+        from agent.gemini_cloudcode_models import EffortUnsupportedError
+
+        extra = extra_body if isinstance(extra_body, dict) else {}
+        scalar_effort = (
+            extra.get("effort")
+            or extra.get("reasoning_effort")
+            or kwargs.get("effort")
+            or kwargs.get("reasoning_effort")
+        )
+        thinking_config = (
+            extra.get("thinking_config")
+            or extra.get("thinkingConfig")
+            or kwargs.get("thinking_config")
+            or kwargs.get("thinkingConfig")
+        )
+
+        eff_str = str(scalar_effort).strip().lower() if scalar_effort is not None else None
+
+        # Inspect explicit thinking_config for thinkingLevel and validate against scalar effort
+        if isinstance(thinking_config, dict):
+            level = thinking_config.get("thinkingLevel")
+            if level is not None:
+                level_str = str(level).strip().lower()
+                if eff_str is not None and eff_str != "none" and eff_str != level_str:
+                    raise EffortUnsupportedError(
+                        f"Conflicting effort {eff_str!r} and thinkingLevel {level_str!r}"
+                    )
+                if eff_str is None:
+                    eff_str = level_str
+
+        if eff_str == "none":
+            return "none", {"includeThoughts": False}
+
+        return eff_str, thinking_config if isinstance(thinking_config, dict) else None
+
+    def _resolve_model_route(
+        self,
+        model: str,
+        extra_body: Optional[Dict[str, Any]] = None,
+        kwargs: Optional[Dict[str, Any]] = None,
+    ) -> tuple[Any, Optional[Dict[str, Any]]]:
+        """Resolve model and effort atomically into ResolvedModel and effective thinkingConfig."""
+        from agent.gemini_cloudcode_models import resolve_model_selection
+
+        kw = kwargs or {}
+        effort, caller_thinking = self._extract_cloudcode_reasoning_inputs(extra_body, kw)
+        bare = bare_gemini_model_id(model).strip() or "gemini-3.7-flash"
+
+        if effort == "none":
+            resolved = resolve_model_selection(bare, effort=None)
+            return resolved, {"includeThoughts": False}
+
+        is_claude = "claude" in bare.lower()
+        if is_claude:
+            # Preserve existing Claude adapter budget handling until Claude effort registry is formalized
+            resolved = resolve_model_selection(bare, effort=None)
+        else:
+            resolved = resolve_model_selection(bare, effort=effort)
+
+        if caller_thinking is not None:
+            effective_thinking = dict(caller_thinking)
+            if "thinkingLevel" in effective_thinking and "includeThoughts" not in effective_thinking:
+                effective_thinking["includeThoughts"] = True
+        else:
+            effective_thinking = resolved.thinking_config
+
+        # Claude partner thinking budget fallback if not handled in registry
+        bare_mapped = bare_gemini_model_id(resolved.wire_model).strip().lower()
+        if "claude" in bare_mapped and effective_thinking is None and ("thinking" in bare_mapped or effort):
+            budget_map = {"minimal": 1024, "low": 1024, "medium": 4096, "high": 16384, "max": 24576, "ultra": 32768}
+            effective_thinking = {"thinkingBudget": budget_map.get(effort or "high", 4096), "includeThoughts": True}
+
+        return resolved, effective_thinking
+
+    def _map_model_id(
+        self,
+        model: str,
+        extra_body: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Extract and resolve wire model ID from model string and effort."""
+        resolved, _ = self._resolve_model_route(model, extra_body, kwargs)
+        return resolved.wire_model
 
     def _create_chat_completion(
         self,
@@ -215,54 +263,14 @@ class GeminiCloudCodeClient:
         timeout: Any = None,
         **kwargs: Any,
     ) -> Any:
-        thinking_config = None
-        effort = None
         media_resolution = None
         if isinstance(extra_body, dict):
-            thinking_config = extra_body.get("thinking_config") or extra_body.get("thinkingConfig")
-            effort = extra_body.get("effort") or extra_body.get("reasoning_effort")
             media_resolution = extra_body.get("media_resolution") or extra_body.get("mediaResolution")
-
         if not media_resolution:
             media_resolution = kwargs.get("media_resolution") or kwargs.get("mediaResolution")
 
-        if not effort:
-            effort = kwargs.get("effort") or kwargs.get("reasoning_effort")
-        if not thinking_config:
-            thinking_config = kwargs.get("thinking_config") or kwargs.get("thinkingConfig")
-
-        bare = bare_gemini_model_id(model).strip()
-        if not effort:
-            for eff in ("high", "medium", "low", "extra-low", "none"):
-                if bare.endswith(f"-{eff}"):
-                    effort = "low" if eff == "extra-low" else eff
-                    break
-
-        if not thinking_config:
-            import re
-            is_dynamic_gemini = (
-                bool(re.match(r"^gemini-(?:3\.(?:[7-9]|\d{2,})|[4-9]\.\d+)-flash", bare))
-                or bare in ("gemini-3.7", "gemini-3.7-thinking", "gemini-3.8", "gemini-3.8-thinking")
-            )
-            if is_dynamic_gemini:
-                eff_val = (effort or "high").strip().lower()
-                if eff_val == "none":
-                    thinking_config = {"includeThoughts": False}
-                elif eff_val in ("low", "minimal"):
-                    thinking_config = {"thinkingLevel": "low", "includeThoughts": True}
-                elif eff_val in ("medium",):
-                    thinking_config = {"thinkingLevel": "medium", "includeThoughts": True}
-                else:
-                    thinking_config = {"thinkingLevel": "high", "includeThoughts": True}
-            elif "claude" in bare and ("thinking" in bare or effort):
-                eff_val = (effort or "high").strip().lower()
-                if eff_val == "none":
-                    thinking_config = {"includeThoughts": False}
-                else:
-                    budget_map = {"minimal": 1024, "low": 1024, "medium": 4096, "high": 16384, "max": 24576, "ultra": 32768}
-                    thinking_config = {"thinkingBudget": budget_map.get(eff_val, 4096), "includeThoughts": True}
-
-        mapped_model = self._map_model_id(model, extra_body)
+        resolved_model, thinking_config = self._resolve_model_route(model, extra_body, kwargs)
+        mapped_model = resolved_model.wire_model
         bare_mapped = bare_gemini_model_id(mapped_model).strip().lower()
 
         effective_max_tokens = _effective_gemini_max_output_tokens(
@@ -342,10 +350,14 @@ class GeminiCloudCodeClient:
         system_instruction: Any = None,
         tools: Any = None,
         timeout: Any = None,
+        effort: Optional[str] = None,
         **kwargs: Any,
     ) -> int:
         """Call Cloud Code PA :countTokens endpoint to get exact token count."""
-        mapped_model = self._map_model_id(model)
+        call_kwargs = dict(kwargs)
+        if effort is not None:
+            call_kwargs["effort"] = effort
+        mapped_model = self._map_model_id(model, kwargs.get("extra_body"), **call_kwargs)
         target_contents = contents if contents is not None else messages
         req_payload: Dict[str, Any] = {}
 
@@ -522,6 +534,7 @@ class AsyncGeminiCloudCodeClient:
         system_instruction: Any = None,
         tools: Any = None,
         timeout: Any = None,
+        effort: Optional[str] = None,
         **kwargs: Any,
     ) -> int:
         """Async wrapper over GeminiCloudCodeClient.count_tokens."""
@@ -533,6 +546,7 @@ class AsyncGeminiCloudCodeClient:
             system_instruction=system_instruction,
             tools=tools,
             timeout=timeout,
+            effort=effort,
             **kwargs,
         )
 
@@ -560,6 +574,7 @@ class _AsyncGeminiCloudCodeChatNamespace:
         system_instruction: Any = None,
         tools: Any = None,
         timeout: Any = None,
+        effort: Optional[str] = None,
         **kwargs: Any,
     ) -> int:
         return await self._client.count_tokens(
@@ -569,6 +584,7 @@ class _AsyncGeminiCloudCodeChatNamespace:
             system_instruction=system_instruction,
             tools=tools,
             timeout=timeout,
+            effort=effort,
             **kwargs,
         )
 

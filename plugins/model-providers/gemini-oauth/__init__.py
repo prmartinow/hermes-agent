@@ -22,6 +22,34 @@ class GeminiOAuthProfile(ProviderProfile):
         """Gemini Cloud Code PA routes reasoning level via model ID rather than extra_body."""
         return {}
 
+    def build_api_kwargs_extras(
+        self,
+        *,
+        reasoning_config: dict[str, Any] | None = None,
+        model: str | None = None,
+        **context: Any,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Forward selected reasoning effort into private Cloud Code adapter extra_body."""
+        if not reasoning_config or not reasoning_config.get("enabled", True):
+            return {}, {}
+
+        from agent.gemini_cloudcode_models import parse_model_slug, get_model_capability
+
+        clean_model = model or ""
+        parsed = parse_model_slug(clean_model)
+        if parsed.legacy_alias:
+            return {}, {}
+
+        cap = get_model_capability(parsed.base_model)
+        if cap is None or not cap.efforts:
+            return {}, {}
+
+        effort = str(reasoning_config.get("effort") or "").strip().lower()
+        if not effort or effort == "none":
+            return {}, {}
+
+        return {"effort": effort}, {}
+
 
 gemini_oauth = GeminiOAuthProfile(
     name="gemini-oauth",
