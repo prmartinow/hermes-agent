@@ -400,3 +400,38 @@ def test_bare_registered_model_reports_empty_efforts_unless_wire_established():
     assert result.base_model == "gemini-3.8-flash"
     assert result.available_efforts == ()
     assert result.canonicalized is False
+# ============================================================================
+# J. Milestone 4: Fallback Catalog Invariants & Wire Route Uniqueness
+# ============================================================================
+
+def test_gemini_oauth_fallback_models_are_canonical_bases():
+    from providers import get_provider_profile
+    profile = get_provider_profile("gemini-oauth")
+    assert profile is not None
+    # All fallback models must be canonical base identities, never legacy aliases
+    for model in profile.fallback_models:
+        assert not parse_model_slug(model).legacy_alias, f"Fallback model '{model}' is a legacy alias!"
+
+    assert "gemini-3.8-flash" in profile.fallback_models
+    assert "gemini-3.7-flash" in profile.fallback_models
+    assert "gemini-3.6-flash" in profile.fallback_models
+    assert "gemini-3.1-pro" in profile.fallback_models
+
+    for virtual_suffix in ("-high", "-medium", "-low", "-tiered"):
+        for base in ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.1-pro"):
+            assert f"{base}{virtual_suffix}" not in profile.fallback_models
+
+
+def test_static_wire_model_routes_uniqueness():
+    from agent.gemini_cloudcode_models import _STATIC_WIRE_MODEL_ROUTES
+    seen = {}
+    for base, cap in _MODEL_CAPABILITIES.items():
+        if base in ("gemini-3.8-flash", "gemini-3.7-flash"):
+            continue
+        for effort, route in cap.routes.items():
+            if route.wire_model == base or not effort:
+                continue
+            if route.wire_model in seen:
+                assert seen[route.wire_model] == (base, effort), f"Collision on static wire model {route.wire_model}"
+            seen[route.wire_model] = (base, effort)
+    assert seen == _STATIC_WIRE_MODEL_ROUTES

@@ -1,164 +1,121 @@
-# Dynamic Model Resolution & Display Name Architecture Plan
+# Canonical Model Resolution & Discovery Architecture Plan
 
-**Document Path**: `docs/plans/gemini_dynamic_model_resolution_plan.md`  
-**Specification Reference**: `docs/concepts/antigravity-architecture-and-model-resolution.md` & `agy-binaly/docs/MODEL_DISPLAY_RESOLUTION.md`  
-**Status**: Approved for Implementation  
-
----
-
-## 1. Executive Summary & Problem Statement
-
-This implementation plan establishes full behavioral and wire-level alignment between Hermes Agent's Google Gemini OAuth capability (`gemini-oauth`) and Google's production Antigravity CLI Go binary (`agy` v1.1.25, compiled from `google3/third_party/jetski`).
-
-### The Core Problem
-1. **Catalog Drop on Null `displayName`**: Google Cloud Code PA returns newly released dynamic models (e.g. `gemini-3.8-flash-tiered`) with `displayName: null`, `supportsThinking: true`, and `thinkingBudget: -1`. Hermes Agent previously discarded any model without an explicit `displayName` (`hermes_cli/auth.py`), preventing newly deployed Google models from appearing in the UI without a manual codebase patch.
-2. **Hardcoded Model Version Checks**: Model resolution and wire routing relied on version-specific filters (e.g. `bare.startswith("gemini-3.7-flash")`), which prevented `gemini-3.8-flash` from routing to its required wire target (`gemini-3.8-flash-tiered`) and resulted in upstream HTTP 404 errors.
-3. **Missing Dynamic Tier Expansion**: Google returns tiered models as a single endpoint (`-tiered`). The Antigravity CLI expands each dynamic tiered model into three user-facing options (`-high`, `-medium`, `-low`) with corresponding reasoning effort levels. Hermes Agent previously lacked this automated expansion mechanism.
+**Document Path**: `website/docs/developer-guide/plans/gemini_dynamic_model_resolution_plan.md`
+**Specification Reference**: `agent/gemini_cloudcode_models.py` & Google AGY Binary (`v1.2.13`)
+**Status**: Implemented & Verified on `dev`
 
 ---
 
-## 2. Architecture Comparison
+## 1. Executive Summary & Problem Resolution
 
-| Architectural Dimension | Google AGY CLI Binary (`v1.1.25`) | Hermes Agent (Prior State) | Target Hermes Architecture |
+This architecture establishes full behavioral, semantic, and wire-level alignment between Hermes Agent's Google Gemini OAuth provider (`gemini-oauth`) and Google's production Antigravity CLI Go binary (`agy` v1.2.13, reverse-engineered from `google3/third_party/jetski`).
+
+### The Historical Architectural Deficiencies (P0)
+1. **Virtual-Slug Leakage**: Previously, tiered Google models were expanded into synthesized virtual slugs (`gemini-3.8-flash-high`, `gemini-3.8-flash-medium`, `gemini-3.8-flash-low`) directly in discovery. This leaked transport-level concepts into model identity, polluted fallback rosters, and corrupted session-level model persistence.
+2. **Dual Reasoning Resolvers**: Model resolution and thinking configuration were computed in separate disconnected functions (`resolve_cloudcode_model_and_effort` and `_build_gemini_thinking_config`), risking configuration drift between generation and token accounting (`countTokens`).
+3. **Lossy Discovery**: Dynamic models returning `displayName: null` were either dropped or expanded into fragmented artificial rows rather than aggregating supported effort tiers under the canonical base model.
+4. **Catalog Drop on Failure**: If live model fetching failed or returned empty results, the catalog resolver returned an empty list rather than falling through to curated profile fallback models.
+
+---
+
+## 2. Canonical `(base_model, effort)` Architecture
+
+The system enforces strict decoupling between **Model Identity** and **Reasoning Effort**:
+
+```
+[Inbound Model Selection]
+  │  Accepts: canonical base ('gemini-3.8-flash') OR legacy alias ('gemini-3.8-flash-high')
+  ▼
+[Canonical Resolver: agent/gemini_cloudcode_models.py]
+  │  parse_model_slug(input) ──► (base_model, effort, is_legacy_alias)
+  │  Validates effort against model capability envelope (efforts_for_base)
+  │  Fail-closed on unsupported efforts (EffortUnsupportedError)
+  ▼
+[Resolved Model Route: ResolvedModel]
+  ├── wire_model: Target Google Cloud Code PA slug (e.g. 'gemini-3.8-flash-tiered')
+  └── thinking_config: Structured payload {'thinkingLevel': effort, 'includeThoughts': True}
+  ▼
+[Transport & Adapter Execution]
+  ├── chat.completions.create: Sends wire_model + generationConfig.thinkingConfig
+  └── count_tokens: Dispatches exact same resolved wire_model to :countTokens endpoint
+```
+
+---
+
+## 3. Inbound vs Outbound Asymmetry & Discovery Isolation
+
+| Dimension | Inbound (User / Client Input) | Outbound (Google Cloud Code PA Wire) | Discovery Catalog (`hermes_cli/auth.py`) |
 |---|---|---|---|
-| **Missing `displayName`** | Dynamically synthesizes title from slug when `displayName` is `null` | Filtered out models where `displayName` was `null` | Synthesizes human-readable title dynamically for all valid models |
-| **Tier Expansion** | Automatically expands `thinkingBudget: -1` into `-high`, `-medium`, `-low` | Relied on static hardcoded model catalogs | Dynamically spawns `-high`, `-medium`, `-low` virtual options |
-| **Version Generalization** | Matches all `gemini-3.*` / `supportsThinking` models generically | Hardcoded `startswith("gemini-3.7-flash")` checks | Generic regex matching for all `gemini-3.*` and future tiered versions |
-| **Wire Target Mapping** | Maps all effort tiers back to `-tiered` on the wire | Sent unmapped bare slugs, triggering HTTP 404 | Translates virtual tier slugs to `-tiered` in Cloud Code PA requests |
-| **Reasoning Configuration** | Maps effort to `thinkingLevel` or `thinkingBudget` (`-1`/`4000`/`1000`) | Manual configuration per turn | Automatically attaches `thinkingLevel` (`high`/`medium`/`low`) from slug |
+| **Model Identity** | Canonical base (`gemini-3.8-flash`) or legacy alias (`gemini-3.8-flash-high`) | Exact Google wire model (`gemini-3.8-flash-tiered`) | Canonical base only (`gemini-3.8-flash`) |
+| **Reasoning Effort** | Expressed via session `reasoning_config` or legacy slug suffix | Transmitted in `generationConfig.thinkingConfig.thinkingLevel` | Stored in capability map `get_gemini_model_efforts()[base]` |
+| **Virtual Slugs** | Accepted for 100% backward compatibility | **Never emitted** | **Never synthesized or advertised** |
+| **Validation** | Unsupported effort raises explicit `EffortUnsupportedError` | Wire models guaranteed to exist in upstream Google catalog | Aggregates dynamic wire tiers into single base model |
 
 ---
 
-## 3. End-to-End Resolution Pipeline
+## 4. Component Implementations
 
-```
-[Google Cloud Code PA API: :fetchAvailableModels]
-       │  Returns raw catalog: "gemini-3.8-flash-tiered" (displayName: null, supportsThinking: true, budget: -1)
-       ▼
-[Dynamic Discovery & Tier Expansion (hermes_cli/auth.py)]
-       │  Detects supportsThinking=true & thinkingBudget=-1, spawning 3 virtual tiers (-high, -medium, -low)
-       ▼
-[Dynamic Slug Parsing & Label Formatting (format_gemini_user_facing_slug)]
-       │  Derives: "Gemini 3.8 Flash (High)", "Gemini 3.8 Flash (Medium)", "Gemini 3.8 Flash (Low)"
-       ▼
-[Frontend Presentation (Web Dashboard /api/model/options & TUI model.options)]
-       │  Renders interactive ModelPickerDialog / Bubble Tea model picker
-       ▼
-[Outbound Wire Resolution (agent/gemini_cloudcode_adapter.py)]
-       │  Translates virtual slug "gemini-3.8-flash-high" -> Wire Slug "gemini-3.8-flash-tiered"
-       │  Attaches generationConfig.thinkingConfig: {"thinkingLevel": "high", "includeThoughts": true}
-       ▼
-[Cloud Code PA Inference Gateway: POST /v1internal:streamGenerateContent]
-       │  HTTP 200 OK — Real-time token streaming with thought tokens
-```
+### Component 1: Canonical Capability Registry (`agent/gemini_cloudcode_models.py`)
+- Defines `ModelCapability`, `EffortRoute`, `ParsedModelSelection`, and `ResolvedModel`.
+- Maintains static capability registry for `gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-3.1-pro`, `gemini-3.5-flash`, `gemini-3-flash-agent`, `gemini-pro-agent`, and partner models (`claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`).
+- Provides `model_for_base_effort()` and `efforts_for_base()`.
+- Implements `LEGACY_MODEL_ALIASES` mapping all historical `-high`, `-medium`, `-low` virtual slugs to `(base_model, effort)`.
 
----
+### Component 2: Discovery Normalization (`hermes_cli/auth.py`)
+- Refactored `fetch_gemini_available_models()`:
+  - Collapses dynamic wire tiers (e.g. `gemini-3.8-flash-tiered` with `thinkingBudget: -1`) into canonical base `gemini-3.8-flash`.
+  - Normalizes static tiered models (`gemini-3.6-flash-low`, `medium`, `high`) into base `gemini-3.6-flash`.
+  - Stores aggregated effort tuples in global registry accessible via `get_gemini_model_efforts()`.
+  - Deprecated and removed legacy `_expand_model_tier_slugs()`.
 
-## 4. Detailed Component Engineering Specifications
+### Component 3: Adapter & countTokens Cutover (`agent/gemini_cloudcode_adapter.py`)
+- Refactored `GeminiCloudCodeClient`:
+  - Centralized model resolution in `_resolve_model_route()`.
+  - Chat completions and `count_tokens()` consume the identical resolver route.
+  - Eliminated duplicate `extra_body` kwarg handling.
+  - Generates exact wire models and `thinkingConfig` without version-dependent regular expressions.
 
-### Component A: Dynamic Discovery & Tier Expansion Engine (`hermes_cli/auth.py`)
+### Component 4: Provider Profile & Fallback Roster (`plugins/model-providers/gemini-oauth/__init__.py`)
+- `GeminiOAuthProfile.fallback_models` updated to strictly advertise canonical base models:
+  ```python
+  fallback_models = (
+      "gemini-3.8-flash",
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      "gemini-3-flash-agent",
+      "gemini-3.5-flash",
+      "gemini-pro-agent",
+      "gemini-3.1-pro",
+      "claude-sonnet-4-6",
+      "claude-opus-4-6-thinking",
+      "gpt-oss-120b-medium",
+  )
+  ```
+- `build_api_kwargs_extras()` passes `{"effort": effort}` in `extra_body` for canonical base models while bypassing effort injection when legacy aliases or non-thinking configurations are active.
 
-* **Target Function**: `fetch_gemini_available_models(account, force, timeout_seconds)`
-* **Modifications**:
-  1. Remove hardcoded model insertion blocks (e.g. `if "gemini-3.7-flash-tiered" in models_dict:`).
-  2. Implement `FetchTieredModels` parity:
-     - Scan all models in `models_dict`.
-     - Filter out internal non-conversational helpers (`tab_*`, `chat_*`, `models/*`, `*image*`).
-     - If `minfo.get("supportsThinking") is True` and `minfo.get("thinkingBudget") == -1` and `mid_str.endswith("-tiered")`:
-       - Derive `base_slug = mid_str[:-7]`.
-       - Append `f"{base_slug}-high"`, `f"{base_slug}-medium"`, `f"{base_slug}-low"` to `ordered_ids`.
-       - Format each tier label via `format_gemini_user_facing_slug(v_slug)`.
-     - For static models with explicit `displayName` or general family identifiers:
-       - Append `mid_str` to `ordered_ids`.
-       - Format display name using `dname or format_gemini_user_facing_slug(mid_str, dname)`.
-
-### Component B: Display Name Synthesizer (`hermes_cli/auth.py`)
-
-* **Target Function**: `format_gemini_user_facing_slug(model_id, raw_display_name)`
-* **Modifications**:
-  1. If `raw_display_name` is present and does not equal the raw slug, use it as base.
-  2. Normalize version substrings (e.g. `3-8` $	o$ `3.8`, `4-6` $	o$ `4.6`).
-  3. Extract effort tags (`-high`, `-medium`, `-low`, `-thinking`) into title-cased suffixes (`(High)`, `(Medium)`, `(Low)`, `(Thinking)`).
-  4. Ensure output matches standard vendor naming:
-     - `gemini-3.8-flash-high` $\longrightarrow$ `Gemini 3.8 Flash (High)`
-     - `gemini-3.8-flash-medium` $\longrightarrow$ `Gemini 3.8 Flash (Medium)`
-     - `gemini-3.8-flash-low` $\longrightarrow$ `Gemini 3.8 Flash (Low)`
-     - `gemini-3.7-flash-high` $\longrightarrow$ `Gemini 3.7 Flash (High)`
-
-### Component C: Cloud Code PA Wire Translation Adapter (`agent/gemini_cloudcode_adapter.py`)
-
-* **Target Functions**:
-  1. `resolve_cloudcode_model_and_effort(model, effort)`:
-     - Generalize tiered detection using regex `r"^gemini-3\.\d+-flash(?:-(high|medium|low|tiered))?$"`.
-     - Ensure any dynamic flash model resolves to `f"gemini-{version}-flash-tiered"` on the wire.
-  2. `_create_chat_completion` and `_create_chat_completion_async`:
-     - Generalize `thinkingConfig` generation for all `gemini-3.*-flash` models.
-     - Automatically map extracted effort (`high`, `medium`, `low`) into `thinkingLevel` (`"high"`, `"medium"`, `"low"`) with `"includeThoughts": True`.
-
-### Component D: Transport Layer Reasoning Config (`agent/transports/chat_completions.py`)
-
-* **Target Function**: `_build_gemini_thinking_config(model, reasoning_config)`
-* **Modifications**:
-  1. Verify `normalized_model.startswith("gemini-3")` cleanly handles 3.8.
-  2. Ensure token ceiling calculations default to 65,536 output tokens for all Gemini 3.x Flash variants.
-
-### Component E: Fallback Provider Roster (`plugins/model-providers/gemini-oauth/__init__.py`)
-
-* **Target Class**: `GeminiOAuthProfile`
-* **Modifications**:
-  - Update `fallback_models` tuple to prioritize 3.8 dynamic tiers:
-    ```python
-    fallback_models = (
-        "gemini-3.8-flash-high",
-        "gemini-3.8-flash-medium",
-        "gemini-3.8-flash-low",
-        "gemini-3.7-flash-high",
-        "gemini-3.7-flash-medium",
-        "gemini-3.7-flash-low",
-        "gemini-3.6-flash-high",
-        "gemini-3.6-flash-medium",
-        "gemini-3.6-flash-low",
-        "gemini-3.1-pro-low",
-        "claude-sonnet-4-6",
-        "claude-opus-4-6-thinking",
-        "gpt-oss-120b-medium",
-    )
-    ```
+### Component 5: Catalog Fallthrough Resiliency (`hermes_cli/models.py`)
+- `_gemini_oauth_catalog()` returns `models or None` instead of `[]`, enabling seamless tri-state fallthrough to `profile.fallback_models` when live OAuth discovery is unauthenticated, empty, or offline.
 
 ---
 
-## 5. Verification & Test Strategy
+## 5. Verification & Test Architecture
 
-### 1. Automated Test Suite
-- `tests/test_gemini_oauth.py`:
-  - Assert dynamic expansion of `gemini-3.8-flash-tiered` into 3 virtual tiers.
-  - Verify formatting of `Gemini 3.8 Flash (High/Medium/Low)`.
-- `tests/agent/test_gemini_cloudcode_adapter.py`:
-  - Test wire slug translation: `gemini-3.8-flash-high` $	o$ `gemini-3.8-flash-tiered`.
-  - Validate generation config: assert `thinkingLevel: "high"`, `includeThoughts: true`.
+The test suite enforces mathematical closure across all four layers:
 
-### 2. Live API Catalog Discovery
-- Execute offline/mocked and live discovery probes to verify that `POST /v1internal:fetchAvailableModels` hydrates the options list without error.
+1. **Resolver Unit Suite** (`tests/agent/test_gemini_cloudcode_models.py` — 83 tests):
+   - Contract verification for `parse_model_slug`, `model_for_base_effort`, and `efforts_for_base`.
+   - Backward compatibility for every entry in `LEGACY_MODEL_ALIASES`.
+   - Prefix stripping across standard vendor namespaces (`gemini/`, `google/`, `anthropic/`).
+   - Fallback catalog canonical invariant: asserts no legacy aliases exist in `profile.fallback_models`.
+   - Static wire route uniqueness invariant: guarantees injective wire mapping.
 
-### 3. REST & Web UI Validation
-- Confirm `GET /api/model/options` contains the full 3.8 roster under provider `gemini-oauth`.
-- Verify the Web Dashboard `ModelPickerDialog` and TUI picker render the formatted display names.
+2. **Discovery & Provider Suite** (`tests/test_gemini_oauth.py` — 53 tests):
+   - Discovery aggregation of dynamic and static wire tiers into base models.
+   - Discovery-to-resolver closure property: verifies that every discovered base and effort resolves to a valid upstream wire model.
+   - Provider catalog fallthrough on network error and empty discovery responses.
 
----
-
-## 6. Git Branching & Sanitation Protocol
-
-1. **Branch Isolation**:
-   - All code edits must be committed directly to consolidated topic branch `dev`.
-   - Feature changes live linearly on `dev` and must never be committed directly to `main` or `local`.
-2. **Sanitation Verification**:
-   - Execute strict regex scans across all staged files prior to commit:
-     ```bash
-     rg -n --hidden -S "(TOKEN|API_KEY|PRIVATE_KEY|INTERNAL_IP|HOST_PATH)" <staged-files>
-     ```
-   - Confirm zero host paths, zero private LAN IPs, and zero credentials.
-3. **Integration into Serving Branch**:
-   - Push topic branch to `origin/dev`.
-   - Switch to serving branch `local` and perform `--no-ff` merge of `dev`.
-   - Recompile asset bundles (`npm run build:ink && npm run build`).
-   - Push updated baseline to `origin/local`.
+3. **Adapter & Integration Suite** (`tests/agent/test_gemini_cloudcode_adapter.py` — 72 tests):
+   - 11-case generation and `count_tokens` route parity matrix (`3.8`, `3.7`, `3.6`, `3.1-pro`).
+   - Full wire equivalence closure across all legacy aliases.
+   - End-to-end transport seam tests verifying `ChatCompletionsTransport` + `GeminiOAuthProfile` interaction.
+   - Strict rejection tests for unsupported efforts (`3.8 + max`, `3.1 + medium`).

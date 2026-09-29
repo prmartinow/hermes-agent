@@ -409,3 +409,90 @@ def test_production_transport_legacy_alias_not_overridden_by_reasoning_config():
     sent_body = mock_http.post.call_args[1]["json"]
     assert sent_body["model"] == "gemini-3.8-flash-tiered"
     assert sent_body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"
+# ============================================================================
+# 9. Milestone 4: Generation/countTokens Parity Matrix & Legacy Equivalence Closure
+# ============================================================================
+
+from agent.gemini_cloudcode_models import LEGACY_MODEL_ALIASES, model_for_base_effort
+
+
+@pytest.mark.parametrize(
+    "base, effort",
+    [
+        ("gemini-3.8-flash", "low"),
+        ("gemini-3.8-flash", "medium"),
+        ("gemini-3.8-flash", "high"),
+        ("gemini-3.7-flash", "low"),
+        ("gemini-3.7-flash", "medium"),
+        ("gemini-3.7-flash", "high"),
+        ("gemini-3.6-flash", "low"),
+        ("gemini-3.6-flash", "medium"),
+        ("gemini-3.6-flash", "high"),
+        ("gemini-3.1-pro", "low"),
+        ("gemini-3.1-pro", "high"),
+    ],
+)
+def test_generation_and_count_tokens_route_parity_matrix(base, effort):
+    client_gen, mock_http_gen = _make_mock_client()
+    client_count, mock_http_count = _make_mock_client()
+
+    client_gen.chat.completions.create(
+        model=base,
+        messages=[{"role": "user", "content": "hi"}],
+        extra_body={"effort": effort},
+    )
+    client_count.count_tokens(
+        model=base,
+        contents="hi",
+        extra_body={"effort": effort},
+    )
+
+    gen_body = mock_http_gen.post.call_args[1]["json"]
+    count_body = mock_http_count.post.call_args[1]["json"]
+    expected_resolved = model_for_base_effort(base, effort)
+
+    assert gen_body["model"] == count_body["request"]["model"] == expected_resolved.wire_model
+    if expected_resolved.thinking_config:
+        assert gen_body["request"]["generationConfig"]["thinkingConfig"] == expected_resolved.thinking_config
+    else:
+        assert "thinkingConfig" not in gen_body["request"]["generationConfig"]
+
+
+@pytest.mark.parametrize("alias", list(LEGACY_MODEL_ALIASES.keys()))
+def test_legacy_alias_full_wire_equivalence_closure(alias):
+    base, effort = LEGACY_MODEL_ALIASES[alias]
+
+    client_alias, mock_http_alias = _make_mock_client()
+    client_canon, mock_http_canon = _make_mock_client()
+
+    client_alias.chat.completions.create(
+        model=alias,
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    client_canon.chat.completions.create(
+        model=base,
+        messages=[{"role": "user", "content": "hi"}],
+        extra_body={"effort": effort},
+    )
+
+    alias_body = mock_http_alias.post.call_args[1]["json"]
+    canon_body = mock_http_canon.post.call_args[1]["json"]
+
+    assert alias_body["model"] == canon_body["model"]
+    assert alias_body["request"]["generationConfig"].get("thinkingConfig") == canon_body["request"]["generationConfig"].get("thinkingConfig")
+
+
+@pytest.mark.parametrize(
+    "reasoning_cfg",
+    [
+        {"enabled": False},
+        {"enabled": True, "effort": "none"},
+    ],
+)
+def test_reasoning_disabled_does_not_inject_extra_body_effort(reasoning_cfg):
+    profile = get_provider_profile("gemini-oauth")
+    extra_body, _ = profile.build_api_kwargs_extras(
+        model="gemini-3.8-flash",
+        reasoning_config=reasoning_cfg,
+    )
+    assert "effort" not in extra_body

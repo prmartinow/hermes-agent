@@ -53,7 +53,7 @@ def test_gemini_oauth_profile_discovery():
     assert profile.name == "gemini-oauth"
     assert profile.display_name == "Google Gemini (OAuth / Antigravity)"
     assert profile.auth_type == "oauth_external"
-    assert "gemini-3.6-flash-low" in profile.fallback_models
+    assert "gemini-3.6-flash" in profile.fallback_models
     assert profile.supports_vision is True
     assert profile.supports_health_check is False
 
@@ -834,7 +834,7 @@ def test_gemini_http_error_retry_info_and_reset_at():
     mock_resp = MagicMock()
     mock_resp.status_code = 429
     mock_resp.headers = {}
-    
+
     error_payload = {
         "error": {
             "code": 429,
@@ -1380,17 +1380,19 @@ def test_credential_pool_gemini_oauth_session_stickiness():
 def test_gemini_oauth_chat_completions_thinking_config():
     import agent.transports.chat_completions  # noqa: F401
     from agent.transports import get_transport
+    from providers import get_provider_profile
     cc = get_transport("chat_completions")
     assert cc is not None
+    profile = get_provider_profile("gemini-oauth")
     kw = cc.build_kwargs(
+        provider_profile=profile,
         model="gemini-3.7-flash",
         messages=[{"role": "user", "content": "hi"}],
-        provider_name="gemini-oauth",
+        base_url=profile.base_url,
         reasoning_config={"enabled": True, "effort": "high"},
     )
     assert "extra_body" in kw
-    assert "thinking_config" in kw["extra_body"]
-    assert kw["extra_body"]["thinking_config"] == {"includeThoughts": True, "thinkingLevel": "high"}
+    assert kw["extra_body"].get("effort") == "high"
 
 
 def test_gemini_cloudcode_adapter_default_max_output_tokens():
@@ -1814,4 +1816,78 @@ def test_clear_gemini_oauth_account_disconnect(tmp_path, monkeypatch):
         assert not tok2.get("access_token")
     except AuthError:
         pass
+# ============================================================================
+# Milestone 4: Discovery-Resolver Closure Property & Catalog Fallthrough
+# ============================================================================
 
+def test_discovery_to_resolver_closure_property():
+    from agent.gemini_cloudcode_models import model_for_base_effort
+    from hermes_cli.auth import (
+        fetch_gemini_available_models,
+        get_gemini_model_efforts,
+        _GEMINI_MODELS_CACHE,
+    )
+
+    raw_models = {
+        "gemini-3.8-flash-tiered": {"displayName": None, "supportsThinking": True},
+        "gemini-3.7-flash-tiered": {"displayName": None, "supportsThinking": True},
+        "gemini-3.6-flash-low": {"displayName": "Gemini 3.6 Flash (Low)", "supportsThinking": True},
+        "gemini-3.6-flash-medium": {"displayName": "Gemini 3.6 Flash (Medium)", "supportsThinking": True},
+        "gemini-3.6-flash-high": {"displayName": "Gemini 3.6 Flash (High)", "supportsThinking": True},
+        "gemini-3.1-pro-low": {"displayName": "Gemini 3.1 Pro (Low)", "supportsThinking": True},
+        "gemini-3.1-pro-high": {"displayName": "Gemini 3.1 Pro (High)", "supportsThinking": True},
+        "gemini-3-flash-agent": {"displayName": "Gemini 3 Flash Agent"},
+        "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6"},
+        "claude-opus-4-6-thinking": {"displayName": "Claude Opus 4.6 Thinking"},
+        "gpt-oss-120b-medium": {"displayName": "GPT OSS 120B Medium"},
+    }
+
+    mock_resp = {
+        "models": raw_models,
+        "agentModelSorts": [{"groups": [{"modelIds": list(raw_models.keys())}]}],
+    }
+
+    with patch("hermes_cli.auth.resolve_gemini_oauth_runtime_credentials") as mock_creds,          patch("httpx.post") as mock_post:
+        mock_creds.return_value = {"access_token": "ya29.test"}
+        mock_post.return_value = MagicMock(status_code=200, json=lambda: mock_resp)
+        _GEMINI_MODELS_CACHE.clear()
+
+        base_models = fetch_gemini_available_models(account="test_closure", force=True)
+        efforts_map = get_gemini_model_efforts()
+
+        for base in base_models:
+            efforts = efforts_map.get(base, ())
+            if not efforts:
+                resolved = model_for_base_effort(base, None)
+                assert resolved.wire_model in raw_models, f"Wire model {resolved.wire_model} not in raw catalog for {base}"
+            else:
+                for effort in efforts:
+                    resolved = model_for_base_effort(base, effort)
+                    assert resolved.wire_model in raw_models, f"Wire model {resolved.wire_model} not in raw catalog for ({base}, {effort})"
+
+
+def test_provider_model_ids_gemini_oauth_live_fetch_success():
+    from hermes_cli.models import provider_model_ids
+    with patch("hermes_cli.auth.fetch_gemini_available_models", return_value=["gemini-3.8-flash", "gemini-3.7-flash"]):
+        models = provider_model_ids("gemini-oauth")
+        assert models == ["gemini-3.8-flash", "gemini-3.7-flash"]
+
+
+def test_provider_model_ids_gemini_oauth_live_fetch_empty_falls_through_to_profile():
+    from hermes_cli.models import provider_model_ids
+    from providers import get_provider_profile
+    profile = get_provider_profile("gemini-oauth")
+
+    with patch("hermes_cli.auth.fetch_gemini_available_models", return_value=[]):
+        models = provider_model_ids("gemini-oauth")
+        assert models == list(profile.fallback_models)
+
+
+def test_provider_model_ids_gemini_oauth_live_fetch_exception_falls_through_to_profile():
+    from hermes_cli.models import provider_model_ids
+    from providers import get_provider_profile
+    profile = get_provider_profile("gemini-oauth")
+
+    with patch("hermes_cli.auth.fetch_gemini_available_models", side_effect=RuntimeError("Network down")):
+        models = provider_model_ids("gemini-oauth")
+        assert models == list(profile.fallback_models)

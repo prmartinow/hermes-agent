@@ -1492,12 +1492,13 @@ def _azure_foundry_catalog(normalized: str, force_refresh: bool) -> Optional[lis
         return None
 
 
-def _gemini_oauth_catalog(normalized: str, force_refresh: bool) -> list[str]:
+def _gemini_oauth_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]:
     try:
         from hermes_cli.auth import fetch_gemini_available_models
-        return fetch_gemini_available_models(account=normalized, force=force_refresh)
+        models = fetch_gemini_available_models(account=normalized, force=force_refresh)
+        return models or None
     except Exception:
-        return []
+        return None
 
 
 # Per-provider catalog sources tried before the generic profile fetch. A fetcher returning None
