@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-import re
 from typing import Any, Mapping
 
 
@@ -526,6 +525,14 @@ _CLOUDCODE_EFFORT_PROVIDERS = {
     "antigravity-gemini",
 }
 
+_CLOUDCODE_ACCOUNT_PROVIDERS = {
+    "gemini-1": 1,
+    "gemini-2": 2,
+    "gemini-3": 3,
+    "gemini-4": 4,
+    "gemini-5": 5,
+}
+
 
 def selectable_reasoning_efforts(
     provider: str,
@@ -545,14 +552,15 @@ def selectable_reasoning_efforts(
       2. Fall back to static capability registry.
     """
     prov = (provider or "").strip().lower()
-    target_account: Any = account
-    is_cloudcode = prov in _CLOUDCODE_EFFORT_PROVIDERS
-    if not is_cloudcode:
-        m_acc = re.match(r"^gemini-([1-9]\d*)$", prov)
-        if m_acc:
-            is_cloudcode = True
-            if target_account is None:
-                target_account = int(m_acc.group(1))
+    target_account: Any = (
+        account
+        if account is not None
+        else _CLOUDCODE_ACCOUNT_PROVIDERS.get(prov)
+    )
+    is_cloudcode = (
+        prov in _CLOUDCODE_EFFORT_PROVIDERS
+        or prov in _CLOUDCODE_ACCOUNT_PROVIDERS
+    )
 
     if not is_cloudcode:
         return None

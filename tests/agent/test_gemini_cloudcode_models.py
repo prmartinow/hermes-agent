@@ -533,6 +533,13 @@ def test_selectable_reasoning_efforts_route_scoping():
     assert selectable_reasoning_efforts("openai", "gpt-4o") is None
     assert selectable_reasoning_efforts("anthropic", "claude-3-5-sonnet") is None
 
+    # Bounded numbered routes: gemini-1..5 are valid Cloud Code routes, but gemini-6, gemini-42 are NOT
+    with patch("hermes_cli.auth.get_gemini_model_efforts") as mock_efforts:
+        assert selectable_reasoning_efforts("gemini-6", "gemini-3.8-flash") is None
+        assert selectable_reasoning_efforts("gemini-42", "gemini-3.8-flash") is None
+        assert selectable_reasoning_efforts("gemini-999", "gemini-3.8-flash") is None
+        mock_efforts.assert_not_called()  # Discovery must NEVER be queried for unsupported account routes
+
 
 def test_selectable_reasoning_efforts_account_resolution_and_fallback():
     # 1. Numbered account route automatically derives numeric account
