@@ -316,3 +316,96 @@ def test_count_tokens_unsupported_effort_fails_before_http():
             effort="medium",
         )
     mock_http.post.assert_not_called()
+# ============================================================================
+# 8. Milestone 3 Amendment: countTokens Input Parity & Production Transport Seam
+# ============================================================================
+
+def test_count_tokens_accepts_extra_body_effort():
+    client, mock_http = _make_mock_client()
+    client.count_tokens(
+        model="gemini-3.6-flash",
+        contents="hello",
+        extra_body={"effort": "medium"},
+    )
+    sent_body = mock_http.post.call_args[1]["json"]
+    assert sent_body["request"]["model"] == "gemini-3.6-flash-medium"
+
+
+def test_count_tokens_accepts_extra_body_reasoning_effort():
+    client, mock_http = _make_mock_client()
+    client.count_tokens(
+        model="gemini-3.6-flash",
+        contents="hello",
+        extra_body={"reasoning_effort": "medium"},
+    )
+    sent_body = mock_http.post.call_args[1]["json"]
+    assert sent_body["request"]["model"] == "gemini-3.6-flash-medium"
+
+
+def test_count_tokens_accepts_thinking_level_in_thinking_config():
+    client, mock_http = _make_mock_client()
+    client.count_tokens(
+        model="gemini-3.6-flash",
+        contents="hello",
+        extra_body={
+            "thinking_config": {
+                "thinkingLevel": "medium",
+            }
+        },
+    )
+    sent_body = mock_http.post.call_args[1]["json"]
+    assert sent_body["request"]["model"] == "gemini-3.6-flash-medium"
+
+
+def test_production_transport_profile_build_kwargs_and_client_routing():
+    from agent.transports import get_transport
+
+    transport = get_transport("chat_completions")
+    profile = get_provider_profile("gemini-oauth")
+    assert profile is not None
+
+    kw = transport.build_kwargs(
+        provider_profile=profile,
+        model="gemini-3.8-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        base_url=profile.base_url,
+        reasoning_config={"enabled": True, "effort": "medium"},
+    )
+    assert kw["extra_body"]["effort"] == "medium"
+
+    client, mock_http = _make_mock_client()
+    client.chat.completions.create(
+        model=kw["model"],
+        messages=kw["messages"],
+        extra_body=kw["extra_body"],
+    )
+    sent_body = mock_http.post.call_args[1]["json"]
+    assert sent_body["model"] == "gemini-3.8-flash-tiered"
+    assert sent_body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "medium"
+
+
+def test_production_transport_legacy_alias_not_overridden_by_reasoning_config():
+    from agent.transports import get_transport
+
+    transport = get_transport("chat_completions")
+    profile = get_provider_profile("gemini-oauth")
+
+    kw_legacy = transport.build_kwargs(
+        provider_profile=profile,
+        model="gemini-3.8-flash-low",
+        messages=[{"role": "user", "content": "hi"}],
+        base_url=profile.base_url,
+        reasoning_config={"enabled": True, "effort": "medium"},
+    )
+    # Suffix alias embedded effort must NOT be overridden by global reasoning_config
+    assert "effort" not in kw_legacy.get("extra_body", {})
+
+    client, mock_http = _make_mock_client()
+    client.chat.completions.create(
+        model=kw_legacy["model"],
+        messages=kw_legacy["messages"],
+        extra_body=kw_legacy.get("extra_body"),
+    )
+    sent_body = mock_http.post.call_args[1]["json"]
+    assert sent_body["model"] == "gemini-3.8-flash-tiered"
+    assert sent_body["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"

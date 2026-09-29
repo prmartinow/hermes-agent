@@ -355,9 +355,15 @@ class GeminiCloudCodeClient:
     ) -> int:
         """Call Cloud Code PA :countTokens endpoint to get exact token count."""
         call_kwargs = dict(kwargs)
+        extra_body = call_kwargs.pop("extra_body", None)
         if effort is not None:
             call_kwargs["effort"] = effort
-        mapped_model = self._map_model_id(model, kwargs.get("extra_body"), **call_kwargs)
+        resolved, _ = self._resolve_model_route(
+            model,
+            extra_body,
+            call_kwargs,
+        )
+        mapped_model = resolved.wire_model
         target_contents = contents if contents is not None else messages
         req_payload: Dict[str, Any] = {}
 
