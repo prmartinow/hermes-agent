@@ -1260,6 +1260,7 @@ def _make_stream_chunk(
     tool_call_delta: Optional[Dict[str, Any]] = None,
     finish_reason: Optional[str] = None,
     reasoning: str = "",
+    reasoning_details: Optional[Any] = None,
 ) -> _GeminiStreamChunk:
     delta_kwargs: Dict[str, Any] = {
         "role": "assistant",
@@ -1287,9 +1288,11 @@ def _make_stream_chunk(
     if reasoning:
         delta_kwargs["reasoning"] = reasoning
         delta_kwargs["reasoning_content"] = reasoning
+    if reasoning_details is not None:
+        delta_kwargs["reasoning_details"] = reasoning_details
     delta = SimpleNamespace(**delta_kwargs)
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
-    return _GeminiStreamChunk(
+    chunk = _GeminiStreamChunk(
         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
         object="chat.completion.chunk",
         created=int(time.time()),
@@ -1297,6 +1300,9 @@ def _make_stream_chunk(
         choices=[choice],
         usage=None,
     )
+    if reasoning_details is not None:
+        chunk.reasoning_details = reasoning_details
+    return chunk
 
 
 _SSE_DONE = object()  # sentinel: terminal [DONE] frame
@@ -1338,23 +1344,28 @@ def _iter_sse_events(response: httpx.Response) -> Iterator[Dict[str, Any]]:
             yield payload
 
 
-def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices: Dict[str, Dict[str, Any]]) -> List[_GeminiStreamChunk]:
+def translate_stream_event(
+    event: Dict[str, Any],
+    model: str,
+    tool_call_indices: Dict[str, Dict[str, Any]],
+    native_stream_state: Optional[Any] = None,
+) -> List[_GeminiStreamChunk]:
     candidates = event.get("candidates") or []
     if not candidates:
         return []
     cand = candidates[0] if isinstance(candidates[0], dict) else {}
-    parts = ((cand.get("content") or {}).get("parts") or []) if isinstance(cand, dict) else []
+    content_obj = cand.get("content") if isinstance(cand, dict) else {}
+    parts = ((content_obj.get("parts") or []) if isinstance(content_obj, dict) else [])
     chunks: List[_GeminiStreamChunk] = []
     seen_slots_in_event: Set[int] = set()
+
+    is_gemini = is_gemini_model(model)
+    if is_gemini and native_stream_state is not None and isinstance(content_obj, dict) and content_obj.get("role"):
+        native_stream_state.role = str(content_obj["role"])
 
     for part_index, part in enumerate(parts):
         if not isinstance(part, dict):
             continue
-        if part.get("thought") is True and isinstance(part.get("text"), str):
-            chunks.append(_make_stream_chunk(model=model, reasoning=part["text"]))
-            continue
-        if isinstance(part.get("text"), str) and part["text"]:
-            chunks.append(_make_stream_chunk(model=model, content=part["text"]))
         fc = part.get("functionCall")
         if isinstance(fc, dict) and fc.get("name"):
             name = str(fc["name"])
@@ -1377,7 +1388,6 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
                     }
                     tool_call_indices[call_key] = slot
             else:
-                # Find matching slot by name and argument continuity, excluding slots already matched in this event
                 for k, s in tool_call_indices.items():
                     if s.get("index") in seen_slots_in_event:
                         continue
@@ -1397,6 +1407,10 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
                     tool_call_indices[slot_key] = slot
 
             seen_slots_in_event.add(slot["index"])
+
+            # Observe in native accumulator
+            if is_gemini and native_stream_state is not None:
+                native_stream_state.observe_part(part, function_slot=slot["index"])
 
             emitted_arguments = args_str
             last_arguments = str(slot.get("last_arguments") or "")
@@ -1418,14 +1432,32 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
                     },
                 )
             )
+            continue
+
+        # Non-function-call part: observe in native accumulator
+        if is_gemini and native_stream_state is not None:
+            native_stream_state.observe_part(part)
+
+        if part.get("thought") is True and isinstance(part.get("text"), str):
+            chunks.append(_make_stream_chunk(model=model, reasoning=part["text"]))
+            continue
+        if isinstance(part.get("text"), str) and part["text"]:
+            chunks.append(_make_stream_chunk(model=model, content=part["text"]))
 
     finish_reason_raw = str(cand.get("finishReason") or "")
     if finish_reason_raw:
         mapped = "tool_calls" if tool_call_indices else _map_gemini_finish_reason(finish_reason_raw)
-        finish_chunk = _make_stream_chunk(model=model, finish_reason=mapped)
-        # Attach usage from this event's usageMetadata so the streaming
-        # loop in run_agent.py can record token counts (mirrors the
-        # non-streaming path in translate_gemini_response).
+        terminal_reasoning_details = None
+        if is_gemini and native_stream_state is not None:
+            carrier = native_stream_state.build_carrier(model)
+            if carrier:
+                terminal_reasoning_details = [carrier]
+
+        finish_chunk = _make_stream_chunk(
+            model=model,
+            finish_reason=mapped,
+            reasoning_details=terminal_reasoning_details,
+        )
         usage_meta = event.get("usageMetadata") or {}
         if usage_meta:
             finish_chunk.usage = SimpleNamespace(
@@ -1850,8 +1882,12 @@ class GeminiNativeClient:
                             response, body_text=body_text, api_key=self.api_key, base_url=self.base_url
                         )
                     tool_call_indices: Dict[str, Dict[str, Any]] = {}
+                    from agent.native_replay import GoogleNativeStreamAccumulator
+                    native_state = GoogleNativeStreamAccumulator() if is_gemini_model(model) else None
                     for event in _iter_sse_events(response):
-                        for chunk in translate_stream_event(event, model, tool_call_indices):
+                        for chunk in translate_stream_event(
+                            event, model, tool_call_indices, native_stream_state=native_state
+                        ):
                             yield chunk
             except httpx.HTTPError as exc:
                 raise GeminiAPIError(

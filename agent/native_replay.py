@@ -127,3 +127,71 @@ def build_google_native_carrier(
             "parts": valid_parts,
         },
     }
+class GoogleNativeStreamAccumulator:
+    """Accumulates streamed raw Gemini response parts into an ordered native assistant Content structure."""
+
+    def __init__(self, role: str = "model"):
+        self.role = role
+        self.parts: List[Dict[str, Any]] = []
+        self._slot_to_part_index: Dict[int, int] = {}
+        self._call_id_to_part_index: Dict[str, int] = {}
+
+    def observe_part(
+        self,
+        part: Dict[str, Any],
+        *,
+        function_slot: Optional[int] = None,
+    ) -> None:
+        """Observe one raw Gemini response Part dictionary from an SSE event."""
+        if not isinstance(part, dict):
+            return
+
+        fc = part.get("functionCall")
+        if isinstance(fc, dict):
+            call_id = str(fc.get("id") or "")
+            target_idx = None
+            if call_id and call_id in self._call_id_to_part_index:
+                target_idx = self._call_id_to_part_index[call_id]
+            elif function_slot is not None and function_slot in self._slot_to_part_index:
+                target_idx = self._slot_to_part_index[function_slot]
+
+            if target_idx is not None:
+                # Merge into existing part for this logical function call
+                existing = self.parts[target_idx]
+                existing_fc = existing.setdefault("functionCall", {})
+                if fc.get("name"):
+                    existing_fc["name"] = fc["name"]
+                if fc.get("args") is not None:
+                    existing_fc["args"] = copy.deepcopy(fc["args"])
+                if call_id:
+                    existing_fc["id"] = call_id
+                    self._call_id_to_part_index[call_id] = target_idx
+
+                # Retain thoughtSignature: if already observed, do not overwrite with None/empty
+                sig = part.get("thoughtSignature") or part.get("thought_signature")
+                if sig and not existing.get("thoughtSignature"):
+                    existing["thoughtSignature"] = sig
+                return
+
+            # First time observing this function call
+            part_copy = copy.deepcopy(part)
+            new_idx = len(self.parts)
+            self.parts.append(part_copy)
+            if function_slot is not None:
+                self._slot_to_part_index[function_slot] = new_idx
+            if call_id:
+                self._call_id_to_part_index[call_id] = new_idx
+            return
+
+        # Non-function-call part (text, thought, signature-only, unknown)
+        self.parts.append(copy.deepcopy(part))
+
+    def build_carrier(self, source_model: str) -> Optional[Dict[str, Any]]:
+        """Construct the completed google.native_assistant replay carrier dictionary."""
+        if not self.parts:
+            return None
+        return build_google_native_carrier(
+            parts=self.parts,
+            source_model=source_model,
+            role=self.role,
+        )

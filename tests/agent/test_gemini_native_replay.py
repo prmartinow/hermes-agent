@@ -435,3 +435,344 @@ def test_production_intake_pipeline_gemini_response_to_session_db():
         loaded_carrier = find_native_assistant_detail(loaded_msg["reasoning_details"])
         assert loaded_carrier is not None
         assert loaded_carrier == carrier
+# ============================================================================
+# 5. Milestone 2: Streaming Native Carrier Accumulation & Parity Tests
+# ============================================================================
+
+from agent.native_replay import GoogleNativeStreamAccumulator
+from agent.gemini_native_adapter import translate_stream_event
+
+
+def test_stream_accumulator_preserves_text_thought_and_signature_only():
+    acc = GoogleNativeStreamAccumulator(role="model")
+
+    # Frame 1: thought text
+    acc.observe_part({"thought": True, "text": "Analyzing..."})
+    # Frame 2: visible text
+    acc.observe_part({"text": "Hello "})
+    acc.observe_part({"text": "world!"})
+    # Frame 3: standalone signature-only part (R0 discovery)
+    acc.observe_part({"thoughtSignature": "sig_standalone_123"})
+    # Frame 4: unknown provider part
+    acc.observe_part({"customMeta": {"foo": "bar"}})
+
+    carrier = acc.build_carrier("gemini-3.8-flash-tiered")
+    assert carrier is not None
+    assert carrier["type"] == GOOGLE_NATIVE_ASSISTANT_TYPE
+    assert carrier["source_model"] == "gemini-3.8-flash-tiered"
+    parts = carrier["content"]["parts"]
+    assert len(parts) == 5
+    assert parts[0] == {"thought": True, "text": "Analyzing..."}
+    assert parts[1] == {"text": "Hello "}
+    assert parts[2] == {"text": "world!"}
+    assert parts[3] == {"thoughtSignature": "sig_standalone_123"}
+    assert parts[4] == {"customMeta": {"foo": "bar"}}
+
+
+def test_stream_accumulator_function_call_frame_deduplication_and_signature_retention():
+    acc = GoogleNativeStreamAccumulator(role="model")
+
+    # Frame 1: initial function call with signature and partial args
+    acc.observe_part(
+        {"functionCall": {"name": "query_db", "args": {"q": "SEL"}, "id": "call_1"}, "thoughtSignature": "sig_early"},
+        function_slot=0,
+    )
+    # Frame 2: incremental args, signature omitted in later SSE frame
+    acc.observe_part(
+        {"functionCall": {"name": "query_db", "args": {"q": "SELECT * FROM users"}, "id": "call_1"}},
+        function_slot=0,
+    )
+
+    carrier = acc.build_carrier("gemini-3.8-flash-tiered")
+    assert carrier is not None
+    parts = carrier["content"]["parts"]
+    # Must resolve into exactly ONE Part, not two!
+    assert len(parts) == 1
+    fc_part = parts[0]
+    assert fc_part["functionCall"]["name"] == "query_db"
+    assert fc_part["functionCall"]["args"] == {"q": "SELECT * FROM users"}
+    assert fc_part["functionCall"]["id"] == "call_1"
+    # Signature observed early must NOT be lost
+    assert fc_part["thoughtSignature"] == "sig_early"
+
+
+def test_stream_accumulator_late_arriving_signature_recorded():
+    acc = GoogleNativeStreamAccumulator(role="model")
+
+    # Frame 1: call without signature
+    acc.observe_part({"functionCall": {"name": "calc", "args": {"x": 1}}}, function_slot=0)
+    # Frame 2: signature arrives
+    acc.observe_part({"functionCall": {"name": "calc", "args": {"x": 1}}, "thoughtSignature": "sig_late"}, function_slot=0)
+
+    carrier = acc.build_carrier("gemini-3.8-flash-tiered")
+    parts = carrier["content"]["parts"]
+    assert len(parts) == 1
+    assert parts[0]["thoughtSignature"] == "sig_late"
+
+
+def test_streaming_single_signed_function_call_events():
+    events = [
+        {"candidates": [{"content": {"role": "model", "parts": [{"thought": True, "text": "Calling tool"}]}}]},
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"functionCall": {"name": "get_weather", "args": {"city": "Tokyo"}}, "thoughtSignature": "sig_stream_tokyo"}
+                        ],
+                    }
+                }
+            ]
+        },
+        {"candidates": [{"finishReason": "STOP"}]},
+    ]
+
+    tool_call_indices = {}
+    native_state = GoogleNativeStreamAccumulator()
+    all_chunks = []
+    for ev in events:
+        chunks = translate_stream_event(ev, "gemini-3.8-flash-tiered", tool_call_indices, native_stream_state=native_state)
+        all_chunks.extend(chunks)
+
+    # Generic output verification
+    tool_chunks = [c for c in all_chunks if getattr(c.choices[0].delta, "tool_calls", None)]
+    assert len(tool_chunks) == 1
+    assert tool_chunks[0].choices[0].delta.tool_calls[0].function.name == "get_weather"
+
+    # Terminal chunk verification: carries native carrier
+    finish_chunks = [c for c in all_chunks if getattr(c.choices[0], "finish_reason", None) == "tool_calls"]
+    assert len(finish_chunks) == 1
+    terminal = finish_chunks[0]
+    assert hasattr(terminal.choices[0].delta, "reasoning_details")
+    carrier = terminal.choices[0].delta.reasoning_details[0]
+    assert carrier["type"] == GOOGLE_NATIVE_ASSISTANT_TYPE
+    assert len(carrier["content"]["parts"]) == 2
+    assert carrier["content"]["parts"][1]["thoughtSignature"] == "sig_stream_tokyo"
+
+
+def test_streaming_parallel_calls_first_signed_second_unsigned():
+    events = [
+        {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"functionCall": {"name": "get_weather", "args": {"city": "Tokyo"}}, "thoughtSignature": "sig_first"},
+                            {"functionCall": {"name": "get_stock_price", "args": {"symbol": "AAPL"}}},  # Unsigned sibling
+                        ],
+                    }
+                }
+            ]
+        },
+        {"candidates": [{"finishReason": "STOP"}]},
+    ]
+
+    tool_call_indices = {}
+    native_state = GoogleNativeStreamAccumulator()
+    all_chunks = []
+    for ev in events:
+        chunks = translate_stream_event(ev, "gemini-3.8-flash-tiered", tool_call_indices, native_stream_state=native_state)
+        all_chunks.extend(chunks)
+
+    terminal = [c for c in all_chunks if c.choices[0].finish_reason][0]
+    carrier = terminal.choices[0].delta.reasoning_details[0]
+    parts = carrier["content"]["parts"]
+    assert len(parts) == 2
+    assert parts[0]["functionCall"]["name"] == "get_weather"
+    assert parts[0]["thoughtSignature"] == "sig_first"
+    assert parts[1]["functionCall"]["name"] == "get_stock_price"
+    assert "thoughtSignature" not in parts[1]
+
+
+def test_streaming_text_plus_signature_only_r0_fixture():
+    events = [
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "Philosophical answer."}]}}]},
+        {"candidates": [{"content": {"role": "model", "parts": [{"thoughtSignature": "sig_stream_c4_only"}]}}]},
+        {"candidates": [{"finishReason": "STOP"}]},
+    ]
+
+    tool_call_indices = {}
+    native_state = GoogleNativeStreamAccumulator()
+    all_chunks = []
+    for ev in events:
+        chunks = translate_stream_event(ev, "gemini-3.8-flash-tiered", tool_call_indices, native_stream_state=native_state)
+        all_chunks.extend(chunks)
+
+    terminal = [c for c in all_chunks if c.choices[0].finish_reason][0]
+    carrier = terminal.choices[0].delta.reasoning_details[0]
+    parts = carrier["content"]["parts"]
+    assert len(parts) == 2
+    assert parts[0] == {"text": "Philosophical answer."}
+    assert parts[1] == {"thoughtSignature": "sig_stream_c4_only"}
+
+
+def test_streaming_partner_models_never_emit_native_carrier():
+    events = [
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "Hello from Claude"}]}}]},
+        {"candidates": [{"finishReason": "STOP"}]},
+    ]
+
+    for partner_model in ["claude-sonnet-4-6", "gpt-oss-120b-medium"]:
+        tool_call_indices = {}
+        native_state = GoogleNativeStreamAccumulator()
+        all_chunks = []
+        for ev in events:
+            chunks = translate_stream_event(ev, partner_model, tool_call_indices, native_stream_state=native_state)
+            all_chunks.extend(chunks)
+
+        terminal = [c for c in all_chunks if c.choices[0].finish_reason][0]
+        assert getattr(terminal.choices[0].delta, "reasoning_details", None) is None
+
+
+def test_streaming_sync_fallback_forwards_carrier():
+    from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
+    from unittest.mock import MagicMock, patch
+
+    mock_client = GeminiCloudCodeClient(access_token="test_token")
+    mock_http = MagicMock()
+
+    # Mock 1: streamGenerateContent returns 400
+    mock_resp_400 = MagicMock()
+    mock_resp_400.status_code = 400
+    mock_resp_400.text = "Streaming unsupported"
+    mock_resp_400.headers = {}
+    mock_resp_400.content = b"Streaming unsupported"
+    mock_resp_400.iter_lines.return_value = []
+    mock_http.stream.return_value.__enter__.return_value = mock_resp_400
+
+    # Mock 2: fallback generateContent returns 200 with signed Gemini response
+    raw_resp_200 = {
+        "response": {
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {"text": "Fallback answer", "thoughtSignature": "sig_fallback_200"}
+                        ],
+                    },
+                    "finishReason": "STOP",
+                }
+            ]
+        }
+    }
+    mock_resp_200 = MagicMock()
+    mock_resp_200.status_code = 200
+    mock_resp_200.json.return_value = raw_resp_200
+    mock_http.post.return_value = mock_resp_200
+
+    mock_client._http = mock_http
+
+    chunks = list(mock_client.chat.completions.create(
+        model="gemini-3.8-flash",
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+    ))
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    delta = chunk.choices[0].delta
+    assert delta.content == "Fallback answer"
+    assert delta.reasoning_details is not None
+    carrier = find_native_assistant_detail(delta.reasoning_details)
+    assert carrier is not None
+    assert carrier["content"]["parts"][0]["thoughtSignature"] == "sig_fallback_200"
+
+
+def test_generic_stream_assembler_preserves_carrier_in_assistant_message():
+    from agent.reasoning_summaries import append_streamed_reasoning_detail
+    from agent.chat_completion_helpers import build_assistant_message
+    from unittest.mock import MagicMock
+
+    carrier = build_google_native_carrier(
+        parts=[{"thoughtSignature": "sig_sse_1"}],
+        source_model="gemini-3.8-flash-tiered",
+    )
+
+    # 1. Accumulate via production append_streamed_reasoning_detail
+    reasoning_details = []
+    append_streamed_reasoning_detail(reasoning_details, carrier)
+    assert len(reasoning_details) == 1
+    assert reasoning_details[0] == carrier
+
+    # 2. Attach to final streaming message and pass to build_assistant_message
+    assistant_msg = SimpleNamespace(
+        role="assistant",
+        content="Streaming completed",
+        tool_calls=None,
+        reasoning="thought",
+        reasoning_content="thought",
+        reasoning_details=reasoning_details,
+    )
+
+    mock_agent = MagicMock()
+    mock_agent._needs_thinking_reasoning_pad.return_value = False
+    mock_agent._extract_reasoning.return_value = None
+
+    persisted = build_assistant_message(mock_agent, assistant_msg, finish_reason="stop")
+    assert persisted["reasoning_details"] == [carrier]
+
+
+def test_streaming_intake_to_session_db_persistence_roundtrip():
+    from agent.reasoning_summaries import append_streamed_reasoning_detail
+    from agent.chat_completion_helpers import build_assistant_message
+    from agent.session_persistence import _db_flush_row
+    from unittest.mock import MagicMock
+
+    events = [
+        {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "query", "args": {"id": 1}}, "thoughtSignature": "sig_stream_db"}]}}]},
+        {"candidates": [{"finishReason": "tool_calls"}]},
+    ]
+
+    tool_call_indices = {}
+    native_state = GoogleNativeStreamAccumulator()
+    all_chunks = []
+    for ev in events:
+        chunks = translate_stream_event(ev, "gemini-3.8-flash-tiered", tool_call_indices, native_stream_state=native_state)
+        all_chunks.extend(chunks)
+
+    terminal = [c for c in all_chunks if c.choices[0].finish_reason][0]
+    reasoning_details = []
+    for d in terminal.choices[0].delta.reasoning_details:
+        append_streamed_reasoning_detail(reasoning_details, d)
+
+    assistant_msg = SimpleNamespace(
+        role="assistant",
+        content=None,
+        tool_calls=[
+            SimpleNamespace(
+                id="call_db_1",
+                type="function",
+                function=SimpleNamespace(name="query", arguments='{"id": 1}'),
+                extra_content={"google": {"thought_signature": "sig_stream_db"}},
+            )
+        ],
+        reasoning=None,
+        reasoning_content=None,
+        reasoning_details=reasoning_details,
+    )
+
+    mock_agent = MagicMock()
+    mock_agent._needs_thinking_reasoning_pad.return_value = False
+    mock_agent._extract_reasoning.return_value = None
+    mock_agent._split_responses_tool_id.side_effect = lambda rid: (rid, None)
+    mock_agent._derive_responses_function_call_id.return_value = None
+
+    persisted_dict = build_assistant_message(mock_agent, assistant_msg, finish_reason="tool_calls")
+
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "state.db"
+        db = SessionDB(db_path)
+        session_id = "test-stream-persist"
+        db.create_session(session_id, source="cli")
+        row = _db_flush_row(mock_agent, persisted_dict, is_current_turn_user=False)
+        db.append_message(session_id, **row)
+
+        db2 = SessionDB(db_path)
+        loaded = db2.get_messages(session_id)
+        assert len(loaded) == 1
+        loaded_carrier = find_native_assistant_detail(loaded[0]["reasoning_details"])
+        assert loaded_carrier is not None
+        assert loaded_carrier["content"]["parts"][0]["thoughtSignature"] == "sig_stream_db"

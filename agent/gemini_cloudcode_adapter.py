@@ -485,6 +485,7 @@ class GeminiCloudCodeClient:
                                                 content=getattr(msg, "content", None),
                                                 tool_calls=getattr(msg, "tool_calls", None),
                                                 reasoning=getattr(msg, "reasoning", None),
+                                                reasoning_details=getattr(msg, "reasoning_details", None),
                                             ),
                                             finish_reason="stop",
                                         )
@@ -496,12 +497,17 @@ class GeminiCloudCodeClient:
                         raise gemini_http_error(response, body_text=body_text)
 
                     tool_call_indices: Dict[str, Dict[str, Any]] = {}
+                    from agent.native_replay import GoogleNativeStreamAccumulator
+                    from agent.gemini_native_adapter import is_gemini_model
+                    native_state = GoogleNativeStreamAccumulator() if is_gemini_model(model) else None
                     for raw_event in _iter_sse_events(response):
                         # Unwrap CaGenerateContentResponse container if wrapped
                         event = raw_event
                         if isinstance(raw_event, dict):
                             event = raw_event.get("response", raw_event)
-                        for chunk in translate_stream_event(event, model, tool_call_indices):
+                        for chunk in translate_stream_event(
+                            event, model, tool_call_indices, native_stream_state=native_state
+                        ):
                             yield chunk
             except httpx.HTTPError as exc:
                 raise GeminiAPIError(
