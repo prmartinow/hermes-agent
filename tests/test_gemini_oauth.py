@@ -1829,8 +1829,8 @@ def test_discovery_to_resolver_closure_property():
     )
 
     raw_models = {
-        "gemini-3.8-flash-tiered": {"displayName": None, "supportsThinking": True},
-        "gemini-3.7-flash-tiered": {"displayName": None, "supportsThinking": True},
+        "gemini-3.8-flash-tiered": {"displayName": None, "supportsThinking": True, "thinkingBudget": -1},
+        "gemini-3.7-flash-tiered": {"displayName": None, "supportsThinking": True, "thinkingBudget": -1},
         "gemini-3.6-flash-low": {"displayName": "Gemini 3.6 Flash (Low)", "supportsThinking": True},
         "gemini-3.6-flash-medium": {"displayName": "Gemini 3.6 Flash (Medium)", "supportsThinking": True},
         "gemini-3.6-flash-high": {"displayName": "Gemini 3.6 Flash (High)", "supportsThinking": True},
@@ -1853,7 +1853,15 @@ def test_discovery_to_resolver_closure_property():
         _GEMINI_MODELS_CACHE.clear()
 
         base_models = fetch_gemini_available_models(account="test_closure", force=True)
-        efforts_map = get_gemini_model_efforts()
+        efforts_map = get_gemini_model_efforts(account="test_closure")
+
+        assert "gemini-3.8-flash" in base_models
+        assert "gemini-3.7-flash" in base_models
+        assert "gemini-3.8-flash-tiered" not in base_models
+        assert "gemini-3.7-flash-tiered" not in base_models
+
+        assert efforts_map["gemini-3.8-flash"] == ("low", "medium", "high")
+        assert efforts_map["gemini-3.7-flash"] == ("low", "medium", "high")
 
         for base in base_models:
             efforts = efforts_map.get(base, ())
@@ -1873,21 +1881,29 @@ def test_provider_model_ids_gemini_oauth_live_fetch_success():
         assert models == ["gemini-3.8-flash", "gemini-3.7-flash"]
 
 
-def test_provider_model_ids_gemini_oauth_live_fetch_empty_falls_through_to_profile():
+@pytest.mark.parametrize(
+    "provider",
+    ["gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"],
+)
+def test_provider_model_ids_gemini_accounts_empty_discovery_falls_back(provider):
     from hermes_cli.models import provider_model_ids
     from providers import get_provider_profile
     profile = get_provider_profile("gemini-oauth")
 
     with patch("hermes_cli.auth.fetch_gemini_available_models", return_value=[]):
-        models = provider_model_ids("gemini-oauth")
+        models = provider_model_ids(provider)
         assert models == list(profile.fallback_models)
 
 
-def test_provider_model_ids_gemini_oauth_live_fetch_exception_falls_through_to_profile():
+@pytest.mark.parametrize(
+    "provider",
+    ["gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"],
+)
+def test_provider_model_ids_gemini_accounts_exception_discovery_falls_back(provider):
     from hermes_cli.models import provider_model_ids
     from providers import get_provider_profile
     profile = get_provider_profile("gemini-oauth")
 
     with patch("hermes_cli.auth.fetch_gemini_available_models", side_effect=RuntimeError("Network down")):
-        models = provider_model_ids("gemini-oauth")
+        models = provider_model_ids(provider)
         assert models == list(profile.fallback_models)

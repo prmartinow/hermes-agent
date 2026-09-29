@@ -8,7 +8,7 @@
 
 ## 1. Executive Summary & Problem Resolution
 
-This architecture establishes full behavioral, semantic, and wire-level alignment between Hermes Agent's Google Gemini OAuth provider (`gemini-oauth`) and Google's production Antigravity CLI Go binary (`agy` v1.2.13, reverse-engineered from `google3/third_party/jetski`).
+This architecture establishes behavioral and wire-level alignment for Cloud Code model identity, effort resolution, discovery normalization, and request routing between Hermes Agent's Google Gemini OAuth provider (`gemini-oauth`) and Google's production Antigravity CLI Go binary (`agy` v1.2.13, reverse-engineered from `google3/third_party/jetski`).
 
 ### The Historical Architectural Deficiencies (P0)
 1. **Virtual-Slug Leakage**: Previously, tiered Google models were expanded into synthesized virtual slugs (`gemini-3.8-flash-high`, `gemini-3.8-flash-medium`, `gemini-3.8-flash-low`) directly in discovery. This leaked transport-level concepts into model identity, polluted fallback rosters, and corrupted session-level model persistence.
@@ -105,7 +105,7 @@ The test suite enforces mathematical closure across all four layers:
 1. **Resolver Unit Suite** (`tests/agent/test_gemini_cloudcode_models.py` — 83 tests):
    - Contract verification for `parse_model_slug`, `model_for_base_effort`, and `efforts_for_base`.
    - Backward compatibility for every entry in `LEGACY_MODEL_ALIASES`.
-   - Prefix stripping across standard vendor namespaces (`gemini/`, `google/`, `anthropic/`).
+   - Prefix stripping across Gemini vendor namespaces (`gemini/`, `google/`, `gemini-oauth/`), while intentionally preserving unrelated vendor-qualified namespaces (such as `anthropic/`) without mutation.
    - Fallback catalog canonical invariant: asserts no legacy aliases exist in `profile.fallback_models`.
    - Static wire route uniqueness invariant: guarantees injective wire mapping.
 
@@ -119,3 +119,8 @@ The test suite enforces mathematical closure across all four layers:
    - Full wire equivalence closure across all legacy aliases.
    - End-to-end transport seam tests verifying `ChatCompletionsTransport` + `GeminiOAuthProfile` interaction.
    - Strict rejection tests for unsupported efforts (`3.8 + max`, `3.1 + medium`).
+### Known Upstream Availability Exception: `gemini-3.1-pro-high`
+- **Catalog Discovery**: Exists in Google Cloud Code PA `:fetchAvailableModels` (`displayName: "Gemini 3.1 Pro (High)"`, `tagTitle: "New"`, `model: "MODEL_PLACEHOLDER_M37"`).
+- **Token Accounting**: Successfully accepted by Google Cloud Code PA `:countTokens` (HTTP 200 OK).
+- **Inference Service**: Upstream Google Cloud Code PA currently rejects `:generateContent` and `:streamGenerateContent` with HTTP 400 (`INVALID_ARGUMENT: Request contains an invalid argument`) across all authenticated accounts.
+- **Resolution Architecture Decision**: Hermes correctly preserves the verified canonical route (`gemini-3.1-pro-high` in static capabilities) to maintain catalog/accounting closure and full parity with AGY strings, while documenting that upstream Google has not yet activated inference serving for this placeholder tier.

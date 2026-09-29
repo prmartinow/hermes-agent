@@ -1496,9 +1496,14 @@ def _gemini_oauth_catalog(normalized: str, force_refresh: bool) -> Optional[list
     try:
         from hermes_cli.auth import fetch_gemini_available_models
         models = fetch_gemini_available_models(account=normalized, force=force_refresh)
-        return models or None
+        if models:
+            return models
     except Exception:
-        return None
+        pass
+
+    from providers import get_provider_profile
+    profile = get_provider_profile("gemini-oauth")
+    return list(profile.fallback_models) if profile and profile.fallback_models else None
 
 
 # Per-provider catalog sources tried before the generic profile fetch. A fetcher returning None
