@@ -309,3 +309,129 @@ def test_m1_outbound_build_gemini_contents_unmodified():
     fc_part = [p for p in model_turn["parts"] if "functionCall" in p][0]
     assert fc_part["functionCall"]["name"] == "my_tool"
     assert fc_part["thoughtSignature"] == "orig_sig_1"
+# ============================================================================
+# 4. Milestone 1 Amendment Tests: Partner Exclusion & Boundary Hardening
+# ============================================================================
+
+def test_translate_gemini_response_excludes_partner_models():
+    raw_resp = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "functionCall": {"name": "get_weather", "args": {"city": "Paris"}},
+                        }
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ]
+    }
+
+    # Claude partner model: must NOT receive google.native_assistant
+    res_claude = translate_gemini_response(raw_resp, model="claude-sonnet-4-6")
+    assert res_claude.choices[0].message.reasoning_details is None
+    assert len(res_claude.choices[0].message.tool_calls) == 1
+
+    # GPT-OSS partner model: must NOT receive google.native_assistant
+    res_gpt = translate_gemini_response(raw_resp, model="gpt-oss-120b-medium")
+    assert res_gpt.choices[0].message.reasoning_details is None
+    assert len(res_gpt.choices[0].message.tool_calls) == 1
+
+
+def test_filter_native_assistant_details_preserves_non_dicts():
+    details = [
+        {"type": "google.native_assistant", "version": 1},
+        "opaque-provider-detail",
+        17,
+        {"type": "ordinary_reasoning", "content": "text"},
+    ]
+
+    filtered = filter_native_assistant_details(details, keep_type=None)
+    assert "opaque-provider-detail" in filtered
+    assert 17 in filtered
+    assert {"type": "ordinary_reasoning", "content": "text"} in filtered
+    assert not any(isinstance(d, dict) and d.get("type") == "google.native_assistant" for d in filtered)
+
+
+def test_build_google_native_carrier_takes_deep_snapshot():
+    parts = [
+        {
+            "functionCall": {
+                "name": "tool",
+                "args": {"nested": {"x": 1}},
+            },
+            "thoughtSignature": "sig",
+        }
+    ]
+
+    carrier = build_google_native_carrier(parts, "gemini-3.8-flash-tiered")
+
+    # Mutate the source part
+    parts[0]["functionCall"]["args"]["nested"]["x"] = 99
+    parts[0]["thoughtSignature"] = "mutated"
+
+    # Carrier must remain unchanged
+    carrier_part = carrier["content"]["parts"][0]
+    assert carrier_part["functionCall"]["args"]["nested"]["x"] == 1
+    assert carrier_part["thoughtSignature"] == "sig"
+
+
+def test_production_intake_pipeline_gemini_response_to_session_db():
+    from agent.chat_completion_helpers import build_assistant_message
+    from unittest.mock import MagicMock
+
+    raw_resp = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"thought": True, "text": "Analyzing request"},
+                        {"functionCall": {"name": "query_metrics", "args": {"id": 42}}, "thoughtSignature": "sig_metric_42"},
+                    ],
+                },
+                "finishReason": "STOP",
+            }
+        ]
+    }
+
+    # 1. Translate raw Gemini response
+    translated = translate_gemini_response(raw_resp, model="gemini-3.8-flash-tiered")
+    assistant_msg = translated.choices[0].message
+    assert assistant_msg.reasoning_details is not None
+
+    # 2. Intake via build_assistant_message
+    mock_agent = MagicMock()
+    mock_agent._needs_thinking_reasoning_pad.return_value = False
+    mock_agent._extract_reasoning.return_value = None
+    mock_agent._split_responses_tool_id.side_effect = lambda rid: (rid, None)
+    mock_agent._derive_responses_function_call_id.return_value = None
+    persisted_dict = build_assistant_message(mock_agent, assistant_msg, finish_reason="tool_calls")
+
+    assert "reasoning_details" in persisted_dict
+    carrier = find_native_assistant_detail(persisted_dict["reasoning_details"])
+    assert carrier is not None
+    assert carrier["content"]["parts"] == raw_resp["candidates"][0]["content"]["parts"]
+
+    # 3. Store in SessionDB, close, restore, and verify
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "state.db"
+        db = SessionDB(db_path)
+        session_id = "test-prod-intake"
+        db.create_session(session_id, source="cli")
+        from agent.session_persistence import _db_flush_row
+        row = _db_flush_row(mock_agent, persisted_dict, is_current_turn_user=False)
+        db.append_message(session_id, **row)
+
+        # Restore from fresh DB
+        db2 = SessionDB(db_path)
+        loaded = db2.get_messages(session_id)
+        assert len(loaded) == 1
+        loaded_msg = loaded[0]
+
+        loaded_carrier = find_native_assistant_detail(loaded_msg["reasoning_details"])
+        assert loaded_carrier is not None
+        assert loaded_carrier == carrier

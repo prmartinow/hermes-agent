@@ -5,11 +5,12 @@ Providers that emit cryptographic signatures or ordered native part structures
 message's ``reasoning_details`` list under ``type: "<provider>.native_assistant"``.
 
 These helpers provide representation-safe operations across both in-memory
-``list[dict]`` structures and SQLite-restored JSON text representations.
+``list`` structures and SQLite-restored JSON text representations.
 """
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any, Dict, List, Optional
 
@@ -18,12 +19,12 @@ GOOGLE_NATIVE_ASSISTANT_TYPE = "google.native_assistant"
 CURRENT_NATIVE_CARRIER_VERSION = 1
 
 
-def normalize_reasoning_details(value: Any) -> List[Dict[str, Any]]:
-    """Normalize a reasoning_details value (list, None, or JSON string) to a list of dicts.
+def normalize_reasoning_details(value: Any) -> List[Any]:
+    """Normalize a reasoning_details value (list, None, or JSON string) to a list.
 
     SQLite readers return ``reasoning_details`` as a raw JSON string. This helper
-    guarantees callers receive a mutable list of dictionaries without breaking
-    non-dict elements.
+    guarantees callers receive a mutable list without dropping or altering unknown
+    or non-dict provider entries.
     """
     if value is None:
         return []
@@ -34,17 +35,17 @@ def normalize_reasoning_details(value: Any) -> List[Dict[str, Any]]:
         try:
             parsed = json.loads(trimmed)
             if isinstance(parsed, list):
-                return [d for d in parsed if isinstance(d, dict)]
+                return copy.deepcopy(parsed)
             if isinstance(parsed, dict):
-                return [parsed]
-            return []
+                return [copy.deepcopy(parsed)]
+            return [parsed]
         except (json.JSONDecodeError, TypeError):
             return []
     if isinstance(value, list):
-        return [dict(d) for d in value if isinstance(d, dict)]
+        return copy.deepcopy(value)
     if isinstance(value, dict):
-        return [dict(value)]
-    return []
+        return [copy.deepcopy(value)]
+    return [copy.deepcopy(value)]
 
 
 def find_native_assistant_detail(
@@ -54,7 +55,7 @@ def find_native_assistant_detail(
     """Find the first native assistant carrier matching target_type."""
     normalized = normalize_reasoning_details(details)
     for d in normalized:
-        if d.get("type") == target_type:
+        if isinstance(d, dict) and d.get("type") == target_type:
             return d
     return None
 
@@ -62,18 +63,22 @@ def find_native_assistant_detail(
 def filter_native_assistant_details(
     details: Any,
     keep_type: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    """Filter reasoning_details, retaining non-native details plus native details matching keep_type.
+) -> List[Any]:
+    """Filter reasoning_details, retaining non-native entries plus native details matching keep_type.
 
-    Any carrier whose type ends with ``.native_assistant`` is removed unless its
-    type matches keep_type exactly.
+    Only dictionary entries whose type ends with ``.native_assistant`` are evaluated;
+    they are removed unless their type matches keep_type exactly. Non-dict entries
+    and non-native dictionaries are preserved untouched.
     """
     normalized = normalize_reasoning_details(details)
-    kept: List[Dict[str, Any]] = []
+    kept: List[Any] = []
     for d in normalized:
-        dtype = str(d.get("type") or "")
-        if dtype.endswith(".native_assistant"):
-            if keep_type and dtype == keep_type:
+        if isinstance(d, dict):
+            dtype = str(d.get("type") or "")
+            if dtype.endswith(".native_assistant"):
+                if keep_type and dtype == keep_type:
+                    kept.append(d)
+            else:
                 kept.append(d)
         else:
             kept.append(d)
@@ -83,7 +88,7 @@ def filter_native_assistant_details(
 def upsert_native_assistant_detail(
     details: Any,
     carrier: Dict[str, Any],
-) -> List[Dict[str, Any]]:
+) -> List[Any]:
     """Insert or update a native assistant carrier in reasoning_details by carrier type."""
     normalized = normalize_reasoning_details(details)
     carrier_type = carrier.get("type")
@@ -91,16 +96,17 @@ def upsert_native_assistant_detail(
         raise ValueError("Native carrier dictionary must contain a non-empty 'type' key.")
 
     updated = False
-    result: List[Dict[str, Any]] = []
+    result: List[Any] = []
+    carrier_copy = copy.deepcopy(carrier)
     for d in normalized:
-        if d.get("type") == carrier_type:
-            result.append(dict(carrier))
+        if isinstance(d, dict) and d.get("type") == carrier_type:
+            result.append(carrier_copy)
             updated = True
         else:
             result.append(d)
 
     if not updated:
-        result.append(dict(carrier))
+        result.append(carrier_copy)
     return result
 
 
@@ -110,13 +116,14 @@ def build_google_native_carrier(
     role: str = "model",
     version: int = CURRENT_NATIVE_CARRIER_VERSION,
 ) -> Dict[str, Any]:
-    """Construct an ordered google.native_assistant replay carrier dictionary."""
+    """Construct an ordered google.native_assistant replay carrier dictionary with a deep snapshot."""
+    valid_parts = [copy.deepcopy(p) for p in parts if isinstance(p, dict)]
     return {
         "type": GOOGLE_NATIVE_ASSISTANT_TYPE,
         "version": version,
         "source_model": source_model,
         "content": {
             "role": role,
-            "parts": [dict(p) for p in parts if isinstance(p, dict)],
+            "parts": valid_parts,
         },
     }

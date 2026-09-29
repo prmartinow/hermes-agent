@@ -1221,7 +1221,7 @@ def translate_gemini_response(resp: Dict[str, Any], model: str) -> SimpleNamespa
     )
     reasoning = "".join(reasoning_pieces) or None
     native_carrier = None
-    if isinstance(parts, list) and parts:
+    if is_gemini_model(model) and isinstance(parts, list) and parts:
         from agent.native_replay import build_google_native_carrier
         native_carrier = build_google_native_carrier(
             parts=parts,
