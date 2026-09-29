@@ -156,21 +156,25 @@ class GoogleNativeStreamAccumulator:
                 target_idx = self._slot_to_part_index[function_slot]
 
             if target_idx is not None:
-                # Merge into existing part for this logical function call
+                # Generic lossless merge into existing part for this logical function call
                 existing = self.parts[target_idx]
-                existing_fc = existing.setdefault("functionCall", {})
-                if fc.get("name"):
-                    existing_fc["name"] = fc["name"]
-                if fc.get("args") is not None:
-                    existing_fc["args"] = copy.deepcopy(fc["args"])
-                if call_id:
-                    existing_fc["id"] = call_id
-                    self._call_id_to_part_index[call_id] = target_idx
 
-                # Retain thoughtSignature: if already observed, do not overwrite with None/empty
-                sig = part.get("thoughtSignature") or part.get("thought_signature")
-                if sig and not existing.get("thoughtSignature"):
-                    existing["thoughtSignature"] = sig
+                incoming_fc = part.get("functionCall")
+                if isinstance(incoming_fc, dict):
+                    existing_fc = existing.setdefault("functionCall", {})
+                    for k, v in incoming_fc.items():
+                        existing_fc[k] = copy.deepcopy(v)
+                    if call_id:
+                        self._call_id_to_part_index[call_id] = target_idx
+
+                for k, v in part.items():
+                    if k == "functionCall":
+                        continue
+                    if k in {"thoughtSignature", "thought_signature"}:
+                        if v and not (existing.get("thoughtSignature") or existing.get("thought_signature")):
+                            existing[k] = copy.deepcopy(v)
+                        continue
+                    existing[k] = copy.deepcopy(v)
                 return
 
             # First time observing this function call

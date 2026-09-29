@@ -776,3 +776,44 @@ def test_streaming_intake_to_session_db_persistence_roundtrip():
         loaded_carrier = find_native_assistant_detail(loaded[0]["reasoning_details"])
         assert loaded_carrier is not None
         assert loaded_carrier["content"]["parts"][0]["thoughtSignature"] == "sig_stream_db"
+def test_stream_accumulator_preserves_unknown_fields_across_function_snapshots():
+    acc = GoogleNativeStreamAccumulator()
+
+    acc.observe_part(
+        {
+            "functionCall": {
+                "name": "tool",
+                "args": {"x": 1},
+                "id": "c1",
+                "nativeCallMeta": {"v": 1},
+            },
+            "thoughtSignature": "sig",
+            "nativePartMeta": {"stage": 1},
+            "earlyOnlyField": {"init": True},
+        },
+        function_slot=0,
+    )
+
+    acc.observe_part(
+        {
+            "functionCall": {
+                "name": "tool",
+                "args": {"x": 2},
+                "id": "c1",
+                "nativeCallMeta": {"v": 2},
+            },
+            "nativePartMeta": {"stage": 2},
+            "lateNativeField": {"ok": True},
+            # earlyOnlyField omitted in frame 2
+        },
+        function_slot=0,
+    )
+
+    part = acc.build_carrier("gemini-3.8-flash-tiered")["content"]["parts"][0]
+
+    assert part["functionCall"]["args"] == {"x": 2}
+    assert part["functionCall"]["nativeCallMeta"] == {"v": 2}
+    assert part["nativePartMeta"] == {"stage": 2}
+    assert part["lateNativeField"] == {"ok": True}
+    assert part["earlyOnlyField"] == {"init": True}  # Preserved across omission!
+    assert part["thoughtSignature"] == "sig"  # Preserved across omission!
