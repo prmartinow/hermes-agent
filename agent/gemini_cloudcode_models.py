@@ -79,7 +79,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=("low", "medium", "high"),
         default_effort="high",  # Hermes compatibility default; aligns with thinkingBudget=-1
         supports_thinking=True,
-        supports_thought_circulation=None,
+        supports_thought_circulation=True,
         max_tokens=1048576,
         max_output_tokens=65536,
         routes={
@@ -94,7 +94,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=("low", "medium", "high"),
         default_effort="high",
         supports_thinking=True,
-        supports_thought_circulation=None,
+        supports_thought_circulation=True,
         max_tokens=1048576,
         max_output_tokens=65536,
         routes={
@@ -111,7 +111,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=("low", "medium", "high"),
         default_effort="high",
         supports_thinking=True,
-        supports_thought_circulation=None,
+        supports_thought_circulation=True,
         max_tokens=1048576,
         max_output_tokens=65536,
         routes={
@@ -143,7 +143,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=("low", "high"),
         default_effort="high",
         supports_thinking=True,
-        supports_thought_circulation=None,
+        supports_thought_circulation=True,
         max_tokens=1048576,
         max_output_tokens=65535,
         routes={
@@ -171,6 +171,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=(),
         default_effort=None,
         supports_thinking=True,
+        supports_thought_circulation=False,
         max_tokens=250000,
         max_output_tokens=64000,
         routes={
@@ -183,6 +184,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=(),
         default_effort=None,
         supports_thinking=True,
+        supports_thought_circulation=False,
         max_tokens=250000,
         max_output_tokens=64000,
         routes={
@@ -196,6 +198,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         default_effort=None,
         # Upstream catalog reports supportsThinking=True, but model has no user-selectable effort levels
         supports_thinking=True,
+        supports_thought_circulation=False,
         max_tokens=131072,
         max_output_tokens=32768,
         routes={
@@ -504,3 +507,11 @@ def normalize_discovered_model(
         available_efforts=(),
         canonicalized=False,
     )
+def thought_circulation_support(model: str) -> Optional[bool]:
+    """Return thought circulation support (True/False/None) for a model identity.
+
+    Handles canonical base models, legacy aliases, and known Gemini provider prefixes.
+    """
+    parsed = parse_model_slug(model)
+    cap = get_model_capability(parsed.base_model)
+    return cap.supports_thought_circulation if cap is not None else None

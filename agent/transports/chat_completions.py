@@ -275,13 +275,49 @@ def _is_openai_api_base_url(base_url: Any) -> bool:
         return False
 
 
-def _model_consumes_thought_signature(model: Any) -> bool:
-    """True for Gemini-family targets, which require tool-call ``extra_content`` (thought_signature) replay.
+def thought_circulation_support(model: Any) -> bool | None:
+    """Helper delegating to agent.gemini_cloudcode_models.thought_circulation_support."""
+    from agent.gemini_cloudcode_models import thought_circulation_support as _tcs
+    return _tcs(str(model or ""))
 
-    Every other strict provider rejects it, so it is stripped for non-Gemini targets.
+
+def _model_consumes_thought_signature(model: Any) -> bool:
+    """Deprecated: check whether model has verified thought circulation support."""
+    return thought_circulation_support(model) is True
+
+
+def _destination_accepts_google_thought_replay(
+    *,
+    model: Any,
+    base_url: Any = None,
+    provider_profile: Any = None,
+) -> tuple[bool, bool]:
+    """Determine whether destination route and model capability authorize Google thought replay.
+
+    Returns (allow_signature_sidecar, allow_native_carrier).
     """
-    m = str(model or "").lower()
-    return "gemini" in m or "gemma" in m
+    model_str = str(model or "").strip()
+    if not model_str:
+        return False, False
+
+    circulation = thought_circulation_support(model_str)
+    if circulation is not True:
+        return False, False
+
+    native_type = getattr(provider_profile, "native_reasoning_details_type", None)
+    is_gemini_profile = (native_type == "google.native_assistant")
+
+    if is_gemini_profile:
+        # Direct Gemini or Gemini OAuth route with verified circulation capability
+        return True, True
+
+    if _route_replays_reasoning_details(base_url):
+        # OpenRouter / Nous aggregator route: allows tool-call signature sidecar,
+        # but strips private google.native_assistant carrier
+        return True, False
+
+    # Any other strict or unrelated route
+    return False, False
 
 
 def _route_replays_reasoning_details(base_url: Any) -> bool:
@@ -408,29 +444,33 @@ def _sanitize_message(
     """Sanitized copy of ``msg``, or None when nothing needs stripping.
 
     Drops persistence sidecars, ``_``-prefixed scaffolding markers, tool-call ``call_id`` /
-    ``response_item_id`` (and ``extra_content`` unless Gemini), an assistant
+    ``response_item_id`` (and ``extra_content`` unless authorized), an assistant
     ``tool_calls: []`` / ``null`` (strict providers reject both), ``name``
     on tool results (schema-valid only on user/assistant messages; strict
     providers reject it with ``contains item with unknown key name``), and
-    ``reasoning_details`` unless the route replays it (``_route_replays_reasoning_details``).
-    On a replaying route, private ``<provider>.native_assistant`` carriers still go only to the
-    profile that declared that exact type: another provider's signed replay is meaningless (or
-    rejected) elsewhere, and stored history keeps it for a return to the original provider.
+    ``reasoning_details`` unless the route replays it.
     """
     if not isinstance(msg, dict):
         return None
+    from agent.native_replay import filter_native_assistant_details
+
     strip_keys = [k for k in msg if k in _STRIP_MSG_KEYS or (isinstance(k, str) and k.startswith("_"))]
     kept_details = None
-    if strip_reasoning_details and "reasoning_details" in msg:
-        strip_keys.append("reasoning_details")
-    elif isinstance(msg.get("reasoning_details"), list):
-        details = msg["reasoning_details"]
-        kept = [d for d in details if not (
-            isinstance(d, dict) and isinstance(d.get("type"), str)
-            and d["type"].endswith(".native_assistant") and d["type"] != native_reasoning_details_type)]
-        if len(kept) != len(details):
+    if "reasoning_details" in msg:
+        if strip_reasoning_details:
             strip_keys.append("reasoning_details")
-            kept_details = kept
+        else:
+            raw_details = msg["reasoning_details"]
+            filtered = filter_native_assistant_details(
+                raw_details,
+                keep_type=native_reasoning_details_type,
+            )
+            if isinstance(raw_details, str):
+                strip_keys.append("reasoning_details")
+                kept_details = filtered if filtered else None
+            elif len(filtered) != len(raw_details):
+                strip_keys.append("reasoning_details")
+                kept_details = filtered if filtered else None
     # ``name`` is schema-valid on user/assistant messages, so the removal is
     # role-qualified: only tool results carry it illegally (strict providers
     # reject with "contains item with unknown key name").
@@ -478,11 +518,26 @@ class ChatCompletionsTransport(ProviderTransport):
 
         Returns the input list unchanged when nothing needs sanitizing.
         """
-        strip_extra_content = not _model_consumes_thought_signature(kwargs.get("model"))
-        # A profile declaring a native carrier type consumes replayed details by contract.
-        native_type = getattr(kwargs.get("provider_profile"), "native_reasoning_details_type", None) or None
-        strip_reasoning_details = not (native_type or _route_replays_reasoning_details(kwargs.get("base_url")))
-        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning_details, native_type))
+        provider_profile = kwargs.get("provider_profile")
+        base_url = kwargs.get("base_url")
+        model = kwargs.get("model")
+
+        allow_sig, allow_carrier = _destination_accepts_google_thought_replay(
+            model=model,
+            base_url=base_url,
+            provider_profile=provider_profile,
+        )
+        strip_extra_content = not allow_sig
+
+        profile_native_type = getattr(provider_profile, "native_reasoning_details_type", None) or None
+        replays_reasoning = _route_replays_reasoning_details(base_url)
+
+        strip_reasoning_details = not (profile_native_type or replays_reasoning)
+        effective_native_type = "google.native_assistant" if allow_carrier else (
+            profile_native_type if not (profile_native_type and profile_native_type == "google.native_assistant") else None
+        )
+
+        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning_details, effective_native_type))
                            for m in messages]
         if all(s is None for _, s in sanitized_pairs):
             return messages

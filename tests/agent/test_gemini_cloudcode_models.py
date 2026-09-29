@@ -435,3 +435,44 @@ def test_static_wire_model_routes_uniqueness():
                 assert seen[route.wire_model] == (base, effort), f"Collision on static wire model {route.wire_model}"
             seen[route.wire_model] = (base, effort)
     assert seen == _STATIC_WIRE_MODEL_ROUTES
+# ============================================================================
+# K. Action Item 2, Milestone 3: Thought Circulation Capability Matrix
+# ============================================================================
+
+from agent.gemini_cloudcode_models import thought_circulation_support
+
+
+def test_thought_circulation_support_verified_models():
+    # Verified True
+    assert thought_circulation_support("gemini-3.8-flash") is True
+    assert thought_circulation_support("gemini-3.7-flash") is True
+    assert thought_circulation_support("gemini-3.6-flash") is True
+    assert thought_circulation_support("gemini-3.1-pro") is True
+
+    # Verified False for Cloud Code partner models that reject Google signatures
+    assert thought_circulation_support("claude-sonnet-4-6") is False
+    assert thought_circulation_support("claude-opus-4-6-thinking") is False
+    assert thought_circulation_support("gpt-oss-120b-medium") is False
+
+    # Unverified / Unknown: None (never inferred from supports_thinking)
+    assert thought_circulation_support("gemini-3.5-flash") is None
+    assert thought_circulation_support("gemini-3.1-flash-lite") is None
+    assert thought_circulation_support("gemini-3-flash-agent") is None
+    assert thought_circulation_support("gemini-pro-agent") is None
+    assert thought_circulation_support("gemini-4.2-flash") is None
+    assert thought_circulation_support("unknown-model-xyz") is None
+
+
+def test_thought_circulation_support_aliases_and_prefixes():
+    # Legacy virtual aliases resolve to base capability
+    assert thought_circulation_support("gemini-3.8-flash-high") is True
+    assert thought_circulation_support("gemini-3.6-flash-low") is True
+
+    # Standard Gemini vendor prefixes stripped cleanly
+    assert thought_circulation_support("google/gemini-3.8-flash") is True
+    assert thought_circulation_support("gemini/gemini-3.8-flash") is True
+    assert thought_circulation_support("gemini-oauth/gemini-3.8-flash") is True
+
+    # Unrelated vendor prefixes preserved without false positive matching
+    assert thought_circulation_support("acme/gemini-3.8-flash") is None
+    assert thought_circulation_support("my-gemini-proxy") is None

@@ -36,6 +36,7 @@ gemini = GeminiProfile(
     env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
     base_url="https://generativelanguage.googleapis.com/v1beta", auth_type="api_key",
     default_aux_model="gemini-3.6-flash",
+    native_reasoning_details_type="google.native_assistant",
 )
 
 register_provider(gemini)
