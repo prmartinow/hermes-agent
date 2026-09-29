@@ -515,3 +515,50 @@ def thought_circulation_support(model: str) -> Optional[bool]:
     parsed = parse_model_slug(model)
     cap = get_model_capability(parsed.base_model)
     return cap.supports_thought_circulation if cap is not None else None
+
+def selectable_reasoning_efforts(
+    provider: str,
+    model: str,
+    *,
+    account: Any = None,
+) -> tuple[str, ...] | None:
+    """Return verified user-selectable reasoning effort strings for a route/model.
+
+    Semantics:
+      tuple -> verified selectable set (e.g. ('low', 'medium', 'high'))
+      ()    -> verified no user-selectable effort (e.g. gemini-3.1-flash-lite, claude)
+      None  -> unknown capability (generic/custom providers)
+
+    Priority for Gemini (gemini-oauth, numbered aliases gemini-1..5, or gemini):
+      1. Observed discovery via get_gemini_model_efforts(account)
+      2. Static registry fallback via get_model_capability(canonical_base)
+    """
+    prov = (provider or "").strip().lower()
+    is_gemini_prov = (
+        prov.startswith("gemini-oauth")
+        or prov.startswith("gemini")
+        or prov.startswith("google")
+    )
+    m_lower = (model or "").strip().lower()
+    is_gemini_route = is_gemini_prov or "gemini" in m_lower or m_lower.startswith("google/")
+    if not is_gemini_route:
+        return None
+
+    parsed = parse_model_slug(model)
+    base_model = parsed.base_model
+
+    discovered_efforts: dict[str, tuple[str, ...]] | None = None
+    try:
+        from hermes_cli.auth import get_gemini_model_efforts
+        discovered_efforts = get_gemini_model_efforts(account=account or 1)
+    except Exception:
+        discovered_efforts = None
+
+    if discovered_efforts is not None and base_model in discovered_efforts:
+        return discovered_efforts[base_model]
+
+    cap = get_model_capability(base_model)
+    if cap is not None:
+        return cap.efforts
+
+    return None

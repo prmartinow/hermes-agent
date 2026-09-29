@@ -682,6 +682,44 @@ def _apply_featured_with_dates(rows, dates: dict[str, str]):
     with patch("agent.models_dev.get_model_info", side_effect=_fake_get_model_info):
         inventory._apply_featured(rows)
 
+def test_apply_capabilities_gemini_selectable_efforts():
+    """Verify _apply_capabilities attaches reasoning_efforts for Gemini models."""
+    from hermes_cli.inventory import _apply_capabilities
 
+    rows = [
+        {
+            "slug": "gemini-oauth",
+            "models": [
+                "gemini-3.8-flash",
+                "gemini-3.1-pro",
+                "gemini-3.1-flash-lite",
+                "claude-sonnet-4-6",
+            ],
+        },
+        {
+            "slug": "openai",
+            "models": ["gpt-4o"],
+        },
+    ]
 
+    _apply_capabilities(rows)
+
+    gemini_caps = rows[0]["capabilities"]
+    # Dynamic tiered 3.8 has exact effort ladder and can_disable_reasoning=False
+    assert gemini_caps["gemini-3.8-flash"]["reasoning_efforts"] == ["low", "medium", "high"]
+    assert gemini_caps["gemini-3.8-flash"]["can_disable_reasoning"] is False
+
+    # 3.1 Pro has low/high and can_disable_reasoning=False
+    assert gemini_caps["gemini-3.1-pro"]["reasoning_efforts"] == ["low", "high"]
+    assert gemini_caps["gemini-3.1-pro"]["can_disable_reasoning"] is False
+
+    # Flash Lite has empty selectable efforts
+    assert gemini_caps["gemini-3.1-flash-lite"]["reasoning_efforts"] == []
+
+    # Claude partner model has empty selectable efforts
+    assert gemini_caps["claude-sonnet-4-6"]["reasoning_efforts"] == []
+
+    # Non-Gemini provider retains generic capability shape without reasoning_efforts override
+    openai_caps = rows[1]["capabilities"]
+    assert "reasoning_efforts" not in openai_caps["gpt-4o"]
 

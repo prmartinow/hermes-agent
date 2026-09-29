@@ -476,3 +476,85 @@ def test_thought_circulation_support_aliases_and_prefixes():
     # Unrelated vendor prefixes preserved without false positive matching
     assert thought_circulation_support("acme/gemini-3.8-flash") is None
     assert thought_circulation_support("my-gemini-proxy") is None
+
+# ============================================================================
+# Action Item 3, Milestone 1: Selectable Reasoning Efforts & Alias Canonicalization
+# ============================================================================
+
+from unittest.mock import patch
+from agent.gemini_cloudcode_models import selectable_reasoning_efforts
+from hermes_constants import resolve_per_model_reasoning_effort
+
+
+def test_selectable_reasoning_efforts_canonical_and_aliases():
+    # Canonical Gemini models
+    assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.8-flash") == ("low", "medium", "high")
+    assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.7-flash") == ("low", "medium", "high")
+    assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.6-flash") == ("low", "medium", "high")
+    assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.1-pro") == ("low", "high")
+
+    # Legacy aliases resolve to canonical base effort set
+    assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.8-flash-high") == ("low", "medium", "high")
+    assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.1-pro-low") == ("low", "high")
+
+    # Prefix handling (gemini-oauth/ and google/)
+    assert selectable_reasoning_efforts("gemini-oauth", "google/gemini-3.8-flash") == ("low", "medium", "high")
+    assert selectable_reasoning_efforts("gemini-oauth", "gemini-oauth/gemini-3.8-flash") == ("low", "medium", "high")
+    assert selectable_reasoning_efforts("gemini", "gemini-3.8-flash") == ("low", "medium", "high")
+
+
+def test_selectable_reasoning_efforts_known_no_effort_models():
+    # Verified models that do not expose selectable reasoning effort
+    assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.1-flash-lite") == ()
+    assert selectable_reasoning_efforts("gemini-oauth", "claude-sonnet-4-6") == ()
+    assert selectable_reasoning_efforts("gemini-oauth", "claude-opus-4-6-thinking") == ()
+    assert selectable_reasoning_efforts("gemini-oauth", "gpt-oss-120b-medium") == ()
+
+
+def test_selectable_reasoning_efforts_unknown_models_and_providers():
+    # Unknown model under Gemini OAuth returns None (fails conservatively)
+    assert selectable_reasoning_efforts("gemini-oauth", "unknown-future-model") is None
+
+    # Non-Gemini providers return None
+    assert selectable_reasoning_efforts("openai", "gpt-4o") is None
+    assert selectable_reasoning_efforts("anthropic", "claude-3-5-sonnet") is None
+
+
+def test_selectable_reasoning_efforts_discovery_precedence_and_fallback():
+    # 1. When discovery returns an explicit empty tuple (), it is authoritative (not overridden by registry)
+    fake_discovery = {
+        "gemini-3.8-flash": ("low", "medium", "high"),
+        "gemini-custom-zero": (),
+    }
+    with patch("hermes_cli.auth.get_gemini_model_efforts", return_value=fake_discovery):
+        assert selectable_reasoning_efforts("gemini-oauth", "gemini-custom-zero") == ()
+        assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.8-flash") == ("low", "medium", "high")
+
+    # 2. When discovery is absent / model not in discovery, falls back to static capability registry
+    with patch("hermes_cli.auth.get_gemini_model_efforts", return_value={}):
+        assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.8-flash") == ("low", "medium", "high")
+        assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.1-pro") == ("low", "high")
+        assert selectable_reasoning_efforts("gemini-oauth", "claude-sonnet-4-6") == ()
+        assert selectable_reasoning_efforts("gemini-oauth", "unknown-model") is None
+
+
+def test_resolve_per_model_reasoning_effort_alias_canonicalization():
+    # Bug fix: override set on canonical base 'gemini-3.8-flash' must match legacy alias 'gemini-3.8-flash-high'
+    overrides = {
+        "gemini-3.8-flash": "low",
+        "gemini-3.1-pro": "high",
+    }
+
+    # Direct canonical lookup
+    assert resolve_per_model_reasoning_effort("gemini-3.8-flash", overrides) == {"enabled": True, "effort": "low"}
+
+    # Legacy alias lookup canonicalizes to base
+    assert resolve_per_model_reasoning_effort("gemini-3.8-flash-high", overrides) == {"enabled": True, "effort": "low"}
+    assert resolve_per_model_reasoning_effort("gemini-3.1-pro-low", overrides) == {"enabled": True, "effort": "high"}
+
+    # Prefixed aliases also canonicalize cleanly
+    assert resolve_per_model_reasoning_effort("google/gemini-3.8-flash-high", overrides) == {"enabled": True, "effort": "low"}
+    assert resolve_per_model_reasoning_effort("gemini-oauth/gemini-3.8-flash-high", overrides) == {"enabled": True, "effort": "low"}
+
+    # Unrelated models remain unmatched
+    assert resolve_per_model_reasoning_effort("gpt-4o", overrides) is None

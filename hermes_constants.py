@@ -1337,6 +1337,15 @@ def resolve_per_model_reasoning_effort(model: str, overrides: dict | None) -> di
     if not overrides or not isinstance(overrides, dict) or not model:
         return None
     variants = _canonical_model_variants(model)
+    try:
+        from agent.gemini_cloudcode_models import parse_model_slug
+        parsed = parse_model_slug(model)
+        if parsed.legacy_alias or parsed.base_model != model:
+            for b_var in _canonical_model_variants(parsed.base_model):
+                if b_var not in variants:
+                    variants.append(b_var)
+    except Exception:
+        pass
     for variant in variants:
         if variant in overrides:
             result = parse_reasoning_effort(overrides[variant])

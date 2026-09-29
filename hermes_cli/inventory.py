@@ -341,6 +341,16 @@ def _apply_capabilities(rows: list[dict]) -> None:
                 elif detail:
                     entry["can_disable_reasoning"] = not detail.get("mandatory")
 
+            try:
+                from agent.gemini_cloudcode_models import selectable_reasoning_efforts
+                efforts = selectable_reasoning_efforts(slug, model)
+                if efforts is not None:
+                    entry["reasoning_efforts"] = list(efforts)
+                    if efforts:
+                        entry["can_disable_reasoning"] = False
+            except Exception:
+                pass
+
             caps[model] = entry
 
         row["capabilities"] = caps
