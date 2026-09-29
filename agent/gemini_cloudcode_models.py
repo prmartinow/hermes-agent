@@ -419,6 +419,16 @@ def resolve_model_selection(
         selected_effort,
         explicit=is_explicit,
     )
+# Reverse index for unambiguous static wire models derived from registry capabilities
+_STATIC_WIRE_MODEL_ROUTES: dict[str, tuple[str, str]] = {
+    route.wire_model: (base, eff)
+    for base, cap in _MODEL_CAPABILITIES.items()
+    if base not in ("gemini-3.8-flash", "gemini-3.7-flash")
+    for eff, route in cap.routes.items()
+    if route.wire_model != base and eff
+}
+
+
 @dataclass(frozen=True)
 class DiscoveredModel:
     """Normalized result of an upstream Google Cloud Code PA catalog discovery record."""
@@ -465,25 +475,25 @@ def normalize_discovered_model(
             canonicalized=False,
         )
 
-    # 2. Static Tiered Models (e.g. gemini-3.6-flash-high, gemini-3.1-pro-high)
-    if mid_clean in LEGACY_MODEL_ALIASES:
-        base, eff = LEGACY_MODEL_ALIASES[mid_clean]
-        cap = get_model_capability(base)
-        if cap is not None and eff in cap.efforts:
-            return DiscoveredModel(
-                raw_model=mid_clean,
-                base_model=base,
-                available_efforts=(eff,),
-                canonicalized=True,
-            )
+    # 2. Static Tiered Wire Models (e.g. gemini-3.6-flash-high, gemini-3.1-pro-high)
+    # Derived strictly from wire routes in capability registry, NOT legacy user aliases
+    if mid_clean in _STATIC_WIRE_MODEL_ROUTES:
+        base, eff = _STATIC_WIRE_MODEL_ROUTES[mid_clean]
+        return DiscoveredModel(
+            raw_model=mid_clean,
+            base_model=base,
+            available_efforts=(eff,),
+            canonicalized=True,
+        )
 
     # 3. Known Base Models (e.g. claude-sonnet-4-6, gpt-oss-120b-medium, gemini-3.1-flash-lite)
+    # A bare base model reported by upstream does not establish effort capabilities by itself
     cap = get_model_capability(mid_clean)
     if cap is not None:
         return DiscoveredModel(
             raw_model=mid_clean,
             base_model=mid_clean,
-            available_efforts=cap.efforts,
+            available_efforts=(),
             canonicalized=False,
         )
 

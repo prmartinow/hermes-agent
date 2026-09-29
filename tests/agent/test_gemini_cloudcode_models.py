@@ -376,3 +376,27 @@ def test_normalize_discovered_model_passthroughs_and_future_models():
         available_efforts=(),
         canonicalized=False,
     )
+def test_dynamic_tier_requires_verified_metadata():
+    # If Google returns gemini-3.8-flash-tiered with unverified metadata, do not canonicalize
+    result = normalize_discovered_model(
+        "gemini-3.8-flash-tiered",
+        {"supportsThinking": False, "thinkingBudget": 0},
+    )
+    assert result.base_model == "gemini-3.8-flash-tiered"
+    assert result.available_efforts == ()
+    assert result.canonicalized is False
+
+
+def test_shorthand_aliases_not_canonicalized_in_discovery():
+    # Suffix/user shorthands are not wire models and must pass through unchanged if in catalog
+    assert normalize_discovered_model("gemini-3.8", {}).base_model == "gemini-3.8"
+    assert normalize_discovered_model("gemini-3.8-thinking", {}).base_model == "gemini-3.8-thinking"
+    assert normalize_discovered_model("gemini-3.6", {}).base_model == "gemini-3.6"
+
+
+def test_bare_registered_model_reports_empty_efforts_unless_wire_established():
+    # A bare base model reported by upstream does not establish effort capabilities by itself
+    result = normalize_discovered_model("gemini-3.8-flash", {})
+    assert result.base_model == "gemini-3.8-flash"
+    assert result.available_efforts == ()
+    assert result.canonicalized is False
