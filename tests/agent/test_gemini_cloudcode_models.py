@@ -481,13 +481,13 @@ def test_thought_circulation_support_aliases_and_prefixes():
 # Action Item 3, Milestone 1: Selectable Reasoning Efforts & Alias Canonicalization
 # ============================================================================
 
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from agent.gemini_cloudcode_models import selectable_reasoning_efforts
 from hermes_constants import resolve_per_model_reasoning_effort
 
 
 def test_selectable_reasoning_efforts_canonical_and_aliases():
-    # Canonical Gemini models
+    # Canonical Gemini models under Cloud Code routes
     assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.8-flash") == ("low", "medium", "high")
     assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.7-flash") == ("low", "medium", "high")
     assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.6-flash") == ("low", "medium", "high")
@@ -500,7 +500,10 @@ def test_selectable_reasoning_efforts_canonical_and_aliases():
     # Prefix handling (gemini-oauth/ and google/)
     assert selectable_reasoning_efforts("gemini-oauth", "google/gemini-3.8-flash") == ("low", "medium", "high")
     assert selectable_reasoning_efforts("gemini-oauth", "gemini-oauth/gemini-3.8-flash") == ("low", "medium", "high")
-    assert selectable_reasoning_efforts("gemini", "gemini-3.8-flash") == ("low", "medium", "high")
+
+    # Recognized Cloud Code aliases
+    for cc_alias in ["gemini_oauth", "gemini-antigravity", "google-oauth", "antigravity-gemini"]:
+        assert selectable_reasoning_efforts(cc_alias, "gemini-3.8-flash") == ("low", "medium", "high")
 
 
 def test_selectable_reasoning_efforts_known_no_effort_models():
@@ -511,31 +514,61 @@ def test_selectable_reasoning_efforts_known_no_effort_models():
     assert selectable_reasoning_efforts("gemini-oauth", "gpt-oss-120b-medium") == ()
 
 
-def test_selectable_reasoning_efforts_unknown_models_and_providers():
+def test_selectable_reasoning_efforts_route_scoping():
     # Unknown model under Gemini OAuth returns None (fails conservatively)
     assert selectable_reasoning_efforts("gemini-oauth", "unknown-future-model") is None
 
-    # Non-Gemini providers return None
+    # OpenRouter models MUST NOT receive Cloud Code efforts even with google/ or gemini in name
+    assert selectable_reasoning_efforts("openrouter", "google/gemini-3.8-flash") is None
+    assert selectable_reasoning_efforts("openrouter", "google/gemini-2.5-pro") is None
+
+    # Custom proxy models MUST NOT receive Cloud Code efforts
+    assert selectable_reasoning_efforts("custom:my-gemini-proxy", "gemini-3.8-flash") is None
+    assert selectable_reasoning_efforts("custom", "gemini-3.8-flash") is None
+
+    # Direct Gemini / AI Studio provider MUST NOT receive Cloud Code OAuth efforts
+    assert selectable_reasoning_efforts("gemini", "gemini-3.8-flash") is None
+
+    # Standard third-party providers return None
     assert selectable_reasoning_efforts("openai", "gpt-4o") is None
     assert selectable_reasoning_efforts("anthropic", "claude-3-5-sonnet") is None
 
 
-def test_selectable_reasoning_efforts_discovery_precedence_and_fallback():
-    # 1. When discovery returns an explicit empty tuple (), it is authoritative (not overridden by registry)
+def test_selectable_reasoning_efforts_account_resolution_and_fallback():
+    # 1. Numbered account route automatically derives numeric account
+    with patch("hermes_cli.auth.get_gemini_model_efforts") as mock_efforts:
+        mock_efforts.return_value = {"gemini-3.8-flash": ("low", "medium", "high")}
+        res = selectable_reasoning_efforts("gemini-2", "gemini-3.8-flash")
+        assert res == ("low", "medium", "high")
+        mock_efforts.assert_called_with(account=2)
+
+    # 2. Explicit account parameter is forwarded
+    with patch("hermes_cli.auth.get_gemini_model_efforts") as mock_efforts:
+        mock_efforts.return_value = {"gemini-3.8-flash": ("low", "medium", "high")}
+        res = selectable_reasoning_efforts("gemini-oauth", "gemini-3.8-flash", account=3)
+        assert res == ("low", "medium", "high")
+        mock_efforts.assert_called_with(account=3)
+
+    # 3. Canonical gemini-oauth without explicit account: does NOT fetch discovery, uses static registry
+    with patch("hermes_cli.auth.get_gemini_model_efforts") as mock_efforts:
+        res = selectable_reasoning_efforts("gemini-oauth", "gemini-3.8-flash")
+        assert res == ("low", "medium", "high")
+        mock_efforts.assert_not_called()
+
+    # 4. When discovery returns an explicit empty tuple (), it is authoritative
     fake_discovery = {
         "gemini-3.8-flash": ("low", "medium", "high"),
         "gemini-custom-zero": (),
     }
     with patch("hermes_cli.auth.get_gemini_model_efforts", return_value=fake_discovery):
-        assert selectable_reasoning_efforts("gemini-oauth", "gemini-custom-zero") == ()
-        assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.8-flash") == ("low", "medium", "high")
+        assert selectable_reasoning_efforts("gemini-1", "gemini-custom-zero") == ()
 
-    # 2. When discovery is absent / model not in discovery, falls back to static capability registry
+    # 5. When discovery is absent / model not in discovery, falls back to static capability registry
     with patch("hermes_cli.auth.get_gemini_model_efforts", return_value={}):
-        assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.8-flash") == ("low", "medium", "high")
-        assert selectable_reasoning_efforts("gemini-oauth", "gemini-3.1-pro") == ("low", "high")
-        assert selectable_reasoning_efforts("gemini-oauth", "claude-sonnet-4-6") == ()
-        assert selectable_reasoning_efforts("gemini-oauth", "unknown-model") is None
+        assert selectable_reasoning_efforts("gemini-1", "gemini-3.8-flash") == ("low", "medium", "high")
+        assert selectable_reasoning_efforts("gemini-1", "gemini-3.1-pro") == ("low", "high")
+        assert selectable_reasoning_efforts("gemini-1", "claude-sonnet-4-6") == ()
+        assert selectable_reasoning_efforts("gemini-1", "unknown-model") is None
 
 
 def test_resolve_per_model_reasoning_effort_alias_canonicalization():

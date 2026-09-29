@@ -700,6 +700,10 @@ def test_apply_capabilities_gemini_selectable_efforts():
             "slug": "openai",
             "models": ["gpt-4o"],
         },
+        {
+            "slug": "openrouter",
+            "models": ["google/gemini-3.8-flash"],
+        },
     ]
 
     _apply_capabilities(rows)
@@ -722,4 +726,8 @@ def test_apply_capabilities_gemini_selectable_efforts():
     # Non-Gemini provider retains generic capability shape without reasoning_efforts override
     openai_caps = rows[1]["capabilities"]
     assert "reasoning_efforts" not in openai_caps["gpt-4o"]
+
+    # OpenRouter provider MUST NOT receive Cloud Code reasoning_efforts even for google/gemini models
+    openrouter_caps = rows[2]["capabilities"]
+    assert "reasoning_efforts" not in openrouter_caps["google/gemini-3.8-flash"]
 

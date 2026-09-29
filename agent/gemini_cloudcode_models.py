@@ -8,6 +8,8 @@ aligned with Google Antigravity CLI (agy v1.2.13) model resolution semantics.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
+import re
 from typing import Any, Mapping
 
 
@@ -516,6 +518,15 @@ def thought_circulation_support(model: str) -> Optional[bool]:
     cap = get_model_capability(parsed.base_model)
     return cap.supports_thought_circulation if cap is not None else None
 
+_CLOUDCODE_EFFORT_PROVIDERS = {
+    "gemini-oauth",
+    "gemini_oauth",
+    "gemini-antigravity",
+    "google-oauth",
+    "antigravity-gemini",
+}
+
+
 def selectable_reasoning_efforts(
     provider: str,
     model: str,
@@ -527,35 +538,36 @@ def selectable_reasoning_efforts(
     Semantics:
       tuple -> verified selectable set (e.g. ('low', 'medium', 'high'))
       ()    -> verified no user-selectable effort (e.g. gemini-3.1-flash-lite, claude)
-      None  -> unknown capability (generic/custom providers)
+      None  -> unknown capability (generic/custom providers, openrouter, direct gemini)
 
-    Priority for Gemini (gemini-oauth, numbered aliases gemini-1..5, or gemini):
-      1. Observed discovery via get_gemini_model_efforts(account)
-      2. Static registry fallback via get_model_capability(canonical_base)
+    Priority for Cloud Code routes:
+      1. If explicit or derived account is available, check discovered catalog first.
+      2. Fall back to static capability registry.
     """
     prov = (provider or "").strip().lower()
-    is_gemini_prov = (
-        prov.startswith("gemini-oauth")
-        or prov.startswith("gemini")
-        or prov.startswith("google")
-    )
-    m_lower = (model or "").strip().lower()
-    is_gemini_route = is_gemini_prov or "gemini" in m_lower or m_lower.startswith("google/")
-    if not is_gemini_route:
+    target_account: Any = account
+    is_cloudcode = prov in _CLOUDCODE_EFFORT_PROVIDERS
+    if not is_cloudcode:
+        m_acc = re.match(r"^gemini-([1-9]\d*)$", prov)
+        if m_acc:
+            is_cloudcode = True
+            if target_account is None:
+                target_account = int(m_acc.group(1))
+
+    if not is_cloudcode:
         return None
 
     parsed = parse_model_slug(model)
     base_model = parsed.base_model
 
-    discovered_efforts: dict[str, tuple[str, ...]] | None = None
-    try:
-        from hermes_cli.auth import get_gemini_model_efforts
-        discovered_efforts = get_gemini_model_efforts(account=account or 1)
-    except Exception:
-        discovered_efforts = None
-
-    if discovered_efforts is not None and base_model in discovered_efforts:
-        return discovered_efforts[base_model]
+    if target_account is not None:
+        try:
+            from hermes_cli.auth import get_gemini_model_efforts
+            discovered = get_gemini_model_efforts(account=target_account)
+            if discovered is not None and base_model in discovered:
+                return discovered[base_model]
+        except Exception:
+            pass
 
     cap = get_model_capability(base_model)
     if cap is not None:
