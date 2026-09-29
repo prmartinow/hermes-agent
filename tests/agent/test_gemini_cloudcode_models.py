@@ -2,12 +2,14 @@
 
 Covers:
 - Canonical parsing of base models, legacy aliases, partner models, and unknown IDs.
-- Capability envelope querying (efforts_for_base).
+- Prefix stripping restricted strictly to known Gemini provider namespaces.
+- Capability envelope querying (efforts_for_base) and separation from upstream supportsThinking.
 - Dynamic tier wire translation (Gemini 3.8 and 3.7 Flash -> -tiered with thinkingLevel).
 - Static tier wire translation (Gemini 3.6 Flash and 3.1 Pro).
 - Strict negative validation (unsupported efforts like max, minimal, xhigh, ultra).
 - Legacy equivalence (resolving via alias produces identical ResolvedModel as base+effort).
 - Contradiction detection between alias effort and explicit effort.
+- Backward compatibility passthrough for non-aliased legacy strings (3.5 extra-low, 3.1 pro low-thinking).
 - Registry closure and invariant verification across all capabilities.
 """
 
@@ -30,15 +32,28 @@ from agent.gemini_cloudcode_models import (
 
 
 # ============================================================================
-# A. Canonical Parsing Tests
+# A. Canonical Parsing & Prefix Stripping Tests
 # ============================================================================
 
 def test_parse_model_slug_canonical_base():
     parsed = parse_model_slug("gemini-3.8-flash")
     assert parsed == ParsedModelSelection(base_model="gemini-3.8-flash", effort=None, legacy_alias=False)
 
-    parsed_prefixed = parse_model_slug("google/gemini-3.8-flash")
-    assert parsed_prefixed == ParsedModelSelection(base_model="gemini-3.8-flash", effort=None, legacy_alias=False)
+
+def test_parse_model_slug_known_prefix_stripping():
+    # Only known Gemini provider prefixes are stripped
+    assert parse_model_slug("google/gemini-3.8-flash").base_model == "gemini-3.8-flash"
+    assert parse_model_slug("gemini-oauth/gemini-3.8-flash").base_model == "gemini-3.8-flash"
+    assert parse_model_slug("gemini_oauth/gemini-3.8-flash").base_model == "gemini-3.8-flash"
+    assert parse_model_slug("gemini-1/gemini-3.8-flash").base_model == "gemini-3.8-flash"
+    assert parse_model_slug("gemini-oauth-2/gemini-3.7-flash").base_model == "gemini-3.7-flash"
+
+
+def test_parse_model_slug_preserves_custom_vendor_prefixes():
+    # Slashes in non-Gemini vendor namespaces must be preserved verbatim
+    assert parse_model_slug("vendor/custom-model").base_model == "vendor/custom-model"
+    assert parse_model_slug("foo/bar/baz").base_model == "foo/bar/baz"
+    assert parse_model_slug("openrouter/auto").base_model == "openrouter/auto"
 
 
 @pytest.mark.parametrize(
@@ -64,27 +79,19 @@ def test_parse_model_slug_legacy_aliases(alias, expected_base, expected_effort):
 
 
 def test_parse_model_slug_partner_and_unknown_models():
-    # Partner models are preserved verbatim
     assert parse_model_slug("claude-sonnet-4-6") == ParsedModelSelection(
         base_model="claude-sonnet-4-6", effort=None, legacy_alias=False
     )
     assert parse_model_slug("gpt-oss-120b-medium") == ParsedModelSelection(
         base_model="gpt-oss-120b-medium", effort=None, legacy_alias=False
     )
-
-    # Unknown models remain unchanged
-    assert parse_model_slug("custom-fine-tuned-model") == ParsedModelSelection(
-        base_model="custom-fine-tuned-model", effort=None, legacy_alias=False
-    )
-
-    # Arbitrary unknown string ending in -high is NOT recognized as a virtual alias
     assert parse_model_slug("unknown-model-high") == ParsedModelSelection(
         base_model="unknown-model-high", effort=None, legacy_alias=False
     )
 
 
 # ============================================================================
-# B. Capability Envelope Tests
+# B. Capability Envelope & Upstream Thinking Tests
 # ============================================================================
 
 def test_efforts_for_base_capabilities():
@@ -96,6 +103,14 @@ def test_efforts_for_base_capabilities():
     assert efforts_for_base("gpt-oss-120b-medium") == ()
     assert efforts_for_base("gemini-3.1-flash-lite") == ()
     assert efforts_for_base("unregistered-future-model") == ()
+
+
+def test_gpt_oss_supports_thinking_distinct_from_efforts():
+    # gpt-oss-120b-medium has upstream supportsThinking=True, but zero selectable efforts
+    cap = get_model_capability("gpt-oss-120b-medium")
+    assert cap is not None
+    assert cap.supports_thinking is True
+    assert cap.efforts == ()
 
 
 # ============================================================================
@@ -118,7 +133,6 @@ def test_dynamic_tier_resolution_wire_model_and_thinking(version, effort):
 
 
 def test_dynamic_tier_default_effort():
-    # If no effort is provided, resolves to canonical default (high)
     resolved = model_for_base_effort("gemini-3.8-flash")
     assert resolved.effort == "high"
     assert resolved.wire_model == "gemini-3.8-flash-tiered"
@@ -142,7 +156,6 @@ def test_static_tier_gemini_36_resolution(effort, expected_wire):
     assert resolved.base_model == "gemini-3.6-flash"
     assert resolved.effort == effort
     assert resolved.wire_model == expected_wire
-    # 3.6 wire slug carries the tier; thinking_config is not emitted on wire
     assert resolved.thinking_config is None
 
 
@@ -192,7 +205,7 @@ def test_non_thinking_model_rejects_any_effort(effort):
 
 
 # ============================================================================
-# F. Legacy Equivalence Tests
+# F. Legacy Equivalence & Passthrough Tests
 # ============================================================================
 
 @pytest.mark.parametrize("alias", list(LEGACY_MODEL_ALIASES.keys()))
@@ -208,19 +221,26 @@ def test_legacy_alias_produces_identical_resolution_as_canonical(alias):
     assert resolved_from_alias.thinking_config == resolved_from_canonical.thinking_config
 
 
+def test_non_aliased_legacy_strings_passthrough_verbatim():
+    # Unverified legacy strings must pass through without mutation to preserve compatibility
+    r1 = resolve_model_selection("gemini-3.5-flash-extra-low")
+    assert r1.wire_model == "gemini-3.5-flash-extra-low"
+
+    r2 = resolve_model_selection("gemini-3.1-pro-low-thinking")
+    assert r2.wire_model == "gemini-3.1-pro-low-thinking"
+
+
 # ============================================================================
 # G. Contradiction Detection
 # ============================================================================
 
 def test_resolve_model_selection_rejects_contradictory_alias_and_effort():
-    # Calling alias with conflicting explicit effort must fail
     with pytest.raises(EffortUnsupportedError) as exc_info:
         resolve_model_selection("gemini-3.8-flash-low", effort="high")
     assert "Model alias 'gemini-3.8-flash-low' requests effort 'low', but explicit effort is 'high'" in str(exc_info.value)
 
 
 def test_resolve_model_selection_accepts_matching_alias_and_effort():
-    # Calling alias with matching explicit effort succeeds
     resolved = resolve_model_selection("gemini-3.8-flash-high", effort="high")
     assert resolved.wire_model == "gemini-3.8-flash-tiered"
     assert resolved.effort == "high"
@@ -233,14 +253,12 @@ def test_resolve_model_selection_accepts_matching_alias_and_effort():
 def test_registry_invariants_across_all_capabilities():
     for base, cap in _MODEL_CAPABILITIES.items():
         assert cap.base_model == base
-        # If model declares efforts, each effort must have a valid route
         for eff in cap.efforts:
             res = model_for_base_effort(base, eff)
             assert res.base_model == base
             assert res.effort == eff
             assert res.wire_model != ""
 
-            # Dynamic 3.7 and 3.8 flash wire models must always end with -tiered
             if base in ("gemini-3.8-flash", "gemini-3.7-flash"):
                 assert res.wire_model.endswith("-tiered")
                 assert res.thinking_config is not None
@@ -253,3 +271,18 @@ def test_legacy_aliases_map_strictly_to_registered_capabilities():
         cap = get_model_capability(base)
         assert cap is not None, f"Legacy alias '{alias}' points to unregistered base '{base}'"
         assert eff in cap.efforts, f"Legacy alias '{alias}' specifies effort '{eff}' not supported by base '{base}'"
+
+
+def test_model_for_base_effort_fails_closed_on_missing_route():
+    # If a registered model has an effort without a route, fail closed
+    broken_cap = ModelCapability(
+        base_model="broken-model",
+        display_name="Broken Model",
+        efforts=("high",),
+        routes={},  # missing route
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(_MODEL_CAPABILITIES, "broken-model", broken_cap)
+        with pytest.raises(RuntimeError) as exc_info:
+            model_for_base_effort("broken-model", "high")
+        assert "Cloud Code model registry has no route for 'broken-model' effort 'high'" in str(exc_info.value)

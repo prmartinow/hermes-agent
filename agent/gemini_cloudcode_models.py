@@ -47,7 +47,7 @@ class ModelCapability:
     routes: Mapping[str, EffortRoute]
     default_effort: str | None = None
     supports_thinking: bool = False
-    supports_thought_circulation: bool = False
+    supports_thought_circulation: bool | None = None
     max_tokens: int = 1048576
     max_output_tokens: int = 65536
 
@@ -77,9 +77,9 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         base_model="gemini-3.8-flash",
         display_name="Gemini 3.8 Flash",
         efforts=("low", "medium", "high"),
-        default_effort="high",  # Hermes default; aligns with thinkingBudget=-1
+        default_effort="high",  # Hermes compatibility default; aligns with thinkingBudget=-1
         supports_thinking=True,
-        supports_thought_circulation=True,
+        supports_thought_circulation=None,
         max_tokens=1048576,
         max_output_tokens=65536,
         routes={
@@ -94,7 +94,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=("low", "medium", "high"),
         default_effort="high",
         supports_thinking=True,
-        supports_thought_circulation=True,
+        supports_thought_circulation=None,
         max_tokens=1048576,
         max_output_tokens=65536,
         routes={
@@ -111,7 +111,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=("low", "medium", "high"),
         default_effort="high",
         supports_thinking=True,
-        supports_thought_circulation=True,
+        supports_thought_circulation=None,
         max_tokens=1048576,
         max_output_tokens=65536,
         routes={
@@ -126,7 +126,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=("low", "medium", "high"),
         default_effort="high",
         supports_thinking=True,
-        supports_thought_circulation=False,
+        supports_thought_circulation=None,
         max_tokens=1048576,
         max_output_tokens=65536,
         routes={
@@ -143,7 +143,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         efforts=("low", "high"),
         default_effort="high",
         supports_thinking=True,
-        supports_thought_circulation=False,
+        supports_thought_circulation=None,
         max_tokens=1048576,
         max_output_tokens=65535,
         routes={
@@ -194,7 +194,8 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         display_name="GPT-OSS 120B (Medium)",
         efforts=(),
         default_effort=None,
-        supports_thinking=False,
+        # Upstream catalog reports supportsThinking=True, but model has no user-selectable effort levels
+        supports_thinking=True,
         max_tokens=131072,
         max_output_tokens=32768,
         routes={
@@ -228,7 +229,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
 }
 
 # Explicit mapping of legacy virtual model identifiers to (base_model, effort)
-# Prevents arbitrary string suffixes from silently being recognized as virtual models
+# Strictly mapped to verified aliases; unverified or arbitrary strings pass through verbatim
 LEGACY_MODEL_ALIASES: dict[str, tuple[str, str]] = {
     # Gemini 3.8 Flash virtual tiers
     "gemini-3.8-flash-high": ("gemini-3.8-flash", "high"),
@@ -254,22 +255,30 @@ LEGACY_MODEL_ALIASES: dict[str, tuple[str, str]] = {
     "gemini-3.5-flash-high": ("gemini-3.5-flash", "high"),
     "gemini-3.5-flash-medium": ("gemini-3.5-flash", "medium"),
     "gemini-3.5-flash-low": ("gemini-3.5-flash", "low"),
-    "gemini-3.5-flash-extra-low": ("gemini-3.5-flash", "low"),
     "gemini-3.5": ("gemini-3.5-flash", "high"),
     # Gemini 3.1 Pro tiers
     "gemini-3.1-pro-high": ("gemini-3.1-pro", "high"),
     "gemini-3.1-pro-low": ("gemini-3.1-pro", "low"),
-    "gemini-3.1-pro-low-thinking": ("gemini-3.1-pro", "low"),
     "gemini-3.1": ("gemini-3.1-pro", "high"),
 }
 
+# Known provider namespace prefixes to strip matching bare_gemini_model_id behavior
+_KNOWN_PROVIDER_PREFIXES: tuple[str, ...] = (
+    "google/", "gemini/", "gemini-oauth/", "gemini_oauth/",
+    "gemini-antigravity/", "google-oauth/", "antigravity-gemini/",
+    "gemini-1/", "gemini-2/", "gemini-3/", "gemini-4/", "gemini-5/",
+    "gemini-oauth-1/", "gemini-oauth-2/", "gemini-oauth-3/", "gemini-oauth-4/", "gemini-oauth-5/",
+)
+
 
 def _strip_model_prefix(model: str) -> str:
-    """Normalize model string by removing provider namespace prefixes."""
-    clean = str(model or "").strip()
-    if "/" in clean:
-        clean = clean.split("/", 1)[1].strip()
-    return clean
+    """Strip known Gemini provider namespace prefixes while strictly preserving custom vendor IDs."""
+    name = str(model or "").strip()
+    lowered = name.lower()
+    for prefix in _KNOWN_PROVIDER_PREFIXES:
+        if lowered.startswith(prefix):
+            return name[len(prefix):].strip() or name
+    return name
 
 
 def parse_model_slug(model: str) -> ParsedModelSelection:
@@ -277,7 +286,7 @@ def parse_model_slug(model: str) -> ParsedModelSelection:
 
     Exact registered legacy aliases (e.g. 'gemini-3.8-flash-high') decompose to
     (base_model='gemini-3.8-flash', effort='high', legacy_alias=True).
-    Arbitrary unregistered strings are NOT treated as aliases.
+    Unregistered models or custom vendor models (e.g. 'vendor/custom-model') are preserved verbatim.
     """
     clean = _strip_model_prefix(model)
     if not clean:
@@ -323,13 +332,13 @@ def model_for_base_effort(
 
     Raises:
       EffortUnsupportedError: If effort is explicitly requested but not supported.
+      RuntimeError: If capability registry has an internal route gap.
     """
     clean_base = _strip_model_prefix(base_model)
     cap = get_model_capability(clean_base)
 
     # 1. Models registered in capability registry
     if cap is not None:
-        # Determine effective effort
         normalized_effort = str(effort).strip().lower() if effort is not None else None
 
         if normalized_effort:
@@ -339,7 +348,6 @@ def model_for_base_effort(
                     raise EffortUnsupportedError(
                         f"{clean_base} has no '{normalized_effort}' effort (available: {avail_str})"
                     )
-                # Fallback to model default if not explicit
                 effective_effort = cap.default_effort
             else:
                 effective_effort = normalized_effort
@@ -350,11 +358,12 @@ def model_for_base_effort(
         route_key = effective_effort if (effective_effort and effective_effort in cap.routes) else ""
         if route_key in cap.routes:
             route = cap.routes[route_key]
-        elif cap.efforts and effective_effort in cap.routes:
+        elif effective_effort in cap.routes:
             route = cap.routes[effective_effort]
         else:
-            # Fallback to first available route or pass-through
-            route = next(iter(cap.routes.values())) if cap.routes else EffortRoute(wire_model=clean_base)
+            raise RuntimeError(
+                f"Cloud Code model registry has no route for {clean_base!r} effort {effective_effort!r}"
+            )
 
         return ResolvedModel(
             base_model=clean_base,
@@ -363,7 +372,7 @@ def model_for_base_effort(
             thinking_config=route.build_thinking_config(),
         )
 
-    # 2. Unregistered / passthrough models (e.g. custom endpoints)
+    # 2. Unregistered / passthrough models (e.g. custom endpoints, vendor/models)
     eff_clean = str(effort).strip().lower() if effort else None
     if eff_clean and explicit:
         raise EffortUnsupportedError(f"{clean_base} has no '{eff_clean}' effort (available: none)")
