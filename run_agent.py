@@ -296,6 +296,7 @@ class AIAgent(
         if tool_delay is not None:
             warnings.warn("tool_delay is deprecated and ignored; sequential tool calls "
                           "no longer sleep between executions.", DeprecationWarning, stacklevel=2)
+        self.effort_by_base: dict[str, str] = {}
         from agent.agent_init import init_agent
         init_agent(self, **init_kwargs)
 
