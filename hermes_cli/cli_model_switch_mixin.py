@@ -980,9 +980,16 @@ class CLIModelSwitchMixin:
 
         if request.reasoning_effort and request.target:
             from agent.reasoning_selection import canonical_reasoning_base, reasoning_effort_error
-            early_provider = request.explicit_provider or self.provider or ""
-            if canonical_reasoning_base(early_provider, request.target) is not None:
-                early_err = reasoning_effort_error(early_provider, request.target, request.reasoning_effort)
+            from hermes_cli.models import parse_model_input
+            precheck_provider = request.explicit_provider or self.provider or ""
+            precheck_model = request.target
+            if not request.explicit_provider:
+                custom_ids = {p["id"] for p in custom_provs if isinstance(p, dict) and p.get("id")} if custom_provs else None
+                precheck_provider, precheck_model = parse_model_input(
+                    request.target, precheck_provider, custom_ids=custom_ids
+                )
+            if canonical_reasoning_base(precheck_provider, precheck_model) is not None:
+                early_err = reasoning_effort_error(precheck_provider, precheck_model, request.reasoning_effort)
                 if early_err:
                     _cprint(f"  ✗ {early_err}")
                     return

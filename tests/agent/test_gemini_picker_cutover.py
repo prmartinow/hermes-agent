@@ -434,3 +434,55 @@ def test_typed_model_switch_cloudcode_precheck_rejects_before_switch_model_from(
         cli._handle_model_switch("/model claude-sonnet-4-6 --reasoning low")
         mock_switch_from.assert_not_called()
         mock_cprint.assert_called_with("  ✗ --reasoning is not supported for model 'claude-sonnet-4-6'")
+def test_typed_qualified_cloudcode_target_rejected_before_switch():
+    """Verify provider:model qualified Cloud Code commands reject before _switch_model_from is called."""
+    class MockCLI(CLIModelSwitchMixin):
+        def __init__(self):
+            self.model = "gpt-4o"
+            self.provider = "openrouter"
+            self.requested_provider = "openrouter"
+            self.base_url = None
+            self.api_mode = None
+            self.api_key = None
+            self.reasoning_config = None
+            self.effort_by_base = {}
+            self.agent = MagicMock()
+            self._session_db = None
+            self.session_id = None
+            self.verbose = False
+            self.max_turns = 100
+
+    cli = MockCLI()
+
+    with patch("hermes_cli.cli_model_switch_mixin._switch_model_from") as mock_switch_from,          patch("cli._cprint") as mock_cprint:
+
+        # 1. Qualified gemini-oauth:gemini-3.8-flash with max from an openrouter ambient provider
+        cli._handle_model_switch("/model gemini-oauth:gemini-3.8-flash --reasoning max")
+        mock_cprint.assert_called_with("  ✗ gemini-3.8-flash has no 'max' effort (available: low, medium, high)")
+        mock_switch_from.assert_not_called()
+
+        # 2. Numbered account route gemini-2:gemini-3.1-pro with medium
+        mock_cprint.reset_mock()
+        mock_switch_from.reset_mock()
+        cli._handle_model_switch("/model gemini-2:gemini-3.1-pro --reasoning medium")
+        mock_cprint.assert_called_with("  ✗ gemini-3.1-pro has no 'medium' effort (available: low, high)")
+        mock_switch_from.assert_not_called()
+
+        # 3. Valid qualified Cloud Code choice passes early validator and proceeds to _switch_model_from
+        mock_cprint.reset_mock()
+        mock_switch_from.reset_mock()
+        fake_result = SimpleNamespace(
+            success=True,
+            new_model="gemini-3.8-flash",
+            target_provider="gemini-oauth",
+            provider_label="Gemini OAuth",
+            model_info={},
+            api_key=None,
+            base_url=None,
+            api_mode=None,
+            warning_message=None,
+        )
+        mock_switch_from.return_value = fake_result
+        cli._handle_model_switch("/model gemini-oauth:gemini-3.8-flash --reasoning low")
+        # Invariant: valid command proceeds to _switch_model_from!
+        mock_switch_from.assert_called_once()
