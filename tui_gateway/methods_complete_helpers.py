@@ -167,7 +167,9 @@ def _details_completions(text: str) -> list[dict] | None:
 
 
 def _model_picker_context(agent):
-    """Layer live session state onto config without losing custom identity."""
+    """Layer live session state onto config without losing custom identity.
+    See: website/docs/developer-guide/gemini-cloud-code-runtime.md
+    """
     from hermes_cli.inventory import load_picker_context
     ctx = load_picker_context()
     provider, base_url, model = (getattr(agent, k, "") if agent else "" for k in ("provider", "base_url", "model"))

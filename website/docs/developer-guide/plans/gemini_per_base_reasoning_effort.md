@@ -1,8 +1,11 @@
 # Gemini Per-Base Reasoning-Effort Memory & Model-Switch Semantics
 
+> **Status**: Implemented / Historical Plan
+> **Authoritative Runtime Documentation**: [Gemini Cloud Code Runtime Architecture](../gemini-cloud-code-runtime.md)
+> *Note: This document records the original Action Item 3 design plan and is retained for historical implementation reference. For current normative architecture, consult the authoritative guide linked above.*
+
 **Document Path**: `website/docs/developer-guide/plans/gemini_per_base_reasoning_effort.md`
 **Specification Reference**: `agent/reasoning_selection.py`, `agent/gemini_cloudcode_models.py`, `tui_gateway/model_switch.py`, `tui_gateway/server.py`, `hermes_cli/cli_model_switch_mixin.py`
-**Status**: Implemented & Verified on `dev` (Action Item 3)
 
 ---
 

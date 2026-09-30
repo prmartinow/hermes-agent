@@ -2896,7 +2896,14 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self, model: str, context_length: int, base_url: str = "", api_key: Any = "", provider: str = "",
         api_mode: str = "", max_tokens: int | None = None, persist_durable_reset: bool = True,
     ) -> None:
-        """Update model info after a model switch or fallback activation."""
+        """Update model info after a model switch or fallback activation.
+
+        When persist_durable_reset=False (used during tentative model switch transactions):
+        - Mutates in-memory thresholds, output reservations, and tracking state.
+        - Defers durable resets (strikes, fallback streak, cooldown, prune runway) until
+          commit_switch_runtime() is called after the switch transaction succeeds.
+        See: website/docs/developer-guide/gemini-cloud-code-runtime.md
+        """
         runtime_changed = (model, provider, base_url, api_mode) != (self.model, self.provider, self.base_url, self.api_mode)
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         self.context_length = context_length

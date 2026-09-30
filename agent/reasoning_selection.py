@@ -108,6 +108,7 @@ def resolve_effective_reasoning_config(
 
     For non-Cloud-Code routes (e.g. openrouter, openai, custom):
       Preserves standard resolve_reasoning_config(config, model) semantics.
+    See: website/docs/developer-guide/gemini-cloud-code-runtime.md
     """
     canonical_base = canonical_reasoning_base(provider, model)
     if canonical_base is None:
@@ -163,7 +164,9 @@ def resolve_effective_reasoning_effort(
     model: str,
     effort_by_base: Mapping[str, str] | None = None,
 ) -> str | None:
-    """Return the effective reasoning effort string (e.g. 'medium', 'high') or None if disabled/unsupported."""
+    """Return the effective reasoning effort string (e.g. 'medium', 'high') or None if disabled/unsupported.
+    See: website/docs/developer-guide/gemini-cloud-code-runtime.md
+    """
     eff_cfg = resolve_effective_reasoning_config(
         config=config,
         provider=provider,

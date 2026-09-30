@@ -313,7 +313,9 @@ def _apply_capabilities(rows: list[dict], ctx: ConfigContext | None = None) -> N
     """Attach ``{model: {fast, reasoning, ...}}`` per row. ``reasoning`` defaults True when the catalog is
     silent (the dial is a no-op on models that ignore it; hiding it from a capable model is worse). A
     serving aggregator's detail overrides models.dev (adds ``can_disable_reasoning``). ``supported_efforts``
-    is deliberately NOT forwarded — it under-reports levels that work."""
+    is deliberately NOT forwarded — it under-reports levels that work.
+    See: website/docs/developer-guide/gemini-cloud-code-runtime.md
+    """
     from hermes_cli.models import model_supports_fast_mode
 
     try:

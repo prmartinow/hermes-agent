@@ -291,6 +291,7 @@ def parse_model_slug(model: str) -> ParsedModelSelection:
     Exact registered legacy aliases (e.g. 'gemini-3.8-flash-high') decompose to
     (base_model='gemini-3.8-flash', effort='high', legacy_alias=True).
     Unregistered models or custom vendor models (e.g. 'vendor/custom-model') are preserved verbatim.
+    See: website/docs/developer-guide/gemini-cloud-code-runtime.md
     """
     clean = _strip_model_prefix(model)
     if not clean:
@@ -550,6 +551,7 @@ def selectable_reasoning_efforts(
     Priority for Cloud Code routes:
       1. If explicit or derived account is available, check discovered catalog first.
       2. Fall back to static capability registry.
+    See: website/docs/developer-guide/gemini-cloud-code-runtime.md
     """
     prov = (provider or "").strip().lower()
     target_account: Any = (

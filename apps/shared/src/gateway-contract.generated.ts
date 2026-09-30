@@ -680,7 +680,7 @@ export interface ModelOptionProvider {
   unavailable_models?: string[] | null
   [key: string]: unknown
 }
-/** ``hermes_cli/inventory.py::_apply_capabilities``. */
+/** ``hermes_cli/inventory.py::_apply_capabilities``. Authoritative capability contract: - reasoning_efforts: null = unknown/generic, [] = known no selectable effort, nonempty = exact selectable set. - effective_reasoning_effort: target-effective selectable effort, null when none or disabled. - can_disable_reasoning: False for exact Cloud Code effort models. */
 export interface ModelCapabilities {
   fast: boolean
   reasoning: boolean

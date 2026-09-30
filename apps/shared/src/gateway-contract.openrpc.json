@@ -16874,13 +16874,15 @@
       },
       "ModelCapabilities": {
         "additionalProperties": false,
-        "description": "``hermes_cli/inventory.py::_apply_capabilities``.",
+        "description": "``hermes_cli/inventory.py::_apply_capabilities``.\n\nAuthoritative capability contract:\n  - reasoning_efforts: null = unknown/generic, [] = known no selectable effort, nonempty = exact selectable set.\n  - effective_reasoning_effort: target-effective selectable effort, null when none or disabled.\n  - can_disable_reasoning: False for exact Cloud Code effort models.",
         "properties": {
           "fast": {
+            "description": "Whether fast mode is supported for this model.",
             "title": "Fast",
             "type": "boolean"
           },
           "reasoning": {
+            "description": "Whether reasoning capability is present.",
             "title": "Reasoning",
             "type": "boolean"
           },
@@ -16894,6 +16896,7 @@
               }
             ],
             "default": null,
+            "description": "False for exact Cloud Code effort models; True/None for generic models.",
             "title": "Can Disable Reasoning"
           },
           "reasoning_efforts": {
@@ -16909,6 +16912,7 @@
               }
             ],
             "default": null,
+            "description": "Exact selectable reasoning levels: null = unknown/generic, [] = known no selectable effort, nonempty = exact selectable set.",
             "title": "Reasoning Efforts"
           },
           "effective_reasoning_effort": {
@@ -16921,6 +16925,7 @@
               }
             ],
             "default": null,
+            "description": "Target-effective selectable effort, null when none or disabled.",
             "title": "Effective Reasoning Effort"
           }
         },

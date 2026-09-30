@@ -2035,6 +2035,14 @@ def _snapshot_switch_state(agent) -> Dict[str, Any]:
 
 
 def _restore_switch_snapshot(agent, snapshot: Dict[str, Any]) -> None:
+    """Atomically and non-destructively restore agent runtime to pre-switch snapshot.
+
+    Guarantees:
+    - Non-destructive read: Reusable across nested rollback handlers without losing state.
+    - Attribute isolation: Transient fields like _compressor_state never leak onto agent.
+    - Compressor restoration: Restores bookkeeping directly without triggering update_model resets.
+    See: website/docs/developer-guide/gemini-cloud-code-runtime.md
+    """
     compressor_state = snapshot.get("_compressor_state", _MISSING)
     for name, value in snapshot.items():
         if name == "_compressor_state":
@@ -2398,10 +2406,18 @@ def _persist_switch_billing_route(agent) -> None:
 def switch_model(
     agent, new_model, new_provider, api_key='', base_url='', api_mode='', capabilities=None
 ):
-    """Switch the model/provider in-place for a live agent (rebuild clients, caching flags,
-    compressor). Mirrors ``_try_activate_fallback()`` but also updates ``_primary_runtime`` so
-    the change persists across turns. A failed swap/rebuild rolls back to the pre-switch
-    snapshot and re-raises (callers catch)."""
+    """Switch the model/provider in-place for a live agent within an atomic transaction.
+
+    Architectural contract:
+    - Atomicity: State swap, compressor updates, and capability bindings are strictly guarded.
+      Any exception during client construction or verification rolls back all runtime fields
+      (model, provider, reasoning_config, effort_by_base, capabilities, prompt caching, compressor).
+    - Compressor transaction: Tentative compressor update runs with persist_durable_reset=False;
+      durable resets commit only after the model switch crosses its commit boundary.
+    - Persistence: Swapped runtime persists to agent._primary_runtime; ephemeral effort_by_base
+      survives in-session model switches without leaking to disk.
+    See: website/docs/developer-guide/gemini-cloud-code-runtime.md
+    """
     old_model = agent.model
     old_provider = agent.provider
     old_context_length = getattr(getattr(agent, "context_compressor", None), "context_length", None)

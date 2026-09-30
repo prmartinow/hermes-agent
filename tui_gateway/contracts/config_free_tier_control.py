@@ -236,13 +236,19 @@ class ModelPricing(Result):
 
 
 class ModelCapabilities(Result):
-    """``hermes_cli/inventory.py::_apply_capabilities``."""
+    """``hermes_cli/inventory.py::_apply_capabilities``.
 
-    fast: bool
-    reasoning: bool
-    can_disable_reasoning: bool | None = None
-    reasoning_efforts: list[str] | None = None
-    effective_reasoning_effort: str | None = None
+    Authoritative capability contract:
+      - reasoning_efforts: null = unknown/generic, [] = known no selectable effort, nonempty = exact selectable set.
+      - effective_reasoning_effort: target-effective selectable effort, null when none or disabled.
+      - can_disable_reasoning: False for exact Cloud Code effort models.
+    """
+
+    fast: bool = Field(description="Whether fast mode is supported for this model.")
+    reasoning: bool = Field(description="Whether reasoning capability is present.")
+    can_disable_reasoning: bool | None = Field(default=None, description="False for exact Cloud Code effort models; True/None for generic models.")
+    reasoning_efforts: list[str] | None = Field(default=None, description="Exact selectable reasoning levels: null = unknown/generic, [] = known no selectable effort, nonempty = exact selectable set.")
+    effective_reasoning_effort: str | None = Field(default=None, description="Target-effective selectable effort, null when none or disabled.")
 
 
 class ModelOptionProvider(OpenModel):

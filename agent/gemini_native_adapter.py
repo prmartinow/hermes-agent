@@ -800,6 +800,16 @@ def _build_gemini_contents(
     include_tool_call_ids: bool = False,
     model: str = "",
 ) -> tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Translate OpenAI-format chat messages into Gemini native Contents structure.
+
+    Architectural contract:
+    - Authoritative native replay: Replays Google assistant parts verbatim when carrier exists,
+      preserving thoughts, signatures, and parallel function calls without semantic loss.
+    - Foreign trace bypass: Injects 'skip_thought_signature_validator' sentinel strictly on
+      unsigned foreign tool call turns to satisfy upstream wire validation.
+    - Destination-aware projection: Operates on wire copies without mutating original session history.
+    See: website/docs/developer-guide/gemini-cloud-code-runtime.md
+    """
     system_text_parts: List[str] = []
     contents: List[Dict[str, Any]] = []
     tool_name_by_call_id: Dict[str, str] = {}
