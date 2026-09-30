@@ -154,3 +154,42 @@ def resolve_effective_reasoning_config(
         return {"enabled": True, "effort": selectable[-1]}
 
     return None
+
+
+def reasoning_effort_error(
+    provider: str,
+    model: str,
+    effort: str,
+) -> str | None:
+    """Validate an explicit reasoning effort for a target route/model.
+
+    Returns an error message string if invalid, or None if valid.
+    """
+    if not effort:
+        return None
+
+    clean_effort = effort.lower().strip()
+    canonical_base = canonical_reasoning_base(provider, model)
+    if canonical_base is None:
+        from hermes_constants import VALID_REASONING_EFFORTS
+        valid_generic = set(VALID_REASONING_EFFORTS) | {"none"}
+        if clean_effort not in valid_generic:
+            return f"Unknown reasoning effort '{effort}' (valid: {', '.join(sorted(valid_generic))})"
+        return None
+
+    selectable = selectable_reasoning_efforts(provider, model)
+    if selectable is None:
+        return f"Reasoning effort is not supported for model '{model}'"
+
+    if not selectable:
+        return f"--reasoning is not supported for model '{model}'"
+
+    parsed = parse_model_slug(model)
+    if parsed.legacy_alias and parsed.effort and parsed.effort != clean_effort:
+        return f"Conflicting reasoning effort: alias '{model}' implies '{parsed.effort}', but --reasoning specifies '{clean_effort}'"
+
+    if clean_effort not in selectable:
+        avail_str = ", ".join(selectable)
+        return f"{canonical_base} has no '{effort}' effort (available: {avail_str})"
+
+    return None

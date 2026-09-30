@@ -199,9 +199,17 @@ def _run_confirm_and_apply(cli, target, *args) -> None:
         target(*args)
 
 
-def _picker_reasoning_rows() -> list[tuple[str, str]]:
-    """``(value, label)`` rows for the picker's effort step: the canonical ladder, the off state,
-    then a keep-current row (empty value = leave the effort alone)."""
+def _picker_reasoning_rows(provider_data: dict | None = None, model: str = "") -> list[tuple[str, str]]:
+    """``(value, label)`` rows for the picker's effort step.
+    For Cloud Code routes with verified efforts, returns exact effort rows without 'none' or 'Keep current effort'.
+    For generic routes, returns the canonical ladder plus off state and keep-current row."""
+    caps = (provider_data or {}).get("capabilities") or {}
+    entry = caps.get(model) if isinstance(caps, dict) else None
+    if isinstance(entry, dict) and "reasoning_efforts" in entry:
+        efforts = entry["reasoning_efforts"]
+        if efforts:
+            return [(lvl, lvl) for lvl in efforts]
+        return []
     from hermes_constants import VALID_REASONING_EFFORTS
     rows = [(lvl, lvl) for lvl in VALID_REASONING_EFFORTS]
     rows.append(("none", "none (disable reasoning)"))
@@ -214,7 +222,12 @@ def _picker_offers_reasoning(provider_data: dict, model: str) -> bool:
     control; unknown capabilities keep the step (a no-op dial beats hiding a real one)."""
     caps = (provider_data or {}).get("capabilities")
     entry = caps.get(model) if isinstance(caps, dict) else None
-    return not (isinstance(entry, dict) and entry.get("reasoning") is False)
+    if isinstance(entry, dict):
+        if "reasoning_efforts" in entry:
+            return bool(entry["reasoning_efforts"])
+        if entry.get("reasoning") is False:
+            return False
+    return True
 
 
 def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool, one_turn: bool = False) -> None:
@@ -833,19 +846,42 @@ class CLIModelSwitchMixin:
                     user_providers=state.get("user_provs"),
                     custom_providers=state.get("custom_provs"))
                 if result.success and _picker_offers_reasoning(provider_data, result.new_model):
-                    # Third step: effort for the picked model (skipped for routes the catalog
-                    # marks reasoning-free). Rows come from the canonical level set.
-                    state.update(stage="reasoning", switch_result=result, selected=0, _scroll_offset=0)
+                    # Third step: effort for the picked model
+                    rows = _picker_reasoning_rows(provider_data, result.new_model)
+                    from cli import CLI_CONFIG
+                    from agent.reasoning_selection import resolve_effective_reasoning_config
+                    effort_by_base = getattr(self, "effort_by_base", None)
+                    provider_slug = provider_data.get("slug") or getattr(result, "target_provider", None) or ""
+                    effective = resolve_effective_reasoning_config(
+                        config=CLI_CONFIG,
+                        provider=provider_slug,
+                        model=result.new_model,
+                        effort_by_base=effort_by_base,
+                    )
+                    selected_idx = 0
+                    if effective and isinstance(effective, dict) and effective.get("enabled"):
+                        eff = effective.get("effort")
+                        for i, (val, _lbl) in enumerate(rows):
+                            if val == eff:
+                                selected_idx = i
+                                break
+                    state.update(
+                        stage="reasoning",
+                        switch_result=result,
+                        reasoning_rows=rows,
+                        selected=selected_idx,
+                        _scroll_offset=0,
+                    )
                     self._invalidate(min_interval=0.0)
                     return
                 self._commit_picker_result(result, persist_global)
                 return
             self._close_model_picker()
         if stage == "reasoning":
-            rows = _picker_reasoning_rows()
+            rows = state.get("reasoning_rows") or _picker_reasoning_rows()
             result = state.get("switch_result")
             if selected == len(rows):  # ← Back to the model list
-                state.update(stage="model", selected=0, _scroll_offset=0, switch_result=None)
+                state.update(stage="model", selected=0, _scroll_offset=0, switch_result=None, reasoning_rows=None)
                 self._invalidate(min_interval=0.0)
                 return
             if selected > len(rows) or result is None:
@@ -925,6 +961,15 @@ class CLIModelSwitchMixin:
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
             return
+
+        if request.reasoning_effort:
+            from agent.reasoning_selection import reasoning_effort_error
+            target_prov = getattr(result, "target_provider", None) or self.provider or ""
+            err = reasoning_effort_error(target_prov, result.new_model, request.reasoning_effort)
+            if err:
+                _cprint(f"  ✗ {err}")
+                return
+
         _merge_preflight_warning(self, result, custom_provs)
         extra = (request.reasoning_effort,) if request.reasoning_effort else ()
         _run_confirm_and_apply(
