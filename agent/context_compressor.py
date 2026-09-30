@@ -2815,6 +2815,25 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             seconds = max(seconds, float(idle))
         self._record_compression_failure_cooldown(seconds, stamped)
 
+    def _clear_in_memory_compression_failure_cooldown(self) -> None:
+        """Clear in-memory cooldown state without writing to durable storage."""
+        if ContextCompressor._compression_cancelled(self):
+            return
+        self._summary_failure_cooldown_until, self._last_summary_error = 0.0, None
+        self._consecutive_timeout_failures = self._consecutive_truncation_failures = 0
+        self._cooldown_persist_failed = False
+
+    def commit_switch_runtime(self) -> None:
+        """Persist durable resets after switch_model() crosses its commit boundary."""
+        with contextlib.suppress(Exception):
+            self._persist_ineffective_compression_count()
+        with contextlib.suppress(Exception):
+            self._persist_fallback_compression_streak()
+        with contextlib.suppress(Exception):
+            self._clear_compression_failure_cooldown()
+        with contextlib.suppress(Exception):
+            self._clear_durable_proactive_prune_rearm()
+
     def _clear_compression_failure_cooldown(self) -> None:
         # Fence check BEFORE cooldown-clear: a late cancelled worker must not undo the host's timeout cooldown.
         # Class-qualified helper calls: tests bind this single method onto a bare stub.
@@ -2875,7 +2894,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     def update_model(
         self, model: str, context_length: int, base_url: str = "", api_key: Any = "", provider: str = "",
-        api_mode: str = "", max_tokens: int | None = None,
+        api_mode: str = "", max_tokens: int | None = None, persist_durable_reset: bool = True,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
         runtime_changed = (model, provider, base_url, api_mode) != (self.model, self.provider, self.base_url, self.api_mode)
@@ -2902,17 +2921,24 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         self.last_prompt_tokens = self.last_completion_tokens = self.last_total_tokens = 0
         self._reset_real_usage_pairing()
         # Strikes were judged against the previous threshold; void them durably too.
-        self._record_ineffective_compression_verdict(0)
+        if persist_durable_reset:
+            self._record_ineffective_compression_verdict(0)
+        else:
+            self._ineffective_compression_count = 0
         self._prellm_skip_count = 0
         if runtime_changed:
             self._fallback_compression_streak = 0
-            self._persist_fallback_compression_streak()
-            # Cooldowns are scoped to the failed model/provider; a switch gets an immediate attempt.
-            self._clear_compression_failure_cooldown()
+            if persist_durable_reset:
+                self._persist_fallback_compression_streak()
+                # Cooldowns are scoped to the failed model/provider; a switch gets an immediate attempt.
+                self._clear_compression_failure_cooldown()
+            else:
+                self._clear_in_memory_compression_failure_cooldown()
         self._verify_compaction_cleared_threshold = self._last_compression_made_progress = False
         # Runway was computed against the previous model's trigger; clear the durable copy too.
         self._reset_proactive_prune_rearm()
-        self._clear_durable_proactive_prune_rearm()
+        if persist_durable_reset:
+            self._clear_durable_proactive_prune_rearm()
 
         if not self.quiet_mode:
             cap_overrides = False

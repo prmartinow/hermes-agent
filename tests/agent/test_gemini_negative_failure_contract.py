@@ -323,6 +323,108 @@ class TestSwitchRollback:
         assert agent.context_compressor._summary_failure_cooldown_until == 999999.0
         assert agent.context_compressor._consecutive_timeout_failures == 3
 
+    def test_durable_compressor_state_preserved_on_switch_failure_and_cleared_on_success(self, tmp_path):
+        """Milestone 2 Sign-Off Closure:
+        1. ContextCompressor bound to real SessionDB with non-default strikes, streak, cooldown, runway.
+        2. Failed switch preserves both in-memory runtime snapshot and SQLite durable values untouched.
+        3. Positive control: successful switch makes resets durable in SQLite.
+        """
+        import time
+        from hermes_state import SessionDB
+        from agent.context_compressor import ContextCompressor, PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY
+
+        db_path = tmp_path / "durable_compressor_test.db"
+        db = SessionDB(db_path)
+        db.create_session("s_durable_test", "cli", model="gemini-3.8-flash")
+
+        future = time.time() + 999999.0
+        db.set_compression_ineffective_count("s_durable_test", 1)
+        db.set_compression_fallback_streak("s_durable_test", 2)
+        db.record_compression_failure_cooldown("s_durable_test", future, "test failure cooldown")
+        db.patch_session_model_config("s_durable_test", {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: 8192})
+
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent = AIAgent(
+                model="gemini-3.8-flash",
+                provider="gemini-oauth",
+                api_key="key1",
+                reasoning_config={"enabled": True, "effort": "high"},
+                quiet_mode=True,
+            )
+            agent.effort_by_base = {"gemini-3.8-flash": "high"}
+            agent._client_kwargs = {"api_key": "key1", "base_url": ""}
+
+            comp = ContextCompressor(model="gemini-3.8-flash", config_context_length=100000, provider="gemini-oauth", quiet_mode=True)
+            comp.bind_session_state(session_db=db, session_id="s_durable_test")
+            agent.context_compressor = comp
+
+        orig_snapshot = copy.deepcopy(comp.snapshot_switch_runtime())
+
+        # Negative branch: Switch fails AFTER compressor update
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client),              patch("agent.agent_runtime_helpers._finish_switch", side_effect=RuntimeError("injected post-compressor failure")):
+            with pytest.raises(RuntimeError):
+                agent.switch_model("gemini-3.6-flash", "gemini-oauth")
+
+        # Invariant 1: In-memory compressor restored exactly
+        assert comp.snapshot_switch_runtime() == orig_snapshot
+        assert not hasattr(agent, "_compressor_state")
+
+        # Invariant 2: SQLite database retained all original durable values without reset
+        assert db.get_compression_ineffective_count("s_durable_test") == 1
+        assert db.get_compression_fallback_streak("s_durable_test") == 2
+        assert db.get_compression_failure_cooldown("s_durable_test") is not None
+        assert db.get_session_model_config_value("s_durable_test", PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0) == 8192
+
+        # Positive control: Successful switch commits durable resets to SQLite
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent.switch_model("gemini-3.6-flash", "gemini-oauth")
+
+        assert agent.model == "gemini-3.6-flash"
+        assert db.get_compression_ineffective_count("s_durable_test") == 0
+        assert db.get_compression_fallback_streak("s_durable_test") == 0
+        assert db.get_compression_failure_cooldown("s_durable_test") is None
+        assert db.get_session_model_config_value("s_durable_test", PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0) == 0
+
+    def test_switch_snapshot_restore_is_non_destructive_and_idempotent(self):
+        """Milestone 2 Sign-Off Closure:
+        _restore_switch_snapshot() must not mutate the snapshot dictionary (no .pop())
+        and must remain fully reusable across nested rollbacks.
+        """
+        from agent.agent_runtime_helpers import _snapshot_switch_state, _restore_switch_snapshot
+        from agent.context_compressor import ContextCompressor
+
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent = AIAgent(
+                model="gemini-3.8-flash",
+                provider="gemini-oauth",
+                api_key="key1",
+                reasoning_config={"enabled": True, "effort": "high"},
+                quiet_mode=True,
+            )
+            agent.effort_by_base = {"gemini-3.8-flash": "high"}
+            comp = ContextCompressor(model="gemini-3.8-flash", config_context_length=100000, provider="gemini-oauth", quiet_mode=True)
+            comp.last_prompt_tokens = 42000
+            agent.context_compressor = comp
+
+        snapshot = _snapshot_switch_state(agent)
+        assert "_compressor_state" in snapshot
+
+        # First restore
+        _restore_switch_snapshot(agent, snapshot)
+        assert "_compressor_state" in snapshot  # not popped!
+        assert not hasattr(agent, "_compressor_state")
+        assert agent.context_compressor.last_prompt_tokens == 42000
+
+        # Mutate agent and compressor again
+        agent.model = "mutated-model"
+        agent.context_compressor.last_prompt_tokens = 0
+
+        # Second restore with same snapshot
+        _restore_switch_snapshot(agent, snapshot)
+        assert not hasattr(agent, "_compressor_state")
+        assert agent.model == "gemini-3.8-flash"
+        assert agent.context_compressor.last_prompt_tokens == 42000
+
     def test_compressor_feasibility_probe_failure_does_not_abort_good_switch(self):
         """When compressor update succeeds, a failure in revalidate_compression_feasibility
         probe does NOT abort or roll back the good switch.

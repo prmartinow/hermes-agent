@@ -2035,7 +2035,7 @@ def _snapshot_switch_state(agent) -> Dict[str, Any]:
 
 
 def _restore_switch_snapshot(agent, snapshot: Dict[str, Any]) -> None:
-    compressor_state = snapshot.pop("_compressor_state", None)
+    compressor_state = snapshot.get("_compressor_state", _MISSING)
     for name, value in snapshot.items():
         if name == "_compressor_state":
             continue
@@ -2050,7 +2050,7 @@ def _restore_switch_snapshot(agent, snapshot: Dict[str, Any]) -> None:
         with contextlib.suppress(Exception):
             from agent.usage_anchor import persist_usage_anchor
             persist_usage_anchor(agent, snapshot["_usage_anchor"])
-    if compressor_state is not None and compressor_state is not _MISSING:
+    if compressor_state is not _MISSING and compressor_state is not None:
         cc = getattr(agent, "context_compressor", None)
         if cc is not None:
             if hasattr(cc, "restore_switch_runtime") and callable(cc.restore_switch_runtime):
@@ -2280,14 +2280,26 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
             agent.model, base_url=agent.base_url, api_key=ctx_api_key, provider=agent.provider,
             config_context_length=effective_context_length, custom_providers=custom_providers,
         )
-        agent.context_compressor.update_model(
-            model=agent.model,
-            context_length=new_context_length,
-            base_url=agent.base_url,
-            api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
-            provider=agent.provider,
-            api_mode=agent.api_mode,
-        )
+        try:
+            agent.context_compressor.update_model(
+                model=agent.model,
+                context_length=new_context_length,
+                base_url=agent.base_url,
+                api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
+                provider=agent.provider,
+                api_mode=agent.api_mode,
+                persist_durable_reset=False,
+            )
+        except TypeError:
+            # Fallback for mock or third-party compressors without persist_durable_reset kwarg
+            agent.context_compressor.update_model(
+                model=agent.model,
+                context_length=new_context_length,
+                base_url=agent.base_url,
+                api_key=agent.api_key,
+                provider=agent.provider,
+                api_mode=agent.api_mode,
+            )
     except Exception:
         _restore_switch_snapshot(agent, snapshot)
         raise
@@ -2441,6 +2453,10 @@ def switch_model(
         _reset_stale_streak(agent)
         agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
         _finish_switch(agent, new_provider, old_norm, new_norm)
+        if hasattr(agent, "context_compressor") and agent.context_compressor:
+            if hasattr(agent.context_compressor, "commit_switch_runtime") and callable(agent.context_compressor.commit_switch_runtime):
+                with contextlib.suppress(Exception):
+                    agent.context_compressor.commit_switch_runtime()
     except Exception:
         _restore_switch_snapshot(agent, snapshot)
         raise
