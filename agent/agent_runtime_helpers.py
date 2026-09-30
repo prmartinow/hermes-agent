@@ -2280,8 +2280,15 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
             agent.model, base_url=agent.base_url, api_key=ctx_api_key, provider=agent.provider,
             config_context_length=effective_context_length, custom_providers=custom_providers,
         )
+        update_model = agent.context_compressor.update_model
         try:
-            agent.context_compressor.update_model(
+            import inspect
+            supports_transactional_reset = "persist_durable_reset" in inspect.signature(update_model).parameters
+        except (ValueError, TypeError):
+            supports_transactional_reset = False
+
+        if supports_transactional_reset:
+            update_model(
                 model=agent.model,
                 context_length=new_context_length,
                 base_url=agent.base_url,
@@ -2290,9 +2297,8 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
                 api_mode=agent.api_mode,
                 persist_durable_reset=False,
             )
-        except TypeError:
-            # Fallback for mock or third-party compressors without persist_durable_reset kwarg
-            agent.context_compressor.update_model(
+        else:
+            update_model(
                 model=agent.model,
                 context_length=new_context_length,
                 base_url=agent.base_url,

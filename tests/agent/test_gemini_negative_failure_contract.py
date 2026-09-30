@@ -385,6 +385,125 @@ class TestSwitchRollback:
         assert db.get_compression_failure_cooldown("s_durable_test") is None
         assert db.get_session_model_config_value("s_durable_test", PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0) == 0
 
+    def test_internal_type_error_in_transactional_compressor_fails_without_retry(self, tmp_path):
+        """Milestone 2 Sign-Off Closure:
+        A TypeError raised from inside a transactional compressor is a genuine switch failure.
+        It must never be caught as an API-detection signal or trigger a legacy retry with durable resets.
+        """
+        import time
+        from hermes_state import SessionDB
+        from agent.context_compressor import PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY
+
+        db_path = tmp_path / "type_error_compressor_test.db"
+        db = SessionDB(db_path)
+        db.create_session("s_te_test", "cli", model="gemini-3.8-flash")
+        future = time.time() + 999999.0
+        db.set_compression_ineffective_count("s_te_test", 1)
+        db.set_compression_fallback_streak("s_te_test", 2)
+        db.record_compression_failure_cooldown("s_te_test", future, "test failure cooldown")
+        db.patch_session_model_config("s_te_test", {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: 8192})
+
+        calls = []
+
+        class BuggyTransactionalCompressor:
+            def __init__(self):
+                self.model = "gemini-3.8-flash"
+                self.context_length = 100000
+                self.threshold_tokens = 50000
+                self.last_prompt_tokens = 30000
+
+            def snapshot_switch_runtime(self):
+                return {
+                    "model": self.model,
+                    "context_length": self.context_length,
+                    "threshold_tokens": self.threshold_tokens,
+                    "last_prompt_tokens": self.last_prompt_tokens,
+                }
+
+            def restore_switch_runtime(self, snap):
+                self.model = snap["model"]
+                self.context_length = snap["context_length"]
+                self.threshold_tokens = snap["threshold_tokens"]
+                self.last_prompt_tokens = snap["last_prompt_tokens"]
+
+            def update_model(self, model, context_length, base_url="", api_key="", provider="", api_mode="", max_tokens=None, persist_durable_reset=True):
+                calls.append({"model": model, "persist_durable_reset": persist_durable_reset})
+                self.model = "partially-mutated"
+                raise TypeError("internal compressor bug")
+
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent = AIAgent(
+                model="gemini-3.8-flash",
+                provider="gemini-oauth",
+                api_key="key1",
+                reasoning_config={"enabled": True, "effort": "high"},
+                quiet_mode=True,
+            )
+            agent.effort_by_base = {"gemini-3.8-flash": "high"}
+            comp = BuggyTransactionalCompressor()
+            agent.context_compressor = comp
+
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            with pytest.raises(TypeError) as exc_info:
+                agent.switch_model("gemini-3.6-flash", "gemini-oauth")
+
+        # Invariant 1: TypeError was propagated directly without being swallowed
+        assert "internal compressor bug" in str(exc_info.value)
+
+        # Invariant 2: update_model was called exactly once with persist_durable_reset=False (NO legacy retry!)
+        assert len(calls) == 1
+        assert calls[0]["persist_durable_reset"] is False
+
+        # Invariant 3: Agent and compressor state rolled back cleanly
+        assert agent.model == "gemini-3.8-flash"
+        assert comp.model == "gemini-3.8-flash"
+        assert comp.last_prompt_tokens == 30000
+        assert not hasattr(agent, "_compressor_state")
+
+        # Invariant 4: SQLite durable values untouched
+        assert db.get_compression_ineffective_count("s_te_test") == 1
+        assert db.get_compression_fallback_streak("s_te_test") == 2
+        assert db.get_compression_failure_cooldown("s_te_test") is not None
+        assert db.get_session_model_config_value("s_te_test", PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0) == 8192
+
+    def test_legacy_compressor_without_persist_durable_reset_invoked_once(self):
+        """Milestone 2 Sign-Off Closure:
+        A compressor whose signature genuinely lacks persist_durable_reset is invoked
+        cleanly through the legacy path exactly once without crashing feature detection.
+        """
+        legacy_calls = []
+
+        class LegacyCompressor:
+            def __init__(self):
+                self.model = "gemini-3.8-flash"
+                self.context_length = 100000
+                self.threshold_tokens = 50000
+
+            def snapshot_switch_runtime(self):
+                return {"model": self.model, "context_length": self.context_length, "threshold_tokens": self.threshold_tokens}
+
+            def restore_switch_runtime(self, snap):
+                self.model = snap["model"]
+                self.context_length = snap["context_length"]
+                self.threshold_tokens = snap["threshold_tokens"]
+
+            def update_model(self, model, context_length, base_url="", api_key="", provider="", api_mode="", max_tokens=None):
+                legacy_calls.append({"model": model, "context_length": context_length})
+                self.model = model
+                self.context_length = context_length
+
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent = AIAgent(model="gemini-3.8-flash", provider="gemini-oauth", api_key="key1", quiet_mode=True)
+            leg_comp = LegacyCompressor()
+            agent.context_compressor = leg_comp
+            agent.switch_model("gemini-3.6-flash", "gemini-oauth")
+
+        # Invariant: Legacy update_model called exactly once and switch succeeded
+        assert len(legacy_calls) == 1
+        assert legacy_calls[0]["model"] == "gemini-3.6-flash"
+        assert agent.model == "gemini-3.6-flash"
+        assert leg_comp.model == "gemini-3.6-flash"
+
     def test_switch_snapshot_restore_is_non_destructive_and_idempotent(self):
         """Milestone 2 Sign-Off Closure:
         _restore_switch_snapshot() must not mutate the snapshot dictionary (no .pop())
