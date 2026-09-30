@@ -211,6 +211,19 @@ def test_scenario_2_partner_fallback_excursion_and_foreign_projection():
     # Invariant: Fallback activation did NOT mutate effort_by_base!
     assert agent.effort_by_base == {"gemini-3.8-flash": "medium"}
 
+    # Project existing signed history through active Claude destination route
+    transport = get_transport(agent.api_mode or "chat_completions")
+    claude_projected = transport.convert_messages(
+        copy.deepcopy(history),
+        model=agent.model,
+        base_url=agent.base_url,
+        provider_profile=get_provider_profile(agent.provider),
+    )
+    # Invariant: Google-native reasoning carrier is absent from Claude wire copy!
+    assert find_native_assistant_detail(claude_projected[1].get("reasoning_details")) is None
+    # Invariant: Source history preserved non-destructively
+    assert history == original_history
+
     # Claude turn produces unsigned tool call
     foreign_asst = {
         "role": "assistant",
@@ -241,18 +254,34 @@ def test_scenario_2_partner_fallback_excursion_and_foreign_projection():
     assert claude_part["thoughtSignature"] == "skip_thought_signature_validator"
 
 
-def test_scenario_3_persist_cold_resume_replays_signed_call_and_prunes_unrelated_map():
+def test_scenario_3_persist_cold_resume_replays_signed_call_and_prunes_unrelated_map(tmp_path: Path):
     """Scenario 3:
     Real temporary SessionDB persistence: live agent with effort_by_base (3.8 low, 3.1 high)
-    -> _persist_live_session_runtime writes to actual SQLite state.db
+    + signed history written to actual SQLite DB
+    -> _persist_live_session_runtime writes runtime metadata to actual SQLite state.db
     -> actual row verifies reasoning_config is persisted while effort_by_base is NOT serialized
     -> cold agent reconstruction seeds ONLY active 3.8 low (3.1 pruned)
-    -> historical signed function call replayed with active model.
+    -> signed history loaded back through actual DB reader
+    -> exact signature replay with active resumed model.
     """
-    tmp_dir = tempfile.mkdtemp()
-    db = SessionDB(Path(tmp_dir) / "state.db")
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path)
     sid = "sess_m1_sc3"
     db.create_session(sid, "Test Session", model="gemini-3.8-flash", model_config="{}")
+
+    # Persist signed history directly into SQLite DB before resume
+    carrier = _make_dummy_carrier(thought_sig="c2lnX3Jlc3VtZV90ZXN0", tool_call_id="call_res1", tool_name="get_weather", tool_args={"city": "Tokyo"})
+    history = [
+        {"role": "user", "content": "User prompt"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call_res1", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Tokyo"}'}}],
+            "reasoning_details": [carrier],
+        },
+        {"role": "tool", "tool_call_id": "call_res1", "content": '{"temp": 20}'},
+    ]
+    db.append_messages_batch(sid, history)
 
     # 1. Live agent with two memory entries
     agent = MagicMock()
@@ -267,7 +296,7 @@ def test_scenario_3_persist_cold_resume_replays_signed_call_and_prunes_unrelated
 
     session = {"agent": agent, "session_key": sid}
 
-    # Real persistence to SQLite DB!
+    # Real runtime persistence to SQLite DB!
     server._persist_live_session_runtime(session)
 
     # 2. Read actual session row from DB
@@ -305,28 +334,24 @@ def test_scenario_3_persist_cold_resume_replays_signed_call_and_prunes_unrelated
     assert resumed_agent.effort_by_base == {"gemini-3.8-flash": "low"}
     assert "gemini-3.1-pro" not in resumed_agent.effort_by_base
 
-    # 4. Outbound wire request built from history using resumed_agent.model
-    carrier = _make_dummy_carrier(thought_sig="c2lnX3Jlc3VtZV90ZXN0", tool_call_id="call_res1", tool_name="get_weather", tool_args={"city": "Tokyo"})
-    history = [
-        {"role": "user", "content": "User prompt"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{"id": "call_res1", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Tokyo"}'}}],
-            "reasoning_details": [carrier],
-        },
-        {"role": "tool", "tool_call_id": "call_res1", "content": '{"temp": 20}'},
-    ]
-    original_history = copy.deepcopy(history)
+    # 4. Obtain actual resumed history through the real SQLite DB reader
+    reloaded_history = db.get_messages_as_conversation(sid)
+    assert len(reloaded_history) == 3
+    asst = reloaded_history[1]
+    assert asst["tool_calls"]
+    assert asst["reasoning_details"]
 
-    gemini_contents, _ = _build_gemini_contents(history, model=resumed_agent.model)
+    # 5. Outbound wire request built from reloaded history using resumed_agent.model
+    gemini_contents, _ = _build_gemini_contents(reloaded_history, model=resumed_agent.model)
     part = [p for p in gemini_contents[1]["parts"] if "functionCall" in p][0]
     assert part["thoughtSignature"] == "c2lnX3Jlc3VtZV90ZXN0"
-    assert history == original_history
 
     route = resolve_model_selection(resumed_agent.model, effort=resumed_agent.reasoning_config["effort"])
     assert route.wire_model == "gemini-3.8-flash-tiered"
     assert route.thinking_config.get("thinkingLevel") == "low"
+
+    if hasattr(db, "close"):
+        db.close()
 
 
 def test_scenario_4_openrouter_history_switch_to_cloudcode():
