@@ -858,6 +858,10 @@ class CLIModelSwitchMixin:
                         model=result.new_model,
                         effort_by_base=effort_by_base,
                     )
+                    caps = (provider_data or {}).get("capabilities") or {}
+                    entry = caps.get(result.new_model) if isinstance(caps, dict) else None
+                    has_exact_efforts = isinstance(entry, dict) and "reasoning_efforts" in entry
+
                     target_effort = None
                     selected_idx = 0
                     if effective and isinstance(effective, dict) and effective.get("enabled", True):
@@ -868,14 +872,21 @@ class CLIModelSwitchMixin:
                                     selected_idx = i
                                     break
                     else:
-                        from agent.gemini_cloudcode_models import get_model_capability, parse_model_slug
-                        cap = get_model_capability(parse_model_slug(result.new_model).base_model)
-                        def_eff = cap.default_effort if cap and cap.default_effort else "high"
-                        for i, (val, _lbl) in enumerate(rows):
-                            if val == def_eff:
-                                selected_idx = i
-                                break
-                        target_effort = None
+                        if has_exact_efforts:
+                            from agent.gemini_cloudcode_models import get_model_capability, parse_model_slug
+                            cap = get_model_capability(parse_model_slug(result.new_model).base_model)
+                            def_eff = cap.default_effort if cap and cap.default_effort else "high"
+                            for i, (val, _lbl) in enumerate(rows):
+                                if val == def_eff:
+                                    selected_idx = i
+                                    break
+                            target_effort = None
+                        else:
+                            for i, (val, _lbl) in enumerate(rows):
+                                if val == "none":
+                                    selected_idx = i
+                                    break
+                            target_effort = "none"
 
                     state.update(
                         stage="reasoning",
@@ -966,6 +977,15 @@ class CLIModelSwitchMixin:
 
         if not request.target and not request.explicit_provider:
             return _show_model_picker(self, ctx, request.force_refresh)
+
+        if request.reasoning_effort and request.target:
+            from agent.reasoning_selection import canonical_reasoning_base, reasoning_effort_error
+            early_provider = request.explicit_provider or self.provider or ""
+            if canonical_reasoning_base(early_provider, request.target) is not None:
+                early_err = reasoning_effort_error(early_provider, request.target, request.reasoning_effort)
+                if early_err:
+                    _cprint(f"  ✗ {early_err}")
+                    return
 
         result = _switch_model_from(
             self, request.target, is_global=persist_global,

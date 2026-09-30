@@ -359,3 +359,78 @@ def test_picker_31_pro_disabled_target_preselects_high():
     frags = cli._get_model_picker_display_fragments()
     rendered = "".join(part[1] for part in frags)
     assert "← current" not in rendered
+def test_picker_openrouter_disabled_target_preselects_none():
+    # Generic OpenRouter route with disabled reasoning must preselect 'none' and label 'none  ← current'
+    cli = DummyTUIHarness(model="launch-default", provider="openrouter", effort_by_base={})
+    provider_data_openrouter = {
+        "slug": "openrouter",
+        "capabilities": {
+            "google/gemini-3.8-flash": {"reasoning": True},
+        },
+    }
+    cli._model_picker_state = {
+        "stage": "model",
+        "selected": 0,
+        "provider_data": provider_data_openrouter,
+        "model_list": ["google/gemini-3.8-flash"],
+        "visible_labels": ["google/gemini-3.8-flash"],
+    }
+    fake_result = SimpleNamespace(success=True, new_model="google/gemini-3.8-flash", target_provider="openrouter")
+
+    with patch("hermes_cli.cli_model_switch_mixin._switch_model_from", return_value=fake_result),          patch("cli.CLI_CONFIG", {"agent": {"reasoning_overrides": {"google/gemini-3.8-flash": False}}}):
+        cli._handle_model_picker_selection(persist_global=False)
+
+    state = cli._model_picker_state
+    assert state["stage"] == "reasoning"
+    assert state["reasoning_effective_effort"] == "none"
+
+    # In generic rows, 'none' is the second to last row (before 'Keep current effort')
+    rows = state["reasoning_rows"]
+    none_idx = next(i for i, (val, _lbl) in enumerate(rows) if val == "none")
+    assert state["selected"] == none_idx
+
+    frags = cli._get_model_picker_display_fragments()
+    rendered = "".join(part[1] for part in frags)
+    assert "none (disable reasoning)  ← current" in rendered
+
+
+def test_typed_model_switch_cloudcode_precheck_rejects_before_switch_model_from():
+    """Verify that an invalid --reasoning on Cloud Code fails BEFORE _switch_model_from is called."""
+    class MockCLI(CLIModelSwitchMixin):
+        def __init__(self):
+            self.model = "gemini-3.8-flash"
+            self.provider = "gemini-oauth"
+            self.requested_provider = "gemini-oauth"
+            self.base_url = None
+            self.api_mode = None
+            self.api_key = None
+            self.reasoning_config = {"enabled": True, "effort": "low"}
+            self.effort_by_base = {"gemini-3.8-flash": "low"}
+            self.agent = MagicMock()
+            self._session_db = None
+            self.session_id = None
+            self.verbose = False
+            self.max_turns = 100
+
+    cli = MockCLI()
+
+    with patch("hermes_cli.cli_model_switch_mixin._switch_model_from") as mock_switch_from,          patch("cli._cprint") as mock_cprint:
+
+        # 1. Unsupported effort 'max' on 3.8
+        cli._handle_model_switch("/model gemini-3.8-flash --reasoning max")
+        mock_cprint.assert_called_with("  ✗ gemini-3.8-flash has no 'max' effort (available: low, medium, high)")
+        mock_switch_from.assert_not_called()
+
+        # 2. Contradictory embedded alias effort
+        mock_cprint.reset_mock()
+        mock_switch_from.reset_mock()
+        cli._handle_model_switch("/model gemini-3.8-flash-high --reasoning medium")
+        mock_switch_from.assert_not_called()
+        assert any("Conflicting reasoning effort" in str(c) for c in mock_cprint.call_args_list)
+
+        # 3. No-effort partner model
+        mock_cprint.reset_mock()
+        mock_switch_from.reset_mock()
+        cli._handle_model_switch("/model claude-sonnet-4-6 --reasoning low")
+        mock_switch_from.assert_not_called()
+        mock_cprint.assert_called_with("  ✗ --reasoning is not supported for model 'claude-sonnet-4-6'")
