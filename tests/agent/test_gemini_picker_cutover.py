@@ -239,3 +239,123 @@ def test_typed_model_switch_invalid_effort_causes_zero_mutation():
         assert cli.model == orig_cli_model
         assert cli.reasoning_config == orig_cli_reasoning
         assert cli.effort_by_base == orig_cli_effort_map
+# ============================================================================
+# 4. Milestone 4 Amendment Regressions: Target-State Aware Picker Display
+# ============================================================================
+
+from hermes_cli.cli_tui_mixin import CLITuiMixin
+
+
+class DummyTUIHarness(CLIModelSwitchMixin, CLITuiMixin):
+    def __init__(self, model="gemini-3.8-flash", provider="gemini-oauth", reasoning_config=None, effort_by_base=None):
+        self.model = model
+        self.provider = provider
+        self.reasoning_config = reasoning_config
+        self.effort_by_base = effort_by_base if effort_by_base is not None else {}
+        self._model_picker_state = None
+        self._app = None
+
+    def _invalidate(self, min_interval=0.0): pass
+    def _close_model_picker(self): pass
+
+
+def test_picker_active_low_target_high_labels_only_high_as_current():
+    # Active: gemini-3.8-flash / low
+    # Picker target: gemini-3.1-pro with effective state high
+    cli = DummyTUIHarness(
+        model="gemini-3.8-flash",
+        provider="gemini-oauth",
+        reasoning_config={"enabled": True, "effort": "low"},
+        effort_by_base={"gemini-3.8-flash": "low"},
+    )
+    provider_data = {
+        "slug": "gemini-oauth",
+        "capabilities": {
+            "gemini-3.1-pro": {"reasoning": True, "reasoning_efforts": ["low", "high"]},
+        },
+    }
+    cli._model_picker_state = {
+        "stage": "model",
+        "selected": 0,
+        "provider_data": provider_data,
+        "model_list": ["gemini-3.1-pro"],
+        "visible_labels": ["gemini-3.1-pro"],
+    }
+    fake_result = SimpleNamespace(success=True, new_model="gemini-3.1-pro", target_provider="gemini-oauth")
+
+    with patch("hermes_cli.cli_model_switch_mixin._switch_model_from", return_value=fake_result),          patch("cli.CLI_CONFIG", {"agent": {}}):
+        cli._handle_model_picker_selection(persist_global=False)
+
+    state = cli._model_picker_state
+    assert state["stage"] == "reasoning"
+    assert state["selected"] == 1  # 'high'
+    assert state["reasoning_effective_effort"] == "high"
+
+    # Verify rendered display fragments
+    frags = cli._get_model_picker_display_fragments()
+    rendered = "".join(part[1] for part in frags)
+    assert "high  ← current" in rendered
+    assert "low  ← current" not in rendered
+
+
+def test_picker_disabled_target_preselects_high_without_current_label():
+    # Target: gemini-3.8-flash with persisted disabled reasoning
+    cli = DummyTUIHarness(model="launch-default", provider="launch-default", effort_by_base={})
+    provider_data = {
+        "slug": "gemini-oauth",
+        "capabilities": {
+            "gemini-3.8-flash": {"reasoning": True, "reasoning_efforts": ["low", "medium", "high"]},
+        },
+    }
+    cli._model_picker_state = {
+        "stage": "model",
+        "selected": 0,
+        "provider_data": provider_data,
+        "model_list": ["gemini-3.8-flash"],
+        "visible_labels": ["gemini-3.8-flash"],
+    }
+    fake_result = SimpleNamespace(success=True, new_model="gemini-3.8-flash", target_provider="gemini-oauth")
+
+    with patch("hermes_cli.cli_model_switch_mixin._switch_model_from", return_value=fake_result),          patch("cli.CLI_CONFIG", {"agent": {"reasoning_overrides": {"gemini-3.8-flash": False}}}):
+        cli._handle_model_picker_selection(persist_global=False)
+
+    state = cli._model_picker_state
+    assert state["stage"] == "reasoning"
+    assert state["selected"] == 2  # 'high' default preselected
+    assert state["reasoning_effective_effort"] is None
+
+    frags = cli._get_model_picker_display_fragments()
+    rendered = "".join(part[1] for part in frags)
+    assert "← current" not in rendered
+    assert "none" not in rendered
+
+
+def test_picker_31_pro_disabled_target_preselects_high():
+    # Target: gemini-3.1-pro with persisted disabled reasoning
+    cli = DummyTUIHarness(model="launch-default", provider="launch-default", effort_by_base={})
+    provider_data = {
+        "slug": "gemini-oauth",
+        "capabilities": {
+            "gemini-3.1-pro": {"reasoning": True, "reasoning_efforts": ["low", "high"]},
+        },
+    }
+    cli._model_picker_state = {
+        "stage": "model",
+        "selected": 0,
+        "provider_data": provider_data,
+        "model_list": ["gemini-3.1-pro"],
+        "visible_labels": ["gemini-3.1-pro"],
+    }
+    fake_result = SimpleNamespace(success=True, new_model="gemini-3.1-pro", target_provider="gemini-oauth")
+
+    with patch("hermes_cli.cli_model_switch_mixin._switch_model_from", return_value=fake_result),          patch("cli.CLI_CONFIG", {"agent": {"reasoning_overrides": {"gemini-3.1-pro": False}}}):
+        cli._handle_model_picker_selection(persist_global=False)
+
+    state = cli._model_picker_state
+    assert state["stage"] == "reasoning"
+    assert state["selected"] == 1  # 'high' (not low!)
+    assert state["reasoning_effective_effort"] is None
+
+    frags = cli._get_model_picker_display_fragments()
+    rendered = "".join(part[1] for part in frags)
+    assert "← current" not in rendered

@@ -671,11 +671,16 @@ class CLITuiMixin:
             picked = getattr(result, "new_model", "") or "model"
             title = f"⚙ Model Picker — Reasoning effort for {picked}"
             rows = state.get("reasoning_rows") or _picker_reasoning_rows()
-            rc = self.reasoning_config
-            current = ("none" if isinstance(rc, dict) and rc.get("enabled") is False
-                       else (rc or {}).get("effort", "medium") if isinstance(rc, dict) else "medium")
-            choices = [f"{label}  ← current" if value == current else label
-                       for value, label in rows]
+            if "reasoning_effective_effort" in state:
+                target_eff = state.get("reasoning_effective_effort")
+                choices = [f"{label}  ← current" if target_eff is not None and value == target_eff else label
+                           for value, label in rows]
+            else:
+                rc = self.reasoning_config
+                current = ("none" if isinstance(rc, dict) and rc.get("enabled") is False
+                           else (rc or {}).get("effort", "medium") if isinstance(rc, dict) else "medium")
+                choices = [f"{label}  ← current" if value == current else label
+                           for value, label in rows]
             choices += ["← Back", "Cancel"]
             hint = "Applies with the model switch (same scope) — Enter to choose"
         else:

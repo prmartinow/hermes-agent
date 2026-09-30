@@ -858,17 +858,30 @@ class CLIModelSwitchMixin:
                         model=result.new_model,
                         effort_by_base=effort_by_base,
                     )
+                    target_effort = None
                     selected_idx = 0
-                    if effective and isinstance(effective, dict) and effective.get("enabled"):
-                        eff = effective.get("effort")
+                    if effective and isinstance(effective, dict) and effective.get("enabled", True):
+                        target_effort = effective.get("effort")
+                        if target_effort is not None:
+                            for i, (val, _lbl) in enumerate(rows):
+                                if val == target_effort:
+                                    selected_idx = i
+                                    break
+                    else:
+                        from agent.gemini_cloudcode_models import get_model_capability, parse_model_slug
+                        cap = get_model_capability(parse_model_slug(result.new_model).base_model)
+                        def_eff = cap.default_effort if cap and cap.default_effort else "high"
                         for i, (val, _lbl) in enumerate(rows):
-                            if val == eff:
+                            if val == def_eff:
                                 selected_idx = i
                                 break
+                        target_effort = None
+
                     state.update(
                         stage="reasoning",
                         switch_result=result,
                         reasoning_rows=rows,
+                        reasoning_effective_effort=target_effort,
                         selected=selected_idx,
                         _scroll_offset=0,
                     )
@@ -881,7 +894,7 @@ class CLIModelSwitchMixin:
             rows = state.get("reasoning_rows") or _picker_reasoning_rows()
             result = state.get("switch_result")
             if selected == len(rows):  # ← Back to the model list
-                state.update(stage="model", selected=0, _scroll_offset=0, switch_result=None, reasoning_rows=None)
+                state.update(stage="model", selected=0, _scroll_offset=0, switch_result=None, reasoning_rows=None, reasoning_effective_effort=None)
                 self._invalidate(min_interval=0.0)
                 return
             if selected > len(rows) or result is None:
