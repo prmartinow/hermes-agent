@@ -805,8 +805,11 @@ def _build_gemini_contents(
     Architectural contract:
     - Authoritative native replay: Replays Google assistant parts verbatim when carrier exists,
       preserving thoughts, signatures, and parallel function calls without semantic loss.
-    - Foreign trace bypass: Injects 'skip_thought_signature_validator' sentinel strictly on
-      unsigned foreign tool call turns to satisfy upstream wire validation.
+    - Thought-signature classifier rule:
+      * Mixed carrier-lost group with at least one REAL Google signature: REAL call keeps signature;
+        missing siblings remain unsigned.
+      * Group with no REAL Google signatures (foreign/unsigned traces): missing signatures receive
+        the 'skip_thought_signature_validator' bypass sentinel to satisfy upstream wire validation.
     - Destination-aware projection: Operates on wire copies without mutating original session history.
     See: website/docs/developer-guide/gemini-cloud-code-runtime.md
     """

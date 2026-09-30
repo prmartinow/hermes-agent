@@ -16896,7 +16896,7 @@
               }
             ],
             "default": null,
-            "description": "False for exact Cloud Code effort models; True/None for generic models.",
+            "description": "Whether disabling reasoning is supported: false = explicitly unavailable (Cloud Code effort models), true = explicitly supported, null = capability unknown/not asserted.",
             "title": "Can Disable Reasoning"
           },
           "reasoning_efforts": {

@@ -246,7 +246,10 @@ class ModelCapabilities(Result):
 
     fast: bool = Field(description="Whether fast mode is supported for this model.")
     reasoning: bool = Field(description="Whether reasoning capability is present.")
-    can_disable_reasoning: bool | None = Field(default=None, description="False for exact Cloud Code effort models; True/None for generic models.")
+    can_disable_reasoning: bool | None = Field(
+        default=None,
+        description="Whether disabling reasoning is supported: false = explicitly unavailable (Cloud Code effort models), true = explicitly supported, null = capability unknown/not asserted.",
+    )
     reasoning_efforts: list[str] | None = Field(default=None, description="Exact selectable reasoning levels: null = unknown/generic, [] = known no selectable effort, nonempty = exact selectable set.")
     effective_reasoning_effort: str | None = Field(default=None, description="Target-effective selectable effort, null when none or disabled.")
 
