@@ -1998,6 +1998,7 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
     "_credential_pool", "_credential_pool_entry_id",
     "_usage_anchor", "_turn_base_usage_anchor",
+    "reasoning_config",
 )
 _MISSING = object()
 
@@ -2013,6 +2014,8 @@ def _snapshot_switch_state(agent) -> Dict[str, Any]:
         snapshot["_usage_anchor"] = copy.deepcopy(snapshot["_usage_anchor"])
     if isinstance(snapshot.get("_turn_base_usage_anchor"), dict):
         snapshot["_turn_base_usage_anchor"] = copy.deepcopy(snapshot["_turn_base_usage_anchor"])
+    if hasattr(agent, "effort_by_base") and isinstance(agent.effort_by_base, dict):
+        snapshot["effort_by_base"] = copy.deepcopy(agent.effort_by_base)
     return snapshot
 
 
@@ -2020,6 +2023,9 @@ def _restore_switch_snapshot(agent, snapshot: Dict[str, Any]) -> None:
     for name, value in snapshot.items():
         if value is _MISSING:
             continue  # attribute did not exist before the swap; don't fabricate it
+        if name == "effort_by_base":
+            agent.effort_by_base = copy.deepcopy(value) if isinstance(value, dict) else {}
+            continue
         with contextlib.suppress(Exception):
             setattr(agent, name, value)
     if "_usage_anchor" in snapshot and snapshot["_usage_anchor"] is not _MISSING:
@@ -2379,9 +2385,15 @@ def switch_model(
     # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
     # YAML False = disabled).
     try:
-        from hermes_constants import resolve_reasoning_config
+        from agent.reasoning_selection import resolve_effective_reasoning_config
         from hermes_cli.config import load_config as _sm_load_config
-        agent.reasoning_config = resolve_reasoning_config(_sm_load_config() or {}, agent.model)
+        effort_by_base = getattr(agent, "effort_by_base", None)
+        agent.reasoning_config = resolve_effective_reasoning_config(
+            config=_sm_load_config() or {},
+            provider=new_provider,
+            model=agent.model,
+            effort_by_base=effort_by_base,
+        )
         logger.info(
             "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
         )

@@ -28,20 +28,27 @@ _RUNTIME_FIELDS = (
 
 
 def _runtime_fields(cli) -> dict:
-    return {key: getattr(cli, key, None) for key in _RUNTIME_FIELDS}
+    import copy
+    res = {key: getattr(cli, key, None) for key in _RUNTIME_FIELDS}
+    if hasattr(cli, "effort_by_base") and isinstance(cli.effort_by_base, dict):
+        res["effort_by_base"] = copy.deepcopy(cli.effort_by_base)
+    return res
 
 
 def _resolve_cli_reasoning(cli) -> None:
-    """Re-resolve the CLI-level ``reasoning_config`` for ``cli.model`` through the shared chokepoint
-    (per-model ``reasoning_overrides`` > global ``agent.reasoning_effort``). Startup resolves it once
-    for the launch model; every path that moves ``cli.model`` must call this BEFORE the agent branch,
-    because a lazily built agent inherits this field — an always-thinking model then goes out with
-    the launch model's effort and 400s (#112921, #96012). ``agent.switch_model`` re-resolves its own
-    copy for the live-agent path."""
+    """Re-resolve the CLI-level ``reasoning_config`` for ``cli.model`` through the shared resolver
+    (runtime EffortByBase > per-model ``reasoning_overrides`` > global ``agent.reasoning_effort`` > default)."""
     from cli import CLI_CONFIG
-    from hermes_constants import resolve_reasoning_config
+    from agent.reasoning_selection import resolve_effective_reasoning_config
+    effort_by_base = getattr(cli, "effort_by_base", None)
+    provider = getattr(cli, "provider", "") or ""
     # getattr: tests drive /new unbound on a SimpleNamespace without ``model`` (blank -> config default).
-    cli.reasoning_config = resolve_reasoning_config(CLI_CONFIG, getattr(cli, "model", None) or "")
+    cli.reasoning_config = resolve_effective_reasoning_config(
+        config=CLI_CONFIG,
+        provider=provider,
+        model=getattr(cli, "model", None) or "",
+        effort_by_base=effort_by_base,
+    )
 
 
 def stored_session_route(session_meta, *, current_model, current_provider):
@@ -210,7 +217,7 @@ def _picker_offers_reasoning(provider_data: dict, model: str) -> bool:
     return not (isinstance(entry, dict) and entry.get("reasoning") is False)
 
 
-def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool) -> None:
+def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool, one_turn: bool = False) -> None:
     """Apply a ``--reasoning <level>`` that rode along with a model pick. Runs AFTER the swap: the
     agent's ``switch_model`` re-resolves ``reasoning_config`` from config.yaml, so an earlier write
     would be clobbered. Session-scoped unless the pick itself persists (``--global``)."""
@@ -218,13 +225,47 @@ def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool) -> 
     parsed = _parse_reasoning_config(effort)
     if parsed is None:
         return
+
+    from agent.reasoning_selection import canonical_reasoning_base, remember_reasoning_effort
+    from agent.gemini_cloudcode_models import selectable_reasoning_efforts
+    provider = getattr(cli, "provider", "") or ""
+    model = getattr(cli, "model", "") or ""
+    canonical_base = canonical_reasoning_base(provider, model)
+    selectable = selectable_reasoning_efforts(provider, model) if canonical_base else None
+
+    # Validate against selectable efforts if Cloud Code
+    clean_effort = effort.lower().strip()
+    if canonical_base is not None and selectable:
+        if clean_effort not in selectable:
+            return
+
+    if not one_turn and canonical_base is not None and selectable:
+        if not hasattr(cli, "effort_by_base") or not isinstance(cli.effort_by_base, dict):
+            cli.effort_by_base = {}
+        remember_reasoning_effort(cli.effort_by_base, provider=provider, model=model, effort=clean_effort)
+        if getattr(cli, "agent", None) is not None:
+            if not hasattr(cli.agent, "effort_by_base") or not isinstance(cli.agent.effort_by_base, dict):
+                cli.agent.effort_by_base = {}
+            remember_reasoning_effort(cli.agent.effort_by_base, provider=provider, model=model, effort=clean_effort)
+
     cli.reasoning_config = parsed
     if cli.agent is not None:
         cli.agent.reasoning_config = parsed
-    saved = persist_global and save_config_value("agent.reasoning_effort", effort)
-    if saved:
-        CLI_CONFIG.setdefault("agent", {})["reasoning_effort"] = effort
-    _cprint(f"    Reasoning effort: {effort}" + (" (saved to config)" if saved else ""))
+
+    if persist_global:
+        if canonical_base is not None and selectable:
+            key = f"agent.reasoning_overrides.{canonical_base}"
+            saved = save_config_value(key, clean_effort)
+            if saved:
+                CLI_CONFIG.setdefault("agent", {}).setdefault("reasoning_overrides", {})[canonical_base] = clean_effort
+            _cprint(f"    Reasoning effort: {clean_effort}" + (f" (saved to config as {key})" if saved else ""))
+        else:
+            saved = save_config_value("agent.reasoning_effort", effort)
+            if saved:
+                CLI_CONFIG.setdefault("agent", {})["reasoning_effort"] = effort
+            _cprint(f"    Reasoning effort: {effort}" + (" (saved to config)" if saved else ""))
+    else:
+        _cprint(f"    Reasoning effort: {effort}")
 
 
 def _commit_model_switch(
@@ -243,7 +284,7 @@ def _commit_model_switch(
         cli._pending_one_turn_model_restore = snapshot
     _print_switch_summary(cli, result, old_model, one_turn=one_turn, strict_context=not picker)
     if reasoning_effort:
-        _apply_reasoning_after_switch(cli, reasoning_effort, persist_global=persist_global and not one_turn)
+        _apply_reasoning_after_switch(cli, reasoning_effort, persist_global=persist_global and not one_turn, one_turn=one_turn)
     if persist_global:
         from hermes_cli.model_switch import persist_model_selection
         persist_model_selection(result)
@@ -402,18 +443,14 @@ class CLIModelSwitchMixin:
         sid = getattr(self, "session_id", None)
         if not db or not sid:
             return
+        active_reasoning = getattr(self, "reasoning_config", None)
         route = {
             "provider": _heal_bare_custom_provider(
                 result.target_provider, base_url=result.base_url, model=result.new_model,
             ) or None,
-            # Both shapes use the same or-None discipline so stale keys from a previous switch are deleted
-            # (not merely omitted) in BOTH the nested gateway_runtime dict (CLI reader) and the top-level
-            # keys (TUI gateway reader). _merge_model_config_json only deletes on explicit None, so falsy
-            # values must be converted, not filtered. Deriving the top-level from **route guarantees the two
-            # shapes can never diverge — the asymmetry that caused the original stale-key bug (#85261
-            # simplify-code review).
             "base_url": result.base_url or None,
-            "api_mode": result.api_mode or None}
+            "api_mode": result.api_mode or None,
+            "reasoning_config": active_reasoning if active_reasoning is not None else None}
         try:
             db.update_session_model(sid, result.new_model)
             db.patch_session_model_config(sid, {"gateway_runtime": route, **route})
@@ -489,10 +526,51 @@ class CLIModelSwitchMixin:
                     "Credential re-resolution for resumed session provider "
                     "%s failed; keeping ambient credentials",
                     stored_provider, exc_info=True)
-        _resolve_cli_reasoning(self)
+        from hermes_state import SessionDB as _SessionDB
+        runtime = _SessionDB.session_gateway_runtime(session_meta)
+        stored_reasoning = runtime.get("reasoning_config")
+        if stored_reasoning is None and isinstance(session_meta.get("model_config"), dict):
+            stored_reasoning = session_meta["model_config"].get("reasoning_config")
+        elif stored_reasoning is None and isinstance(session_meta.get("model_config"), str):
+            import json
+            try:
+                parsed_cfg = json.loads(session_meta["model_config"])
+                if isinstance(parsed_cfg, dict):
+                    stored_reasoning = parsed_cfg.get("reasoning_config")
+            except Exception:
+                pass
+
+        from agent.reasoning_selection import canonical_reasoning_base
+        from agent.gemini_cloudcode_models import selectable_reasoning_efforts
+        canonical_base = canonical_reasoning_base(self.provider, self.model)
+        if canonical_base is not None and isinstance(stored_reasoning, dict):
+            if stored_reasoning.get("enabled") is False:
+                self.reasoning_config = {"enabled": False}
+                if hasattr(self, "effort_by_base") and canonical_base in self.effort_by_base:
+                    del self.effort_by_base[canonical_base]
+            else:
+                stored_eff = stored_reasoning.get("effort")
+                selectable = selectable_reasoning_efforts(self.provider, self.model)
+                if selectable and stored_eff in selectable:
+                    self.reasoning_config = {"enabled": True, "effort": stored_eff}
+                    if not hasattr(self, "effort_by_base") or not isinstance(self.effort_by_base, dict):
+                        self.effort_by_base = {}
+                    self.effort_by_base[canonical_base] = stored_eff
+                else:
+                    _resolve_cli_reasoning(self)
+        else:
+            if stored_reasoning is not None:
+                self.reasoning_config = stored_reasoning
+            else:
+                _resolve_cli_reasoning(self)
+
         # Mid-chat /resume swaps the live agent; on startup --resume _init_agent picks up
         # self.model / self.provider / self.reasoning_config.
         if self.agent is not None:
+            if hasattr(self, "effort_by_base") and isinstance(self.effort_by_base, dict):
+                import copy
+                self.agent.effort_by_base = copy.deepcopy(self.effort_by_base)
+            self.agent.reasoning_config = self.reasoning_config
             try:
                 self.agent.switch_model(
                     new_model=self.model, new_provider=self.provider, api_key=self.api_key or "",
@@ -580,6 +658,11 @@ class CLIModelSwitchMixin:
         for key in _RUNTIME_FIELDS:
             if key in snapshot:
                 setattr(self, key, snapshot.get(key))
+        if "effort_by_base" in snapshot:
+            import copy
+            self.effort_by_base = copy.deepcopy(snapshot["effort_by_base"])
+            if getattr(self, "agent", None) is not None:
+                self.agent.effort_by_base = copy.deepcopy(snapshot["effort_by_base"])
 
         agent = getattr(self, "agent", None)
         if agent is None:
