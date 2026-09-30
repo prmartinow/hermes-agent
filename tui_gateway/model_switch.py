@@ -19,6 +19,7 @@ def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
     return {**{k: getattr(agent, k, "") for k in _RUNTIME_KEYS},
             "reasoning_config": copy.deepcopy(getattr(agent, "reasoning_config", None)),
+            "effort_by_base": copy.deepcopy(getattr(agent, "effort_by_base", {})),
             "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None))}
 
 
@@ -29,7 +30,9 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     # `/model X --reasoning high --once`: the effort leaves with the model. Set before the
     # runtime restore paths below (primary_runtime may predate a session /reasoning change).
     if "reasoning_config" in snapshot:
-        agent.reasoning_config = snapshot["reasoning_config"]
+        agent.reasoning_config = copy.deepcopy(snapshot["reasoning_config"])
+    if "effort_by_base" in snapshot:
+        agent.effort_by_base = copy.deepcopy(snapshot["effort_by_base"])
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
@@ -38,7 +41,9 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
                 if "reasoning_config" in snapshot:
-                    agent.reasoning_config = snapshot["reasoning_config"]
+                    agent.reasoning_config = copy.deepcopy(snapshot["reasoning_config"])
+                if "effort_by_base" in snapshot:
+                    agent.effort_by_base = copy.deepcopy(snapshot["effort_by_base"])
                 return
         except Exception:
             logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
@@ -48,7 +53,9 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             new_model=model, new_provider=provider, api_key=api_key, base_url=base_url,
             api_mode=api_mode, capabilities=snapshot.get("capabilities"))
         if "reasoning_config" in snapshot:
-            agent.reasoning_config = snapshot["reasoning_config"]
+            agent.reasoning_config = copy.deepcopy(snapshot["reasoning_config"])
+        if "effort_by_base" in snapshot:
+            agent.effort_by_base = copy.deepcopy(snapshot["effort_by_base"])
 
 
 def _profile_runtime_scope_tokens(profile_home, *, hydrate_secrets: bool = True) -> "_TurnScopes":
@@ -162,6 +169,9 @@ def _switch_request(raw_input: str, parsed_flags, persist_override) -> tuple[str
         MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL, MODEL_SWITCH_ERROR_TEXT, parse_model_switch_args,
         resolve_persist_behavior)
 
+    if raw_input and raw_input.strip().startswith("/model "):
+        raw_input = raw_input.strip()[len("/model "):].strip()
+
     f = parse_model_switch_args(raw_input) if parsed_flags is None else parsed_flags
     model_input, explicit_provider, is_global_flag, is_session, one_turn = (
         f.model_input, f.explicit_provider, f.is_global, f.is_session, f.is_once)
@@ -271,6 +281,21 @@ def _apply_model_switch(
         raise ValueError("/model --once requires a live session")
     current_provider, current_model, current_base_url, current_api_key = _current_model_runtime(
         agent, explicit_provider)
+
+    if reasoning_effort and model_input:
+        from agent.reasoning_selection import canonical_reasoning_base, reasoning_effort_error
+        from hermes_cli.models import parse_model_input
+        precheck_provider = explicit_provider or current_provider or ""
+        precheck_model = model_input
+        if not explicit_provider:
+            precheck_provider, precheck_model = parse_model_input(
+                model_input, precheck_provider, custom_ids=None
+            )
+        if canonical_reasoning_base(precheck_provider, precheck_model) is not None:
+            early_err = reasoning_effort_error(precheck_provider, precheck_model, reasoning_effort)
+            if early_err:
+                raise ValueError(early_err)
+
     # User-defined providers let switch_model resolve named custom endpoints
     # (e.g. "ollama-launch") and validate against saved model lists.
     user_provs = custom_provs = cfg = None
@@ -324,34 +349,89 @@ def _apply_model_switch(
         from hermes_cli.model_switch import persist_model_selection
         persist_model_selection(result)
     if reasoning_effort:
-        _apply_switch_reasoning(sid, session, agent, reasoning_effort, persist_global=persist_global, one_turn=one_turn)
+        _apply_switch_reasoning(
+            sid, session, agent, reasoning_effort,
+            persist_global=persist_global, one_turn=one_turn,
+            target_model=result.new_model, target_provider=result.target_provider
+        )
     return {
         "value": result.new_model, "warning": result.warning_message or "",
         "confirm_required": False,
         "scope": "once" if one_turn else ("global" if persist_global else "session")}
 
 
-def _apply_switch_reasoning(sid: str, session, agent, effort: str, *, persist_global: bool, one_turn: bool) -> None:
+def _apply_switch_reasoning(
+    sid: str, session, agent, effort: str, *, persist_global: bool, one_turn: bool,
+    target_model: str = "", target_provider: str = ""
+) -> None:
     """``/model X --reasoning <level>``: the effort rides with the pick and shares its scope. Runs
     AFTER ``agent.switch_model`` (which re-resolves ``reasoning_config`` from config.yaml, so an
     earlier write would be clobbered). ``--once`` restores through ``one_turn_model_restore`` —
     the snapshot's ``primary_runtime`` carries the pre-switch ``reasoning_config``."""
     from hermes_constants import parse_reasoning_effort
+    from agent.reasoning_selection import canonical_reasoning_base, remember_reasoning_effort
+
+    prov = target_provider or (getattr(agent, "provider", "") if agent else "")
+    mod = target_model or (getattr(agent, "model", "") if agent else "")
+    canonical_base = canonical_reasoning_base(prov, mod)
+
+    if canonical_base is not None:
+        parsed = {"enabled": True, "effort": effort}
+        if agent is not None:
+            agent.reasoning_config = parsed
+            if isinstance(getattr(agent, "_primary_runtime", None), dict) and not one_turn:
+                agent._primary_runtime["reasoning_config"] = dict(parsed)
+            if not one_turn:
+                if not hasattr(agent, "effort_by_base") or not isinstance(agent.effort_by_base, dict):
+                    agent.effort_by_base = {}
+                remember_reasoning_effort(agent.effort_by_base, provider=prov, model=mod, effort=effort)
+        if one_turn or not isinstance(session, dict):
+            return
+        if persist_global:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+            agent_cfg = cfg.get("agent") or {}
+            overrides = dict(agent_cfg.get("reasoning_overrides") or {})
+            overrides[canonical_base] = effort
+            _write_fn = globals().get("_write_config_key")
+            if callable(_write_fn):
+                _write_fn("agent.reasoning_overrides", overrides)
+            session.pop("create_reasoning_override", None)
+        else:
+            session["create_reasoning_override"] = parsed
+        if agent is not None:
+            _persist_fn = globals().get("_persist_live_session_runtime")
+            if callable(_persist_fn):
+                _persist_fn(session)
+            _emit_fn = globals().get("_emit_session_info")
+            if callable(_emit_fn):
+                _emit_fn(sid, session)
+        return
+
+    # Generic non-Cloud Code route
     parsed = parse_reasoning_effort(effort)
     if parsed is None:
         return
     if agent is not None:
         agent.reasoning_config = parsed
+        if isinstance(getattr(agent, "_primary_runtime", None), dict) and not one_turn:
+            agent._primary_runtime["reasoning_config"] = dict(parsed)
     if one_turn or not isinstance(session, dict):
         return
     if persist_global:
-        _write_config_key("agent.reasoning_effort", effort)
+        _write_fn = globals().get("_write_config_key")
+        if callable(_write_fn):
+            _write_fn("agent.reasoning_effort", effort)
         session.pop("create_reasoning_override", None)  # global wins; see _set_reasoning
     else:
         session["create_reasoning_override"] = parsed
     if agent is not None:
-        _persist_live_session_runtime(session)
-        _emit_session_info(sid, session)  # the switch's own emit predates the effort change
+        _persist_fn = globals().get("_persist_live_session_runtime")
+        if callable(_persist_fn):
+            _persist_fn(session)
+        _emit_fn = globals().get("_emit_session_info")
+        if callable(_emit_fn):
+            _emit_fn(sid, session)  # the switch's own emit predates the effort change
 
 
 def _sync_bot_capabilities(sid: str, session: dict) -> None:

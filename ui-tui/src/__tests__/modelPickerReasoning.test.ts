@@ -2,7 +2,7 @@ import type { ModelOptionProvider } from '@hermes/shared/gateway-events'
 import { describe, expect, it } from 'vitest'
 
 import { draftModelNameFromArg } from '../components/activeSessionSwitcher.js'
-import { modelPickerCommand, pickerOffersReasoning, REASONING_PICKER_ROWS } from '../components/modelPicker.js'
+import { modelPickerCommand, pickerOffersReasoning, reasoningPickerRowsForModel, REASONING_PICKER_ROWS } from '../components/modelPicker.js'
 
 const provider = (capabilities?: ModelOptionProvider['capabilities']): ModelOptionProvider => ({
   capabilities,
@@ -30,5 +30,32 @@ describe('ModelPicker reasoning step', () => {
     expect(pickerOffersReasoning(provider({ 'gpt-5.6': { fast: false, reasoning: true } }), 'gpt-5.6')).toBe(true)
     expect(pickerOffersReasoning(provider(undefined), 'gpt-5.6')).toBe(true)
     expect(pickerOffersReasoning(undefined, 'gpt-5.6')).toBe(true)
+  })
+}
+  it('skips reasoning step when reasoning_efforts is explicitly empty', () => {
+    expect(pickerOffersReasoning(provider({ 'flash-lite': { fast: false, reasoning: true, reasoning_efforts: [] } }), 'flash-lite')).toBe(false)
+  })
+
+  it('synthesizes exact capability reasoning rows for models with reasoning_efforts', () => {
+    // 3.8 flash with can_disable_reasoning: false
+    const rows38 = reasoningPickerRowsForModel(
+      provider({ 'gemini-3.8-flash': { fast: false, reasoning: true, reasoning_efforts: ['low', 'medium', 'high'], can_disable_reasoning: false } }),
+      'gemini-3.8-flash'
+    )
+    expect(rows38.map(r => r.value)).toEqual(['low', 'medium', 'high', ''])
+
+    // 3.1 pro with low, high
+    const rows31 = reasoningPickerRowsForModel(
+      provider({ 'gemini-3.1-pro': { fast: false, reasoning: true, reasoning_efforts: ['low', 'high'], can_disable_reasoning: false } }),
+      'gemini-3.1-pro'
+    )
+    expect(rows31.map(r => r.value)).toEqual(['low', 'high', ''])
+
+    // Generic fallback when reasoning_efforts is undefined
+    const genericRows = reasoningPickerRowsForModel(
+      provider({ 'gpt-5.6': { fast: false, reasoning: true } }),
+      'gpt-5.6'
+    )
+    expect(genericRows).toBe(REASONING_PICKER_ROWS)
   })
 })

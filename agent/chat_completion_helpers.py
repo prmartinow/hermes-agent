@@ -2004,8 +2004,14 @@ def _reresolve_fallback_reasoning_config(agent) -> None:
         # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
         # because a config load failure must not kill the swap.
         from hermes_cli.config import load_config
-        from hermes_constants import resolve_reasoning_config
-        agent.reasoning_config = resolve_reasoning_config(load_config() or {}, agent.model)
+        from agent.reasoning_selection import resolve_effective_reasoning_config
+        effort_by_base = getattr(agent, "effort_by_base", None) or {}
+        agent.reasoning_config = resolve_effective_reasoning_config(
+            config=load_config() or {},
+            provider=getattr(agent, "provider", "") or "",
+            model=getattr(agent, "model", "") or "",
+            effort_by_base=effort_by_base,
+        )
         logger.info("Fallback %s: reasoning_config resolved: %s", agent.model, agent.reasoning_config)
     except Exception as _reasoning_err:
         logger.debug("Failed to resolve reasoning_config for fallback %s; keeping current: %s", agent.model, _reasoning_err)

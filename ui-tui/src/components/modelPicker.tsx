@@ -30,10 +30,34 @@ export const REASONING_PICKER_ROWS: ReadonlyArray<{ label: string; value: string
   { label: 'Keep current effort', value: '' }
 ]
 
-/** False only when the catalog says the picked model has no reasoning control;
- *  unknown capabilities keep the step (a no-op dial beats hiding a real one). */
+/** False only when the catalog says the picked model has no reasoning control
+ *  or when reasoning_efforts is explicitly empty; unknown capabilities keep the step. */
 export function pickerOffersReasoning(provider: ModelOptionProvider | undefined, model: string): boolean {
-  return provider?.capabilities?.[model]?.reasoning !== false
+  const cap = provider?.capabilities?.[model]
+  if (Array.isArray(cap?.reasoning_efforts) && cap.reasoning_efforts.length === 0) {
+    return false
+  }
+  return cap?.reasoning !== false
+}
+
+export function reasoningPickerRowsForModel(
+  provider: ModelOptionProvider | undefined,
+  model: string
+): ReadonlyArray<{ label: string; value: string }> {
+  const cap = provider?.capabilities?.[model]
+  if (Array.isArray(cap?.reasoning_efforts) && cap.reasoning_efforts.length > 0) {
+    const rows: Array<{ label: string; value: string }> = cap.reasoning_efforts.map(level => ({
+      label: level,
+      value: level
+    }))
+    if (cap.can_disable_reasoning) {
+      rows.push({ label: 'none (disable reasoning)', value: 'none' })
+    }
+    rows.push({ label: 'Keep current effort', value: '' })
+    return rows
+  }
+
+  return REASONING_PICKER_ROWS
 }
 
 /** The `/model` argument the picker emits: model + provider + scope, plus
@@ -266,9 +290,11 @@ export function ModelPicker({
     }
   }
 
+  const reasoningRows = reasoningPickerRowsForModel(provider, pendingModel)
+
   const chooseReasoning = (index: number) => {
     if (provider && pendingModel) onSelect(modelPickerCommand(pendingModel, provider.slug,
-      allowPersistGlobal && persistGlobal, REASONING_PICKER_ROWS[index]?.value ?? ''))
+      allowPersistGlobal && persistGlobal, reasoningRows[index]?.value ?? ''))
   }
 
   useInput((ch, key) => {
@@ -409,7 +435,7 @@ export function ModelPicker({
         return
       }
 
-      if (key.downArrow && reasoningIdx < REASONING_PICKER_ROWS.length - 1) {
+      if (key.downArrow && reasoningIdx < reasoningRows.length - 1) {
         setReasoningIdx(v => v + 1)
 
         return
@@ -710,7 +736,7 @@ export function ModelPicker({
           {pendingModel} · applies with the switch (same scope) · Esc back
         </Text>
 
-        {REASONING_PICKER_ROWS.map((row, idx) => (
+        {reasoningRows.map((row, idx) => (
           <Box key={row.value || 'keep'} onMouseDown={(event: { stopImmediatePropagation(): void }) => event.stopImmediatePropagation()} onMouseUp={() => chooseReasoning(idx)}>
           <Text
             color={t.color.muted}

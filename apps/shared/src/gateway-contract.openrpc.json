@@ -16895,6 +16895,21 @@
             ],
             "default": null,
             "title": "Can Disable Reasoning"
+          },
+          "reasoning_efforts": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Reasoning Efforts"
           }
         },
         "required": [

@@ -1770,14 +1770,13 @@ def _display_mouse_tracking(display: dict) -> str:
     return "off" if raw is False or raw == 0 else "all"
 
 
-def _load_reasoning_config(model: str = "") -> dict | None:
-    """Via the shared chokepoint :func:`hermes_constants.resolve_reasoning_config` (per-model override >
-    global ``agent.reasoning_effort``; YAML False = disabled).
+def _load_reasoning_config(model: str = "", provider: str = "") -> dict | None:
+    """Via the shared effective resolver (runtime > per-model override > global > default).
 
     Closes #21256.
     """
-    from hermes_constants import resolve_reasoning_config
-    return resolve_reasoning_config(_load_cfg(), model)
+    from agent.reasoning_selection import resolve_effective_reasoning_config
+    return resolve_effective_reasoning_config(config=_load_cfg(), provider=provider, model=model)
 
 
 _SERVICE_TIER_ALIASES = {"fast": "priority", "priority": "priority", "on": "priority", "auto": "auto", "cold": "cold"}
@@ -2470,7 +2469,7 @@ def _make_agent(
         credential_pool=runtime.get("credential_pool"), quiet_mode=True,
         verbose_logging=False,  # DEBUG agent logging; independent of tool_progress_mode
         reasoning_config=(
-            reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""))),
+            reasoning_config_override if reasoning_config_override is not None else _load_reasoning_config(str(model or ""), str(runtime.get("provider") or ""))),
         service_tier=service_tier_override if service_tier_override is not None else _load_service_tier(),
         enabled_toolsets=_load_enabled_toolsets(platform),
         # OpenRouter provider_routing prefs (gateway + CLI parity).
@@ -2492,6 +2491,28 @@ def _make_agent(
     if fallback_notice:
         # Emitted once on the first successful reply via _emit_pending_fallback_notice -> status_callback.
         agent._pending_fallback_notice = fallback_notice
+
+    # Seed active effort_by_base for resumed Cloud Code sessions
+    from agent.reasoning_selection import canonical_reasoning_base, selectable_reasoning_efforts
+    canonical_base = canonical_reasoning_base(agent.provider or "", agent.model or "")
+    if canonical_base is not None and isinstance(agent.reasoning_config, dict):
+        if agent.reasoning_config.get("enabled"):
+            eff = agent.reasoning_config.get("effort")
+            selectable = selectable_reasoning_efforts(agent.provider or "", agent.model or "")
+            if eff and eff in selectable:
+                agent.effort_by_base = {canonical_base: eff}
+            else:
+                agent.effort_by_base = {}
+                from agent.reasoning_selection import resolve_effective_reasoning_config
+                agent.reasoning_config = resolve_effective_reasoning_config(
+                    config=cfg,
+                    provider=agent.provider or "",
+                    model=agent.model or "",
+                    effort_by_base=agent.effort_by_base,
+                )
+        else:
+            agent.effort_by_base = {}
+
     return agent
 
 
