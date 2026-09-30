@@ -156,6 +156,25 @@ def resolve_effective_reasoning_config(
     return None
 
 
+def resolve_effective_reasoning_effort(
+    *,
+    config: dict[str, Any] | None,
+    provider: str,
+    model: str,
+    effort_by_base: Mapping[str, str] | None = None,
+) -> str | None:
+    """Return the effective reasoning effort string (e.g. 'medium', 'high') or None if disabled/unsupported."""
+    eff_cfg = resolve_effective_reasoning_config(
+        config=config,
+        provider=provider,
+        model=model,
+        effort_by_base=effort_by_base,
+    )
+    if isinstance(eff_cfg, dict) and eff_cfg.get("enabled"):
+        return eff_cfg.get("effort")
+    return None
+
+
 def reasoning_effort_error(
     provider: str,
     model: str,

@@ -357,18 +357,14 @@ def _apply_capabilities(rows: list[dict], ctx: ConfigContext | None = None) -> N
                     entry["reasoning_efforts"] = list(efforts)
                     if efforts:
                         entry["can_disable_reasoning"] = False
-                        from agent.reasoning_selection import resolve_effective_reasoning_config
+                        from agent.reasoning_selection import resolve_effective_reasoning_effort
                         from hermes_cli.config import load_config
-                        eff_cfg = resolve_effective_reasoning_config(
+                        entry["effective_reasoning_effort"] = resolve_effective_reasoning_effort(
                             config=load_config() or {},
                             provider=slug,
                             model=model,
                             effort_by_base=getattr(ctx, "effort_by_base", None) if ctx else None,
                         )
-                        if isinstance(eff_cfg, dict) and eff_cfg.get("enabled"):
-                            entry["effective_reasoning_effort"] = eff_cfg.get("effort")
-                        else:
-                            entry["effective_reasoning_effort"] = None
             except Exception:
                 pass
 

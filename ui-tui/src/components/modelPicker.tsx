@@ -70,7 +70,8 @@ export function initialReasoningIndexForModel(
   if (effectiveEffort) {
     const found = rows.findIndex(r => r.value === effectiveEffort)
     if (found >= 0) return found
-  } else if (Array.isArray(cap?.reasoning_efforts) && cap.reasoning_efforts.length > 0) {
+  }
+  if (Array.isArray(cap?.reasoning_efforts) && cap.reasoning_efforts.length > 0) {
     const highIdx = rows.findIndex(r => r.value === 'high')
     return highIdx >= 0 ? highIdx : 0
   }
