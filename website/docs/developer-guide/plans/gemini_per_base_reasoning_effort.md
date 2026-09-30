@@ -9,7 +9,7 @@
 ## 1. Executive Summary & Problem Statement
 
 Google Cloud Code PA models adhere to three distinct model/effort wire taxonomies:
-1. **Dynamic Tiered Models** (`gemini-3.8-flash`, `gemini-3.7-flash`): Route to `*-tiered` wire models (`gemini-3.8-flash-tiered`, `gemini-3.7-flash-tiered`) with structured `thinkingConfig.thinkingLevel` (`low`, `medium`, `high`) and `thinkingBudget: -1`.
+1. **Dynamic Tiered Models** (`gemini-3.8-flash`, `gemini-3.7-flash`): Identified upstream during discovery via `supportsThinking: true` and `thinkingBudget: -1`. Outbound requests route to `*-tiered` wire models (`gemini-3.8-flash-tiered`, `gemini-3.7-flash-tiered`) with structured `thinkingConfig: {"thinkingLevel": <level>, "includeThoughts": true}`.
 2. **Static Tiered Models** (`gemini-3.6-flash`): Route to separate static wire slugs (`gemini-3.6-flash-low`, `gemini-3.6-flash-medium`, `gemini-3.6-flash-high`) with `thinkingConfig: None`.
 3. **Fixed-Tier Models** (`gemini-3.1-pro`): Support `low` and `high` effort via distinct wire slugs (`gemini-3.1-pro-low`, `gemini-3.1-pro-high`), while partner models (`claude-sonnet-4-6`, `gpt-oss-120b-medium`, `gemini-3.1-flash-lite`) reject reasoning effort controls entirely.
 

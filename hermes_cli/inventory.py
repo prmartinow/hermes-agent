@@ -31,9 +31,17 @@ class ConfigContext:
     ) -> "ConfigContext":
         """Copy with TRUTHY overrides applied: the TUI reads agent attributes that may be empty strings
         before an agent is spawned — empties must not clobber the disk-config values."""
-        overrides = (("current_provider", current_provider), ("current_model", current_model),
-                     ("current_base_url", current_base_url), ("effort_by_base", effort_by_base))
-        kw = {k: v for k, v in overrides if v is not None}
+        kw = {
+            k: v
+            for k, v in (
+                ("current_provider", current_provider),
+                ("current_model", current_model),
+                ("current_base_url", current_base_url),
+            )
+            if v
+        }
+        if effort_by_base is not None:
+            kw["effort_by_base"] = effort_by_base
         return replace(self, **kw) if kw else self
 
 

@@ -83,8 +83,51 @@ def _empty_ctx(provider="orig", model="orig-model", base_url="orig-url"):
     )
 
 
+def test_with_overrides_preserves_disk_config_on_empty_agent_attrs():
+    """Empty agent attributes (empty strings) must NOT clobber configured values,
+    while effort_by_base={} is an intentional override that replaces the runtime map.
+    """
+    ctx = _empty_ctx(provider="gemini-oauth", model="gemini-3.8-flash", base_url="configured-url")
+    out = ctx.with_overrides(
+        current_provider="",
+        current_model="",
+        current_base_url="",
+        effort_by_base={},
+    )
+    assert out.current_provider == "gemini-oauth"
+    assert out.current_model == "gemini-3.8-flash"
+    assert out.current_base_url == "configured-url"
+    assert out.effort_by_base == {}
 
 
+def test_model_options_without_live_agent_preserves_configured_provider():
+    """When model.options is called with no live agent, the configured provider
+    and model from disk must remain the returned current provider and model, and mark is_current."""
+    from hermes_cli.inventory import build_model_options_payload
+    import tui_gateway.server as server
+    _model_picker_context = server._model_picker_context
+
+    fake_rows = [
+        {
+            "slug": "gemini-oauth",
+            "name": "Google Gemini (OAuth)",
+            "models": ["gemini-3.8-flash"],
+            "authenticated": True,
+            "is_current": True,
+        }
+    ]
+
+    with patch("hermes_cli.inventory.load_picker_context") as mock_load, \
+         patch.object(server, "_resolve_model", return_value="gemini-3.8-flash"), \
+         patch("hermes_cli.model_switch.list_authenticated_providers", return_value=fake_rows):
+        mock_load.return_value = _empty_ctx(provider="gemini-oauth", model="gemini-3.8-flash", base_url="")
+        ctx = _model_picker_context(None)
+        payload = build_model_options_payload(ctx, include_unconfigured=True)
+
+        assert payload["provider"] == "gemini-oauth"
+        assert payload["model"] == "gemini-3.8-flash"
+        p = next(p for p in payload["providers"] if p["slug"] == "gemini-oauth")
+        assert p["is_current"] is True
 
 
 # ─── build_models_payload ──────────────────────────────────────────────

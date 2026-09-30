@@ -60,6 +60,23 @@ export function reasoningPickerRowsForModel(
   return REASONING_PICKER_ROWS
 }
 
+export function initialReasoningIndexForModel(
+  provider: ModelOptionProvider | undefined,
+  model: string,
+  rows: ReadonlyArray<{ label: string; value: string }>
+): number {
+  const cap = provider?.capabilities?.[model]
+  const effectiveEffort = cap?.effective_reasoning_effort
+  if (effectiveEffort) {
+    const found = rows.findIndex(r => r.value === effectiveEffort)
+    if (found >= 0) return found
+  } else if (Array.isArray(cap?.reasoning_efforts) && cap.reasoning_efforts.length > 0) {
+    const highIdx = rows.findIndex(r => r.value === 'high')
+    return highIdx >= 0 ? highIdx : 0
+  }
+  return 0
+}
+
 /** The `/model` argument the picker emits: model + provider + scope, plus
  *  `--reasoning <level>` when an effort was picked. */
 export function modelPickerCommand(
@@ -284,16 +301,7 @@ export function ModelPicker({
     if (pickerOffersReasoning(provider, model)) {
       setPendingModel(model)
       const rows = reasoningPickerRowsForModel(provider, model)
-      const cap = provider.capabilities?.[model]
-      const effectiveEffort = cap?.effective_reasoning_effort
-      let preselectIdx = 0
-      if (effectiveEffort) {
-        const found = rows.findIndex(r => r.value === effectiveEffort)
-        if (found >= 0) preselectIdx = found
-      } else if (Array.isArray(cap?.reasoning_efforts) && cap.reasoning_efforts.length > 0) {
-        const highIdx = rows.findIndex(r => r.value === 'high')
-        preselectIdx = highIdx >= 0 ? highIdx : 0
-      }
+      const preselectIdx = initialReasoningIndexForModel(provider, model, rows)
       setReasoningIdx(preselectIdx)
       setStage('reasoning')
     } else {

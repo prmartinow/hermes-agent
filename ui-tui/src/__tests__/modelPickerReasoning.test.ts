@@ -6,6 +6,7 @@ import {
   modelPickerCommand,
   pickerOffersReasoning,
   reasoningPickerRowsForModel,
+  initialReasoningIndexForModel,
   REASONING_PICKER_ROWS
 } from '../components/modelPicker.js'
 
@@ -63,5 +64,26 @@ describe('ModelPicker reasoning step', () => {
     )
     expect(genericRows).toBe(REASONING_PICKER_ROWS)
     expect(genericRows.map(r => r.value)).toContain('')
+  })
+it('correctly preselects initial reasoning index based on authoritative effective_reasoning_effort', () => {
+    const rows = [{ label: 'low', value: 'low' }, { label: 'medium', value: 'medium' }, { label: 'high', value: 'high' }]
+
+    // 1. Authoritative effective_reasoning_effort = 'medium' -> index 1
+    const provMedium = provider({
+      'gemini-3.8-flash': { fast: false, reasoning: true, reasoning_efforts: ['low', 'medium', 'high'], effective_reasoning_effort: 'medium' }
+    })
+    expect(initialReasoningIndexForModel(provMedium, 'gemini-3.8-flash', rows)).toBe(1)
+
+    // 2. Unvisited model with no effective_reasoning_effort -> index 2 (default high)
+    const provDefault = provider({
+      'gemini-3.8-flash': { fast: false, reasoning: true, reasoning_efforts: ['low', 'medium', 'high'], effective_reasoning_effort: null }
+    })
+    expect(initialReasoningIndexForModel(provDefault, 'gemini-3.8-flash', rows)).toBe(2)
+
+    // 3. Explicit disabled state (no effective_reasoning_effort) -> index 2 (high visual selection with no current marker)
+    const provDisabled = provider({
+      'gemini-3.8-flash': { fast: false, reasoning: true, reasoning_efforts: ['low', 'medium', 'high'], effective_reasoning_effort: null }
+    })
+    expect(initialReasoningIndexForModel(provDisabled, 'gemini-3.8-flash', rows)).toBe(2)
   })
 })
