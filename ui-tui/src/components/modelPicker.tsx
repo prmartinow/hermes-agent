@@ -53,7 +53,7 @@ export function reasoningPickerRowsForModel(
     if (cap.can_disable_reasoning) {
       rows.push({ label: 'none (disable reasoning)', value: 'none' })
     }
-    rows.push({ label: 'Keep current effort', value: '' })
+    // Known exact Cloud Code capabilities: do not expose ambiguous "Keep current effort" row
     return rows
   }
 
@@ -283,7 +283,18 @@ export function ModelPicker({
     if (!provider || !model) { setStage('provider'); return }
     if (pickerOffersReasoning(provider, model)) {
       setPendingModel(model)
-      setReasoningIdx(0)
+      const rows = reasoningPickerRowsForModel(provider, model)
+      const cap = provider.capabilities?.[model]
+      const effectiveEffort = cap?.effective_reasoning_effort
+      let preselectIdx = 0
+      if (effectiveEffort) {
+        const found = rows.findIndex(r => r.value === effectiveEffort)
+        if (found >= 0) preselectIdx = found
+      } else if (Array.isArray(cap?.reasoning_efforts) && cap.reasoning_efforts.length > 0) {
+        const highIdx = rows.findIndex(r => r.value === 'high')
+        preselectIdx = highIdx >= 0 ? highIdx : 0
+      }
+      setReasoningIdx(preselectIdx)
       setStage('reasoning')
     } else {
       onSelect(modelPickerCommand(model, provider.slug, allowPersistGlobal && persistGlobal))
@@ -736,18 +747,22 @@ export function ModelPicker({
           {pendingModel} · applies with the switch (same scope) · Esc back
         </Text>
 
-        {reasoningRows.map((row, idx) => (
-          <Box key={row.value || 'keep'} onMouseDown={(event: { stopImmediatePropagation(): void }) => event.stopImmediatePropagation()} onMouseUp={() => chooseReasoning(idx)}>
-          <Text
-            color={t.color.muted}
-            {...chipRowProps(t, reasoningIdx === idx)}
-            wrap="truncate-end"
-          >
-            {reasoningIdx === idx ? '▸ ' : '  '}
-            {idx + 1}. {row.label}
-          </Text>
-          </Box>
-        ))}
+        {reasoningRows.map((row, idx) => {
+          const cap = provider?.capabilities?.[pendingModel]
+          const isCurrent = Boolean(cap?.effective_reasoning_effort && cap.effective_reasoning_effort === row.value)
+          return (
+            <Box key={row.value || 'keep'} onMouseDown={(event: { stopImmediatePropagation(): void }) => event.stopImmediatePropagation()} onMouseUp={() => chooseReasoning(idx)}>
+            <Text
+              color={t.color.muted}
+              {...chipRowProps(t, reasoningIdx === idx)}
+              wrap="truncate-end"
+            >
+              {reasoningIdx === idx ? '▸ ' : '  '}
+              {idx + 1}. {row.label}{isCurrent ? '  ← current' : ''}
+            </Text>
+            </Box>
+          )
+        })}
 
         <Text color={t.color.muted} wrap="truncate-end">
           persist: {allowPersistGlobal ? (persistGlobal ? 'global' : 'session') : 'session'}

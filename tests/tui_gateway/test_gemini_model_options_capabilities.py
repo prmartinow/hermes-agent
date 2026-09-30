@@ -83,3 +83,39 @@ def test_model_options_rpc_carries_exact_reasoning_efforts():
             if "gemini" in model_id.lower():
                 # Invariant: OpenRouter routes must never inject Cloud Code exact-effort ladders!
                 assert model_caps.get("reasoning_efforts") is None
+def test_model_options_rpc_carries_effective_reasoning_effort_from_live_agent():
+    """Pin: model.options capabilities carry effective_reasoning_effort populated
+    authoritatively from live agent runtime effort_by_base or config precedence.
+    """
+    from unittest.mock import MagicMock
+    from hermes_cli.inventory import build_model_options_payload
+
+    # Live agent with remembered 3.8 = medium
+    agent = MagicMock()
+    agent.provider = "gemini-oauth"
+    agent.model = "gemini-3.8-flash"
+    agent.base_url = ""
+    agent.effort_by_base = {"gemini-3.8-flash": "medium"}
+
+    fake_rows = [
+        {
+            "slug": "gemini-oauth",
+            "name": "Google Gemini (OAuth)",
+            "models": ["gemini-3.8-flash", "gemini-3.1-pro"],
+            "authenticated": True,
+            "is_current": True,
+        }
+    ]
+
+    with patch("hermes_cli.model_switch.list_authenticated_providers", return_value=fake_rows):
+        ctx = server._model_picker_context(agent)
+        assert ctx.effort_by_base == {"gemini-3.8-flash": "medium"}
+
+        opts = build_model_options_payload(ctx, include_unconfigured=True)
+        p = next(p for p in opts["providers"] if p["slug"] == "gemini-oauth")
+        caps = p["capabilities"]
+
+        # Invariant: 3.8 has effective effort preselected as 'medium'!
+        assert caps["gemini-3.8-flash"]["effective_reasoning_effort"] == "medium"
+        # Invariant: 3.1 pro unvisited in effort_by_base resolves default 'high'!
+        assert caps["gemini-3.1-pro"]["effective_reasoning_effort"] == "high"

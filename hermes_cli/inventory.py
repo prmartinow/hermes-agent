@@ -23,16 +23,17 @@ class ConfigContext:
     user_providers: dict
     custom_providers: list
     excluded_providers: list = None
+    effort_by_base: dict = None
 
     def with_overrides(
         self, *, current_provider: Optional[str] = None, current_model: Optional[str] = None,
-        current_base_url: Optional[str] = None,
+        current_base_url: Optional[str] = None, effort_by_base: Optional[dict] = None,
     ) -> "ConfigContext":
         """Copy with TRUTHY overrides applied: the TUI reads agent attributes that may be empty strings
         before an agent is spawned — empties must not clobber the disk-config values."""
         overrides = (("current_provider", current_provider), ("current_model", current_model),
-                     ("current_base_url", current_base_url))
-        kw = {k: v for k, v in overrides if v}
+                     ("current_base_url", current_base_url), ("effort_by_base", effort_by_base))
+        kw = {k: v for k, v in overrides if v is not None}
         return replace(self, **kw) if kw else self
 
 
@@ -143,7 +144,7 @@ def build_models_payload(
     if pricing:
         _apply_pricing(rows, force_fresh_nous_tier=force_fresh_nous_tier, cached_only=pricing_cache_only)
     if capabilities:
-        _apply_capabilities(rows)
+        _apply_capabilities(rows, ctx=ctx)
     if featured:
         _apply_featured(rows)
     _apply_custom_aliases(rows)
@@ -300,7 +301,7 @@ def _reasoning_catalog_reader(slug: str):
     return read
 
 
-def _apply_capabilities(rows: list[dict]) -> None:
+def _apply_capabilities(rows: list[dict], ctx: ConfigContext | None = None) -> None:
     """Attach ``{model: {fast, reasoning, ...}}`` per row. ``reasoning`` defaults True when the catalog is
     silent (the dial is a no-op on models that ignore it; hiding it from a capable model is worse). A
     serving aggregator's detail overrides models.dev (adds ``can_disable_reasoning``). ``supported_efforts``
@@ -348,6 +349,18 @@ def _apply_capabilities(rows: list[dict]) -> None:
                     entry["reasoning_efforts"] = list(efforts)
                     if efforts:
                         entry["can_disable_reasoning"] = False
+                        from agent.reasoning_selection import resolve_effective_reasoning_config
+                        from hermes_cli.config import load_config
+                        eff_cfg = resolve_effective_reasoning_config(
+                            config=load_config() or {},
+                            provider=slug,
+                            model=model,
+                            effort_by_base=getattr(ctx, "effort_by_base", None) if ctx else None,
+                        )
+                        if isinstance(eff_cfg, dict) and eff_cfg.get("enabled"):
+                            entry["effective_reasoning_effort"] = eff_cfg.get("effort")
+                        else:
+                            entry["effective_reasoning_effort"] = None
             except Exception:
                 pass
 

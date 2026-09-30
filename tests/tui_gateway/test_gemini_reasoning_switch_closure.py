@@ -169,3 +169,35 @@ def test_gateway_sequential_memory_preservation():
         config={}, provider="gemini-oauth", model="gemini-3.8-flash", effort_by_base=agent.effort_by_base
     )
     assert eff_cfg_38 == {"enabled": True, "effort": "medium"}
+def test_gateway_configured_alias_post_resolution_validation_backstop():
+    """Pin: configured alias resolving to Cloud Code with invalid effort
+    is rejected after switch_model resolution and before commit.
+    Alias 'mygem' -> gemini-oauth / gemini-3.8-flash
+    /model mygem --reasoning max
+    """
+    agent = _make_gateway_agent(model="gpt-4o", provider="openrouter", effort=None)
+    agent.effort_by_base = {}
+    session = {"agent": agent}
+
+    fake_result = SimpleNamespace(
+        success=True,
+        new_model="gemini-3.8-flash",
+        target_provider="gemini-oauth",
+        base_url="",
+        api_key="",
+        api_mode="",
+        model_info={},
+        warning_message=None,
+    )
+
+    with patch("hermes_cli.model_switch.switch_model", return_value=fake_result),          patch.object(server, "_commit_agent_switch") as mock_commit:
+
+        with pytest.raises(ValueError) as excinfo:
+            server._apply_model_switch("s1", session, "/model mygem --reasoning max")
+
+        assert "gemini-3.8-flash has no 'max' effort" in str(excinfo.value)
+        # Invariant: commit was NOT called!
+        mock_commit.assert_not_called()
+        assert agent.model == "gpt-4o"
+        assert agent.effort_by_base == {}
+        assert "model_override" not in session

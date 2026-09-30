@@ -178,8 +178,10 @@ def _model_picker_context(agent):
                 base_url=base_url or None, config_provider=ctx.current_provider, model=model or None) or provider
         except Exception:
             logger.debug("custom provider identity recovery failed (model picker)", exc_info=True)
+    effort_by_base = getattr(agent, "effort_by_base", None) if agent else None
     return ctx.with_overrides(
-        current_provider=provider, current_model=model or _resolve_model(), current_base_url=base_url)
+        current_provider=provider, current_model=model or _resolve_model(), current_base_url=base_url,
+        effort_by_base=effort_by_base)
 
 
 def register(server) -> None:

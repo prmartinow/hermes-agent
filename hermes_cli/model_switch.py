@@ -474,7 +474,7 @@ class ModelFlagParseResult:
 
 # --- Flag parsing
 
-_BOOL_FLAGS = {"--global": "is_global", "--session": "is_session", "--refresh": "force_refresh", "--once": "is_once"}
+_BOOL_FLAGS = {"--global": "is_global", "--session": "is_session", "--tui-session": "is_session", "--refresh": "force_refresh", "--once": "is_once"}
 _VALUE_FLAGS = {"--provider": "explicit_provider", "--reasoning": "reasoning_effort"}
 
 

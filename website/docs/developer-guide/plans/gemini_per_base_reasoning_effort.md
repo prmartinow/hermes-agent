@@ -8,7 +8,10 @@
 
 ## 1. Executive Summary & Problem Statement
 
-Google Cloud Code PA dynamic tiered models (`gemini-3.8-flash-tiered`, `gemini-3.1-pro`, etc.) support explicit reasoning effort controls (`low`, `medium`, `high`), while static models (`gemini-3.6-flash`, `gemini-3.7-flash`) bake effort into model slugs, and partner models (`claude-sonnet-4-6`, `gpt-oss-120b-medium`, `gemini-3.1-flash-lite`) reject reasoning effort parameters entirely.
+Google Cloud Code PA models adhere to three distinct model/effort wire taxonomies:
+1. **Dynamic Tiered Models** (`gemini-3.8-flash`, `gemini-3.7-flash`): Route to `*-tiered` wire models (`gemini-3.8-flash-tiered`, `gemini-3.7-flash-tiered`) with structured `thinkingConfig.thinkingLevel` (`low`, `medium`, `high`) and `thinkingBudget: -1`.
+2. **Static Tiered Models** (`gemini-3.6-flash`): Route to separate static wire slugs (`gemini-3.6-flash-low`, `gemini-3.6-flash-medium`, `gemini-3.6-flash-high`) with `thinkingConfig: None`.
+3. **Fixed-Tier Models** (`gemini-3.1-pro`): Support `low` and `high` effort via distinct wire slugs (`gemini-3.1-pro-low`, `gemini-3.1-pro-high`), while partner models (`claude-sonnet-4-6`, `gpt-oss-120b-medium`, `gemini-3.1-flash-lite`) reject reasoning effort controls entirely.
 
 Historically, Hermes suffered from four major inconsistencies across model switches:
 1. **Effort Bleed Across Model Switches**: Switching from a high-effort model to a different model leaked the previous model's reasoning effort into the destination model, or failed with HTTP 400 when switching to a model without reasoning support.

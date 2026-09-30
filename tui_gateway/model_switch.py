@@ -311,6 +311,12 @@ def _apply_model_switch(
         custom_providers=custom_provs)
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
+    if reasoning_effort:
+        from agent.reasoning_selection import canonical_reasoning_base, reasoning_effort_error
+        if canonical_reasoning_base(result.target_provider, result.new_model) is not None:
+            post_err = reasoning_effort_error(result.target_provider, result.new_model, reasoning_effort)
+            if post_err:
+                raise ValueError(post_err)
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
     if agent:
         _merge_preflight_warning(result, agent, session, cfg, custom_provs)
