@@ -177,3 +177,43 @@ def test_runtime_instance_isolation():
 
     agent1.effort_by_base["gemini-3.8-flash"] = "low"
     assert agent2.effort_by_base == {}
+def test_effective_resolver_preserves_exact_legacy_alias_override_precedence():
+    import copy
+    cfg = {
+        "agent": {
+            "reasoning_overrides": {
+                "gemini-3.8-flash-high": "low",
+                "gemini-3.8-flash": "high",
+            }
+        }
+    }
+    orig_cfg = copy.deepcopy(cfg)
+    result = resolve_effective_reasoning_config(
+        config=cfg,
+        provider="gemini-oauth",
+        model="gemini-3.8-flash-high",
+        effort_by_base={},
+    )
+    assert result == {"enabled": True, "effort": "low"}
+    assert cfg == orig_cfg  # Config is not mutated!
+
+
+def test_effective_resolver_accepts_structured_global_reasoning_config():
+    import copy
+    cfg = {
+        "agent": {
+            "reasoning_effort": {
+                "enabled": True,
+                "effort": "low",
+            }
+        }
+    }
+    orig_cfg = copy.deepcopy(cfg)
+    result = resolve_effective_reasoning_config(
+        config=cfg,
+        provider="gemini-oauth",
+        model="gemini-3.8-flash",
+        effort_by_base={},
+    )
+    assert result == {"enabled": True, "effort": "low"}
+    assert cfg == orig_cfg  # Config is not mutated!

@@ -125,21 +125,26 @@ def resolve_effective_reasoning_config(
         if cand_runtime in selectable:
             chosen_effort = cand_runtime
 
-    # 2. Config reasoning_overrides
+    # 2. Config reasoning_overrides (passed with original model to preserve exact alias priority)
     agent_cfg = (config or {}).get("agent") if isinstance(config, dict) else {}
     if chosen_effort is None and isinstance(agent_cfg, dict):
         overrides = agent_cfg.get("reasoning_overrides") or {}
-        cand_override = resolve_per_model_reasoning_effort(canonical_base, overrides)
+        cand_override = resolve_per_model_reasoning_effort(model, overrides)
         if cand_override and isinstance(cand_override, dict):
             cand_eff = cand_override.get("effort")
             if cand_eff in selectable:
                 chosen_effort = cand_eff
 
-    # 3. Global config reasoning_effort
+    # 3. Global config reasoning_effort (supports string or structured dict config)
     if chosen_effort is None and isinstance(agent_cfg, dict):
-        global_eff = agent_cfg.get("reasoning_effort")
-        if global_eff and str(global_eff).strip().lower() in selectable:
-            chosen_effort = str(global_eff).strip().lower()
+        from hermes_constants import parse_reasoning_effort
+        parsed_global = parse_reasoning_effort(agent_cfg.get("reasoning_effort"))
+        if (
+            isinstance(parsed_global, dict)
+            and parsed_global.get("enabled", True)
+            and parsed_global.get("effort") in selectable
+        ):
+            chosen_effort = parsed_global["effort"]
 
     # 4. Model default from capability registry
     if chosen_effort is None:
