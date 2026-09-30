@@ -2495,23 +2495,30 @@ def _make_agent(
     # Seed active effort_by_base for resumed Cloud Code sessions
     from agent.reasoning_selection import canonical_reasoning_base, selectable_reasoning_efforts
     canonical_base = canonical_reasoning_base(agent.provider or "", agent.model or "")
-    if canonical_base is not None and isinstance(agent.reasoning_config, dict):
-        if agent.reasoning_config.get("enabled"):
-            eff = agent.reasoning_config.get("effort")
-            selectable = selectable_reasoning_efforts(agent.provider or "", agent.model or "")
-            if eff and eff in selectable:
-                agent.effort_by_base = {canonical_base: eff}
-            else:
-                agent.effort_by_base = {}
-                from agent.reasoning_selection import resolve_effective_reasoning_config
-                agent.reasoning_config = resolve_effective_reasoning_config(
-                    config=cfg,
-                    provider=agent.provider or "",
-                    model=agent.model or "",
-                    effort_by_base=agent.effort_by_base,
-                )
-        else:
+    if canonical_base is not None:
+        selectable = selectable_reasoning_efforts(agent.provider or "", agent.model or "")
+        rc = agent.reasoning_config
+        is_valid_disabled = isinstance(rc, dict) and rc.get("enabled") is False
+        is_valid_enabled = (
+            isinstance(rc, dict)
+            and rc.get("enabled") is True
+            and isinstance(rc.get("effort"), str)
+            and rc.get("effort") in selectable
+        )
+        if is_valid_enabled:
+            agent.effort_by_base = {canonical_base: rc["effort"]}
+        elif is_valid_disabled:
             agent.effort_by_base = {}
+        else:
+            # Malformed or stale unsupported: fail-closed, re-resolve via M2 precedence/default
+            agent.effort_by_base = {}
+            from agent.reasoning_selection import resolve_effective_reasoning_config
+            agent.reasoning_config = resolve_effective_reasoning_config(
+                config=cfg,
+                provider=agent.provider or "",
+                model=agent.model or "",
+                effort_by_base=agent.effort_by_base,
+            )
 
     return agent
 

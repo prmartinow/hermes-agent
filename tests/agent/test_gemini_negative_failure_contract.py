@@ -1,0 +1,533 @@
+"""Negative and failure-path hardening contract tests for Gemini Cloud Code runtime (Action Item 4, Milestone 2).
+
+Verifies fail-closed, atomic, and rollback-safe behavior across:
+1. Unsupported reasoning effort selection (CLI & Gateway zero-I/O and no-op invariants).
+2. Live model switch rollback across client creation, compressor update, and capability resolution failures.
+3. Fallback activation failure memory immutability and fallback index recovery.
+4. Signature failure semantics: corrupted signatures vs. missing signatures, and partial parallel groups.
+5. Persisted state corruption: stale efforts, malformed reasoning_config, read-time DB immutability.
+6. Capability failure and invalid account boundaries (gemini-0, gemini-6, gemini-42, generic routes).
+7. Precedence resolver behavior with invalid/stale values.
+8. Fallback reasoning config load failure resilience.
+"""
+
+import copy
+import json
+import pytest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+from agent.gemini_cloudcode_models import (
+    selectable_reasoning_efforts,
+    resolve_model_selection,
+    thought_circulation_support,
+)
+from agent.reasoning_selection import (
+    canonical_reasoning_base,
+    resolve_effective_reasoning_config,
+    remember_reasoning_effort,
+    reasoning_effort_error,
+)
+from agent.reasoning_selection import (
+    resolve_effective_reasoning_config,
+    remember_reasoning_effort,
+    reasoning_effort_error,
+)
+from agent.native_replay import (
+    build_google_native_carrier,
+    find_native_assistant_detail,
+    usable_google_native_carrier,
+    classify_google_signature,
+    GoogleSignatureKind,
+)
+from agent.gemini_native_adapter import (
+    _build_gemini_contents,
+)
+from agent.chat_completion_helpers import (
+    try_activate_fallback,
+    _reresolve_fallback_reasoning_config,
+)
+from agent.agent_runtime_helpers import (
+    restore_primary_runtime,
+    switch_model,
+)
+from run_agent import AIAgent
+from hermes_state import SessionDB
+import tui_gateway.server as server
+
+
+def _fake_build_client(ag, api_key="fake", base_url="", *a, **k):
+    ag.api_key = api_key or getattr(ag, "api_key", "fake")
+    ag.base_url = base_url or getattr(ag, "base_url", "")
+    ag._client_kwargs = {}
+    ag.client = MagicMock()
+
+
+# ==============================================================================
+# 1. Unsupported Effort Selection (CLI & Gateway Zero-I/O and No-Op Invariants)
+# ==============================================================================
+
+class TestUnsupportedSelection:
+    @pytest.mark.parametrize("cmd,expected_err", [
+        ("/model gemini-3.8-flash --reasoning max", "gemini-3.8-flash has no 'max' effort"),
+        ("/model gemini-3.8-flash --reasoning none", "gemini-3.8-flash has no 'none' effort"),
+        ("/model gemini-3.1-pro --reasoning medium", "gemini-3.1-pro has no 'medium' effort"),
+        ("/model claude-sonnet-4-6 --reasoning low", "is not supported for model 'claude-sonnet-4-6'"),
+        ("/model gemini-3.1-flash-lite --reasoning low", "is not supported for model 'gemini-3.1-flash-lite'"),
+        ("/model gpt-oss-120b-medium --reasoning low", "is not supported for model 'gpt-oss-120b-medium'"),
+        ("/model gemini-3.8-flash-high --reasoning medium", "Conflicting reasoning effort: alias 'gemini-3.8-flash-high' implies 'high'"),
+        ("/model gemini-oauth:gemini-3.8-flash --reasoning max", "gemini-3.8-flash has no 'max' effort"),
+        ("/model gemini-2:gemini-3.1-pro --reasoning medium", "gemini-3.1-pro has no 'medium' effort"),
+    ])
+    def test_unsupported_effort_is_complete_noop_and_zero_io(self, cmd, expected_err):
+        """Unsupported effort must fail before any route, network, credential, agent, session, or config mutation."""
+        agent = MagicMock()
+        agent.model = "gemini-3.8-flash"
+        agent.provider = "gemini-oauth"
+        agent.base_url = ""
+        agent.api_mode = ""
+        agent.api_key = "key1"
+        agent.reasoning_config = {"enabled": True, "effort": "low"}
+        agent.effort_by_base = {"gemini-3.8-flash": "low"}
+        agent.runtime_capabilities = {"test": True}
+        agent._primary_runtime = {"model": "gemini-3.8-flash", "provider": "gemini-oauth"}
+
+        session = {
+            "agent": agent,
+            "session_key": "s1",
+            "model_override": None,
+            "create_reasoning_override": None,
+        }
+
+        # Snapshot state before rejection
+        pre_agent_model = agent.model
+        pre_agent_provider = agent.provider
+        pre_reasoning_config = copy.deepcopy(agent.reasoning_config)
+        pre_effort_by_base = copy.deepcopy(agent.effort_by_base)
+        pre_capabilities = copy.deepcopy(agent.runtime_capabilities)
+        pre_primary = copy.deepcopy(agent._primary_runtime)
+
+        with patch("hermes_cli.model_switch.switch_model") as mock_switch_model,              patch.object(server, "_write_config_key", create=True) as mock_write_cfg:
+
+            with pytest.raises(ValueError) as excinfo:
+                server._apply_model_switch("s1", session, cmd)
+
+            assert expected_err in str(excinfo.value)
+            # Invariant: switch_model not called (zero I/O)
+            mock_switch_model.assert_not_called()
+            mock_write_cfg.assert_not_called()
+
+        # Invariant: Complete state immutability
+        assert agent.model == pre_agent_model
+        assert agent.provider == pre_agent_provider
+        assert agent.reasoning_config == pre_reasoning_config
+        assert agent.effort_by_base == pre_effort_by_base
+        assert agent.runtime_capabilities == pre_capabilities
+        assert agent._primary_runtime == pre_primary
+        assert session["model_override"] is None
+        assert session["create_reasoning_override"] is None
+
+
+# ==============================================================================
+# 2. Live Model Switch Rollback (Client, Compressor, Capabilities)
+# ==============================================================================
+
+class TestSwitchRollback:
+    def test_switch_rollback_on_client_construction_failure(self):
+        """Phase A: When client construction fails during switch_model(),
+        rolls back model, provider, reasoning_config, effort_by_base, and primary runtime.
+        """
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent = AIAgent(
+                model="gemini-3.8-flash",
+                provider="gemini-oauth",
+                api_key="key1",
+                reasoning_config={"enabled": True, "effort": "low"},
+                quiet_mode=True,
+            )
+            agent.effort_by_base = {"gemini-3.8-flash": "low", "gemini-3.1-pro": "high"}
+            agent.runtime_capabilities = {"circulates_thoughts": True}
+            agent._client_kwargs = {"api_key": "key1"}
+
+        pre_model = agent.model
+        pre_provider = agent.provider
+        pre_reasoning_config = copy.deepcopy(agent.reasoning_config)
+        pre_effort_by_base = copy.deepcopy(agent.effort_by_base)
+        pre_capabilities = copy.deepcopy(agent.runtime_capabilities)
+        pre_primary = copy.deepcopy(agent._primary_runtime)
+
+        def failing_build_client(ag, *a, **k):
+            raise ConnectionError("Upstream API unreachable during switch")
+
+        with patch("agent.agent_runtime_helpers._build_switched_client", side_effect=failing_build_client):
+            with pytest.raises(ConnectionError):
+                agent.switch_model("gemini-3.6-flash", "gemini-oauth")
+
+        # Invariant: Atomic rollback of all runtime fields
+        assert agent.model == pre_model
+        assert agent.provider == pre_provider
+        assert agent.reasoning_config == pre_reasoning_config
+        assert agent.effort_by_base == pre_effort_by_base
+        assert agent.runtime_capabilities == pre_capabilities
+        assert agent._primary_runtime == pre_primary
+
+    def test_switch_rollback_on_compressor_update_failure(self):
+        """Phase B: When compressor update fails after client swap,
+        rolls back all state cleanly to pre-switch snapshot.
+        """
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent = AIAgent(
+                model="gemini-3.8-flash",
+                provider="gemini-oauth",
+                api_key="key1",
+                reasoning_config={"enabled": True, "effort": "low"},
+                quiet_mode=True,
+            )
+            agent.effort_by_base = {"gemini-3.8-flash": "low"}
+            agent._client_kwargs = {"api_key": "key1"}
+
+        pre_primary = copy.deepcopy(agent._primary_runtime)
+
+        def failing_compressor(ag, *a, **k):
+            raise RuntimeError("Compressor update failure")
+
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client),              patch("agent.agent_runtime_helpers._update_switch_compressor", side_effect=failing_compressor):
+            with pytest.raises(RuntimeError):
+                agent.switch_model("gemini-3.6-flash", "gemini-oauth")
+
+        assert agent.model == "gemini-3.8-flash"
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+        assert agent._primary_runtime == pre_primary
+
+
+# ==============================================================================
+# 3. Fallback Activation Failure & Recovery
+# ==============================================================================
+
+class TestFallbackFailure:
+    def test_fallback_activation_failure_does_not_mutate_reasoning_memory(self):
+        """When try_activate_fallback() fails (e.g. resolve_provider_client raises or chain exhausted),
+        effort_by_base remains unmutated and no partial destination reasoning config is installed.
+        """
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent = AIAgent(
+                model="gemini-3.8-flash",
+                provider="gemini-oauth",
+                api_key="fake",
+                reasoning_config={"enabled": True, "effort": "medium"},
+                quiet_mode=True,
+            )
+            agent.effort_by_base = {"gemini-3.8-flash": "medium", "gemini-3.1-pro": "high"}
+
+        agent._fallback_chain = [{"provider": "gemini-oauth", "model": "claude-sonnet-4-6"}]
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+
+        pre_effort_by_base = copy.deepcopy(agent.effort_by_base)
+        pre_reasoning_config = copy.deepcopy(agent.reasoning_config)
+
+        # Force candidate construction failure
+        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=RuntimeError("Provider credentials missing")):
+            res = try_activate_fallback(agent)
+            assert res is False
+
+        # Invariant: Memory and reasoning config remain intact
+        assert agent.effort_by_base == pre_effort_by_base
+        assert agent.reasoning_config == pre_reasoning_config
+
+    def test_fallback_index_exhaustion_recovery_on_next_turn(self):
+        """When fallback chain is exhausted, restore_primary_runtime resets _fallback_index
+        so future turns are not permanently stranded.
+        """
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent = AIAgent(
+                model="gemini-3.8-flash",
+                provider="gemini-oauth",
+                api_key="fake",
+                reasoning_config={"enabled": True, "effort": "medium"},
+                quiet_mode=True,
+            )
+        agent.context_compressor = MagicMock()
+        agent._fallback_chain = [{"provider": "gemini-oauth", "model": "broken-model"}]
+        agent._fallback_index = 0
+        agent._fallback_activated = False
+        agent._rate_limited_until = 0
+
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)):
+            res = try_activate_fallback(agent)
+            assert res is False
+            assert agent._fallback_index >= len(agent._fallback_chain)
+
+        # Next turn start calls restore_primary_runtime
+        restore_primary_runtime(agent)
+        # Invariant: fallback index reset to 0!
+        assert agent._fallback_index == 0
+
+
+# ==============================================================================
+# 4. Signature Failure Semantics (Corrupted vs. Missing & Parallel Groups)
+# ==============================================================================
+
+class TestSignatureFailureSemantics:
+    def test_corrupted_signature_is_not_silently_converted_to_bypass(self):
+        """A nonempty but corrupted signature must be classified as REAL / nonempty signature,
+        and NEVER downgraded to synthesized skip_thought_signature_validator.
+        """
+        corrupted_sig = "garbage_not_a_valid_base64_signature"
+
+        # Classification level
+        kind = classify_google_signature(corrupted_sig)
+        assert kind == GoogleSignatureKind.REAL
+        assert kind != GoogleSignatureKind.BYPASS
+        assert kind != GoogleSignatureKind.MISSING
+
+        # Replay level
+        parts = [
+            {"functionCall": {"name": "test_tool", "args": {}}, "thoughtSignature": corrupted_sig}
+        ]
+        carrier = build_google_native_carrier(parts, source_model="gemini-3.8-flash-tiered")
+        history = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "test_tool", "arguments": "{}"}}],
+                "reasoning_details": [carrier],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "{}"},
+        ]
+
+        contents, _ = _build_gemini_contents(history, model="gemini-3.8-flash")
+        replayed_part = [p for p in contents[1]["parts"] if "functionCall" in p][0]
+
+        # Invariant: Replayed signature preserves corrupted signature verbatim rather than bypass!
+        assert replayed_part["thoughtSignature"] == corrupted_sig
+        assert replayed_part["thoughtSignature"] != "skip_thought_signature_validator"
+
+    def test_missing_vs_corrupt_wire_signatures_are_distinct(self):
+        """Missing foreign signature -> bypass sentinel.
+        Corrupt signature -> preserved real signature classification.
+        missing_wire_signature != corrupt_wire_signature.
+        """
+        # Case A: Missing signature on foreign call
+        history_missing = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c_missing", "type": "function", "function": {"name": "f1", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "c_missing", "content": "{}"},
+        ]
+        contents_a, _ = _build_gemini_contents(history_missing, model="gemini-3.8-flash")
+        sig_a = [p for p in contents_a[1]["parts"] if "functionCall" in p][0]["thoughtSignature"]
+        assert sig_a == "skip_thought_signature_validator"
+
+        # Case B: Corrupted nonempty signature
+        parts_b = [{"functionCall": {"name": "f1", "args": {}}, "thoughtSignature": "corrupt_data"}]
+        carrier_b = build_google_native_carrier(parts_b, source_model="gemini-3.8-flash-tiered")
+        history_corrupt = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "c_corrupt", "type": "function", "function": {"name": "f1", "arguments": "{}"}}],
+                "reasoning_details": [carrier_b],
+            },
+            {"role": "tool", "tool_call_id": "c_corrupt", "content": "{}"},
+        ]
+        contents_b, _ = _build_gemini_contents(history_corrupt, model="gemini-3.8-flash")
+        sig_b = [p for p in contents_b[1]["parts"] if "functionCall" in p][0]["thoughtSignature"]
+        assert sig_b == "corrupt_data"
+
+        # Invariant: Distinct treatment!
+        assert sig_a != sig_b
+
+    def test_partial_gemini_parallel_call_group_does_not_synthesize_bypass_on_siblings(self):
+        """In a native Gemini parallel group: call A has REAL signature, call B is unsigned.
+        call A retains REAL signature, call B remains unsigned (NO bypass synthesized on B).
+        Contrast with foreign group where both A and B receive bypass.
+        """
+        # Native parallel group with carrier where only first call is signed
+        parts = [
+            {"thought": True, "text": "parallel thinking"},
+            {"functionCall": {"name": "tool_a", "args": {}}, "thoughtSignature": "sig_call_a"},
+            {"functionCall": {"name": "tool_b", "args": {}}},  # sibling unsigned
+        ]
+        carrier = build_google_native_carrier(parts, source_model="gemini-3.8-flash-tiered")
+        history_native = [
+            {"role": "user", "content": "run parallel"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "ca", "type": "function", "function": {"name": "tool_a", "arguments": "{}"}},
+                    {"id": "cb", "type": "function", "function": {"name": "tool_b", "arguments": "{}"}},
+                ],
+                "reasoning_details": [carrier],
+            },
+            {"role": "tool", "tool_call_id": "ca", "content": "res_a"},
+            {"role": "tool", "tool_call_id": "cb", "content": "res_b"},
+        ]
+
+        contents, _ = _build_gemini_contents(history_native, model="gemini-3.8-flash")
+        fc_parts = [p for p in contents[1]["parts"] if "functionCall" in p]
+        assert len(fc_parts) == 2
+
+        # Invariant: Call A has real signature, Call B has NO thoughtSignature (neither None nor bypass)!
+        assert fc_parts[0]["thoughtSignature"] == "sig_call_a"
+        assert "thoughtSignature" not in fc_parts[1]
+
+
+# ==============================================================================
+# 5. Persisted State Corruption (Stale, Malformed & Read-Time Immutability)
+# ==============================================================================
+
+class TestPersistedStateCorruption:
+    def test_stale_persisted_effort_rejected_and_does_not_rewrite_db_on_read(self, tmp_path: Path):
+        """Stored stale effort (e.g. gemini-3.1-pro with medium) is rejected during resume,
+        effort_by_base remains empty for that stale model, and reading/resuming DOES NOT rewrite DB.
+        """
+        db = SessionDB(tmp_path / "state.db")
+        sid = "s_stale"
+        initial_config = {
+            "model": "gemini-3.1-pro",
+            "provider": "gemini-oauth",
+            "reasoning_config": {"enabled": True, "effort": "medium"}  # medium unsupported on 3.1 Pro
+        }
+        db.create_session(sid, "Stale Session", model="gemini-3.1-pro", model_config=initial_config)
+
+        row = db.get_session(sid)
+        raw_before = row["model_config"]
+        overrides = server._stored_session_runtime_overrides(row)
+
+        def _fake_resolve_runtime(model_override, provider_override):
+            m = model_override.get('model') if isinstance(model_override, dict) else model_override
+            p = (model_override.get('provider') if isinstance(model_override, dict) else None) or provider_override or 'gemini-oauth'
+            return m, {'provider': p, 'requested_provider': p, 'base_url': '', 'api_key': 'fake', 'api_mode': ''}
+
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client),              patch("tui_gateway.server._resolve_agent_model_runtime", side_effect=_fake_resolve_runtime),              patch("tui_gateway.server._load_cfg", return_value={}),              patch("tui_gateway.server._startup_system_prompt", return_value=""),              patch("agent.shell_hooks.register_from_config"):
+
+            resumed = server._make_agent(
+                sid=sid,
+                key=sid,
+                session_db=db,
+                model_override=overrides.get("model_override"),
+                provider_override=overrides.get("provider_override"),
+                reasoning_config_override=overrides.get("reasoning_config_override"),
+            )
+
+        # Invariant: Stale unsupported effort rejected from seeding
+        assert resumed.effort_by_base == {}
+        # Invariant: Re-resolved to valid default (high)
+        assert resumed.reasoning_config == {"enabled": True, "effort": "high"}
+
+        # Invariant: DB row was NOT rewritten on read/resume!
+        row_after = db.get_session(sid)
+        assert row_after["model_config"] == raw_before
+
+        if hasattr(db, "close"):
+            db.close()
+
+    @pytest.mark.parametrize("malformed_cfg", [
+        "low",                                      # string instead of dict
+        {"effort": ["low"]},                        # list instead of str
+        {"enabled": True},                          # missing effort
+        {"enabled": True, "effort": "ultra"},       # unsupported level
+    ])
+    def test_malformed_persisted_reasoning_config_fails_closed(self, tmp_path: Path, malformed_cfg):
+        """Malformed reasoning_config in DB fails closed without unhandled exception,
+        does not seed invalid effort into effort_by_base, and resolves through defaults.
+        """
+        db = SessionDB(tmp_path / "state_malformed.db")
+        sid = "s_malformed"
+        db.create_session(sid, "Malformed", model="gemini-3.8-flash", model_config={
+            "model": "gemini-3.8-flash",
+            "provider": "gemini-oauth",
+            "reasoning_config": malformed_cfg,
+        })
+
+        row = db.get_session(sid)
+        overrides = server._stored_session_runtime_overrides(row)
+
+        def _fake_resolve_runtime(model_override, provider_override):
+            m = model_override.get('model') if isinstance(model_override, dict) else model_override
+            p = (model_override.get('provider') if isinstance(model_override, dict) else None) or provider_override or 'gemini-oauth'
+            return m, {'provider': p, 'requested_provider': p, 'base_url': '', 'api_key': 'fake', 'api_mode': ''}
+
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client),              patch("tui_gateway.server._resolve_agent_model_runtime", side_effect=_fake_resolve_runtime),              patch("tui_gateway.server._load_cfg", return_value={}),              patch("tui_gateway.server._startup_system_prompt", return_value=""),              patch("agent.shell_hooks.register_from_config"):
+
+            resumed = server._make_agent(
+                sid=sid,
+                key=sid,
+                session_db=db,
+                model_override=overrides.get("model_override"),
+                provider_override=overrides.get("provider_override"),
+                reasoning_config_override=overrides.get("reasoning_config_override"),
+            )
+
+        # Invariant: No invalid effort seeded into effort_by_base!
+        assert "ultra" not in resumed.effort_by_base
+        assert not any(isinstance(v, list) for v in resumed.effort_by_base.values())
+        # Invariant: Re-resolved to valid default (high)
+        assert resumed.reasoning_config == {"enabled": True, "effort": "high"}
+
+        if hasattr(db, "close"):
+            db.close()
+
+
+# ==============================================================================
+# 6. Capability & Invalid Account Route Boundaries
+# ==============================================================================
+
+class TestCapabilityFailure:
+    def test_generic_and_unknown_routes_never_acquire_cloudcode_efforts(self):
+        """OpenRouter routes and invalid account numbers (gemini-0, gemini-6, gemini-42)
+        must never acquire Cloud Code capability semantics or invent effort ladders.
+        """
+        assert selectable_reasoning_efforts("openrouter", "google/gemini-3.8-flash") is None
+        assert canonical_reasoning_base("openrouter", "google/gemini-3.8-flash") is None
+
+        # Invalid account routes
+        for bad_slug in ("gemini-0", "gemini-6", "gemini-42", "gemini-99"):
+            assert selectable_reasoning_efforts(bad_slug, "gemini-3.8-flash") is None
+            assert canonical_reasoning_base(bad_slug, "gemini-3.8-flash") is None
+
+    def test_precedence_with_invalid_runtime_or_override_values(self):
+        """Resolver precedence handles invalid/stale layers:
+        1. Invalid runtime effort (3.8: 'ultra') -> falls back to config override 'medium'.
+        2. Unsupported override (3.1: 'medium') with global 'low' -> falls back to global 'low'.
+        3. Explicit disable override (3.1: false) with global 'low' -> resolves disabled.
+        """
+        # Case 1: Invalid runtime effort
+        cfg1 = {"agent": {"reasoning_overrides": {"gemini-3.8-flash": "medium"}, "reasoning_effort": "low"}}
+        r1 = resolve_effective_reasoning_config(config=cfg1, provider="gemini-oauth", model="gemini-3.8-flash", effort_by_base={"gemini-3.8-flash": "ultra"})
+        assert r1 == {"enabled": True, "effort": "medium"}
+
+        # Case 2: Unsupported config override
+        cfg2 = {"agent": {"reasoning_overrides": {"gemini-3.1-pro": "medium"}, "reasoning_effort": "low"}}
+        r2 = resolve_effective_reasoning_config(config=cfg2, provider="gemini-oauth", model="gemini-3.1-pro", effort_by_base={})
+        assert r2 == {"enabled": True, "effort": "low"}
+
+        # Case 3: Explicit disable override wins over global
+        cfg3 = {"agent": {"reasoning_overrides": {"gemini-3.1-pro": "none"}, "reasoning_effort": "low"}}
+        r3 = resolve_effective_reasoning_config(config=cfg3, provider="gemini-oauth", model="gemini-3.1-pro", effort_by_base={})
+        assert r3 == {"enabled": False}
+
+    def test_fallback_resolver_config_read_failure_resilience(self):
+        """_reresolve_fallback_reasoning_config catches load_config() exceptions,
+        keeping the existing reasoning_config without crashing.
+        """
+        agent = MagicMock()
+        agent.model = "gemini-3.8-flash"
+        agent.provider = "gemini-oauth"
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+        agent.effort_by_base = {"gemini-3.8-flash": "high"}
+
+        with patch("hermes_cli.config.load_config", side_effect=IOError("Corrupt config.yaml")):
+            # Must not raise!
+            _reresolve_fallback_reasoning_config(agent)
+
+        # Invariant: Keeps current reasoning_config rather than crashing!
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+        assert agent.effort_by_base == {"gemini-3.8-flash": "high"}

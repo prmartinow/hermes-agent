@@ -2369,47 +2369,47 @@ def switch_model(
         _swap_switch_runtime(
             agent, new_model, new_provider, api_key, base_url, api_mode, old_provider, old_norm, new_norm
         )
+        custom_providers, effective_context_length = _resolve_switch_context_length(agent, snapshot)
+        # Refresh the custom-provider snapshot from the config just loaded so the prompt_caching lookup
+        # sees flags added to config.yaml after session start.
+        if custom_providers is not None:
+            agent._custom_providers = custom_providers
+        agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
+            provider=new_provider, base_url=agent.base_url, api_mode=api_mode, model=new_model
+        )
+        if hasattr(agent, "context_compressor") and agent.context_compressor:
+            _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot)
+        # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
+        # YAML False = disabled).
+        try:
+            from agent.reasoning_selection import resolve_effective_reasoning_config
+            from hermes_cli.config import load_config as _sm_load_config
+            effort_by_base = getattr(agent, "effort_by_base", None)
+            agent.reasoning_config = resolve_effective_reasoning_config(
+                config=_sm_load_config() or {},
+                provider=new_provider,
+                model=agent.model,
+                effort_by_base=effort_by_base,
+            )
+            logger.info(
+                "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
+            )
+        except Exception as _reasoning_err:
+            logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
+        # Invalidate the cached system prompt so it rebuilds next turn.
+        agent._cached_system_prompt = None
+        # Publish the destination capability map only after every runtime setup above has succeeded.
+        # Failed switches must leave the old map intact.
+        agent.runtime_capabilities = destination_capabilities
+        # Reset the cross-turn stale-call circuit breaker; otherwise the latched streak keeps
+        # short-circuiting the freshly selected healthy provider.
+        from agent.chat_completion_helpers import _reset_stale_streak
+        _reset_stale_streak(agent)
+        agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
+        _finish_switch(agent, new_provider, old_norm, new_norm)
     except Exception:
         _restore_switch_snapshot(agent, snapshot)
         raise
-    custom_providers, effective_context_length = _resolve_switch_context_length(agent, snapshot)
-    # Refresh the custom-provider snapshot from the config just loaded so the prompt_caching lookup
-    # sees flags added to config.yaml after session start.
-    if custom_providers is not None:
-        agent._custom_providers = custom_providers
-    agent._use_prompt_caching, agent._use_native_cache_layout = agent._anthropic_prompt_cache_policy(
-        provider=new_provider, base_url=agent.base_url, api_mode=api_mode, model=new_model
-    )
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
-        _update_switch_compressor(agent, custom_providers, effective_context_length, snapshot)
-    # Re-read the per-model reasoning_effort override so it applies immediately (per-model > global;
-    # YAML False = disabled).
-    try:
-        from agent.reasoning_selection import resolve_effective_reasoning_config
-        from hermes_cli.config import load_config as _sm_load_config
-        effort_by_base = getattr(agent, "effort_by_base", None)
-        agent.reasoning_config = resolve_effective_reasoning_config(
-            config=_sm_load_config() or {},
-            provider=new_provider,
-            model=agent.model,
-            effort_by_base=effort_by_base,
-        )
-        logger.info(
-            "switch_model: reasoning_config resolved for %s: %s", agent.model, agent.reasoning_config
-        )
-    except Exception as _reasoning_err:
-        logger.debug("switch_model: could not re-resolve reasoning_config: %s", _reasoning_err)
-    # Invalidate the cached system prompt so it rebuilds next turn.
-    agent._cached_system_prompt = None
-    # Publish the destination capability map only after every runtime setup above has succeeded.
-    # Failed switches must leave the old map intact.
-    agent.runtime_capabilities = destination_capabilities
-    # Reset the cross-turn stale-call circuit breaker; otherwise the latched streak keeps
-    # short-circuiting the freshly selected healthy provider.
-    from agent.chat_completion_helpers import _reset_stale_streak
-    _reset_stale_streak(agent)
-    agent._primary_runtime = _build_primary_runtime_snapshot(agent, api_mode)
-    _finish_switch(agent, new_provider, old_norm, new_norm)
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",
         old_model, old_provider, new_model, new_provider,
