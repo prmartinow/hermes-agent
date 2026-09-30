@@ -68,96 +68,103 @@ def test_documentation_file_exists_and_references_authoritative_sections():
     assert '5. "None" & Disabled-State Semantics' in content
     assert "6. `model.options` Capability Contract" in content
     assert "7. Thought-Signature Provenance & History Circulation" in content
-    assert "8. Switching & Rollback Transaction Contract" in content
-    assert "9. Fallback & Restoration Matrix" in content
-    assert "10. Surface Equivalence & Scope Semantics" in content
-    assert "11. Empirical Upstream Caveats" in content
+    assert "8. History Carrier & Persistence Model" in content
+    assert "9. Switching & Rollback Transaction Contract" in content
+    assert "10. Fallback & Restoration Matrix" in content
+    assert "11. Resume & Session Rebuild Contract" in content
+    assert "12. Surface Equivalence & Scope Semantics" in content
+    assert "13. Failure Policy Reference" in content
+    assert "14. Empirical Upstream Caveats" in content
 
-    # Invariant: Broken math formulas must not appear
+    # Invariant: Clean typography without broken math formatting
     assert "eq$" not in content
     assert "Logical Base Model ≠ Legacy Compatibility Alias ≠ Wire Model" in content
 
 
 def test_all_registry_models_present_in_markdown_table():
-    """Every core canonical Cloud Code model in the registry must appear in the Markdown truth table,
-    and every documented model must exist in the production capability registry."""
+    """Every model in agent/gemini_cloudcode_models.py must appear in the Markdown truth table,
+    and every documented model must exist in the production capability registry (exact set equality)."""
     parsed_table = _parse_markdown_truth_table()
-    # 1. Core Cloud Code canonical models must all be documented
-    core_models = (
-        "gemini-3.8-flash",
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash",
-        "gemini-3.1-pro",
-        "gemini-3.1-flash-lite",
-    )
-    for base_model in core_models:
-        assert base_model in parsed_table, (
-            f"Documentation drift: canonical model {base_model} missing from Markdown Truth Table"
-        )
-
-    # 2. Every documented model must be a valid subset of production registry
-    for model_id in parsed_table:
-        if "Partner" in model_id:
-            continue
-        assert model_id in _MODEL_CAPABILITIES, (
-            f"Documentation drift: documented model {model_id} not in production capability registry"
-        )
+    diff_missing = set(_MODEL_CAPABILITIES) - set(parsed_table)
+    diff_extra = set(parsed_table) - set(_MODEL_CAPABILITIES)
+    err = f"Documentation drift: missing={diff_missing}, extra={diff_extra}"
+    assert set(parsed_table) == set(_MODEL_CAPABILITIES), err
 
 
 def test_markdown_truth_table_matches_production_capabilities():
     """The Markdown Truth Table rows must match selectable_reasoning_efforts and model defaults."""
     parsed_table = _parse_markdown_truth_table()
 
-    for model, parsed in parsed_table.items():
-        if "Partner" in model:
-            continue
+    for model, cap in _MODEL_CAPABILITIES.items():
+        assert model in parsed_table
+        parsed = parsed_table[model]
+
         actual_efforts = selectable_reasoning_efforts("gemini-oauth", model)
         assert parsed["efforts"] == actual_efforts, (
             f"Documentation drift on {model}: Markdown parsed {parsed['efforts']} != registry {actual_efforts}"
         )
         if actual_efforts:
-            cap = get_model_capability(model)
             assert parsed["default"] == cap.default_effort, (
                 f"Documentation drift on {model} default: Markdown parsed {parsed['default']} != registry {cap.default_effort}"
             )
 
 
-def test_dynamic_tiered_wire_models_and_outbound_thinking_config():
-    """Dynamic models (3.8, 3.7) wire to -tiered and build thinkingConfig without thinkingBudget."""
+def test_wire_models_and_outbound_thinking_config():
+    """Verify that documented wire templates match resolve_model_selection() for every model in registry."""
     parsed_table = _parse_markdown_truth_table()
 
-    for dynamic_model in ("gemini-3.8-flash", "gemini-3.7-flash"):
-        assert dynamic_model in parsed_table
-        parsed = parsed_table[dynamic_model]
+    for model, cap in _MODEL_CAPABILITIES.items():
+        parsed = parsed_table[model]
 
-        # Invariant 1: Wire model in Markdown matches resolve_model_selection
-        resolved_high = resolve_model_selection(dynamic_model, effort="high")
-        assert parsed["wire_model"] == resolved_high.wire_model
+        is_dynamic = bool(cap.routes and cap.routes.get("high") and cap.routes["high"].thinking_level)
 
-        # Invariant 2: Markdown describes thinkingLevel and includeThoughts, NOT thinkingBudget
-        assert "thinkingLevel" in parsed["wire_cfg"]
-        assert "includeThoughts" in parsed["wire_cfg"]
-        assert "thinkingBudget" not in parsed["wire_cfg"]
+        if is_dynamic:
+            # Dynamic tiered models (3.8, 3.7)
+            resolved_high = resolve_model_selection(model, effort="high")
+            assert parsed["wire_model"] == resolved_high.wire_model
 
-        # Invariant 3: Production EffortRoute builds outbound thinkingConfig without thinkingBudget
-        for effort in ("low", "medium", "high"):
-            resolved = resolve_model_selection(dynamic_model, effort=effort)
-            assert resolved.thinking_config == {
-                "thinkingLevel": effort,
-                "includeThoughts": True,
-            }
+            # Markdown describes thinkingLevel and includeThoughts, NOT thinkingBudget
+            assert "thinkingLevel" in parsed["wire_cfg"]
+            assert "includeThoughts" in parsed["wire_cfg"]
+            assert "thinkingBudget" not in parsed["wire_cfg"]
+
+            # Outbound thinkingConfig has thinkingLevel and includeThoughts without thinkingBudget
+            for effort in cap.efforts:
+                resolved = resolve_model_selection(model, effort=effort)
+                assert resolved.thinking_config == {
+                    "thinkingLevel": effort,
+                    "includeThoughts": True,
+                }
+        elif cap.efforts:
+            # Static tiered models (3.6, 3.5, 3.1-pro)
+            for effort in cap.efforts:
+                resolved = resolve_model_selection(model, effort=effort)
+                wire_template = parsed["wire_model"].replace("<level>", effort)
+                assert resolved.wire_model == wire_template, (
+                    f"Documentation drift on static wire model for {model} (effort {effort}): "
+                    f"Markdown template {wire_template} != resolved {resolved.wire_model}"
+                )
+        else:
+            # Zero-effort models (flash-lite, claude, gpt-oss)
+            resolved = resolve_model_selection(model)
+            assert resolved.wire_model == parsed["wire_model"], (
+                f"Documentation drift on no-effort wire model for {model}: "
+                f"Markdown {parsed['wire_model']} != resolved {resolved.wire_model}"
+            )
 
 
-def test_canonical_account_routes_match_production_registry():
-    """Documented account routes must match exact set of gemini-oauth + _CLOUDCODE_ACCOUNT_PROVIDERS."""
+def test_canonical_account_routes_parsed_from_markdown():
+    """Extract canonical routes directly from the Markdown subsection and verify exact equality."""
     content = DOC_PATH.read_text(encoding="utf-8")
 
-    expected_routes = {"gemini-oauth"} | set(_CLOUDCODE_ACCOUNT_PROVIDERS.keys())
-    assert expected_routes == {"gemini-oauth", "gemini-1", "gemini-2", "gemini-3", "gemini-4", "gemini-5"}
+    routes_match = re.search(r"### Canonical Cloud Code Routes:.*?\n(.*?)\n\n", content, re.DOTALL)
+    assert routes_match, "Canonical Cloud Code Routes subsection not found in documentation"
 
-    for route in expected_routes:
-        assert route in content, f"Documentation drift: valid route {route} not documented in guide"
+    extracted_routes = set(re.findall(r"`([^`]+)`", routes_match.group(1)))
+    expected_routes = {"gemini-oauth"} | set(_CLOUDCODE_ACCOUNT_PROVIDERS.keys())
+
+    err = f"Documentation drift on canonical routes: documented={extracted_routes}, expected={expected_routes}"
+    assert extracted_routes == expected_routes, err
 
 
 def test_historical_plans_contain_authoritative_status_notice():

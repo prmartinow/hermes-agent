@@ -1,6 +1,6 @@
 # Google Gemini Cloud Code PA (`gemini-oauth`) Runtime Architecture
 
-This document is the authoritative architectural specification and developer reference for Google Gemini Cloud Code PA (`gemini-oauth`) support in Hermes Agent. It documents the contracts for canonical model resolution, wire translation, thought-signature circulation, reasoning effort selection, multi-turn replay, transaction rollback, and cross-surface parity.
+This document is the authoritative architectural specification and developer reference for Google Gemini Cloud Code PA (`gemini-oauth`) support in Hermes Agent. It documents the contracts for canonical model resolution, wire translation, thought-signature circulation, reasoning effort selection, multi-turn replay, transaction rollback, session resumption, and cross-surface parity.
 
 ---
 
@@ -33,13 +33,17 @@ Hermes strictly decouples **inbound logical model identities** (used by users, c
 | `gemini-3.5-flash` | `low`, `medium`, `high` | `high` | `gemini-3.5-flash-<level>` | Static wire slug (e.g. `gemini-3.5-flash-high`) |
 | `gemini-3.1-pro` | `low`, `high` | `high` | `gemini-3.1-pro-<level>` | Static wire slug (e.g. `gemini-3.1-pro-high`) |
 | `gemini-3.1-flash-lite` | *None* (`[]`) | — | `gemini-3.1-flash-lite` | No thinking configuration |
-| Claude Partner Routes | *None* (`[]`) | — | Partner route name | No Google thinking configuration |
-| GPT-OSS Partner Routes | *None* (`[]`) | — | Partner route name | No Google thinking configuration |
+| `claude-sonnet-4-6` | *None* (`[]`) | — | `claude-sonnet-4-6` | Partner route (no Google thinking configuration) |
+| `claude-opus-4-6-thinking` | *None* (`[]`) | — | `claude-opus-4-6-thinking` | Partner route (no Google thinking configuration) |
+| `gpt-oss-120b-medium` | *None* (`[]`) | — | `gpt-oss-120b-medium` | Partner route (no Google thinking configuration) |
+| `gemini-3-flash-agent` | *None* (`[]`) | — | `gemini-3-flash-agent` | Specialized route (no Google thinking configuration) |
+| `gemini-pro-agent` | *None* (`[]`) | — | `gemini-pro-agent` | Specialized route (no Google thinking configuration) |
 
 ### Canonical Cloud Code Routes:
 The Cloud Code PA architectural contract applies across:
 - `gemini-oauth`: Primary Google Gemini OAuth provider identity.
 - `gemini-1`, `gemini-2`, `gemini-3`, `gemini-4`, `gemini-5`: Multi-account isolated Cloud Code provider routes.
+
 Invalid aliases (e.g. `gemini-0`, `gemini-6`, `gemini-42`) remain strictly outside Cloud Code semantics.
 
 ### Core Invariants:
@@ -48,7 +52,7 @@ Invalid aliases (e.g. `gemini-0`, `gemini-6`, `gemini-42`) remain strictly outsi
    - `gemini-3.8-flash-high`: Inbound legacy compatibility alias (decomposes to base `gemini-3.8-flash` + effort `high`).
    - `gemini-3.8-flash-tiered`: Outbound wire model sent in Google Cloud Code PA requests.
 2. **Dynamic Tiered Models**: Dynamic models (`3.8`, `3.7`) require the wire suffix `-tiered` and must pass explicit outbound `thinkingConfig` with `thinkingLevel: "low" | "medium" | "high"` and `includeThoughts: true`. Outbound requests do not send `thinkingBudget`. (The `thinkingBudget: -1` property belongs exclusively to upstream catalog discovery metadata in `:fetchAvailableModels`, not outbound request bodies).
-3. **Static Slugs**: Prior models (`3.6`, `3.1-pro`) require wire routing via distinct static sub-slugs (`-low`, `-medium`, `-high`).
+3. **Static Slugs**: Prior models (`3.6`, `3.5`, `3.1-pro`) require wire routing via distinct static sub-slugs (`-low`, `-medium`, `-high`).
 
 ---
 
@@ -126,7 +130,7 @@ The OpenRPC `model.options` method exposes model capabilities to frontends with 
 | Field Name | Type | Value & Semantic Meaning |
 | :--- | :--- | :--- |
 | `reasoning_efforts` | `Array<string> \| null` | `null` = capability unknown or generic.<br>`[]` = known route with no selectable effort (e.g. Flash-Lite, Claude).<br>`["low", ...]` = exact verified selectable effort set. |
-| `effective_reasoning_effort` | `string \| null` | `string` = authoritative currently effective target effort.<br>`null` = disabled, no selectable effort, or unconfigured. |
+| `effective_reasoning_effort` | `string \| null` | `string` = authoritative currently effective target effort.<br>`null` = disabled, known no-effort route, or capability/effective state not asserted for a generic/unknown route.<br>*(Note: an unconfigured exact effort model resolves to its architectural default, e.g. high, rather than null)*. |
 | `can_disable_reasoning` | `boolean \| null` | `false` = disabling is explicitly unavailable (exact Cloud Code effort models).<br>`true` = disabling is explicitly supported.<br>`null` = capability unknown / not asserted. |
 
 ---
@@ -154,41 +158,65 @@ Google Cloud Code endpoints enforce strict server-side thought-signature validat
 
 ---
 
-## 8. Switching & Rollback Transaction Contract
+## 8. History Carrier & Persistence Model
+
+Hermes uses a non-destructive persistence carrier architecture across chat completions and SQLite session stores:
+
+```
+   assistant.tool_calls[*].extra_content + reasoning_details
+                             ↓
+             SQLite Session Message Storage
+                             ↓
+                      Reload / Resume
+                             ↓
+         Destination-Specific Projection on a Copy
+```
+
+### Invariants:
+1. **Provenance Retention**: Stored source history in SQLite retains full provenance carriers (`google.native_assistant` extra content, thought signatures, reasoning blocks).
+2. **Zero In-Place Rewriting**: Destination-specific projection (stripping signatures for OpenAI/Anthropic, or injecting bypass sentinels for unsigned tool calls) operates exclusively on memory copies during wire serialization. The underlying session transcript remains unmutated.
+
+---
+
+## 9. Switching & Rollback Transaction Contract
 
 Model switches initiated via CLI (`/model`) or Gateway RPC (`_apply_model_switch`) are fully atomic transactions managed by `switch_model()` in `agent/agent_runtime_helpers.py`:
 
 ```
-   ┌────────────────────────────────────────────────────────┐
-   │ 1. Capture Pre-Switch Snapshot (_snapshot_switch_state)│
-   └───────────────────────────┬────────────────────────────┘
-                               ▼
-   ┌────────────────────────────────────────────────────────┐
-   │ 2. Swap Runtime State & Rebuild Switched Client        │  Rollback on Client Construction Error
-   └───────────────────────────┬────────────────────────────┘
-                               ▼
-   ┌────────────────────────────────────────────────────────┐
-   │ 3. Tentative Compressor Update (persist_durable_reset=False)
-   └───────────────────────────┬────────────────────────────┘
-                               ▼
-   ┌────────────────────────────────────────────────────────┐
-   │ 4. Re-resolve Effective Reasoning & Primary Runtime    │
-   └───────────────────────────┬────────────────────────────┘
-                               ▼
-   ┌────────────────────────────────────────────────────────┐
-   │ 5. Commit Durable Compressor Resets (_finish_switch)   │  commit_switch_runtime()
-   └────────────────────────────────────────────────────────┘
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │ 1. Capture Pre-Switch Snapshot (_snapshot_switch_state)                │
+   └───────────────────────────────────┬────────────────────────────────────┘
+                                       ▼
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │ 2. Swap Runtime State & Rebuild Switched Client                        │  Rollback on Client Construction Error
+   └───────────────────────────────────┬────────────────────────────────────┘
+                                       ▼
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │ 3. Tentative Compressor Update (persist_durable_reset=False)           │  Rollback on Context / Update Failure
+   └───────────────────────────────────┬────────────────────────────────────┘
+                                       ▼
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │ 4. Re-resolve Effective Reasoning & Primary Runtime Snapshot           │
+   └───────────────────────────────────┬────────────────────────────────────┘
+                                       ▼
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │ 5. Complete Guarded Switch (_finish_switch)                            │  Guarded boundary completed
+   └───────────────────────────────────┬────────────────────────────────────┘
+                                       ▼
+   ┌────────────────────────────────────────────────────────────────────────┐
+   │ 6. Commit Durable Compressor Resets (commit_switch_runtime)            │  Best-effort (exceptions suppressed)
+   └────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Rollback Guarantees:
 - **Complete Reversal**: Any failure prior to completing step 5 triggers `_restore_switch_snapshot()`, restoring `model`, `provider`, `client`, `reasoning_config`, `effort_by_base`, `runtime_capabilities`, prompt cache layout, and compressor state.
 - **Probe Failure Policy**: In step 3, failure in context resolution or compressor update triggers rollback. However, post-update feasibility revalidation (`revalidate_compression_feasibility`) is an eager best-effort probe; a network hiccup there is logged and does NOT roll back a good switch.
-- **Durable Compressor Isolation**: Step 3 passes `persist_durable_reset=False` to `ContextCompressor.update_model()`. Strikes, cooldowns, and streaks in SQLite are never cleared until step 5 succeeds via `commit_switch_runtime()`.
+- **Durable Compressor Isolation**: Step 3 passes `persist_durable_reset=False` to `ContextCompressor.update_model()`. Strikes, cooldowns, and streaks in SQLite are never cleared until step 6 succeeds via `commit_switch_runtime()`.
 - **Idempotent Snapshot Consumption**: `_restore_switch_snapshot()` accesses `_compressor_state` non-destructively (via `get()`, not `pop()`), allowing safe execution across nested rollback boundaries without losing state.
 
 ---
 
-## 9. Fallback & Restoration Matrix
+## 10. Fallback & Restoration Matrix
 
 When a primary Cloud Code model encounters a recoverable provider error (e.g. rate limit or 503), Hermes activates configured fallbacks via `try_activate_fallback()`:
 
@@ -206,15 +234,42 @@ When a primary Cloud Code model encounters a recoverable provider error (e.g. ra
 
 ---
 
-## 10. Surface Equivalence & Scope Semantics
+## 11. Resume & Session Rebuild Contract
+
+When resuming an existing session (via `/resume` or Gateway session startup), `tui_gateway/server.py::_make_agent()` and `hermes_cli/cli_model_switch_mixin.py` reconstruct active runtime state from persisted checkpoints:
+
+```
+   Stored Active reasoning_config in SQLite
+                      ↓
+           _make_agent() Reconstruction
+                      ↓
+    Validate Against Active Route Capabilities
+                      ↓
+      Seed At Most ONE effort_by_base Entry
+```
+
+### Exact Rebuild Cases:
+1. **Valid Enabled Effort**: Stored `{"enabled": True, "effort": "low"}` on `gemini-3.8-flash` seeds `agent.effort_by_base = {"gemini-3.8-flash": "low"}`.
+2. **Valid Disabled**: Stored `{"enabled": False}` seeds `agent.effort_by_base = {}` with `reasoning_config = {"enabled": False}`.
+3. **Stale / Unsupported Effort**: Stored effort unsupported on the active model (e.g. `medium` on `3.1-pro`) seeds `agent.effort_by_base = {}` and re-resolves via normal precedence (override $ightarrow$ global $ightarrow$ default).
+4. **Malformed `reasoning_config`**: Corrupt database JSON fails closed, seeds `agent.effort_by_base = {}`, and falls back to normal resolver.
+5. **Known No-Effort Model**: Resuming on a no-effort model (e.g. Flash-Lite, Claude) seeds `agent.effort_by_base = {}`.
+
+### Rebuild Invariants:
+- **No Resurrection of Unrelated Memory**: Resuming a session with active model `3.8` seeds only `3.8`. It never reconstructs unrelated entries from the previous process's in-memory map (e.g. `3.1-pro` is not restored from dead memory).
+- **Read Immutability**: Reading or evaluating stale/malformed session state during resume never silently rewrites or mutates the underlying SQLite database row.
+
+---
+
+## 12. Surface Equivalence & Scope Semantics
 
 Hermes guarantees complete semantic parity across all interaction surfaces:
 
 | Surface | Exact Validation | Session Memory | Global Persistence | One-Turn (`--once`) | Preselection |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Classic CLI Typed** | Yes | Yes | Yes (`--global`) | Yes (`--once`) | Yes |
+| **Classic CLI Typed** | Yes | Yes | Yes (`--global`) | Yes (`--once`) | N/A |
 | **Classic CLI Picker** | Yes | Yes | Yes (`--global`) | N/A | Yes |
-| **Gateway RPC Typed** | Yes | Yes | Yes (`--global`) | Yes (`--once`) | Yes |
+| **Gateway RPC Typed** | Yes | Yes | Yes (`--global`) | Yes (`--once`) | N/A |
 | **Desktop / Ink TUI** | Yes | Yes | Yes (`^g` toggle) | N/A (modal emits session/global) | Yes |
 
 ### Scope Semantics:
@@ -236,7 +291,22 @@ Hermes guarantees complete semantic parity across all interaction surfaces:
 
 ---
 
-## 11. Empirical Upstream Caveats
+## 13. Failure Policy Reference
+
+| Failure Class | Contract / Behavioral Treatment |
+| :--- | :--- |
+| **Unsupported Effort** | Reject before mutation (zero I/O, no state changes). |
+| **Stale / Malformed Persisted Effort** | Ignore for runtime seeding; do not rewrite DB row. |
+| **Corrupted Non-Empty Signature** | Preserve verbatim as `REAL`; never convert to bypass sentinel. |
+| **Client Construction Failure** | Atomic rollback to pre-switch snapshot. |
+| **Compressor Mutation Failure** | Atomic rollback to pre-switch snapshot; durable SQLite untouched. |
+| **Fallback Construction Failure** | No effort map mutation; recovery on next turn. |
+| **Failed Global Switch** | Zero partial config persistence. |
+| **Failed `--once` Turn** | Production finally-block restores prior runtime. |
+
+---
+
+## 14. Empirical Upstream Caveats
 
 These behaviors reflect verified Google upstream API properties, distinct from Hermes runtime bugs:
 1. **`gemini-3.1-pro-high` Upstream Inference 400**:
