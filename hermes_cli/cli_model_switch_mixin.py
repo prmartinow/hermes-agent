@@ -235,11 +235,11 @@ def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool, one
 
     # Validate against selectable efforts if Cloud Code
     clean_effort = effort.lower().strip()
-    if canonical_base is not None and selectable:
-        if clean_effort not in selectable:
+    if canonical_base is not None:
+        if not selectable or clean_effort not in selectable:
             return
 
-    if not one_turn and canonical_base is not None and selectable:
+    if not one_turn and canonical_base is not None:
         if not hasattr(cli, "effort_by_base") or not isinstance(cli.effort_by_base, dict):
             cli.effort_by_base = {}
         remember_reasoning_effort(cli.effort_by_base, provider=provider, model=model, effort=clean_effort)
@@ -253,7 +253,7 @@ def _apply_reasoning_after_switch(cli, effort: str, *, persist_global: bool, one
         cli.agent.reasoning_config = parsed
 
     if persist_global:
-        if canonical_base is not None and selectable:
+        if canonical_base is not None:
             key = f"agent.reasoning_overrides.{canonical_base}"
             saved = save_config_value(key, clean_effort)
             if saved:
@@ -458,74 +458,70 @@ class CLIModelSwitchMixin:
             logger.debug("Failed to persist model switch to session DB", exc_info=True)
 
     def _restore_session_model(self, session_meta: dict, *, quiet: bool = False) -> None:
-        """Restore model/provider from the session DB row on every resume path.
-
-        Skips when no model is recorded or the CLI got an explicit ``-m`` (user intent wins).
-        A different stored provider gets its credentials re-resolved — the ambient ``api_key``
-        must not be sent to the session's endpoint; on failure the ambient credentials are kept
-        so the session still opens (the first turn surfaces the auth error).
-        """
+        """Restore model/provider and active reasoning state from the session DB row on every resume path."""
         from cli import logger
-        if not (session_meta or {}).get("model") or getattr(self, "_explicit_model_override", False):
+        raw_stored_model = (session_meta or {}).get("model")
+        if not raw_stored_model or getattr(self, "_explicit_model_override", False):
             return
+
         route = stored_session_route(session_meta, current_model=self.model, current_provider=self.provider)
-        if route is None:
-            return
-        stored_model, stored_provider, stored_base_url, stored_api_mode, provider_changed = route
-        from hermes_cli.local_runtime.endpoint import LLAMACPP_ALIASES
-        managed = str(stored_provider or "").strip().lower() in LLAMACPP_ALIASES
-        self.model = stored_model
-        if stored_provider:
-            self.provider = stored_provider
-            self.requested_provider = stored_provider
-            if stored_base_url and not managed:
-                self.base_url = stored_base_url
-            if stored_api_mode:
-                self.api_mode = stored_api_mode
-        if managed and not (getattr(self, "_explicit_base_url", None) and not provider_changed):
-            # The supervisor owns the live port: last boot's loopback URL (an ephemeral fallback when
-            # 18434 was busy) must not pin the resume onto a dead endpoint. A launch-time --base-url
-            # for this same provider is user intent and keeps winning.
-            self._explicit_api_key = None
-            self._explicit_base_url = None
-            try:
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                resolved = resolve_runtime_provider(requested=stored_provider, target_model=self.model or None)
-                if resolved.get("api_key"):
-                    self.api_key = resolved["api_key"]
-                    self._credential_pool = resolved.get("credential_pool")
-                if resolved.get("base_url"):
-                    self.base_url = resolved["base_url"]
-                if not stored_api_mode and resolved.get("api_mode"):
-                    self.api_mode = resolved["api_mode"]
-            except Exception:
-                if stored_base_url:
+        if route is not None:
+            stored_model, stored_provider, stored_base_url, stored_api_mode, provider_changed = route
+            from hermes_cli.local_runtime.endpoint import LLAMACPP_ALIASES
+            managed = str(stored_provider or "").strip().lower() in LLAMACPP_ALIASES
+            self.model = stored_model
+            if stored_provider:
+                self.provider = stored_provider
+                self.requested_provider = stored_provider
+                if stored_base_url and not managed:
                     self.base_url = stored_base_url
-                logger.debug(
-                    "Credential re-resolution for resumed session provider "
-                    "%s failed; keeping ambient credentials",
-                    stored_provider, exc_info=True)
-        elif provider_changed:
-            # Launch-time explicit overrides belong to the AMBIENT provider and would poison
-            # _ensure_runtime_credentials for the restored one. api_key is never persisted to
-            # the session DB — runtime provider resolution owns credentials.
-            self._explicit_api_key = None
-            self._explicit_base_url = stored_base_url
-            try:
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                resolved = resolve_runtime_provider(requested=stored_provider, target_model=self.model or None)
-                if resolved.get("api_key"):
-                    self.api_key = resolved["api_key"]
-                    self._credential_pool = resolved.get("credential_pool")
-                if not stored_base_url and resolved.get("base_url"):
-                    self.base_url = resolved["base_url"]
-                if not stored_api_mode and resolved.get("api_mode"):
-                    self.api_mode = resolved["api_mode"]
-            except Exception:
-                logger.debug(
-                    "Credential re-resolution for resumed session provider "
-                    "%s failed; keeping ambient credentials",
-                    stored_provider, exc_info=True)
+                if stored_api_mode:
+                    self.api_mode = stored_api_mode
+            if managed and not (getattr(self, "_explicit_base_url", None) and not provider_changed):
+                self._explicit_api_key = None
+                self._explicit_base_url = None
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    resolved = resolve_runtime_provider(requested=stored_provider, target_model=self.model or None)
+                    if resolved.get("api_key"):
+                        self.api_key = resolved["api_key"]
+                        self._credential_pool = resolved.get("credential_pool")
+                    if resolved.get("base_url"):
+                        self.base_url = resolved["base_url"]
+                    if not stored_api_mode and resolved.get("api_mode"):
+                        self.api_mode = resolved["api_mode"]
+                except Exception:
+                    if stored_base_url:
+                        self.base_url = stored_base_url
+                    logger.debug(
+                        "Credential re-resolution for resumed session provider "
+                        "%s failed; keeping ambient credentials",
+                        stored_provider, exc_info=True)
+            elif provider_changed:
+                self._explicit_api_key = None
+                self._explicit_base_url = stored_base_url
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    resolved = resolve_runtime_provider(requested=stored_provider, target_model=self.model or None)
+                    if resolved.get("api_key"):
+                        self.api_key = resolved["api_key"]
+                        self._credential_pool = resolved.get("credential_pool")
+                    if not stored_base_url and resolved.get("base_url"):
+                        self.base_url = resolved["base_url"]
+                    if not stored_api_mode and resolved.get("api_mode"):
+                        self.api_mode = resolved["api_mode"]
+                except Exception:
+                    logger.debug(
+                        "Credential re-resolution for resumed session provider "
+                        "%s failed; keeping ambient credentials",
+                        stored_provider, exc_info=True)
+        else:
+            stored_model = str(raw_stored_model).strip()
+            stored_provider = self.provider
+
+        # Reset session-local EffortByBase map when adopting a resumed session
+        self.effort_by_base = {}
+
         from hermes_state import SessionDB as _SessionDB
         runtime = _SessionDB.session_gateway_runtime(session_meta)
         stored_reasoning = runtime.get("reasoning_config")
@@ -546,37 +542,41 @@ class CLIModelSwitchMixin:
         if canonical_base is not None and isinstance(stored_reasoning, dict):
             if stored_reasoning.get("enabled") is False:
                 self.reasoning_config = {"enabled": False}
-                if hasattr(self, "effort_by_base") and canonical_base in self.effort_by_base:
-                    del self.effort_by_base[canonical_base]
+                self.effort_by_base = {}
             else:
                 stored_eff = stored_reasoning.get("effort")
                 selectable = selectable_reasoning_efforts(self.provider, self.model)
                 if selectable and stored_eff in selectable:
                     self.reasoning_config = {"enabled": True, "effort": stored_eff}
-                    if not hasattr(self, "effort_by_base") or not isinstance(self.effort_by_base, dict):
-                        self.effort_by_base = {}
-                    self.effort_by_base[canonical_base] = stored_eff
+                    self.effort_by_base = {canonical_base: stored_eff}
                 else:
+                    self.effort_by_base = {}
                     _resolve_cli_reasoning(self)
         else:
+            self.effort_by_base = {}
             if stored_reasoning is not None:
                 self.reasoning_config = stored_reasoning
             else:
                 _resolve_cli_reasoning(self)
 
         # Mid-chat /resume swaps the live agent; on startup --resume _init_agent picks up
-        # self.model / self.provider / self.reasoning_config.
+        # self.model / self.provider / self.reasoning_config / self.effort_by_base.
         if self.agent is not None:
+            import copy
             if hasattr(self, "effort_by_base") and isinstance(self.effort_by_base, dict):
-                import copy
                 self.agent.effort_by_base = copy.deepcopy(self.effort_by_base)
-            self.agent.reasoning_config = self.reasoning_config
-            try:
-                self.agent.switch_model(
-                    new_model=self.model, new_provider=self.provider, api_key=self.api_key or "",
-                    base_url=self.base_url or "", api_mode=self.api_mode or "")
-            except Exception:
-                logger.debug("In-place agent model swap on resume failed", exc_info=True)
+            if route is not None:
+                try:
+                    self.agent.switch_model(
+                        new_model=self.model, new_provider=self.provider, api_key=self.api_key or "",
+                        base_url=self.base_url or "", api_mode=self.api_mode or "")
+                except Exception:
+                    logger.debug("In-place agent model swap on resume failed", exc_info=True)
+            # Reapply authoritative resumed active reasoning state to agent and its primary runtime snapshot
+            self.agent.reasoning_config = copy.deepcopy(self.reasoning_config)
+            if hasattr(self.agent, "_primary_runtime") and isinstance(self.agent._primary_runtime, dict):
+                self.agent._primary_runtime["reasoning_config"] = copy.deepcopy(self.reasoning_config)
+
         msg = f"Model restored from session: {stored_model}"
         if stored_provider:
             msg += f" ({stored_provider})"

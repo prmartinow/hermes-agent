@@ -278,3 +278,121 @@ def test_failed_switch_rollback_restores_map_and_reasoning_atomically():
     assert cli.reasoning_config == {"enabled": True, "effort": "low"}
     assert cli.effort_by_base == {"gemini-3.8-flash": "low"}
     assert "gemini-3.1-pro" not in cli.effort_by_base
+# ============================================================================
+# 5. Milestone 3 Amendment Regressions (Resume Boundaries & No-Effort Validation)
+# ============================================================================
+
+def test_same_route_resume_restores_reasoning_config():
+    # A. Same-route resume: launch model/provider matches stored session, but stored reasoning differs
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "state.db"
+        db = SessionDB(db_path)
+        session_id = "test-same-route-resume"
+
+        model_config = {
+            "provider": "gemini-oauth",
+            "reasoning_config": {"enabled": True, "effort": "low"},
+        }
+        db.create_session(session_id, source="cli", model="gemini-3.8-flash", model_config=model_config)
+
+        # CLI launched on gemini-3.8-flash / gemini-oauth already (ambient default)
+        cli = FakeCLI(model="gemini-3.8-flash", provider="gemini-oauth", session_id=session_id, session_db=db)
+        cli.reasoning_config = None
+        cli.effort_by_base = {}
+
+        from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
+        session_meta = db.get_session(session_id)
+        CLIModelSwitchMixin._restore_session_model(cli, session_meta)
+
+        # Invariant: despite identical route, reasoning_config is restored and active base seeded!
+        assert cli.reasoning_config == {"enabled": True, "effort": "low"}
+        assert cli.effort_by_base == {"gemini-3.8-flash": "low"}
+
+
+def test_cross_session_resume_resets_runtime_map():
+    # B. Cross-session map reset: prior session entries must NOT leak into resumed session
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "state.db"
+        db = SessionDB(db_path)
+        session_id = "test-cross-session-clean"
+
+        model_config = {
+            "provider": "gemini-oauth",
+            "reasoning_config": {"enabled": True, "effort": "low"},
+        }
+        db.create_session(session_id, source="cli", model="gemini-3.8-flash", model_config=model_config)
+
+        # CLI had stale entries in effort_by_base from a previous conversation
+        cli = FakeCLI(model="gemini-3.1-pro", provider="gemini-oauth", session_id=session_id, session_db=db)
+        cli.effort_by_base = {
+            "gemini-3.1-pro": "high",
+            "gemini-3.7-flash": "low",
+        }
+
+        from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
+        session_meta = db.get_session(session_id)
+        CLIModelSwitchMixin._restore_session_model(cli, session_meta)
+
+        # Invariant: map was reset! Only resumed active base exists.
+        assert cli.effort_by_base == {"gemini-3.8-flash": "low"}
+
+
+def test_live_agent_disabled_resume_not_overwritten_by_switch_model():
+    # C. Live agent disabled resume: switch_model() re-resolution must not overwrite {"enabled": False}
+    with tempfile.TemporaryDirectory() as td:
+        db_path = Path(td) / "state.db"
+        db = SessionDB(db_path)
+        session_id = "test-agent-disabled-resume"
+
+        model_config = {
+            "provider": "gemini-oauth",
+            "reasoning_config": {"enabled": False},
+        }
+        db.create_session(session_id, source="cli", model="gemini-3.8-flash", model_config=model_config)
+
+        cli = FakeCLI(model="other-model", provider="other-prov", session_id=session_id, session_db=db)
+        # Mock live agent whose switch_model re-resolves to high
+        fake_agent = SimpleNamespace(
+            model="other-model",
+            provider="other-prov",
+            effort_by_base={"other-model": "high"},
+            reasoning_config={"enabled": True, "effort": "high"},
+            _primary_runtime={"reasoning_config": {"enabled": True, "effort": "high"}},
+        )
+        def _mock_switch_model(new_model, new_provider, **kwargs):
+            fake_agent.model = new_model
+            fake_agent.provider = new_provider
+            fake_agent.reasoning_config = {"enabled": True, "effort": "high"} # would clobber if not reapplied
+        fake_agent.switch_model = _mock_switch_model
+        cli.agent = fake_agent
+
+        from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
+        session_meta = db.get_session(session_id)
+        CLIModelSwitchMixin._restore_session_model(cli, session_meta)
+
+        # Invariants: authoritative disabled state restored on both CLI and agent!
+        assert cli.reasoning_config == {"enabled": False}
+        assert fake_agent.reasoning_config == {"enabled": False}
+        assert cli.effort_by_base == {}
+        assert fake_agent.effort_by_base == {}
+        assert fake_agent._primary_runtime["reasoning_config"] == {"enabled": False}
+
+
+def test_no_effort_cloudcode_explicit_selection_rejected():
+    # D. Explicit reasoning on Cloud Code no-effort models must be strictly rejected
+    for no_eff_model in ["claude-sonnet-4-6", "gemini-3.1-flash-lite", "gpt-oss-120b-medium"]:
+        cli = FakeCLI(model=no_eff_model, provider="gemini-oauth")
+        cli.effort_by_base = {}
+        cli.reasoning_config = None
+
+        cli_config = {"agent": {"reasoning_effort": "high", "reasoning_overrides": {}}}
+
+        with patch("cli.CLI_CONFIG", cli_config),              patch("cli.save_config_value") as mock_save:
+            _apply_reasoning_after_switch(cli, "low", persist_global=True)
+
+            # Invariants: rejected without map mutation, without reasoning_config mutation, without config save!
+            assert cli.effort_by_base == {}
+            assert cli.reasoning_config is None
+            mock_save.assert_not_called()
+            assert cli_config["agent"]["reasoning_effort"] == "high"
+            assert no_eff_model not in cli_config["agent"]["reasoning_overrides"]
