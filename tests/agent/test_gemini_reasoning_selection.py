@@ -217,3 +217,56 @@ def test_effective_resolver_accepts_structured_global_reasoning_config():
     )
     assert result == {"enabled": True, "effort": "low"}
     assert cfg == orig_cfg  # Config is not mutated!
+def test_per_model_disabled_override_is_preserved():
+    import copy
+    cfg = {
+        "agent": {
+            "reasoning_effort": "high",
+            "reasoning_overrides": {
+                "gemini-3.8-flash": False,
+            },
+        }
+    }
+    orig_cfg = copy.deepcopy(cfg)
+    assert resolve_effective_reasoning_config(
+        config=cfg,
+        provider="gemini-oauth",
+        model="gemini-3.8-flash",
+        effort_by_base={},
+    ) == {"enabled": False}
+    assert cfg == orig_cfg
+
+
+def test_global_disabled_reasoning_is_preserved():
+    import copy
+    cfg = {"agent": {"reasoning_effort": False}}
+    orig_cfg = copy.deepcopy(cfg)
+    assert resolve_effective_reasoning_config(
+        config=cfg,
+        provider="gemini-oauth",
+        model="gemini-3.8-flash",
+        effort_by_base={},
+    ) == {"enabled": False}
+    assert cfg == orig_cfg
+
+
+def test_runtime_effort_beats_disabled_config():
+    import copy
+    cfg = {
+        "agent": {
+            "reasoning_overrides": {
+                "gemini-3.8-flash": False,
+            }
+        }
+    }
+    m = {"gemini-3.8-flash": "low"}
+    orig_cfg = copy.deepcopy(cfg)
+    orig_m = copy.deepcopy(m)
+    assert resolve_effective_reasoning_config(
+        config=cfg,
+        provider="gemini-oauth",
+        model="gemini-3.8-flash",
+        effort_by_base=m,
+    ) == {"enabled": True, "effort": "low"}
+    assert cfg == orig_cfg
+    assert m == orig_m

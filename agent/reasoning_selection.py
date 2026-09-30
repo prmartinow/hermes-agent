@@ -117,43 +117,40 @@ def resolve_effective_reasoning_config(
     if not selectable:
         return None
 
-    chosen_effort: str | None = None
-
     # 1. Runtime memory
     if effort_by_base and canonical_base in effort_by_base:
         cand_runtime = effort_by_base[canonical_base]
         if cand_runtime in selectable:
-            chosen_effort = cand_runtime
+            return {"enabled": True, "effort": cand_runtime}
 
     # 2. Config reasoning_overrides (passed with original model to preserve exact alias priority)
     agent_cfg = (config or {}).get("agent") if isinstance(config, dict) else {}
-    if chosen_effort is None and isinstance(agent_cfg, dict):
+    if isinstance(agent_cfg, dict):
         overrides = agent_cfg.get("reasoning_overrides") or {}
         cand_override = resolve_per_model_reasoning_effort(model, overrides)
-        if cand_override and isinstance(cand_override, dict):
+        if isinstance(cand_override, dict):
+            if cand_override.get("enabled") is False:
+                return {"enabled": False}
             cand_eff = cand_override.get("effort")
             if cand_eff in selectable:
-                chosen_effort = cand_eff
+                return {"enabled": True, "effort": cand_eff}
 
     # 3. Global config reasoning_effort (supports string or structured dict config)
-    if chosen_effort is None and isinstance(agent_cfg, dict):
+    if isinstance(agent_cfg, dict):
         from hermes_constants import parse_reasoning_effort
         parsed_global = parse_reasoning_effort(agent_cfg.get("reasoning_effort"))
-        if (
-            isinstance(parsed_global, dict)
-            and parsed_global.get("enabled", True)
-            and parsed_global.get("effort") in selectable
-        ):
-            chosen_effort = parsed_global["effort"]
+        if isinstance(parsed_global, dict):
+            if parsed_global.get("enabled") is False:
+                return {"enabled": False}
+            global_eff = parsed_global.get("effort")
+            if global_eff in selectable:
+                return {"enabled": True, "effort": global_eff}
 
     # 4. Model default from capability registry
-    if chosen_effort is None:
-        cap = get_model_capability(canonical_base)
-        if cap and cap.default_effort and cap.default_effort in selectable:
-            chosen_effort = cap.default_effort
-        elif selectable:
-            chosen_effort = selectable[-1]
+    cap = get_model_capability(canonical_base)
+    if cap and cap.default_effort and cap.default_effort in selectable:
+        return {"enabled": True, "effort": cap.default_effort}
+    elif selectable:
+        return {"enabled": True, "effort": selectable[-1]}
 
-    if chosen_effort is not None:
-        return {"enabled": True, "effort": chosen_effort}
     return None
