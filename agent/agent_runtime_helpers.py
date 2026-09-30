@@ -2020,19 +2020,25 @@ def _snapshot_switch_state(agent) -> Dict[str, Any]:
         snapshot["effort_by_base"] = copy.deepcopy(agent.effort_by_base)
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         cc = agent.context_compressor
-        snapshot["_compressor_state"] = {
-            "model": getattr(cc, "model", None),
-            "context_length": getattr(cc, "context_length", None),
-            "base_url": getattr(cc, "base_url", None),
-            "api_key": getattr(cc, "api_key", None),
-            "provider": getattr(cc, "provider", None),
-            "api_mode": getattr(cc, "api_mode", ""),
-        }
+        if hasattr(cc, "snapshot_switch_runtime") and callable(cc.snapshot_switch_runtime):
+            snapshot["_compressor_state"] = cc.snapshot_switch_runtime()
+        else:
+            snapshot["_compressor_state"] = {
+                "model": getattr(cc, "model", None),
+                "context_length": getattr(cc, "context_length", None),
+                "base_url": getattr(cc, "base_url", None),
+                "api_key": getattr(cc, "api_key", None),
+                "provider": getattr(cc, "provider", None),
+                "api_mode": getattr(cc, "api_mode", ""),
+            }
     return snapshot
 
 
 def _restore_switch_snapshot(agent, snapshot: Dict[str, Any]) -> None:
+    compressor_state = snapshot.pop("_compressor_state", None)
     for name, value in snapshot.items():
+        if name == "_compressor_state":
+            continue
         if value is _MISSING:
             continue  # attribute did not exist before the swap; don't fabricate it
         if name == "effort_by_base":
@@ -2044,11 +2050,19 @@ def _restore_switch_snapshot(agent, snapshot: Dict[str, Any]) -> None:
         with contextlib.suppress(Exception):
             from agent.usage_anchor import persist_usage_anchor
             persist_usage_anchor(agent, snapshot["_usage_anchor"])
-    if "_compressor_state" in snapshot and snapshot["_compressor_state"] is not _MISSING:
-        cc_state = snapshot["_compressor_state"]
-        if hasattr(agent, "context_compressor") and agent.context_compressor and hasattr(agent.context_compressor, "update_model"):
-            with contextlib.suppress(Exception):
-                agent.context_compressor.update_model(**cc_state)
+    if compressor_state is not None and compressor_state is not _MISSING:
+        cc = getattr(agent, "context_compressor", None)
+        if cc is not None:
+            if hasattr(cc, "restore_switch_runtime") and callable(cc.restore_switch_runtime):
+                with contextlib.suppress(Exception):
+                    cc.restore_switch_runtime(compressor_state)
+            elif hasattr(cc, "update_model") and callable(cc.update_model):
+                with contextlib.suppress(Exception):
+                    cc.update_model(**compressor_state)
+            elif isinstance(compressor_state, dict):
+                for k, v in compressor_state.items():
+                    with contextlib.suppress(Exception):
+                        setattr(cc, k, copy.deepcopy(v))
 
 
 def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm):

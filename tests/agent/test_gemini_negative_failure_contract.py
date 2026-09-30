@@ -166,17 +166,22 @@ class TestUnsupportedSelection:
                 pass
 
         cli = MockCLI()
+        cli.reasoning_config = {"enabled": True, "effort": "low"}
+        cli.agent.reasoning_config = {"enabled": True, "effort": "low"}
         pre_model = cli.model
         pre_provider = cli.provider
         pre_effort = copy.deepcopy(cli.effort_by_base)
         pre_agent_effort = copy.deepcopy(cli.agent.effort_by_base)
+        pre_reasoning = copy.deepcopy(cli.reasoning_config)
+        pre_agent_reasoning = copy.deepcopy(cli.agent.reasoning_config)
 
-        with patch("hermes_cli.cli_model_switch_mixin._switch_model_from") as mock_switch_from,              patch("cli._cprint") as mock_cprint:
+        with patch("hermes_cli.cli_model_switch_mixin._switch_model_from") as mock_switch_from,              patch("hermes_cli.model_switch.persist_model_selection") as mock_persist,              patch("cli._cprint") as mock_cprint:
 
             cli._handle_model_switch(cmd)
 
-            # Invariant: _switch_model_from never called!
+            # Invariant: _switch_model_from and persistence never called!
             mock_switch_from.assert_not_called()
+            mock_persist.assert_not_called()
             # Invariant: Error surfaced cleanly to user
             assert any(expected_err in str(call) for call in mock_cprint.call_args_list)
 
@@ -185,6 +190,8 @@ class TestUnsupportedSelection:
         assert cli.provider == pre_provider
         assert cli.effort_by_base == pre_effort
         assert cli.agent.effort_by_base == pre_agent_effort
+        assert cli.reasoning_config == pre_reasoning
+        assert cli.agent.reasoning_config == pre_agent_reasoning
 
 
 class TestSwitchRollback:
@@ -228,8 +235,12 @@ class TestSwitchRollback:
 
     def test_switch_rollback_on_compressor_mutation_and_failure(self):
         """Phase B: When compressor mutates and then fails during switch_model(),
-        rolls back all state cleanly including compressor, cache flags, and custom providers.
+        rolls back all state cleanly without calling update_model() resets,
+        preserving token counters, strikes, streaks, and cooldowns byte-for-byte.
+        Guarantees agent._compressor_state is never leaked on agent.
         """
+        from agent.context_compressor import ContextCompressor
+
         with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
             agent = AIAgent(
                 model="gemini-3.8-flash",
@@ -239,27 +250,31 @@ class TestSwitchRollback:
                 quiet_mode=True,
             )
             agent.effort_by_base = {"gemini-3.8-flash": "low"}
-            agent._client_kwargs = {"api_key": "key1"}
+            agent._client_kwargs = {"api_key": "key1", "base_url": ""}
             agent._use_prompt_caching = False
             agent._use_native_cache_layout = False
             agent._custom_providers = [{"name": "old_provider"}]
-            class FakeCompressor:
-                def __init__(self, model, context_length, base_url, api_key, provider, api_mode=""):
-                    self.model = model
-                    self.context_length = context_length
-                    self.base_url = base_url
-                    self.api_key = api_key
-                    self.provider = provider
-                    self.api_mode = api_mode
-                def update_model(self, model, context_length, base_url, api_key, provider, api_mode=""):
-                    self.model = model
-                    self.context_length = context_length
-                    self.base_url = base_url
-                    self.api_key = api_key
-                    self.provider = provider
-                    self.api_mode = api_mode
 
-            agent.context_compressor = FakeCompressor("gemini-3.8-flash", 100000, "old_url", "old_key", "gemini-oauth", "")
+            compressor = ContextCompressor(
+                model="gemini-3.8-flash",
+                config_context_length=100000,
+                provider="gemini-oauth",
+                quiet_mode=True,
+            )
+            # Seed non-default bookkeeping state
+            compressor.last_prompt_tokens = 30000
+            compressor.last_completion_tokens = 4500
+            compressor.last_total_tokens = 34500
+            compressor._prellm_skip_count = 4
+            compressor._fallback_compression_streak = 2
+            compressor._ineffective_compression_count = 1
+            compressor._summary_failure_cooldown_until = 999999.0
+            compressor._consecutive_timeout_failures = 3
+
+            agent.context_compressor = compressor
+
+        # Invariant: No leaked _compressor_state attribute before switch
+        assert not hasattr(agent, "_compressor_state")
 
         pre_model = agent.model
         pre_provider = agent.provider
@@ -271,14 +286,21 @@ class TestSwitchRollback:
         pre_primary = copy.deepcopy(agent._primary_runtime)
 
         def mutating_and_failing_compressor(ag, custom_providers, effective_context_length, snapshot):
-            # Mutate compressor fields then fail
+            # Mutate compressor fields and wipe counters
             ag.context_compressor.model = "mutated_destination_model"
             ag.context_compressor.context_length = 999999
+            ag.context_compressor.last_prompt_tokens = 0
+            ag.context_compressor._prellm_skip_count = 0
+            ag.context_compressor._fallback_compression_streak = 0
+            ag.context_compressor._summary_failure_cooldown_until = 0.0
             raise RuntimeError("Compressor internal failure after mutation")
 
         with patch("agent.agent_init._build_client", side_effect=_fake_build_client),              patch("agent.agent_runtime_helpers._update_switch_compressor", side_effect=mutating_and_failing_compressor):
             with pytest.raises(RuntimeError):
                 agent.switch_model("gemini-3.6-flash", "gemini-oauth")
+
+        # Invariant: No leaked _compressor_state attribute after rollback
+        assert not hasattr(agent, "_compressor_state")
 
         # Invariant: Complete rollback of agent and compressor fields!
         assert agent.model == pre_model
@@ -289,8 +311,17 @@ class TestSwitchRollback:
         assert agent._use_native_cache_layout == pre_layout
         assert agent._custom_providers == pre_custom
         assert agent._primary_runtime == pre_primary
+
+        # Invariant: Non-default bookkeeping state restored byte-for-byte without reset
         assert agent.context_compressor.model == "gemini-3.8-flash"
-        assert agent.context_compressor.context_length == 100000
+        assert agent.context_compressor.last_prompt_tokens == 30000
+        assert agent.context_compressor.last_completion_tokens == 4500
+        assert agent.context_compressor.last_total_tokens == 34500
+        assert agent.context_compressor._prellm_skip_count == 4
+        assert agent.context_compressor._fallback_compression_streak == 2
+        assert agent.context_compressor._ineffective_compression_count == 1
+        assert agent.context_compressor._summary_failure_cooldown_until == 999999.0
+        assert agent.context_compressor._consecutive_timeout_failures == 3
 
     def test_compressor_feasibility_probe_failure_does_not_abort_good_switch(self):
         """When compressor update succeeds, a failure in revalidate_compression_feasibility

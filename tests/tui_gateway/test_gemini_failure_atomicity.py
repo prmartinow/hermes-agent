@@ -140,17 +140,34 @@ class TestOneTurnAtomicity:
 
     def test_one_turn_lifecycle_failure_restores_complete_state(self):
         """Lifecycle-level --once failure:
-        1. Live agent on 3.8 high with effort_by_base={'gemini-3.8-flash': 'high'}.
-        2. server._apply_model_switch(sid, session, "/model gemini-3.8-flash --reasoning low --once")
-           -> applies temporary low
+        1. Live real AIAgent on permanent gemini-3.8-flash / high with effort_by_base={'gemini-3.8-flash': 'high'}.
+        2. Real cross-model switch: server._apply_model_switch(sid, session, "/model gemini-3.6-flash --reasoning medium --once")
+           -> applies temporary gemini-3.6-flash / medium
            -> installs session["one_turn_model_restore"].
-        3. Turn execution fails.
-        4. Production restore seam consumes session.pop("one_turn_model_restore") via _restore_agent_model_runtime().
-        5. Asserts complete restoration of model, provider, reasoning_config, effort_by_base, _primary_runtime.
-        6. Asserts no permanent config write or permanent session model_override!
+        3. Turn execution begins: prompt_turn builds st = server._TurnRun(agent, session.pop("one_turn_model_restore"), ...).
+        4. Turn execution encounters an exception.
+        5. Production finally seam executes: server._finish_turn(sid, session, st).
+        6. Asserts complete restoration of model, provider, reasoning_config, effort_by_base, _primary_runtime.
+        7. Asserts no permanent config write or permanent session model_override!
         """
-        agent = _make_gateway_agent(model="gemini-3.8-flash", provider="gemini-oauth", effort="high")
-        agent.effort_by_base = {"gemini-3.8-flash": "high"}
+        from run_agent import AIAgent
+
+        def fake_build_client(ag, api_key="fake", base_url="", *a, **k):
+            ag.api_key = api_key or getattr(ag, "api_key", "fake")
+            ag.base_url = base_url or getattr(ag, "base_url", "")
+            ag._client_kwargs = {"api_key": ag.api_key, "base_url": ag.base_url}
+            ag.client = MagicMock()
+
+        with patch("agent.agent_init._build_client", side_effect=fake_build_client):
+            agent = AIAgent(
+                model="gemini-3.8-flash",
+                provider="gemini-oauth",
+                api_key="key1",
+                reasoning_config={"enabled": True, "effort": "high"},
+                quiet_mode=True,
+            )
+            agent.effort_by_base = {"gemini-3.8-flash": "high"}
+
         original_primary = copy.deepcopy(agent._primary_runtime)
 
         session = {
@@ -161,25 +178,36 @@ class TestOneTurnAtomicity:
         }
 
         with patch("hermes_cli.model_switch.switch_model", return_value=SimpleNamespace(
-                 success=True, new_model="gemini-3.8-flash", target_provider="gemini-oauth",
-                 base_url="", api_key="", api_mode="", model_info={}, warning_message=None)),              patch.object(server, "_restart_slash_worker"),              patch.object(server, "_persist_live_session_runtime"),              patch.object(server, "_persist_live_session_system_prompt"),              patch.object(server, "_append_model_switch_marker"),              patch.object(server, "_emit_session_info"),              patch.object(server, "_write_config_key", create=True) as mock_write_cfg:
+                 success=True, new_model="gemini-3.6-flash", target_provider="gemini-oauth",
+                 base_url="", api_key="key1", api_mode="chat_completions", model_info={}, warning_message=None)),              patch.object(server, "_restart_slash_worker"),              patch.object(server, "_persist_live_session_runtime"),              patch.object(server, "_persist_live_session_system_prompt"),              patch.object(server, "_append_model_switch_marker"),              patch.object(server, "_emit_session_info"),              patch.object(server, "_write_config_key", create=True) as mock_write_cfg:
 
-            out = server._apply_model_switch("s_once_lifecycle", session, "/model gemini-3.8-flash --reasoning low --once")
+            out = server._apply_model_switch("s_once_lifecycle", session, "/model gemini-3.6-flash --reasoning medium --once")
             assert out["scope"] == "once"
 
-            # Invariant: Temporary low applied
-            assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+            # Invariant: Temporary cross-model and effort applied
+            assert agent.model == "gemini-3.6-flash"
+            assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
             # Invariant: effort_by_base untouched
             assert agent.effort_by_base == {"gemini-3.8-flash": "high"}
             # Invariant: session contains one_turn_model_restore snapshot
             assert "one_turn_model_restore" in session
+            assert session["one_turn_model_restore"]["model"] == "gemini-3.8-flash"
             assert session["one_turn_model_restore"]["reasoning_config"] == {"enabled": True, "effort": "high"}
 
-            # Simulate turn failure and post-turn restore seam consumption
-            restore_snapshot = session.pop("one_turn_model_restore")
-            _restore_agent_model_runtime(agent, restore_snapshot)
+            # Prompt turn execution begins: pops one_turn_model_restore into st
+            st = server._TurnRun(
+                agent=session["agent"],
+                one_turn_restore=session.pop("one_turn_model_restore", None),
+                terminal_callback=None,
+                receipt_committed=True,
+            )
 
-            # Invariant: Completely restored!
+            # Turn encounters error; production finally block calls _finish_turn
+            server._finish_turn("s_once_lifecycle", session, st)
+
+            # Invariant: Completely restored to original model and effort!
+            assert agent.model == "gemini-3.8-flash"
+            assert agent.provider == "gemini-oauth"
             assert agent.reasoning_config == {"enabled": True, "effort": "high"}
             assert agent.effort_by_base == {"gemini-3.8-flash": "high"}
             assert agent._primary_runtime == original_primary

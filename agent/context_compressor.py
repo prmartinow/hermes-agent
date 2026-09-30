@@ -2948,6 +2948,49 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         """Resolve a switch's trigger without mutating live compression state."""
         return self.preview_threshold_tokens(model, context_length, provider)
 
+    def snapshot_switch_runtime(self) -> dict[str, Any]:
+        """Capture all compressor runtime and bookkeeping state mutated across a model switch."""
+        return {
+            "model": self.model,
+            "base_url": self.base_url,
+            "api_key": self.api_key,
+            "provider": self.provider,
+            "api_mode": self.api_mode,
+            "context_length": self.context_length,
+            "max_tokens": getattr(self, "max_tokens", None),
+            "_aux_context_ceiling": getattr(self, "_aux_context_ceiling", None),
+            "_base_threshold_percent": getattr(self, "_base_threshold_percent", None),
+            "threshold_percent": getattr(self, "threshold_percent", None),
+            "threshold_tokens": getattr(self, "threshold_tokens", None),
+            "_tail_token_budget": getattr(self, "_tail_token_budget", None),
+            "max_summary_tokens": getattr(self, "max_summary_tokens", None),
+            "last_prompt_tokens": getattr(self, "last_prompt_tokens", 0),
+            "last_completion_tokens": getattr(self, "last_completion_tokens", 0),
+            "last_total_tokens": getattr(self, "last_total_tokens", 0),
+            "last_real_prompt_tokens": getattr(self, "last_real_prompt_tokens", 0),
+            "last_compression_rough_tokens": getattr(self, "last_compression_rough_tokens", 0),
+            "awaiting_real_usage_after_compression": getattr(self, "awaiting_real_usage_after_compression", False),
+            "_provider_omits_usage": getattr(self, "_provider_omits_usage", False),
+            "_ineffective_compression_count": getattr(self, "_ineffective_compression_count", 0),
+            "_prellm_skip_count": getattr(self, "_prellm_skip_count", 0),
+            "_fallback_compression_streak": getattr(self, "_fallback_compression_streak", 0),
+            "_summary_failure_cooldown_until": getattr(self, "_summary_failure_cooldown_until", 0.0),
+            "_last_summary_error": getattr(self, "_last_summary_error", None),
+            "_consecutive_timeout_failures": getattr(self, "_consecutive_timeout_failures", 0),
+            "_consecutive_truncation_failures": getattr(self, "_consecutive_truncation_failures", 0),
+            "_cooldown_persist_failed": getattr(self, "_cooldown_persist_failed", False),
+            "_verify_compaction_cleared_threshold": getattr(self, "_verify_compaction_cleared_threshold", False),
+            "_last_compression_made_progress": getattr(self, "_last_compression_made_progress", False),
+            "_proactive_prune_rearm_tokens": getattr(self, "_proactive_prune_rearm_tokens", 0),
+            "_last_reclaim_block_warn": getattr(self, "_last_reclaim_block_warn", None),
+        }
+
+    def restore_switch_runtime(self, snapshot: dict[str, Any]) -> None:
+        """Atomically restore compressor runtime and bookkeeping state without invoking update_model resets."""
+        import copy
+        for k, v in snapshot.items():
+            setattr(self, k, copy.deepcopy(v))
+
     # When the MINIMUM_CONTEXT_LENGTH floor binds on a small window, trigger near the top instead.
     _MIN_CTX_TRIGGER_RATIO = 0.85
 
