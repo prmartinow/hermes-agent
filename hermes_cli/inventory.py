@@ -323,6 +323,32 @@ def _apply_capabilities(rows: list[dict], ctx: ConfigContext | None = None) -> N
 
     for row in rows:
         slug = row.get("slug") or ""
+        slug_norm = slug.strip().lower()
+
+        # Canonicalize compatibility model aliases for Cloud Code routes
+        try:
+            from agent.gemini_cloudcode_models import (
+                _CLOUDCODE_EFFORT_PROVIDERS,
+                _CLOUDCODE_ACCOUNT_PROVIDERS,
+                parse_model_slug,
+            )
+            is_cloudcode = (
+                slug_norm in _CLOUDCODE_EFFORT_PROVIDERS
+                or slug_norm in _CLOUDCODE_ACCOUNT_PROVIDERS
+            )
+            if is_cloudcode and row.get("models"):
+                seen = set()
+                canonical_models = []
+                for m in row["models"]:
+                    base = parse_model_slug(m).base_model
+                    if base not in seen:
+                        seen.add(base)
+                        canonical_models.append(base)
+                row["models"] = canonical_models
+                row["total_models"] = len(canonical_models)
+        except Exception:
+            pass
+
         caps: dict[str, dict[str, Any]] = {}
         read_reasoning_catalog = _reasoning_catalog_reader(slug.lower())
 

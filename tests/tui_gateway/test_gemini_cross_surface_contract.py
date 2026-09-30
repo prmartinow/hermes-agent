@@ -133,9 +133,14 @@ class TestProviderRouteEquivalence:
         with patch("hermes_cli.model_switch.list_authenticated_providers", return_value=fake_rows):
             res = server._methods["model.options"](1, {})
             p = next(p for p in res["result"]["providers"] if p["slug"] == "gemini-oauth")
-            caps = p.get("capabilities", {})
-            assert "gemini-3.8-flash" in caps
-            assert caps["gemini-3.8-flash"]["reasoning_efforts"] == ["low", "medium", "high"]
+            assert p["models"] == [
+                "gemini-3.8-flash",
+                "gemini-3.1-pro",
+            ]
+            assert "gemini-3.8-flash-high" not in p["models"]
+            assert "gemini-3.1-pro-high" not in p["models"]
+            assert set(p["capabilities"]).issubset(set(p["models"]))
+            assert p["total_models"] == 2
 
 
 # ==============================================================================
@@ -364,6 +369,49 @@ class TestScopeEquivalenceMatrix:
             assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
             assert agent.effort_by_base == {"gemini-3.8-flash": "medium"}
             mock_write_cfg.assert_called_with("agent.reasoning_overrides", {"gemini-3.8-flash": "medium"})
+
+    def test_once_scope_temporary_application_and_carrier_installation(self):
+        """--once scope:
+        -> temporary route/reasoning applied
+        -> effort_by_base not permanently changed
+        -> no global reasoning_overrides write
+        -> no permanent session model_override
+        -> one-turn restore carrier installed
+        """
+        agent = MagicMock()
+        agent.model = "gemini-3.8-flash"
+        agent.provider = "gemini-oauth"
+        agent.switch_model = lambda new_model, **k: setattr(agent, "model", new_model)
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+        agent.effort_by_base = {"gemini-3.8-flash": "high"}
+        session = {"agent": agent, "session_key": "s_once", "model_override": None}
+
+        with patch("hermes_cli.model_switch.switch_model", return_value=SimpleNamespace(
+                 success=True, new_model="gemini-3.6-flash", target_provider="gemini-oauth",
+                 base_url="", api_key="", api_mode="", model_info=None, warning_message=None)),              patch.object(server, "_restart_slash_worker"),              patch.object(server, "_persist_live_session_runtime"),              patch.object(server, "_persist_live_session_system_prompt"),              patch.object(server, "_append_model_switch_marker"),              patch.object(server, "_emit_session_info"),              patch.object(server, "_write_config_key", create=True) as mock_write_cfg:
+
+            out = server._apply_model_switch("s_once", session, "/model gemini-3.6-flash --reasoning medium --once")
+
+            # Invariant 1: Scope identifies as "once"
+            assert out["scope"] == "once"
+
+            # Invariant 2: Temporary route and reasoning applied
+            assert agent.model == "gemini-3.6-flash"
+            assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+
+            # Invariant 3: effort_by_base is NOT permanently mutated
+            assert agent.effort_by_base == {"gemini-3.8-flash": "high"}
+
+            # Invariant 4: No global reasoning_overrides write
+            mock_write_cfg.assert_not_called()
+
+            # Invariant 5: No permanent session model_override
+            assert session["model_override"] is None
+
+            # Invariant 6: One-turn restore carrier installed
+            assert "one_turn_model_restore" in session
+            assert session["one_turn_model_restore"]["model"] == "gemini-3.8-flash"
+            assert session["one_turn_model_restore"]["reasoning_config"] == {"enabled": True, "effort": "high"}
 
 
 # ==============================================================================

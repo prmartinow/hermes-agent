@@ -58,7 +58,8 @@ class TestClassicPickerParity:
         assert "" in values  # Keep current effort
 
     def test_classic_picker_current_marker_and_preselection(self):
-        """When target model has effective effort 'medium', Classic CLI marks 'medium  ← current'."""
+        """When target model has effective effort 'medium', Classic CLI marks 'medium  ← current'
+        and renders through the live _get_model_picker_display_fragments() production seam."""
         class MockCLI(CLITuiMixin, CLIModelSwitchMixin):
             def __init__(self):
                 self.reasoning_config = {"enabled": True, "effort": "high"}
@@ -75,22 +76,31 @@ class TestClassicPickerParity:
                 }
             }
         }
-        state = {
+        cli._model_picker_state = {
             "stage": "reasoning",
             "provider_data": prov_data,
             "reasoning_rows": _picker_reasoning_rows(prov_data, "gemini-3.8-flash"),
             "reasoning_effective_effort": "medium",
+            "selected_idx": 1,
         }
-        # In hermes_cli/cli_tui_mixin.py lines 674-677:
-        rows = state["reasoning_rows"]
-        target_eff = state["reasoning_effective_effort"]
-        choices = [f"{label}  ← current" if target_eff is not None and value == target_eff else label
-                   for value, label in rows]
 
-        assert choices == ["low", "medium  ← current", "high"]
+        # Exercise direct production fragment rendering
+        frags = cli._get_model_picker_display_fragments()
+        rendered_text = "".join(t for _, t in frags)
+
+        assert "medium  ← current" in rendered_text
+        assert "low" in rendered_text
+        assert "high" in rendered_text
 
     def test_classic_picker_disabled_state_has_no_current_marker(self):
-        """When Cloud Code reasoning is disabled, target_eff is None -> no row marked '← current'."""
+        """When Cloud Code reasoning is disabled, target_eff is None -> no row marked '← current'
+        and renders through the live _get_model_picker_display_fragments() production seam."""
+        class MockCLI(CLITuiMixin, CLIModelSwitchMixin):
+            def __init__(self):
+                self.reasoning_config = {"enabled": True, "effort": "high"}
+                self.effort_by_base = {}
+
+        cli = MockCLI()
         prov_data = {
             "slug": "gemini-oauth",
             "capabilities": {
@@ -100,18 +110,23 @@ class TestClassicPickerParity:
                 }
             }
         }
-        state = {
+        cli._model_picker_state = {
             "stage": "reasoning",
             "provider_data": prov_data,
             "reasoning_rows": _picker_reasoning_rows(prov_data, "gemini-3.8-flash"),
             "reasoning_effective_effort": None,
+            "selected_idx": 2,
         }
-        rows = state["reasoning_rows"]
-        target_eff = state["reasoning_effective_effort"]
-        choices = [f"{label}  ← current" if target_eff is not None and value == target_eff else label
-                   for value, label in rows]
 
-        assert choices == ["low", "medium", "high"]
+        # Exercise direct production fragment rendering
+        frags = cli._get_model_picker_display_fragments()
+        rendered_text = "".join(t for _, t in frags)
+
+        assert "← current" not in rendered_text
+        assert "none" not in rendered_text
+        assert "low" in rendered_text
+        assert "medium" in rendered_text
+        assert "high" in rendered_text
 
 
 class TestClassicPickerToRuntimeExecution:
@@ -133,3 +148,33 @@ class TestClassicPickerToRuntimeExecution:
         assert cli.agent.reasoning_config == {"enabled": True, "effort": "low"}
         assert cli.effort_by_base == {"gemini-3.8-flash": "low"}
         assert cli.agent.effort_by_base == {"gemini-3.8-flash": "low"}
+
+    def test_classic_cli_once_scope_parity(self):
+        """Classic CLI --once scope parity:
+        - applies temporary reasoning to cli and agent
+        - does NOT permanently mutate cli.effort_by_base or agent.effort_by_base
+        - does NOT write global config
+        """
+        class MockCLI(CLITuiMixin, CLIModelSwitchMixin):
+            def __init__(self):
+                self.model = "gemini-3.8-flash"
+                self.provider = "gemini-oauth"
+                self.reasoning_config = {"enabled": True, "effort": "high"}
+                self.effort_by_base = {"gemini-3.8-flash": "high"}
+                self.agent = MagicMock()
+                self.agent.effort_by_base = {"gemini-3.8-flash": "high"}
+
+        cli = MockCLI()
+        with patch("cli.save_config_value") as mock_save:
+            _apply_reasoning_after_switch(cli, "medium", persist_global=False, one_turn=True)
+
+            # Invariant 1: Temporary reasoning applied
+            assert cli.reasoning_config == {"enabled": True, "effort": "medium"}
+            assert cli.agent.reasoning_config == {"enabled": True, "effort": "medium"}
+
+            # Invariant 2: effort_by_base NOT permanently mutated
+            assert cli.effort_by_base == {"gemini-3.8-flash": "high"}
+            assert cli.agent.effort_by_base == {"gemini-3.8-flash": "high"}
+
+            # Invariant 3: Global config write not called
+            mock_save.assert_not_called()
