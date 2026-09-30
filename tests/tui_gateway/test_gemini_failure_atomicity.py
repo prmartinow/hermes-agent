@@ -138,6 +138,57 @@ class TestOneTurnAtomicity:
         assert agent._primary_runtime == original_primary
 
 
+    def test_one_turn_lifecycle_failure_restores_complete_state(self):
+        """Lifecycle-level --once failure:
+        1. Live agent on 3.8 high with effort_by_base={'gemini-3.8-flash': 'high'}.
+        2. server._apply_model_switch(sid, session, "/model gemini-3.8-flash --reasoning low --once")
+           -> applies temporary low
+           -> installs session["one_turn_model_restore"].
+        3. Turn execution fails.
+        4. Production restore seam consumes session.pop("one_turn_model_restore") via _restore_agent_model_runtime().
+        5. Asserts complete restoration of model, provider, reasoning_config, effort_by_base, _primary_runtime.
+        6. Asserts no permanent config write or permanent session model_override!
+        """
+        agent = _make_gateway_agent(model="gemini-3.8-flash", provider="gemini-oauth", effort="high")
+        agent.effort_by_base = {"gemini-3.8-flash": "high"}
+        original_primary = copy.deepcopy(agent._primary_runtime)
+
+        session = {
+            "agent": agent,
+            "session_key": "s_once_lifecycle",
+            "model_override": None,
+            "create_reasoning_override": None,
+        }
+
+        with patch("hermes_cli.model_switch.switch_model", return_value=SimpleNamespace(
+                 success=True, new_model="gemini-3.8-flash", target_provider="gemini-oauth",
+                 base_url="", api_key="", api_mode="", model_info={}, warning_message=None)),              patch.object(server, "_restart_slash_worker"),              patch.object(server, "_persist_live_session_runtime"),              patch.object(server, "_persist_live_session_system_prompt"),              patch.object(server, "_append_model_switch_marker"),              patch.object(server, "_emit_session_info"),              patch.object(server, "_write_config_key", create=True) as mock_write_cfg:
+
+            out = server._apply_model_switch("s_once_lifecycle", session, "/model gemini-3.8-flash --reasoning low --once")
+            assert out["scope"] == "once"
+
+            # Invariant: Temporary low applied
+            assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+            # Invariant: effort_by_base untouched
+            assert agent.effort_by_base == {"gemini-3.8-flash": "high"}
+            # Invariant: session contains one_turn_model_restore snapshot
+            assert "one_turn_model_restore" in session
+            assert session["one_turn_model_restore"]["reasoning_config"] == {"enabled": True, "effort": "high"}
+
+            # Simulate turn failure and post-turn restore seam consumption
+            restore_snapshot = session.pop("one_turn_model_restore")
+            _restore_agent_model_runtime(agent, restore_snapshot)
+
+            # Invariant: Completely restored!
+            assert agent.reasoning_config == {"enabled": True, "effort": "high"}
+            assert agent.effort_by_base == {"gemini-3.8-flash": "high"}
+            assert agent._primary_runtime == original_primary
+
+            # Invariant: No permanent config or session override written!
+            mock_write_cfg.assert_not_called()
+            assert session["model_override"] is None
+
+
 class TestGlobalSwitchFailureAtomicity:
     def test_failed_global_switch_never_partially_persists(self):
         """When /model 3.8 --reasoning low --global fails during live switch,

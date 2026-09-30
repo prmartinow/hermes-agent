@@ -132,6 +132,61 @@ class TestUnsupportedSelection:
 # 2. Live Model Switch Rollback (Client, Compressor, Capabilities)
 # ==============================================================================
 
+
+    @pytest.mark.parametrize("cmd,expected_err", [
+        ("/model gemini-3.8-flash --reasoning max", "gemini-3.8-flash has no 'max' effort"),
+        ("/model gemini-3.1-pro --reasoning medium", "gemini-3.1-pro has no 'medium' effort"),
+        ("/model claude-sonnet-4-6 --reasoning low", "is not supported for model 'claude-sonnet-4-6'"),
+        ("/model gemini-oauth:gemini-3.8-flash --reasoning max", "gemini-3.8-flash has no 'max' effort"),
+        ("/model gemini-3.8-flash-high --reasoning medium", "Conflicting reasoning effort: alias 'gemini-3.8-flash-high' implies 'high'"),
+    ])
+    def test_classic_cli_unsupported_effort_is_complete_noop(self, cmd, expected_err):
+        """Classic CLI unsupported effort must fail closed before _switch_model_from and leave all state unchanged."""
+        from hermes_cli.cli_model_switch_mixin import CLIModelSwitchMixin
+        from hermes_cli.cli_tui_mixin import CLITuiMixin
+
+        class MockCLI(CLITuiMixin, CLIModelSwitchMixin):
+            def __init__(self):
+                self.model = "gemini-3.8-flash"
+                self.provider = "gemini-oauth"
+                self.requested_provider = "gemini-oauth"
+                self.base_url = None
+                self.api_mode = None
+                self.api_key = None
+                self.reasoning_config = None
+                self.effort_by_base = {}
+                self.agent = MagicMock()
+                self.agent.effort_by_base = {}
+                self._session_db = None
+                self.session_id = None
+                self.verbose = False
+                self.max_turns = 100
+
+            def _console_print(self, *a, **k):
+                pass
+
+        cli = MockCLI()
+        pre_model = cli.model
+        pre_provider = cli.provider
+        pre_effort = copy.deepcopy(cli.effort_by_base)
+        pre_agent_effort = copy.deepcopy(cli.agent.effort_by_base)
+
+        with patch("hermes_cli.cli_model_switch_mixin._switch_model_from") as mock_switch_from,              patch("cli._cprint") as mock_cprint:
+
+            cli._handle_model_switch(cmd)
+
+            # Invariant: _switch_model_from never called!
+            mock_switch_from.assert_not_called()
+            # Invariant: Error surfaced cleanly to user
+            assert any(expected_err in str(call) for call in mock_cprint.call_args_list)
+
+        # Invariant: State completely unchanged
+        assert cli.model == pre_model
+        assert cli.provider == pre_provider
+        assert cli.effort_by_base == pre_effort
+        assert cli.agent.effort_by_base == pre_agent_effort
+
+
 class TestSwitchRollback:
     def test_switch_rollback_on_client_construction_failure(self):
         """Phase A: When client construction fails during switch_model(),
@@ -171,9 +226,9 @@ class TestSwitchRollback:
         assert agent.runtime_capabilities == pre_capabilities
         assert agent._primary_runtime == pre_primary
 
-    def test_switch_rollback_on_compressor_update_failure(self):
-        """Phase B: When compressor update fails after client swap,
-        rolls back all state cleanly to pre-switch snapshot.
+    def test_switch_rollback_on_compressor_mutation_and_failure(self):
+        """Phase B: When compressor mutates and then fails during switch_model(),
+        rolls back all state cleanly including compressor, cache flags, and custom providers.
         """
         with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
             agent = AIAgent(
@@ -185,19 +240,84 @@ class TestSwitchRollback:
             )
             agent.effort_by_base = {"gemini-3.8-flash": "low"}
             agent._client_kwargs = {"api_key": "key1"}
+            agent._use_prompt_caching = False
+            agent._use_native_cache_layout = False
+            agent._custom_providers = [{"name": "old_provider"}]
+            class FakeCompressor:
+                def __init__(self, model, context_length, base_url, api_key, provider, api_mode=""):
+                    self.model = model
+                    self.context_length = context_length
+                    self.base_url = base_url
+                    self.api_key = api_key
+                    self.provider = provider
+                    self.api_mode = api_mode
+                def update_model(self, model, context_length, base_url, api_key, provider, api_mode=""):
+                    self.model = model
+                    self.context_length = context_length
+                    self.base_url = base_url
+                    self.api_key = api_key
+                    self.provider = provider
+                    self.api_mode = api_mode
 
+            agent.context_compressor = FakeCompressor("gemini-3.8-flash", 100000, "old_url", "old_key", "gemini-oauth", "")
+
+        pre_model = agent.model
+        pre_provider = agent.provider
+        pre_reasoning = copy.deepcopy(agent.reasoning_config)
+        pre_map = copy.deepcopy(agent.effort_by_base)
+        pre_caching = agent._use_prompt_caching
+        pre_layout = agent._use_native_cache_layout
+        pre_custom = copy.deepcopy(agent._custom_providers)
         pre_primary = copy.deepcopy(agent._primary_runtime)
 
-        def failing_compressor(ag, *a, **k):
-            raise RuntimeError("Compressor update failure")
+        def mutating_and_failing_compressor(ag, custom_providers, effective_context_length, snapshot):
+            # Mutate compressor fields then fail
+            ag.context_compressor.model = "mutated_destination_model"
+            ag.context_compressor.context_length = 999999
+            raise RuntimeError("Compressor internal failure after mutation")
 
-        with patch("agent.agent_init._build_client", side_effect=_fake_build_client),              patch("agent.agent_runtime_helpers._update_switch_compressor", side_effect=failing_compressor):
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client),              patch("agent.agent_runtime_helpers._update_switch_compressor", side_effect=mutating_and_failing_compressor):
             with pytest.raises(RuntimeError):
                 agent.switch_model("gemini-3.6-flash", "gemini-oauth")
 
-        assert agent.model == "gemini-3.8-flash"
-        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+        # Invariant: Complete rollback of agent and compressor fields!
+        assert agent.model == pre_model
+        assert agent.provider == pre_provider
+        assert agent.reasoning_config == pre_reasoning
+        assert agent.effort_by_base == pre_map
+        assert agent._use_prompt_caching == pre_caching
+        assert agent._use_native_cache_layout == pre_layout
+        assert agent._custom_providers == pre_custom
         assert agent._primary_runtime == pre_primary
+        assert agent.context_compressor.model == "gemini-3.8-flash"
+        assert agent.context_compressor.context_length == 100000
+
+    def test_compressor_feasibility_probe_failure_does_not_abort_good_switch(self):
+        """When compressor update succeeds, a failure in revalidate_compression_feasibility
+        probe does NOT abort or roll back the good switch.
+        """
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client):
+            agent = AIAgent(
+                model="gemini-3.8-flash",
+                provider="gemini-oauth",
+                api_key="key1",
+                reasoning_config={"enabled": True, "effort": "low"},
+                quiet_mode=True,
+            )
+            agent.effort_by_base = {"gemini-3.8-flash": "low"}
+            agent.context_compressor = MagicMock()
+            agent.context_compressor.update_model = MagicMock()
+
+        def failing_probe(ag):
+            raise ConnectionError("Feasibility probe network hiccup")
+
+        with patch("agent.agent_init._build_client", side_effect=_fake_build_client),              patch("agent.conversation_compression.revalidate_compression_feasibility", side_effect=failing_probe):
+            # Must NOT raise!
+            agent.switch_model("gemini-3.6-flash", "gemini-oauth")
+
+        # Invariant: Good switch completed successfully despite probe failure!
+        assert agent.model == "gemini-3.6-flash"
+        assert agent.provider == "gemini-oauth"
 
 
 # ==============================================================================
@@ -343,40 +463,65 @@ class TestSignatureFailureSemantics:
         # Invariant: Distinct treatment!
         assert sig_a != sig_b
 
-    def test_partial_gemini_parallel_call_group_does_not_synthesize_bypass_on_siblings(self):
-        """In a native Gemini parallel group: call A has REAL signature, call B is unsigned.
-        call A retains REAL signature, call B remains unsigned (NO bypass synthesized on B).
-        Contrast with foreign group where both A and B receive bypass.
+    def test_partial_gemini_parallel_call_group_carrier_lost_branch(self):
+        """In carrier-lost fallback: when tool A has extra_content.thought_signature (REAL),
+        and tool B is unsigned (MISSING), group_has_real=True.
+        Tool A receives exact REAL signature, and Tool B remains unsigned (NO bypass synthesized).
+        Contrast with fully unsigned foreign group where both receive bypass sentinel.
         """
-        # Native parallel group with carrier where only first call is signed
-        parts = [
-            {"thought": True, "text": "parallel thinking"},
-            {"functionCall": {"name": "tool_a", "args": {}}, "thoughtSignature": "sig_call_a"},
-            {"functionCall": {"name": "tool_b", "args": {}}},  # sibling unsigned
-        ]
-        carrier = build_google_native_carrier(parts, source_model="gemini-3.8-flash-tiered")
-        history_native = [
+        # Carrier-lost group: NO reasoning_details / native carrier!
+        history_native_carrier_lost = [
             {"role": "user", "content": "run parallel"},
             {
                 "role": "assistant",
                 "content": None,
                 "tool_calls": [
-                    {"id": "ca", "type": "function", "function": {"name": "tool_a", "arguments": "{}"}},
-                    {"id": "cb", "type": "function", "function": {"name": "tool_b", "arguments": "{}"}},
+                    {
+                        "id": "ca",
+                        "type": "function",
+                        "function": {"name": "tool_a", "arguments": "{}"},
+                        "extra_content": {"google": {"thought_signature": "sig_real_parallel_a"}},
+                    },
+                    {
+                        "id": "cb",
+                        "type": "function",
+                        "function": {"name": "tool_b", "arguments": "{}"},
+                        # tool_b has NO extra_content
+                    },
                 ],
-                "reasoning_details": [carrier],
             },
             {"role": "tool", "tool_call_id": "ca", "content": "res_a"},
             {"role": "tool", "tool_call_id": "cb", "content": "res_b"},
         ]
 
-        contents, _ = _build_gemini_contents(history_native, model="gemini-3.8-flash")
-        fc_parts = [p for p in contents[1]["parts"] if "functionCall" in p]
-        assert len(fc_parts) == 2
+        contents_native, _ = _build_gemini_contents(history_native_carrier_lost, model="gemini-3.8-flash")
+        fc_native = [p for p in contents_native[1]["parts"] if "functionCall" in p]
+        assert len(fc_native) == 2
+        # Invariant: Tool A retains REAL signature
+        assert fc_native[0]["thoughtSignature"] == "sig_real_parallel_a"
+        # Invariant: Tool B remains unsigned (NO bypass synthesized onto sibling!)
+        assert "thoughtSignature" not in fc_native[1]
 
-        # Invariant: Call A has real signature, Call B has NO thoughtSignature (neither None nor bypass)!
-        assert fc_parts[0]["thoughtSignature"] == "sig_call_a"
-        assert "thoughtSignature" not in fc_parts[1]
+        # Contrast: Fully unsigned foreign parallel group
+        history_foreign = [
+            {"role": "user", "content": "run parallel"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "t1", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "t2", "arguments": "{}"}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "r1"},
+            {"role": "tool", "tool_call_id": "c2", "content": "r2"},
+        ]
+        contents_foreign, _ = _build_gemini_contents(history_foreign, model="gemini-3.8-flash")
+        fc_foreign = [p for p in contents_foreign[1]["parts"] if "functionCall" in p]
+        assert len(fc_foreign) == 2
+        # Invariant: Fully unsigned foreign group receives bypass on both calls!
+        assert fc_foreign[0]["thoughtSignature"] == "skip_thought_signature_validator"
+        assert fc_foreign[1]["thoughtSignature"] == "skip_thought_signature_validator"
 
 
 # ==============================================================================
@@ -471,6 +616,10 @@ class TestPersistedStateCorruption:
         assert not any(isinstance(v, list) for v in resumed.effort_by_base.values())
         # Invariant: Re-resolved to valid default (high)
         assert resumed.reasoning_config == {"enabled": True, "effort": "high"}
+
+        # Invariant: DB read immutability -- reading malformed row does NOT rewrite DB!
+        row_after = db.get_session(sid)
+        assert row_after["model_config"] == row["model_config"]
 
         if hasattr(db, "close"):
             db.close()

@@ -1999,6 +1999,8 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "_credential_pool", "_credential_pool_entry_id",
     "_usage_anchor", "_turn_base_usage_anchor",
     "reasoning_config",
+    "_use_prompt_caching", "_use_native_cache_layout", "_cached_system_prompt",
+    "_custom_providers",
 )
 _MISSING = object()
 
@@ -2016,6 +2018,16 @@ def _snapshot_switch_state(agent) -> Dict[str, Any]:
         snapshot["_turn_base_usage_anchor"] = copy.deepcopy(snapshot["_turn_base_usage_anchor"])
     if hasattr(agent, "effort_by_base") and isinstance(agent.effort_by_base, dict):
         snapshot["effort_by_base"] = copy.deepcopy(agent.effort_by_base)
+    if hasattr(agent, "context_compressor") and agent.context_compressor:
+        cc = agent.context_compressor
+        snapshot["_compressor_state"] = {
+            "model": getattr(cc, "model", None),
+            "context_length": getattr(cc, "context_length", None),
+            "base_url": getattr(cc, "base_url", None),
+            "api_key": getattr(cc, "api_key", None),
+            "provider": getattr(cc, "provider", None),
+            "api_mode": getattr(cc, "api_mode", ""),
+        }
     return snapshot
 
 
@@ -2032,6 +2044,11 @@ def _restore_switch_snapshot(agent, snapshot: Dict[str, Any]) -> None:
         with contextlib.suppress(Exception):
             from agent.usage_anchor import persist_usage_anchor
             persist_usage_anchor(agent, snapshot["_usage_anchor"])
+    if "_compressor_state" in snapshot and snapshot["_compressor_state"] is not _MISSING:
+        cc_state = snapshot["_compressor_state"]
+        if hasattr(agent, "context_compressor") and agent.context_compressor and hasattr(agent.context_compressor, "update_model"):
+            with contextlib.suppress(Exception):
+                agent.context_compressor.update_model(**cc_state)
 
 
 def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm):
@@ -2262,8 +2279,11 @@ def _update_switch_compressor(agent, custom_providers, effective_context_length,
         raise
     # Outside the rollback guard: a probe hiccup must not undo a good switch. Eager, so the aux
     # clamp lands before the first compaction on the new window, not after it (#114707).
-    from agent.conversation_compression import revalidate_compression_feasibility
-    revalidate_compression_feasibility(agent)
+    try:
+        from agent.conversation_compression import revalidate_compression_feasibility
+        revalidate_compression_feasibility(agent)
+    except Exception as exc:
+        logger.debug("revalidate_compression_feasibility probe failed during switch: %s", exc)
 
 
 def _build_primary_runtime_snapshot(agent, api_mode) -> Dict[str, Any]:
