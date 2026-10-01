@@ -4,21 +4,23 @@
 Certifies that production Hermes correctly executes:
 1. Dynamic model & effort routing (gemini-3.8-flash -> gemini-3.8-flash-tiered, thinkingLevel: low).
 2. Static model routing (gemini-3.6-flash -> gemini-3.6-flash-medium).
-3. In-memory per-base effort retention across model switches.
-4. Partner route excursion & restoration (claude-sonnet-4-6).
-5. Live Google thought-signature acquisition & verbatim tool replay.
-6. Empirical signed native group provenance (first sibling signed, siblings unsigned).
-7. SQLite persistence closure (session DB close, reopen, and replay).
-8. Cold session resume from persisted database row via production resume reader.
-9. Foreign unsigned tool trace bypass projection and live acceptance.
-10. Isolated global reasoning persistence and reload.
-11. Once-turn lifecycle restoration via production _TurnRun / _finish_turn.
-12. Zero I/O rejection of invalid configurations with spied side-effect seams.
-13. Provider route resolution sanity across numbered accounts.
+3. Static high tier replacement routing (gemini-3.1-pro high -> gemini-pro-agent).
+4. In-memory per-base effort retention across model switches.
+5. True partner route excursion & restoration (claude-sonnet-4-6).
+6. Live Google thought-signature acquisition & verbatim tool replay.
+7. Empirical signed native group provenance (first sibling signed, siblings unsigned).
+8. SQLite persistence closure (session DB close, reopen, and conversation reader replay).
+9. Cold session resume from persisted database row via production resume reader.
+10. Foreign unsigned tool trace bypass projection and live acceptance.
+11. End-to-end /model --global switch with isolated config persistence and reload.
+12. Once-turn lifecycle restoration via production _TurnRun / _finish_turn.
+13. Zero I/O rejection of invalid configurations with spied side-effect seams.
+14. Provider route resolution sanity across numbered accounts.
 
 Safety contracts:
 - Requires explicit --live flag to avoid accidental external network requests.
-- Real operator credentials and configs are never mutated; uses isolated temporary HERMES_HOME.
+- Dynamic home anchoring: real_hermes_home = Path(get_hermes_home()).
+- Unconditional pre/post hash comparisons ensuring zero operator state mutation.
 - Secret sanitization on all output (tokens, signatures, keys, and local paths redacted).
 """
 
@@ -52,7 +54,7 @@ from agent.gemini_native_adapter import _build_gemini_contents
 from agent.native_replay import find_native_assistant_detail
 from agent.reasoning_selection import resolve_effective_reasoning_effort
 from hermes_cli.auth import get_gemini_oauth_auth_status
-from hermes_cli.config import load_config, save_config
+from hermes_cli.config import load_config
 from hermes_constants import (
     get_hermes_home,
     reset_hermes_home_override,
@@ -82,6 +84,7 @@ def sanitize_secrets(text: Any) -> str:
         text = str(text)
     # Redact Google thought signatures
     text = re.sub(r'EmQKY[A-Za-z0-9_\-]+', '[REDACTED_THOUGHT_SIGNATURE]', text)
+    text = re.sub(r'EvUCC[A-Za-z0-9_\-]+', '[REDACTED_THOUGHT_SIGNATURE]', text)
     # Redact OAuth access tokens
     text = re.sub(r'ya29\.[A-Za-z0-9_\-]+', '[REDACTED_OAUTH_TOKEN]', text)
     # Redact Google API keys
@@ -180,7 +183,10 @@ def run_certification(*, live: bool, as_json: bool) -> int:
         print("Notice: --live flag is required to run live Cloud Code certification.", file=sys.stderr)
         return 1
 
-    real_hermes_home = Path.home() / ".hermes"
+    # 1. Dynamic Home Anchor: Resolve currently active Hermes home before installing override
+    real_hermes_home = Path(get_hermes_home())
+    orig_env_home = os.environ.get("HERMES_HOME")
+
     real_config_path = real_hermes_home / "config.yaml"
     real_auth_path = real_hermes_home / "auth.json"
 
@@ -207,7 +213,6 @@ def run_certification(*, live: bool, as_json: bool) -> int:
         yaml.safe_dump(initial_temp_config, f)
 
     override_token = set_hermes_home_override(temp_hermes_home)
-    orig_env_home = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = str(temp_hermes_home)
 
     try:
@@ -245,7 +250,7 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                 report.record_fail("dynamic_3_8_low", msg)
 
         # ------------------------------------------------------------------
-        # 2. Static Routing Live Gate
+        # 2. Static Routing Live Gate (gemini-3.6-flash medium)
         # ------------------------------------------------------------------
         try:
             resolved_static = resolve_model_selection("gemini-3.6-flash", effort="medium")
@@ -268,7 +273,32 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                 report.record_fail("static_3_6_medium", msg)
 
         # ------------------------------------------------------------------
-        # 3. Same-Process Per-Base Effort Memory
+        # 3. Static High Tier Replacement Gate (gemini-3.1-pro high -> gemini-pro-agent)
+        # ------------------------------------------------------------------
+        try:
+            resolved_pro = resolve_model_selection("gemini-3.1-pro", effort="high")
+            assert resolved_pro.wire_model == "gemini-pro-agent", f"Wrong wire model: {resolved_pro.wire_model}"
+            assert resolved_pro.thinking_config is None, "Static model must not have thinkingConfig"
+
+            resp_pro = client.chat.completions.create(
+                model="gemini-3.1-pro",
+                messages=[{"role": "user", "content": "Respond with 'pro_ok'"}],
+                extra_body={"effort": "high"},
+                max_tokens=25,
+            )
+            assert resp_pro.choices and resp_pro.choices[0].message
+            rd_pro = getattr(resp_pro.choices[0].message, "reasoning_details", None)
+            assert find_native_assistant_detail(rd_pro), "Native carrier missing on gemini-pro-agent response"
+            report.record_pass("static_3_1_pro_high", wire_model="gemini-pro-agent", signature_present=True, status=200)
+        except Exception as exc:
+            kind, msg = classify_api_exception(exc)
+            if kind == "UPSTREAM_UNAVAILABLE":
+                report.record_upstream_unavailable("static_3_1_pro_high", msg)
+            else:
+                report.record_fail("static_3_1_pro_high", msg)
+
+        # ------------------------------------------------------------------
+        # 4. Same-Process Per-Base Effort Memory
         # ------------------------------------------------------------------
         try:
             def fake_build_client_local(ag, *a, **k):
@@ -313,16 +343,23 @@ def run_certification(*, live: bool, as_json: bool) -> int:
             report.record_fail("switch_memory", str(exc))
 
         # ------------------------------------------------------------------
-        # 4. Partner Route Excursion & Restoration
+        # 5. True Partner Route Excursion & Restoration (claude-sonnet-4-6)
         # ------------------------------------------------------------------
         try:
             assert selectable_reasoning_efforts("gemini-oauth", "claude-sonnet-4-6") == ()
-            e_partner = resolve_effective_reasoning_effort(
-                config={}, provider="gemini-oauth", model="claude-sonnet-4-6", effort_by_base={"gemini-3.8-flash": "low"}
-            )
-            assert e_partner is None, f"Partner model must have None effective reasoning effort, got {e_partner}"
 
-            # Attempt live completion request on partner route
+            # 1. Switch to partner model through live agent switch seam
+            with patch("hermes_cli.model_switch.switch_model", return_value=SimpleNamespace(
+                     success=True, new_model="claude-sonnet-4-6", target_provider="gemini-oauth",
+                     base_url="", api_key=token, api_mode="chat_completions", model_info=None, warning_message=None)),                  patch.object(server, "_restart_slash_worker"),                  patch.object(server, "_persist_live_session_runtime"),                  patch.object(server, "_persist_live_session_system_prompt"),                  patch.object(server, "_append_model_switch_marker"),                  patch.object(server, "_emit_session_info"):
+
+                server._apply_model_switch("s_mem", session, "/model claude-sonnet-4-6 --tui-session")
+                assert agent.model == "claude-sonnet-4-6"
+                assert agent.reasoning_config is None
+                assert agent.effort_by_base.get("gemini-3.8-flash") == "low"
+
+            # 2. Live partner request
+            partner_status = None
             try:
                 resp_partner = client.chat.completions.create(
                     model="claude-sonnet-4-6",
@@ -330,7 +367,7 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                     max_tokens=15,
                 )
                 assert resp_partner.choices and resp_partner.choices[0].message
-                report.record_pass("partner_excursion", partner="claude-sonnet-4-6", status=200)
+                partner_status = 200
             except Exception as p_exc:
                 p_kind, p_msg = classify_api_exception(p_exc)
                 if p_kind == "UPSTREAM_UNAVAILABLE":
@@ -338,16 +375,23 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                 else:
                     report.record_fail("partner_excursion", p_msg)
 
-            # Return to gemini-3.8-flash
-            e_restored = resolve_effective_reasoning_effort(
-                config={}, provider="gemini-oauth", model="gemini-3.8-flash", effort_by_base={"gemini-3.8-flash": "low"}
-            )
-            assert e_restored == "low", f"Failed to restore low effort after partner excursion: {e_restored}"
+            # 3. Switch back to gemini-3.8-flash
+            with patch("hermes_cli.model_switch.switch_model", return_value=SimpleNamespace(
+                     success=True, new_model="gemini-3.8-flash", target_provider="gemini-oauth",
+                     base_url="", api_key=token, api_mode="chat_completions", model_info=None, warning_message=None)),                  patch.object(server, "_restart_slash_worker"),                  patch.object(server, "_persist_live_session_runtime"),                  patch.object(server, "_persist_live_session_system_prompt"),                  patch.object(server, "_append_model_switch_marker"),                  patch.object(server, "_emit_session_info"):
+
+                server._apply_model_switch("s_mem", session, "/model gemini-3.8-flash --tui-session")
+                assert agent.model == "gemini-3.8-flash"
+                assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+                assert agent.effort_by_base.get("gemini-3.8-flash") == "low"
+
+            if partner_status == 200:
+                report.record_pass("partner_excursion", partner="claude-sonnet-4-6", status=200)
         except Exception as exc:
             report.record_fail("partner_excursion", str(exc))
 
         # ------------------------------------------------------------------
-        # 5. Live Signed Tool Replay & 6. Group Provenance
+        # 6. Live Signed Tool Replay & 7. Group Provenance
         # ------------------------------------------------------------------
         captured_tc_list: List[Any] = []
         captured_carrier: Any = None
@@ -368,7 +412,6 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                 }
             ]
 
-            # Request 2 parallel tool calls to observe and verify group provenance topology
             resp_tool = client.chat.completions.create(
                 model="gemini-3.8-flash",
                 messages=[
@@ -420,7 +463,7 @@ def run_certification(*, live: bool, as_json: bool) -> int:
             assert resp_followup.choices and resp_followup.choices[0].message
             report.record_pass("signed_tool_replay", signature_present=True, native_carrier_present=True, replay_status=200)
 
-            # Gate 6: Signed Native Group Provenance (empirical verification)
+            # Gate 7: Signed Native Group Provenance (empirical verification)
             if len(captured_tc_list) > 1:
                 assert orig_sig is not None, "First sibling missing signature"
                 for tc_sibling in captured_tc_list[1:]:
@@ -447,7 +490,7 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                 report.record_fail("signed_native_group_provenance", msg)
 
         # ------------------------------------------------------------------
-        # 7. SQLite Replay with DB Close / Reopen & Exact Carrier Mirrors
+        # 8. SQLite Replay with DB Close / Reopen & Conversation Reader
         # ------------------------------------------------------------------
         try:
             db_path = temp_dir / "sqlite_replay.db"
@@ -471,7 +514,8 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                     session_id=sid,
                     role="tool",
                     content="echo_receipt",
-                    tool_calls=[{"id": call_id, "name": fn_name}],
+                    tool_call_id=call_id,
+                    tool_name=fn_name,
                 )
 
             # Close DB connection
@@ -479,8 +523,10 @@ def run_certification(*, live: bool, as_json: bool) -> int:
 
             # Reopen DB connection cleanly
             db_reopened = SessionDB(db_path)
-            reloaded_msgs = db_reopened.get_messages(sid)
-            reloaded_assistant = reloaded_msgs[0]
+
+            # Use normal conversation reader seam for live replay
+            reloaded_conversation = db_reopened.get_messages_as_conversation(sid, repair_alternation=True)
+            reloaded_assistant = next(m for m in reloaded_conversation if m["role"] == "assistant")
 
             # Assert exact byte-for-byte carrier and signature mirrors
             assert reloaded_assistant["tool_calls"][0]["extra_content"]["google"]["thought_signature"] == orig_sig
@@ -489,7 +535,7 @@ def run_certification(*, live: bool, as_json: bool) -> int:
 
             replay_payload = [
                 {"role": "user", "content": "Run certification echo"},
-                *reloaded_msgs,
+                *reloaded_conversation,
             ]
             resp_db = client.chat.completions.create(
                 model="gemini-3.8-flash",
@@ -508,7 +554,7 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                 report.record_fail("sqlite_signed_replay", msg)
 
         # ------------------------------------------------------------------
-        # 8. Cold Session Resume via Production Overrides Reader
+        # 9. Cold Session Resume via Production Overrides Reader
         # ------------------------------------------------------------------
         try:
             db_cold_path = temp_dir / "cold_resume.db"
@@ -558,7 +604,7 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                 report.record_fail("cold_resume", msg)
 
         # ------------------------------------------------------------------
-        # 9. Foreign Unsigned Tool Trace Bypass Projection & Upstream Acceptance
+        # 10. Foreign Unsigned Tool Trace Bypass Projection & Upstream Acceptance
         # ------------------------------------------------------------------
         try:
             foreign_history = [
@@ -610,13 +656,16 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                 report.record_fail("foreign_unsigned_bypass", msg)
 
         # ------------------------------------------------------------------
-        # 10. Isolated Global Reasoning Persistence and Reload
+        # 11. End-to-End /model --global Switch with Isolated Config Persistence
         # ------------------------------------------------------------------
         try:
-            # Write global override in isolated home using production config persistence
-            cfg_to_save = load_config()
-            cfg_to_save.setdefault("agent", {}).setdefault("reasoning_overrides", {})["gemini-3.8-flash"] = "low"
-            save_config(cfg_to_save, merge_existing=True)
+            session_global = {"agent": agent, "session_key": "s_global"}
+            with patch("hermes_cli.model_switch.switch_model", return_value=SimpleNamespace(
+                     success=True, new_model="gemini-3.8-flash", target_provider="gemini-oauth",
+                     base_url="", api_key=token, api_mode="chat_completions", model_info=None, warning_message=None)),                  patch.object(server, "_restart_slash_worker"),                  patch.object(server, "_persist_live_session_runtime"),                  patch.object(server, "_persist_live_session_system_prompt"),                  patch.object(server, "_append_model_switch_marker"),                  patch.object(server, "_emit_session_info"):
+
+                # Execute end-to-end /model --global switch against isolated home
+                server._apply_model_switch("s_global", session_global, "/model gemini-3.8-flash --reasoning low --global")
 
             # Reload config through production config reader
             reloaded_cfg = load_config()
@@ -625,15 +674,12 @@ def run_certification(*, live: bool, as_json: bool) -> int:
             # Verify effective effort resolver reflects persisted override
             eff = resolve_effective_reasoning_effort(config=reloaded_cfg, provider="gemini-oauth", model="gemini-3.8-flash")
             assert eff == "low"
-
-            # Assert operator's real config was never touched
-            assert _hash_file(real_config_path) == initial_real_config_hash
             report.record_pass("isolated_global", reasoning_overrides_keyed=True)
         except Exception as exc:
             report.record_fail("isolated_global", str(exc))
 
         # ------------------------------------------------------------------
-        # 11. Once Turn Lifecycle Restoration
+        # 12. Once Turn Lifecycle Restoration
         # ------------------------------------------------------------------
         try:
             def fake_build_once(ag, *a, **k):
@@ -664,14 +710,14 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                 assert agent_once.effort_by_base == {"gemini-3.8-flash": "high"}
                 assert "one_turn_model_restore" in session_once
 
-                st = server._TurnRun(
+                st_run = server._TurnRun(
                     agent=session_once["agent"],
                     one_turn_restore=session_once.pop("one_turn_model_restore", None),
                     terminal_callback=None,
                     receipt_committed=True,
                 )
 
-                server._finish_turn("s_once", session_once, st)
+                server._finish_turn("s_once", session_once, st_run)
 
                 assert agent_once.model == "gemini-3.8-flash"
                 assert agent_once.reasoning_config == {"enabled": True, "effort": "high"}
@@ -682,7 +728,7 @@ def run_certification(*, live: bool, as_json: bool) -> int:
             report.record_fail("once_restore", str(exc))
 
         # ------------------------------------------------------------------
-        # 12. Zero I/O Rejection with Spied Side-Effect Seams
+        # 13. Zero I/O Rejection with Spied Side-Effect Seams
         # ------------------------------------------------------------------
         try:
             agent_zero = MagicMock()
@@ -690,16 +736,18 @@ def run_certification(*, live: bool, as_json: bool) -> int:
             agent_zero.provider = "gemini-oauth"
             agent_zero.reasoning_config = {"enabled": True, "effort": "low"}
             agent_zero.effort_by_base = {"gemini-3.8-flash": "low"}
+            agent_zero.switch_model = MagicMock()
             session_zero = {"agent": agent_zero, "session_key": "s_zero", "model_override": None}
 
             bad_switches = [
                 "/model gemini-3.8-flash --reasoning max --tui-session",
                 "/model gemini-3.1-pro --reasoning medium --tui-session",
                 "/model claude-sonnet-4-6 --reasoning high --tui-session",
+                "/model gemini-3.8-flash-high --reasoning medium --tui-session",
             ]
 
             for bad_cmd in bad_switches:
-                with patch("httpx.Client.send") as mock_http,                      patch.object(server, "_write_config_key") as mock_cfg,                      patch.object(server, "_persist_live_session_runtime") as mock_persist,                      patch("agent.agent_runtime_helpers.switch_model") as mock_agent_switch:
+                with patch("httpx.Client.send") as mock_http,                      patch.object(server, "_write_config_key") as mock_cfg,                      patch.object(server, "_persist_live_session_runtime") as mock_persist,                      patch("hermes_cli.model_switch.switch_model") as mock_switch_fn:
 
                     caught = False
                     try:
@@ -711,26 +759,28 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                     assert mock_http.call_count == 0, f"HTTP calls occurred for {bad_cmd}"
                     assert mock_cfg.call_count == 0, f"Config write occurred for {bad_cmd}"
                     assert mock_persist.call_count == 0, f"Session persistence occurred for {bad_cmd}"
-                    assert mock_agent_switch.call_count == 0, f"Agent switch invoked for {bad_cmd}"
+                    assert mock_switch_fn.call_count == 0, f"switch_model invoked for {bad_cmd}"
+                    assert agent_zero.switch_model.call_count == 0, f"agent.switch_model invoked for {bad_cmd}"
 
             report.record_pass("invalid_zero_io", zero_io_verified=True)
         except Exception as exc:
             report.record_fail("invalid_zero_io", str(exc))
 
         # ------------------------------------------------------------------
-        # 13. Provider Route Resolution Sanity Across Numbered Accounts
+        # 14. Provider Route Resolution Sanity Across Numbered Accounts
         # ------------------------------------------------------------------
         try:
             routes_verified: List[str] = []
             for acc in [1, 2, 3, 4, 5]:
-                prov_name = "gemini-oauth" if acc == 1 else f"gemini-{acc}"
-                st_acc = get_gemini_oauth_auth_status(acc)
-                if st_acc.get("logged_in") or st_acc.get("api_key"):
-                    res = resolve_model_selection("gemini-3.8-flash", effort="low")
-                    assert res.wire_model == "gemini-3.8-flash-tiered"
-                    routes_verified.append(prov_name)
+                for prov_name in ([f"gemini-{acc}"] if acc > 1 else ["gemini-oauth", "gemini-1"]):
+                    st_acc = get_gemini_oauth_auth_status(acc)
+                    if st_acc.get("logged_in") or st_acc.get("api_key"):
+                        res = resolve_model_selection("gemini-3.8-flash", effort="low")
+                        assert res.wire_model == "gemini-3.8-flash-tiered"
+                        routes_verified.append(prov_name)
 
             assert "gemini-oauth" in routes_verified
+            assert "gemini-1" in routes_verified
             report.record_pass("provider_route_sanity", verified_routes=routes_verified, route_resolved=True)
         except Exception as exc:
             report.record_fail("provider_route_sanity", str(exc))
@@ -746,10 +796,12 @@ def run_certification(*, live: bool, as_json: bool) -> int:
         post_config_hash = _hash_file(real_config_path)
         post_auth_hash = _hash_file(real_auth_path)
 
-        if initial_real_config_hash and post_config_hash != initial_real_config_hash:
-            report.record_fail("safety_check", "CRITICAL: Real operator config.yaml was mutated during certification!")
-        if initial_real_auth_hash and post_auth_hash != initial_real_auth_hash:
-            report.record_fail("safety_check", "CRITICAL: Real operator auth.json was mutated during certification!")
+        assert post_config_hash == initial_real_config_hash, (
+            f"CRITICAL: Real operator config.yaml was mutated ({initial_real_config_hash} -> {post_config_hash})"
+        )
+        assert post_auth_hash == initial_real_auth_hash, (
+            f"CRITICAL: Real operator auth.json was mutated ({initial_real_auth_hash} -> {post_auth_hash})"
+        )
 
         shutil.rmtree(temp_dir, ignore_errors=True)
 

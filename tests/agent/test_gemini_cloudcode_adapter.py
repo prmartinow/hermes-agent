@@ -88,7 +88,7 @@ def test_cloudcode_client_static_tier_36_routing(effort, expected_wire):
     "effort, expected_wire",
     [
         ("low", "gemini-3.1-pro-low"),
-        ("high", "gemini-3.1-pro-high"),
+        ("high", "gemini-pro-agent"),
     ],
 )
 def test_cloudcode_client_static_tier_31_pro_routing(effort, expected_wire):

@@ -166,3 +166,33 @@ def test_clean_exit_on_missing_auth():
     with patch("scripts.verify_gemini_cloudcode_integration.get_gemini_oauth_auth_status", return_value={"logged_in": False}):
         code = run_certification(live=True, as_json=True)
         assert code == 2
+
+
+def test_harness_cleanup_and_isolation_end_to_end():
+    """Calling run_certification() with an injected mid-run crash must execute finally cleanup."""
+    from scripts.verify_gemini_cloudcode_integration import _hash_file
+    from hermes_constants import get_hermes_home_override
+
+    orig_env = os.environ.get("HERMES_HOME")
+    real_home = Path(get_hermes_home())
+    real_cfg = real_home / "config.yaml"
+    real_auth = real_home / "auth.json"
+    init_cfg_hash = _hash_file(real_cfg)
+    init_auth_hash = _hash_file(real_auth)
+
+    with patch("scripts.verify_gemini_cloudcode_integration.GeminiCloudCodeClient") as mock_client_cls, \
+         patch("scripts.verify_gemini_cloudcode_integration.get_gemini_oauth_auth_status", return_value={"logged_in": True, "api_key": "fake_token"}):
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = RuntimeError("Injected mid-run crash")
+        mock_client_cls.return_value = mock_client
+
+        code = run_certification(live=True, as_json=True)
+        assert code == 1
+
+    # Assert home override reset
+    assert get_hermes_home_override() is None
+    # Assert HERMES_HOME env restored
+    assert os.environ.get("HERMES_HOME") == orig_env
+    # Assert real config and auth unchanged
+    assert _hash_file(real_cfg) == init_cfg_hash
+    assert _hash_file(real_auth) == init_auth_hash
