@@ -2510,11 +2510,27 @@ def _get_account_aliases_map() -> dict[str, str]:
 
     func_id = id(load_config)
     now = time.time()
-    if _CONFIG_ALIASES_CACHE[1] == func_id and (now - _CONFIG_ALIASES_CACHE[0] < 5.0):
-        return _CONFIG_ALIASES_CACHE[2]
-    with _ALIASES_CACHE_LOCK:
-        if _CONFIG_ALIASES_CACHE[1] == func_id and (now - _CONFIG_ALIASES_CACHE[0] < 5.0):
+
+    def _is_cache_valid() -> bool:
+        if len(_CONFIG_ALIASES_CACHE) == 3:
+            return _CONFIG_ALIASES_CACHE[1] == func_id and (now - _CONFIG_ALIASES_CACHE[0] < 5.0)
+        elif len(_CONFIG_ALIASES_CACHE) == 2:
+            return (now - _CONFIG_ALIASES_CACHE[0] < 5.0) and bool(_CONFIG_ALIASES_CACHE[1])
+        return False
+
+    def _get_cached_dict() -> dict[str, str]:
+        if len(_CONFIG_ALIASES_CACHE) == 3:
             return _CONFIG_ALIASES_CACHE[2]
+        elif len(_CONFIG_ALIASES_CACHE) == 2 and isinstance(_CONFIG_ALIASES_CACHE[1], dict):
+            return _CONFIG_ALIASES_CACHE[1]
+        return {}
+
+    if _is_cache_valid():
+        return _get_cached_dict()
+
+    with _ALIASES_CACHE_LOCK:
+        if _is_cache_valid():
+            return _get_cached_dict()
         try:
             cfg = load_config()
             raw_aliases = (cfg.get("display") or {}).get("account_aliases") or {}
@@ -2527,7 +2543,7 @@ def _get_account_aliases_map() -> dict[str, str]:
             _CONFIG_ALIASES_CACHE = (now, func_id, parsed)
             return parsed
         except Exception:
-            return _CONFIG_ALIASES_CACHE[2]
+            return _get_cached_dict()
 
 
 def get_account_alias(email_or_account: Any, aliases: dict | None = None) -> str:
