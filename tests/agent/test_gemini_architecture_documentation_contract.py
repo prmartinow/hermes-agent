@@ -139,11 +139,17 @@ def test_wire_models_and_outbound_thinking_config():
             # Static tiered models (3.6, 3.5, 3.1-pro)
             for effort in cap.efforts:
                 resolved = resolve_model_selection(model, effort=effort)
-                wire_template = parsed["wire_model"].replace("<level>", effort)
-                assert resolved.wire_model == wire_template, (
-                    f"Documentation drift on static wire model for {model} (effort {effort}): "
-                    f"Markdown template {wire_template} != resolved {resolved.wire_model}"
-                )
+                if "<level>" in parsed["wire_model"]:
+                    wire_template = parsed["wire_model"].replace("<level>", effort)
+                    assert resolved.wire_model == wire_template, (
+                        f"Documentation drift on static wire model for {model} (effort {effort}): "
+                        f"Markdown template {wire_template} != resolved {resolved.wire_model}"
+                    )
+                else:
+                    assert resolved.wire_model in parsed["wire_model"], (
+                        f"Documentation drift on static wire model for {model} (effort {effort}): "
+                        f"Resolved wire model {resolved.wire_model} not in Markdown text {parsed['wire_model']}"
+                    )
         else:
             # Zero-effort models (flash-lite, claude, gpt-oss)
             resolved = resolve_model_selection(model)

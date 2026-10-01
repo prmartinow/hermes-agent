@@ -31,13 +31,12 @@ Hermes strictly decouples **inbound logical model identities** (used by users, c
 | `gemini-3.7-flash` | `low`, `medium`, `high` | `high` | `gemini-3.7-flash-tiered` | `thinkingConfig: { thinkingLevel: "<LEVEL>", includeThoughts: true }` |
 | `gemini-3.6-flash` | `low`, `medium`, `high` | `high` | `gemini-3.6-flash-<level>` | Static wire slug (e.g. `gemini-3.6-flash-high`) |
 | `gemini-3.5-flash` | `low`, `medium`, `high` | `high` | `gemini-3.5-flash-<level>` | Static wire slug (e.g. `gemini-3.5-flash-high`) |
-| `gemini-3.1-pro` | `low`, `high` | `high` | `gemini-3.1-pro-<level>` | Static wire slug (e.g. `gemini-3.1-pro-high`) |
+| `gemini-3.1-pro` | `low`, `high` | `high` | `gemini-pro-agent` (`high`) / `gemini-3.1-pro-low` (`low`) | Static wire models (`gemini-pro-agent` for high, `gemini-3.1-pro-low` for low) |
 | `gemini-3.1-flash-lite` | *None* (`[]`) | — | `gemini-3.1-flash-lite` | No thinking configuration |
 | `claude-sonnet-4-6` | *None* (`[]`) | — | `claude-sonnet-4-6` | Partner route (no Google thinking configuration) |
 | `claude-opus-4-6-thinking` | *None* (`[]`) | — | `claude-opus-4-6-thinking` | Partner route (no Google thinking configuration) |
 | `gpt-oss-120b-medium` | *None* (`[]`) | — | `gpt-oss-120b-medium` | Partner route (no Google thinking configuration) |
 | `gemini-3-flash-agent` | *None* (`[]`) | — | `gemini-3-flash-agent` | Specialized route (no Google thinking configuration) |
-| `gemini-pro-agent` | *None* (`[]`) | — | `gemini-pro-agent` | Specialized route (no Google thinking configuration) |
 
 ### Canonical Cloud Code Routes:
 The Cloud Code PA architectural contract applies across:
@@ -251,7 +250,9 @@ When resuming an existing session (via `/resume` or Gateway session startup), `t
 ### Exact Rebuild Cases:
 1. **Valid Enabled Effort**: Stored `{"enabled": True, "effort": "low"}` on `gemini-3.8-flash` seeds `agent.effort_by_base = {"gemini-3.8-flash": "low"}`.
 2. **Valid Disabled**: Stored `{"enabled": False}` seeds `agent.effort_by_base = {}` with `reasoning_config = {"enabled": False}`.
-3. **Stale / Unsupported Effort**: Stored effort unsupported on the active model (e.g. `medium` on `3.1-pro`) seeds `agent.effort_by_base = {}` and re-resolves via normal precedence (override $ightarrow$ global $ightarrow$ default).
+3. **Stale / Unsupported Effort**: Stored effort unsupported on the active model (e.g. `medium` on `3.1-pro`) seeds `agent.effort_by_base = {}` and re-resolves via normal precedence (override $
+ightarrow$ global $
+ightarrow$ default).
 4. **Malformed `reasoning_config`**: Corrupt database JSON fails closed, seeds `agent.effort_by_base = {}`, and falls back to normal resolver.
 5. **Known No-Effort Model**: Resuming on a no-effort model (e.g. Flash-Lite, Claude) seeds `agent.effort_by_base = {}`.
 
@@ -309,9 +310,9 @@ Hermes guarantees complete semantic parity across all interaction surfaces:
 ## 14. Empirical Upstream Caveats
 
 These behaviors reflect verified Google upstream API properties, distinct from Hermes runtime bugs:
-1. **`gemini-3.1-pro-high` Upstream Inference 400**:
-   - `gemini-3.1-pro-high` is catalog-advertised by Cloud Code PA discovery, but upstream inference requests currently return HTTP 400 (`MODEL_PLACEHOLDER_M37` / "New").
-   - Hermes permits the model in discovery and routing envelopes per upstream specification, but surfaces Google's upstream error cleanly if selected.
+1. **`gemini-3.1-pro-high` Deprecation and `gemini-pro-agent` Migration**:
+   - `gemini-3.1-pro-high` was catalog-advertised by Cloud Code PA discovery under placeholder `MODEL_PLACEHOLDER_M37` before being officially deprecated in favor of `gemini-pro-agent` (`MODEL_PLACEHOLDER_M16`).
+   - Hermes maps `gemini-3.1-pro / high` directly to wire model `gemini-pro-agent`, and accepts `gemini-pro-agent` and legacy `gemini-3.1-pro-high` as aliases resolving to canonical base `gemini-3.1-pro` with effort `high`.
 2. **Partial Parallel Call Signatures**:
    - When Gemini generates parallel function calls, Google's wire response only signs the first function call in the group. Sibling function calls remain unsigned.
    - Hermes preserves this topology on replay. Sibling calls are left unsigned, and bypass sentinels are not injected into signed Gemini call groups.

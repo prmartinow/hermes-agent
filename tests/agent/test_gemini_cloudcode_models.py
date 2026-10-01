@@ -69,7 +69,7 @@ def test_parse_model_slug_preserves_custom_vendor_prefixes():
         ("gemini-3.6-flash-high", "gemini-3.6-flash", "high"),
         ("gemini-3.6-flash-medium", "gemini-3.6-flash", "medium"),
         ("gemini-3.6-flash-low", "gemini-3.6-flash", "low"),
-        ("gemini-3.1-pro-high", "gemini-3.1-pro", "high"),
+        ("gemini-pro-agent", "gemini-3.1-pro", "high"),
         ("gemini-3.1-pro-low", "gemini-3.1-pro", "low"),
     ],
 )
@@ -163,7 +163,7 @@ def test_static_tier_gemini_36_resolution(effort, expected_wire):
     "effort, expected_wire",
     [
         ("low", "gemini-3.1-pro-low"),
-        ("high", "gemini-3.1-pro-high"),
+        ("high", "gemini-pro-agent"),
     ],
 )
 def test_static_tier_gemini_31_pro_resolution(effort, expected_wire):
@@ -318,7 +318,7 @@ def test_normalize_discovered_model_dynamic_tiered():
         ("gemini-3.6-flash-high", "gemini-3.6-flash", "high"),
         ("gemini-3.6-flash-medium", "gemini-3.6-flash", "medium"),
         ("gemini-3.6-flash-low", "gemini-3.6-flash", "low"),
-        ("gemini-3.1-pro-high", "gemini-3.1-pro", "high"),
+        ("gemini-pro-agent", "gemini-3.1-pro", "high"),
         ("gemini-3.1-pro-low", "gemini-3.1-pro", "low"),
     ],
 )
@@ -434,6 +434,7 @@ def test_static_wire_model_routes_uniqueness():
             if route.wire_model in seen:
                 assert seen[route.wire_model] == (base, effort), f"Collision on static wire model {route.wire_model}"
             seen[route.wire_model] = (base, effort)
+    seen["gemini-3.1-pro-high"] = ("gemini-3.1-pro", "high")
     assert seen == _STATIC_WIRE_MODEL_ROUTES
 # ============================================================================
 # K. Action Item 2, Milestone 3: Thought Circulation Capability Matrix
@@ -458,7 +459,7 @@ def test_thought_circulation_support_verified_models():
     assert thought_circulation_support("gemini-3.5-flash") is None
     assert thought_circulation_support("gemini-3.1-flash-lite") is None
     assert thought_circulation_support("gemini-3-flash-agent") is None
-    assert thought_circulation_support("gemini-pro-agent") is None
+    assert thought_circulation_support("gemini-pro-agent") is True
     assert thought_circulation_support("gemini-4.2-flash") is None
     assert thought_circulation_support("unknown-model-xyz") is None
 
@@ -598,3 +599,32 @@ def test_resolve_per_model_reasoning_effort_alias_canonicalization():
 
     # Unrelated models remain unmatched
     assert resolve_per_model_reasoning_effort("gpt-4o", overrides) is None
+
+
+def test_gemini_pro_agent_replacement_adoption():
+    """Verify gemini-pro-agent resolves as the canonical high wire model for gemini-3.1-pro."""
+    r_high = resolve_model_selection("gemini-3.1-pro", "high")
+    assert r_high.wire_model == "gemini-pro-agent"
+
+    r_low = resolve_model_selection("gemini-3.1-pro", "low")
+    assert r_low.wire_model == "gemini-3.1-pro-low"
+
+    # Legacy alias resolves to canonical base and new wire model
+    r_legacy = resolve_model_selection("gemini-3.1-pro-high")
+    assert r_legacy.base_model == "gemini-3.1-pro"
+    assert r_legacy.effort == "high"
+    assert r_legacy.wire_model == "gemini-pro-agent"
+
+    # Direct input resolves to canonical base and wire model
+    r_direct = resolve_model_selection("gemini-pro-agent")
+    assert r_direct.base_model == "gemini-3.1-pro"
+    assert r_direct.effort == "high"
+    assert r_direct.wire_model == "gemini-pro-agent"
+
+    # Discovery normalization
+    norm = normalize_discovered_model("gemini-pro-agent", {"supportsThinking": True, "thinkingBudget": 10001})
+    assert norm.base_model == "gemini-3.1-pro"
+    assert "high" in norm.available_efforts
+
+    # Thought circulation support
+    assert thought_circulation_support("gemini-pro-agent") is True

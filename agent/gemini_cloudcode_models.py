@@ -149,7 +149,7 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
         max_output_tokens=65535,
         routes={
             "low": EffortRoute(wire_model="gemini-3.1-pro-low", emit_thinking_config=False),
-            "high": EffortRoute(wire_model="gemini-3.1-pro-high", emit_thinking_config=False),
+            "high": EffortRoute(wire_model="gemini-pro-agent", emit_thinking_config=False),
         },
     ),
     # Non-thinking Fast / Auxiliary Models
@@ -218,18 +218,6 @@ _MODEL_CAPABILITIES: dict[str, ModelCapability] = {
             "": EffortRoute(wire_model="gemini-3-flash-agent", emit_thinking_config=False),
         },
     ),
-    "gemini-pro-agent": ModelCapability(
-        base_model="gemini-pro-agent",
-        display_name="Gemini Pro Agent",
-        efforts=(),
-        default_effort=None,
-        supports_thinking=False,
-        max_tokens=1048576,
-        max_output_tokens=65536,
-        routes={
-            "": EffortRoute(wire_model="gemini-pro-agent", emit_thinking_config=False),
-        },
-    ),
 }
 
 # Explicit mapping of legacy virtual model identifiers to (base_model, effort)
@@ -264,6 +252,7 @@ LEGACY_MODEL_ALIASES: dict[str, tuple[str, str]] = {
     "gemini-3.1-pro-high": ("gemini-3.1-pro", "high"),
     "gemini-3.1-pro-low": ("gemini-3.1-pro", "low"),
     "gemini-3.1": ("gemini-3.1-pro", "high"),
+    "gemini-pro-agent": ("gemini-3.1-pro", "high"),
 }
 
 # Known provider namespace prefixes to strip matching bare_gemini_model_id behavior
@@ -432,6 +421,8 @@ _STATIC_WIRE_MODEL_ROUTES: dict[str, tuple[str, str]] = {
     for eff, route in cap.routes.items()
     if route.wire_model != base and eff
 }
+# Backward compatibility: deprecated upstream high wire model normalizes to canonical base
+_STATIC_WIRE_MODEL_ROUTES["gemini-3.1-pro-high"] = ("gemini-3.1-pro", "high")
 
 
 @dataclass(frozen=True)

@@ -1841,7 +1841,7 @@ def test_discovery_to_resolver_closure_property():
         "gemini-3.6-flash-medium": {"displayName": "Gemini 3.6 Flash (Medium)", "supportsThinking": True},
         "gemini-3.6-flash-high": {"displayName": "Gemini 3.6 Flash (High)", "supportsThinking": True},
         "gemini-3.1-pro-low": {"displayName": "Gemini 3.1 Pro (Low)", "supportsThinking": True},
-        "gemini-3.1-pro-high": {"displayName": "Gemini 3.1 Pro (High)", "supportsThinking": True},
+        "gemini-pro-agent": {"displayName": "Gemini 3.1 Pro (High)", "supportsThinking": True},
         "gemini-3-flash-agent": {"displayName": "Gemini 3 Flash Agent"},
         "claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6"},
         "claude-opus-4-6-thinking": {"displayName": "Claude Opus 4.6 Thinking"},

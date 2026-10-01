@@ -72,7 +72,6 @@ gemini_oauth = GeminiOAuthProfile(
         "gemini-3.6-flash",
         "gemini-3-flash-agent",
         "gemini-3.5-flash",
-        "gemini-pro-agent",
         "gemini-3.1-pro",
         "claude-sonnet-4-6",
         "claude-opus-4-6-thinking",
