@@ -991,6 +991,8 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     # The pre-expansion name is what the codex_app_server overlay judges: ``openai`` is eligible,
     # the anonymous ``custom`` it expands to is not.
     requested_alias = requested_provider
+    if not preferred_account and requested_alias and re.match(r"^gemini(?:-oauth)?-[1-5]$", requested_alias.strip().lower()):
+        preferred_account = requested_alias.strip().lower()
     requested_provider, explicit_base_url = expand_direct_api_alias(requested_provider, explicit_base_url)
     _raise_if_local_alias_missing_endpoint(requested_provider, explicit_base_url)
     runtime = next(r for r in _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, target_model,

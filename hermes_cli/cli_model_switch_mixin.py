@@ -665,6 +665,7 @@ class CLIModelSwitchMixin:
 
     def _restore_model_runtime_snapshot(self, snapshot: dict | None) -> None:
         """Restore a model runtime captured before a one-turn override."""
+        import copy
         from cli import logger
         if not snapshot:
             return

@@ -2277,7 +2277,17 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                     cand_id = str(cand.id or "").strip().lower()
                     cand_email = str(cand.label or "").strip().lower()
                     cand_alias = str(get_account_alias(cand.label or cand.id) or "").strip().lower()
-                    if target_str in {cand_id, cand_acc, cand_email, cand_alias}:
+                    cand_source = str(cand.source or "").strip().lower()
+                    valid_identities = {
+                        cand_id,
+                        cand_acc,
+                        cand_email,
+                        cand_alias,
+                        cand_source,
+                        f"gemini-{cand_acc}",
+                        f"gemini_account_{cand_acc}",
+                    }
+                    if target_str in valid_identities:
                         return cand
                 return None
 

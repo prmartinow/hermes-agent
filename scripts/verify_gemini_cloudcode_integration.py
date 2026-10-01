@@ -814,6 +814,7 @@ def run_certification(*, live: bool, as_json: bool) -> int:
             from hermes_cli.model_switch import switch_model
 
             routes_verified: List[str] = []
+            affinity_verified: List[str] = []
             for acc in [1, 2, 3, 4, 5]:
                 for prov_name in ([f"gemini-{acc}"] if acc > 1 else ["gemini-oauth", "gemini-1"]):
                     st_acc = get_gemini_oauth_auth_status(acc)
@@ -827,11 +828,31 @@ def run_certification(*, live: bool, as_json: bool) -> int:
                         assert res.success is True, f"Failed switch to provider {prov_name}: {res.error_message}"
                         assert res.target_provider == prov_name, f"Expected target {prov_name}, got {res.target_provider}"
                         assert res.new_model == "gemini-3.8-flash", f"Expected model gemini-3.8-flash, got {res.new_model}"
+
+                        # Verify account affinity: healthy account must return exact credential
+                        if prov_name != "gemini-oauth":
+                            expected_key = st_acc.get("api_key")
+                            is_exhausted = st_acc.get("status") in ("rate_limit", "exhausted", 429)
+                            if not is_exhausted and expected_key:
+                                assert res.api_key == expected_key, (
+                                    f"Expected api_key for {prov_name} to match healthy account {acc} token"
+                                )
+                                affinity_verified.append(prov_name)
+                            else:
+                                assert res.api_key is not None, f"Expected non-null api_key on failover for {prov_name}"
+
                         routes_verified.append(prov_name)
 
             assert "gemini-oauth" in routes_verified
             assert "gemini-1" in routes_verified
-            report.record_pass("provider_route_sanity", verified_routes=routes_verified, route_resolved=True)
+            assert "gemini-1" in affinity_verified
+            assert "gemini-2" in affinity_verified
+            report.record_pass(
+                "provider_route_sanity",
+                verified_routes=routes_verified,
+                affinity_verified=affinity_verified,
+                route_resolved=True,
+            )
         except Exception as exc:
             report.record_fail("provider_route_sanity", str(exc))
 
