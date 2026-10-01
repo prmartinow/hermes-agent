@@ -47,11 +47,18 @@ def _parse_markdown_truth_table() -> dict[str, dict]:
         else:
             efforts = tuple(e.strip().replace("`", "") for e in efforts_raw.split(","))
 
+        labeled_routes = {}
+        for part in wire_model.split("/"):
+            m = re.search(r"([a-zA-Z0-9_\.-]+)\s*\(([a-z]+)\)", part.strip())
+            if m:
+                labeled_routes[m.group(2)] = m.group(1)
+
         parsed[model_id] = {
             "efforts": efforts,
             "default": default_eff,
             "wire_model": wire_model,
             "wire_cfg": wire_cfg,
+            "labeled_routes": labeled_routes,
         }
     return parsed
 
@@ -137,18 +144,19 @@ def test_wire_models_and_outbound_thinking_config():
                 }
         elif cap.efforts:
             # Static tiered models (3.6, 3.5, 3.1-pro)
-            for effort in cap.efforts:
-                resolved = resolve_model_selection(model, effort=effort)
-                if "<level>" in parsed["wire_model"]:
+            if parsed.get("labeled_routes"):
+                expected_routes = {eff: cap.routes[eff].wire_model for eff in cap.efforts}
+                assert parsed["labeled_routes"] == expected_routes, (
+                    f"Documentation drift on labeled wire routes for {model}: "
+                    f"Markdown parsed {parsed['labeled_routes']} != registry {expected_routes}"
+                )
+            else:
+                for effort in cap.efforts:
+                    resolved = resolve_model_selection(model, effort=effort)
                     wire_template = parsed["wire_model"].replace("<level>", effort)
                     assert resolved.wire_model == wire_template, (
                         f"Documentation drift on static wire model for {model} (effort {effort}): "
                         f"Markdown template {wire_template} != resolved {resolved.wire_model}"
-                    )
-                else:
-                    assert resolved.wire_model in parsed["wire_model"], (
-                        f"Documentation drift on static wire model for {model} (effort {effort}): "
-                        f"Resolved wire model {resolved.wire_model} not in Markdown text {parsed['wire_model']}"
                     )
         else:
             # Zero-effort models (flash-lite, claude, gpt-oss)

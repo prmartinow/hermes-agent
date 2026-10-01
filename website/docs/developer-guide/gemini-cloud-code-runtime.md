@@ -51,7 +51,7 @@ Invalid aliases (e.g. `gemini-0`, `gemini-6`, `gemini-42`) remain strictly outsi
    - `gemini-3.8-flash-high`: Inbound legacy compatibility alias (decomposes to base `gemini-3.8-flash` + effort `high`).
    - `gemini-3.8-flash-tiered`: Outbound wire model sent in Google Cloud Code PA requests.
 2. **Dynamic Tiered Models**: Dynamic models (`3.8`, `3.7`) require the wire suffix `-tiered` and must pass explicit outbound `thinkingConfig` with `thinkingLevel: "low" | "medium" | "high"` and `includeThoughts: true`. Outbound requests do not send `thinkingBudget`. (The `thinkingBudget: -1` property belongs exclusively to upstream catalog discovery metadata in `:fetchAvailableModels`, not outbound request bodies).
-3. **Static Slugs**: Prior models (`3.6`, `3.5`, `3.1-pro`) require wire routing via distinct static sub-slugs (`-low`, `-medium`, `-high`).
+3. **Static Wire Models**: Prior models `3.6` and `3.5` require wire routing via distinct static sub-slugs (`-low`, `-medium`, `-high`). `3.1 Pro` uses fixed static wire identities: `low` → `gemini-3.1-pro-low`, `high` → `gemini-pro-agent`. Outbound requests do not send `thinkingConfig`.
 
 ---
 

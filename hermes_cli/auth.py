@@ -4656,7 +4656,8 @@ def resolve_provider(
     provider configured) See #29285.
     """
     normalized = (requested or "auto").strip().lower()
-    normalized = _plugin_aliases().get(normalized, normalized)
+    from hermes_cli.providers import normalize_provider
+    normalized = normalize_provider(_plugin_aliases().get(normalized, normalized))
 
     if normalized in ("openrouter", "custom") or _registry_lookup(normalized) is not None:
         return normalized

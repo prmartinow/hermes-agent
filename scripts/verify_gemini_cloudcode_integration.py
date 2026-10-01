@@ -280,17 +280,57 @@ def run_certification(*, live: bool, as_json: bool) -> int:
             assert resolved_pro.wire_model == "gemini-pro-agent", f"Wrong wire model: {resolved_pro.wire_model}"
             assert resolved_pro.thinking_config is None, "Static model must not have thinkingConfig"
 
+            tools_pro = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "certification_echo",
+                        "description": "Echo input value back",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"value": {"type": "string"}},
+                            "required": ["value"],
+                        },
+                    },
+                }
+            ]
+
             resp_pro = client.chat.completions.create(
                 model="gemini-3.1-pro",
-                messages=[{"role": "user", "content": "Respond with 'pro_ok'"}],
+                messages=[{"role": "user", "content": "Call certification_echo with value='pro_test'."}],
+                tools=tools_pro,
+                tool_choice={"type": "function", "function": {"name": "certification_echo"}},
                 extra_body={"effort": "high"},
-                max_tokens=100,
+                max_tokens=800,
             )
             assert resp_pro.choices and resp_pro.choices[0].message
             msg_pro = resp_pro.choices[0].message
-            rd_pro = getattr(msg_pro, "reasoning_details", None)
-            has_carrier = bool(find_native_assistant_detail(rd_pro))
-            report.record_pass("static_3_1_pro_high", wire_model="gemini-pro-agent", signature_present=has_carrier, status=200)
+            tc_list_pro = getattr(msg_pro, "tool_calls", None) or []
+            assert tc_list_pro, "Model failed to emit tool calls on gemini-pro-agent"
+
+            tc_pro = tc_list_pro[0]
+            extra_pro = getattr(tc_pro, "extra_content", {}) or {}
+            sig_pro = extra_pro.get("google", {}).get("thought_signature")
+            assert sig_pro, "gemini-pro-agent tool call did not carry Google thought signature"
+
+            carrier_pro = find_native_assistant_detail(getattr(msg_pro, "reasoning_details", None))
+            assert carrier_pro, "Native assistant carrier missing on gemini-pro-agent response"
+
+            # Replay tool response upstream
+            call_id_pro = getattr(tc_pro, "id", None) or (tc_pro.get("id") if isinstance(tc_pro, dict) else "c1")
+            replay_pro_messages = [
+                {"role": "user", "content": "Call certification_echo with value='pro_test'."},
+                to_dict(msg_pro),
+                {"role": "tool", "tool_call_id": call_id_pro, "name": "certification_echo", "content": "pro_test_done"},
+            ]
+            resp_pro_followup = client.chat.completions.create(
+                model="gemini-3.1-pro",
+                messages=replay_pro_messages,
+                extra_body={"effort": "high"},
+                max_tokens=100,
+            )
+            assert resp_pro_followup.choices and resp_pro_followup.choices[0].message
+            report.record_pass("static_3_1_pro_high", wire_model="gemini-pro-agent", signature_present=True, status=200)
         except Exception as exc:
             kind, msg = classify_api_exception(exc)
             if kind == "UPSTREAM_UNAVAILABLE":
@@ -771,13 +811,22 @@ def run_certification(*, live: bool, as_json: bool) -> int:
         # 14. Provider Route Resolution Sanity Across Numbered Accounts
         # ------------------------------------------------------------------
         try:
+            from hermes_cli.model_switch import switch_model
+
             routes_verified: List[str] = []
             for acc in [1, 2, 3, 4, 5]:
                 for prov_name in ([f"gemini-{acc}"] if acc > 1 else ["gemini-oauth", "gemini-1"]):
                     st_acc = get_gemini_oauth_auth_status(acc)
                     if st_acc.get("logged_in") or st_acc.get("api_key"):
-                        res = resolve_model_selection("gemini-3.8-flash", effort="low")
-                        assert res.wire_model == "gemini-3.8-flash-tiered"
+                        res = switch_model(
+                            raw_input="gemini-3.8-flash",
+                            current_provider="gemini-oauth",
+                            current_model="gemini-3.8-flash",
+                            explicit_provider=prov_name,
+                        )
+                        assert res.success is True, f"Failed switch to provider {prov_name}: {res.error_message}"
+                        assert res.target_provider == prov_name, f"Expected target {prov_name}, got {res.target_provider}"
+                        assert res.new_model == "gemini-3.8-flash", f"Expected model gemini-3.8-flash, got {res.new_model}"
                         routes_verified.append(prov_name)
 
             assert "gemini-oauth" in routes_verified
