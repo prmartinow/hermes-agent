@@ -467,17 +467,23 @@ To maximize throughput and ensure full capacity is replenished as early as possi
 4. **Immediate Verification**: Re-queries `retrieveUserQuotaSummary` to verify that `remainingFraction < 0.99999` and that a fixed 5-hour countdown is actively ticking down.
 5. **Audit Logging & Daemon**: Emits structured verification logs to `agent.log`. The 24/7 background daemon (`start_gemini_quota_watcher_daemon()`) runs in the background, polling every 60 seconds to automatically ignite any reset or sleeping account across both model groups.
 
-### Upstream Synchronization Workflow (3-Branch Architecture)
-Hermes Agent operates on a strict 3-branch Git architecture (`main` -> `dev` -> `local`). Upstream synchronization is run interactively via `scripts/sync_upstream.sh` ("Rebase Dev, Rebuild Serving"):
-- **Script**: `scripts/sync_upstream.sh`
-- **Workflow**:
-  1. Stashes any active local modifications.
-  2. Fetches `upstream` (`NousResearch/hermes-agent`) and `origin`.
-  3. Fast-forwards pristine `main` to `upstream/main` (`--ff-only`) and pushes to `origin/main`.
-  4. Rebases the consolidated `dev` topic branch cleanly onto `main` and pushes with lease to `origin/dev`.
-  5. Rebuilds active serving branch `local` from fresh `main` via `git merge --no-ff dev`.
-  6. Compiles UI/TUI assets (`npm run build:ink && npm run build`), pushes `local` to `origin/local`, and builds/deploys the container release.
-  7. Restores original branch and stash, logging all actions to `~/.hermes/logs/upstream_sync.log`.
+### Upstream Synchronization Workflow (Two Branches)
+
+`main` mirrors `NousResearch/hermes-agent` by fast-forward only. Linear `dev` is both
+development and serving for `prmartinow/hermes-agent`; `local` is retired and must never
+be recreated. `scripts/sync_upstream.sh` delegates to the installed GitHub Ops
+`github-ci/scripts/sync_hermes.sh` (set `GITHUB_CI_DIR` for a nonstandard install).
+
+An authorized upstream sync starts with a clean `dev` checkout, fetches both remotes,
+preserves recovery tags, fast-forwards `main`, rebases `dev`, and validates before any
+publication. Sync defaults to local-only; `--push` publishes the reviewed SHAs atomically
+with explicit expected-remote-SHA leases and verifies the remote refs. `--dry-run`
+inspects without fetching or mutating refs. Dirty work is refused, never auto-stashed.
+Builds, deployment, and restarts are separate operations.
+
+For ordinary scoped changes, validate and sanitize, commit on `dev`, push the reviewed
+SHA to `origin/dev`, and verify the remote ref. Do not run upstream synchronization
+merely to publish a completed commit.
 ---
 
 ## Routing Table — working in X → read X/AGENTS.md
