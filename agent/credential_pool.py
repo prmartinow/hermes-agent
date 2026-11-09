@@ -3080,11 +3080,17 @@ def _seed_minimax_singleton(seed: _Seeder) -> None:
 def _seed_gemini_singletons(seed: _Seeder) -> None:
     try:
         from hermes_cli.auth import (
+            AuthError,
             _read_gemini_account_tokens,
             resolve_gemini_oauth_runtime_credentials,
         )
         for acc_idx in range(1, 6):
-            tokens = _read_gemini_account_tokens(acc_idx)
+            try:
+                tokens = _read_gemini_account_tokens(acc_idx)
+            except AuthError as exc:
+                if exc.code != "gemini_auth_missing":
+                    raise
+                continue
             if not tokens.get("access_token") and not tokens.get("refresh_token"):
                 continue
             token = ""

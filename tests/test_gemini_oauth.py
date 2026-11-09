@@ -12,8 +12,10 @@ Covers:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
+from types import SimpleNamespace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -183,7 +185,63 @@ def test_gemini_access_token_is_expiring():
     assert _gemini_access_token_is_expiring(None) is False
 
 
-def test_refresh_gemini_oauth_tokens(tmp_path):
+@pytest.mark.parametrize("matching_secret_first", [True, False])
+def test_agy_oauth_client_selection_survives_binary_reordering(tmp_path, monkeypatch, matching_secret_first):
+    from hermes_cli import auth
+
+    client_id = b"1071006060591-test.apps.googleusercontent.com"
+    login_secret = b"GOCSPX-" + b"a" * 28
+    other_secret = b"GOCSPX-" + b"b" * 28
+    secrets = (login_secret, other_secret) if matching_secret_first else (other_secret, login_secret)
+    agy = tmp_path / "agy"
+    agy.write_bytes(b"\0".join((client_id, *secrets)))
+    monkeypatch.setenv("HERMES_AGY_PATH", str(agy))
+    monkeypatch.delenv("HERMES_GEMINI_CLIENT_ID", raising=False)
+    monkeypatch.delenv("HERMES_GEMINI_CLIENT_SECRET", raising=False)
+    monkeypatch.setattr(auth, "_EXTRACTED_GEMINI_CREDS", None)
+    monkeypatch.setattr(
+        auth, "_GEMINI_AGY_OAUTH_CLIENT_FINGERPRINT",
+        hashlib.sha256(client_id + b"\0" + login_secret).hexdigest(),
+    )
+
+    assert auth._extract_gemini_oauth_credentials_from_agy() == (client_id.decode(), login_secret.decode())
+
+
+def test_cli_gemini_login_adds_the_selected_account(tmp_path, monkeypatch):
+    import httpx
+    from hermes_cli import auth, auth_commands
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("GEMINI_HOME", str(tmp_path / "gemini"))
+    monkeypatch.delenv("HERMES_GEMINI_TOKEN_PATH", raising=False)
+    monkeypatch.setenv("HERMES_GEMINI_CLIENT_ID", "test-client")
+    monkeypatch.setenv("HERMES_GEMINI_CLIENT_SECRET", "test-secret")
+    monkeypatch.setattr("builtins.input", lambda _prompt: "test-code")
+    pool = MagicMock()
+    pool.entries.return_value = []
+    pool.add_entry.side_effect = lambda entry: entry
+    token_response = httpx.Response(200, json={"access_token": "test-access", "refresh_token": "test-refresh"})
+    user_response = httpx.Response(200, json={"email": "slot3@example.test"})
+
+    with patch("httpx.post", return_value=token_response) as post, \
+         patch("httpx.get", return_value=user_response), \
+         patch("hermes_cli.auth.webbrowser.open") as open_browser:
+        entry = auth_commands._add_credential(
+            SimpleNamespace(no_browser=True), "gemini-3", pool, auth_commands.AUTH_TYPE_OAUTH,
+        )
+
+    open_browser.assert_not_called()
+    assert post.call_args.args == ("https://oauth2.googleapis.com/token",)
+    assert post.call_args.kwargs["data"]["redirect_uri"] == "https://antigravity.google/oauth-callback"
+    assert post.call_args.kwargs["data"]["code"] == "test-code"
+    assert entry.access_token == "test-access"
+    assert entry.source.endswith(":gemini_3")
+    assert auth._read_gemini_account_tokens(3)["refresh_token"] == "test-refresh"
+
+
+def test_refresh_gemini_oauth_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_GEMINI_CLIENT_ID", "test-client")
+    monkeypatch.setenv("HERMES_GEMINI_CLIENT_SECRET", "test-secret")
     token_file = tmp_path / "antigravity-oauth-token"
     initial = {
         "token": {

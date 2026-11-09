@@ -1366,13 +1366,19 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
     parts: List[str] = []
 
     def _add(text) -> None:
-        if text and text not in parts:
-            parts.append(text)
+        if isinstance(text, str):
+            trimmed = text.strip()
+            if trimmed and trimmed not in parts:
+                parts.append(trimmed)
     _add(getattr(assistant_message, "reasoning", None))
     _add(getattr(assistant_message, "reasoning_content", None))
     # reasoning_details: [{"type": "reasoning.summary", "summary": "...", ...}, ...]
     for detail in getattr(assistant_message, "reasoning_details", None) or []:
         if isinstance(detail, dict):
+            # Opaque native assistant replay carriers (e.g. google.native_assistant) carry
+            # structured replay payload dictionaries rather than human-readable reasoning text.
+            if str(detail.get("type") or "").endswith(".native_assistant"):
+                continue
             _add(detail.get('summary') or detail.get('thinking') or detail.get('content') or detail.get('text'))
     # Fall back to reasoning embedded in content only when no structured field was found.
     content = getattr(assistant_message, "content", None)

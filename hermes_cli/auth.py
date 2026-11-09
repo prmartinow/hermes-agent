@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
@@ -25,10 +26,10 @@ import re
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from functools import partial
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlsplit
 
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
@@ -172,6 +173,8 @@ def _api_key_provider(
 # Registry rows in priority order (resolve_provider() scans api_key rows in this order). A tuple
 # row is ``_api_key_provider(id, name, inference_base_url, api_key_env_vars[, base_url_env_var
 # [, auth_type]])``; OAuth / bespoke rows are full ``ProviderConfig`` objects.
+DEFAULT_GEMINI_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/auth"
+
 _REGISTRY_ROWS: Tuple[Any, ...] = (
     ProviderConfig(
         "nous", "Nous Portal", "oauth_device_code", portal_base_url=DEFAULT_NOUS_PORTAL_URL,
@@ -184,22 +187,22 @@ _REGISTRY_ROWS: Tuple[Any, ...] = (
         inference_base_url=DEFAULT_XAI_OAUTH_BASE_URL),
     ProviderConfig("qwen-oauth", "Qwen OAuth", "oauth_external", inference_base_url=DEFAULT_QWEN_BASE_URL),
     ProviderConfig("gemini-oauth", "Google Gemini (OAuth / Antigravity)", "oauth_external",
-                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   portal_base_url=DEFAULT_GEMINI_OAUTH_AUTHORIZE_URL,
                    inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
     ProviderConfig("gemini-1", "Google Gemini Account 1", "oauth_external",
-                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   portal_base_url=DEFAULT_GEMINI_OAUTH_AUTHORIZE_URL,
                    inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
     ProviderConfig("gemini-2", "Google Gemini Account 2", "oauth_external",
-                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   portal_base_url=DEFAULT_GEMINI_OAUTH_AUTHORIZE_URL,
                    inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
     ProviderConfig("gemini-3", "Google Gemini Account 3", "oauth_external",
-                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   portal_base_url=DEFAULT_GEMINI_OAUTH_AUTHORIZE_URL,
                    inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
     ProviderConfig("gemini-4", "Google Gemini Account 4", "oauth_external",
-                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   portal_base_url=DEFAULT_GEMINI_OAUTH_AUTHORIZE_URL,
                    inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
     ProviderConfig("gemini-5", "Google Gemini Account 5", "oauth_external",
-                   portal_base_url="https://accounts.google.com/o/oauth2/v2/auth",
+                   portal_base_url=DEFAULT_GEMINI_OAUTH_AUTHORIZE_URL,
                    inference_base_url=DEFAULT_GEMINI_OAUTH_BASE_URL),
     ("lmstudio", "LM Studio", "http://127.0.0.1:1234/v1", ("LM_API_KEY",), "LM_BASE_URL"),
     ("copilot", "GitHub Copilot", DEFAULT_GITHUB_MODELS_BASE_URL,
@@ -1085,13 +1088,20 @@ DEFAULT_GEMINI_OAUTH_CLIENT_ID = ""
 DEFAULT_GEMINI_OAUTH_CLIENT_SECRET = ""
 DEFAULT_GEMINI_OAUTH_BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal"
 DEFAULT_GEMINI_QUOTA_BASE_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal"
+DEFAULT_GEMINI_OAUTH_REDIRECT_URI = "https://antigravity.google/oauth-callback"
 DEFAULT_GEMINI_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 DEFAULT_GEMINI_OAUTH_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 DEFAULT_GEMINI_OAUTH_SCOPE = (
     "https://www.googleapis.com/auth/cloud-platform "
     "https://www.googleapis.com/auth/userinfo.email "
-    "https://www.googleapis.com/auth/userinfo.profile"
+    "https://www.googleapis.com/auth/userinfo.profile "
+    "https://www.googleapis.com/auth/cclog "
+    "https://www.googleapis.com/auth/experimentsandconfigs "
+    "https://www.googleapis.com/auth/aicode openid"
 )
+# SHA-256 of the client ID, a NUL separator, and its secret. Verified with the
+# AGY 1.5.3 token request. The order of embedded clients' secrets can change.
+_GEMINI_AGY_OAUTH_CLIENT_FINGERPRINT = "0eba362d53c81721da20f4ab53266802b2e39aa8dad0af58956abd1b7c72e3ce"
 GEMINI_OAUTH_REFRESH_SKEW_SECONDS = 300
 _LAST_ACTIVE_GEMINI_ACCOUNT_IDS = None
 
@@ -1121,59 +1131,48 @@ def _get_gemini_refresh_lock(acc_idx: int) -> threading.Lock:
 
 
 def _extract_gemini_oauth_credentials_from_agy() -> tuple[str, str]:
-    """Dynamically extract installed-app Client ID and Secret from local agy binary."""
+    """Resolve the verified AGY OAuth client pair or an explicit override."""
     global _EXTRACTED_GEMINI_CREDS
-    if _EXTRACTED_GEMINI_CREDS is not None and all(_EXTRACTED_GEMINI_CREDS):
-        return _EXTRACTED_GEMINI_CREDS
-
-    import re
-    import shutil
-
-    client_id = os.getenv("HERMES_GEMINI_CLIENT_ID", "").strip()
-    client_secret = os.getenv("HERMES_GEMINI_CLIENT_SECRET", "").strip()
+    client_id = os.getenv("HERMES_GEMINI_CLIENT_ID", "").strip() or DEFAULT_GEMINI_OAUTH_CLIENT_ID
+    client_secret = os.getenv("HERMES_GEMINI_CLIENT_SECRET", "").strip() or DEFAULT_GEMINI_OAUTH_CLIENT_SECRET
     if client_id and client_secret:
-        _EXTRACTED_GEMINI_CREDS = (client_id, client_secret)
-        return _EXTRACTED_GEMINI_CREDS
+        return client_id, client_secret
+    cached = _EXTRACTED_GEMINI_CREDS
+    if cached and (not client_id or client_id == cached[0]) and (not client_secret or client_secret == cached[1]):
+        return cached
 
-    candidate_paths: list[Path] = []
-    for env_var in ("HERMES_AGY_PATH", "AGY_PATH", "AGY_BIN_PATH"):
-        val = os.getenv(env_var, "").strip()
-        if val:
-            candidate_paths.append(Path(val))
-
-    which_agy = shutil.which("agy")
-    if which_agy:
+    candidate_paths = [
+        Path(value)
+        for name in ("HERMES_AGY_PATH", "AGY_PATH", "AGY_BIN_PATH")
+        if (value := os.getenv(name, "").strip())
+    ]
+    if which_agy := shutil.which("agy"):
         candidate_paths.append(Path(which_agy))
+    candidate_paths.extend([Path.home() / ".local/bin/agy", Path("/usr/local/bin/agy"), Path("/usr/bin/agy")])
 
-    candidate_paths.extend([
-        Path.home() / ".local/bin/agy",
-        Path("/usr/local/bin/agy"),
-        Path("/usr/bin/agy"),
-    ])
+    for path in dict.fromkeys(candidate_paths):
+        try:
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+        except OSError:
+            continue
+        ids = set(re.findall(rb"1071006060591-[a-zA-Z0-9_-]+\.apps\.googleusercontent\.com", data))
+        secrets = set(re.findall(rb"GOCSPX-[a-zA-Z0-9_-]{28}", data))
+        for raw_id in ids:
+            for raw_secret in secrets:
+                pair = raw_id.decode("ascii"), raw_secret.decode("ascii")
+                if (client_id and client_id != pair[0]) or (client_secret and client_secret != pair[1]):
+                    continue
+                if hashlib.sha256(raw_id + b"\0" + raw_secret).hexdigest() == _GEMINI_AGY_OAUTH_CLIENT_FINGERPRINT:
+                    _EXTRACTED_GEMINI_CREDS = pair
+                    return pair
 
-    for p in candidate_paths:
-        if p.exists() and p.is_file():
-            try:
-                data = p.read_bytes()
-                id_match = re.search(rb"1071006060591-[a-zA-Z0-9_-]+\.apps\.googleusercontent\.com", data)
-                sec_match = re.search(rb"GOCSPX-[a-zA-Z0-9_-]{28}", data)
-                if id_match and not client_id:
-                    client_id = id_match.group(0).decode("ascii", "ignore")
-                if sec_match and not client_secret:
-                    client_secret = sec_match.group(0).decode("ascii", "ignore")
-                if client_id and client_secret:
-                    _EXTRACTED_GEMINI_CREDS = (client_id, client_secret)
-                    return _EXTRACTED_GEMINI_CREDS
-            except Exception:
-                pass
-
-    if client_id and client_secret:
-        _EXTRACTED_GEMINI_CREDS = (client_id, client_secret)
-        return _EXTRACTED_GEMINI_CREDS
-
-    return (
-        client_id or DEFAULT_GEMINI_OAUTH_CLIENT_ID,
-        client_secret or DEFAULT_GEMINI_OAUTH_CLIENT_SECRET,
+    raise AuthError(
+        "Could not resolve the Google OAuth client from AGY. Point HERMES_AGY_PATH at a "
+        "compatible AGY binary or configure both HERMES_GEMINI_CLIENT_ID and HERMES_GEMINI_CLIENT_SECRET.",
+        provider="gemini-oauth",
+        code="gemini_oauth_client_unavailable",
     )
 
 
@@ -2148,148 +2147,137 @@ def _save_gemini_account_tokens(account: Any, tokens: Dict[str, Any]) -> None:
         pass
 
 
-def _gemini_oauth_pkce_login(account: Any = 1, timeout_seconds: float = 120.0) -> Dict[str, Any]:
-    """Run Hermes-native Google OAuth PKCE authorization flow for Gemini accounts.
-
-    Uses installed-app client credentials extracted from agy (or built-in defaults)
-    and prompts the user to authorize their Google account.
-    """
-    import secrets
-    import webbrowser
-    from urllib.parse import urlencode
-
-    acc_idx = _normalize_gemini_account_id(account)
-    client_id, client_secret = _extract_gemini_oauth_credentials_from_agy()
-    
-    # Generate PKCE verifier and challenge (S256)
+def _start_gemini_oauth_authorization() -> tuple[str, dict[str, str]]:
+    """Start the AGY terminal-style flow shared by CLI and dashboard logins."""
     import base64
-    import hashlib
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode()).digest()
-    ).rstrip(b"=").decode()
-    oauth_state = secrets.token_urlsafe(32)
+    import secrets
 
-    redirect_uri = "urn:ietf:wg:oauth:2.0:oob" if sys.platform != "darwin" and os.getenv("SSH_CONNECTION") else "http://localhost:8085/oauth2callback"
-    scopes = [
-        "https://www.googleapis.com/auth/cloud-platform",
-        "https://www.googleapis.com/auth/userinfo.email",
-        "https://www.googleapis.com/auth/userinfo.profile",
-    ]
+    client_id, client_secret = _extract_gemini_oauth_credentials_from_agy()
+    verifier = secrets.token_urlsafe(32)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(32)
     params = {
         "client_id": client_id,
-        "redirect_uri": redirect_uri,
+        "redirect_uri": DEFAULT_GEMINI_OAUTH_REDIRECT_URI,
         "response_type": "code",
-        "scope": " ".join(scopes),
+        "scope": DEFAULT_GEMINI_OAUTH_SCOPE,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
-        "state": oauth_state,
+        "state": state,
         "access_type": "offline",
+        # Hermes must let the user choose which Google account to connect to the slot.
         "prompt": "consent select_account",
     }
-    auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
-
-    print()
-    print(f"Authorize Hermes for Google Gemini Account {acc_idx}.")
-    print()
-    print("╭─ Google Gemini Authorization ─────────────────────╮")
-    print("│                                                   │")
-    print("│  Open this link in your browser:                  │")
-    print("╰───────────────────────────────────────────────────╯")
-    print()
-    print(f"  {auth_url}")
-    print()
-
-    try:
-        from hermes_cli.auth import _can_open_graphical_browser as _can_open_gui
-    except Exception:
-        _can_open_gui = lambda: True
-
-    if _can_open_gui():
-        try:
-            webbrowser.open(auth_url)
-            print("  (Browser opened automatically)")
-        except Exception:
-            pass
-
-    print()
-    print("After authorizing, paste the authorization code below.")
-    print()
-    try:
-        auth_code = input("Authorization code: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        raise AuthError("OAuth login cancelled.", provider=f"gemini-{acc_idx}")
-
-    if not auth_code:
-        raise AuthError("No authorization code entered.", provider=f"gemini-{acc_idx}")
-
-    # If the user pasted the entire redirect URL or query string, extract the code param
-    if "code=" in auth_code or auth_code.startswith("http://") or auth_code.startswith("https://"):
-        try:
-            from urllib.parse import urlparse, parse_qs
-            parsed = urlparse(auth_code)
-            qs = parse_qs(parsed.query or parsed.path)
-            if "code" in qs and qs["code"]:
-                auth_code = qs["code"][0]
-            elif "?" in auth_code:
-                qs2 = parse_qs(auth_code.split("?", 1)[1])
-                if "code" in qs2 and qs2["code"]:
-                    auth_code = qs2["code"][0]
-        except Exception:
-            pass
-
-    token_data = {
-        "grant_type": "authorization_code",
-        "code": auth_code,
+    return f"{DEFAULT_GEMINI_OAUTH_AUTHORIZE_URL}?{urlencode(params)}", {
         "client_id": client_id,
-        "redirect_uri": redirect_uri,
+        "client_secret": client_secret,
+        "redirect_uri": DEFAULT_GEMINI_OAUTH_REDIRECT_URI,
         "code_verifier": verifier,
+        "state": state,
     }
-    if client_secret:
-        token_data["client_secret"] = client_secret
 
+
+def _exchange_gemini_oauth_code(
+    login: dict[str, str], code_input: str, account: int, *, timeout_seconds: float = 20.0,
+) -> Dict[str, Any]:
+    """Accept the hosted callback URL or its pasted code, then exchange it with PKCE."""
+    provider = f"gemini-{account}"
+    code = code_input.strip()
+    if code.startswith(("http://", "https://", "?", "code=", "state=")):
+        try:
+            callback = urlsplit(code)
+            if callback.scheme and callback._replace(query="", fragment="").geturl() != login["redirect_uri"]:
+                raise ValueError
+            params = parse_qs(callback.query or callback.path, keep_blank_values=True)
+        except ValueError:
+            raise AuthError("Paste the Antigravity callback URL or its authorization code.", provider=provider) from None
+        if "state" in params and params["state"] != [login["state"]]:
+            raise AuthError("The callback belongs to a different sign-in. Start a new login.", provider=provider)
+        codes = params.get("code", [])
+        code = codes[0] if len(codes) == 1 else ""
+    if not code:
+        raise AuthError("No authorization code entered.", provider=provider)
+
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": login["client_id"],
+        "client_secret": login["client_secret"],
+        "redirect_uri": login["redirect_uri"],
+        "code_verifier": login["code_verifier"],
+    }
     try:
-        resp = httpx.post(DEFAULT_GEMINI_OAUTH_TOKEN_URL, data=token_data, timeout=20.0)
-    except Exception as exc:
-        raise AuthError(f"Google OAuth token exchange failed: {exc}", provider=f"gemini-{acc_idx}") from exc
-
+        resp = httpx.post(DEFAULT_GEMINI_OAUTH_TOKEN_URL, data=data, timeout=timeout_seconds)
+    except httpx.RequestError as exc:
+        raise AuthError("Could not reach Google's OAuth token endpoint.", provider=provider) from exc
+    try:
+        payload = resp.json()
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
     if resp.status_code != 200:
-        raise AuthError(f"Google OAuth token exchange failed (HTTP {resp.status_code}): {resp.text}", provider=f"gemini-{acc_idx}")
+        error = payload.get("error")
+        detail = f": {error}" if isinstance(error, str) and re.fullmatch(r"[a-z_]{1,64}", error) else ""
+        raise AuthError(
+            f"Google OAuth token exchange failed (HTTP {resp.status_code}{detail}).", provider=provider,
+        )
 
-    payload = resp.json()
-    access_token = payload.get("access_token", "")
-    refresh_token = payload.get("refresh_token", "")
-    expires_in = int(payload.get("expires_in", 3600))
-    from datetime import datetime, timezone, timedelta
-    expiry_str = (datetime.now(timezone.utc) + timedelta(seconds=expires_in)).isoformat().replace("+00:00", "Z")
+    access_token = payload.get("access_token")
+    refresh_token = payload.get("refresh_token")
+    if not all(isinstance(token, str) and token.strip() for token in (access_token, refresh_token)):
+        raise AuthError("Google did not return both an access token and a refresh token.", provider=provider)
+    try:
+        expiry = datetime.now(timezone.utc) + timedelta(seconds=int(payload.get("expires_in", 3600)))
+    except (TypeError, ValueError, OverflowError):
+        raise AuthError("Google returned an invalid OAuth token expiry.", provider=provider) from None
 
     email = ""
     name = ""
     try:
-        u_resp = httpx.get(DEFAULT_GEMINI_OAUTH_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=5.0)
+        u_resp = httpx.get(
+            DEFAULT_GEMINI_OAUTH_USERINFO_URL,
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=5.0,
+        )
         if u_resp.status_code == 200:
             u_info = u_resp.json()
             email = u_info.get("email", "")
             name = u_info.get("name", "")
-    except Exception:
+    except (httpx.RequestError, ValueError, AttributeError):
         pass
 
-    creds = {
+    return {
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "expiry": expiry_str,
+        "expiry": expiry.isoformat().replace("+00:00", "Z"),
         "email": email,
         "name": name,
-        "account_id": acc_idx,
-        "source": f"hermes_auth:gemini-{acc_idx}",
+        "account_id": account,
+        "source": f"hermes_auth:{provider}",
     }
-    _save_gemini_account_tokens(acc_idx, creds)
-    return creds
 
+
+def _gemini_oauth_pkce_login(
+    account: Any = 1, timeout_seconds: float = 120.0, *, no_browser: bool = False,
+) -> Dict[str, Any]:
+    """Sign into a numbered Gemini account from the terminal."""
+    acc_idx = _normalize_gemini_account_id(account)
+    auth_url, login = _start_gemini_oauth_authorization()
+    print(f"\nOpen this link in a browser to sign in to Google Gemini Account {acc_idx}:\n\n  {auth_url}\n")
+    if not no_browser and _can_open_graphical_browser():
+        try:
+            webbrowser.open(auth_url)
+        except Exception:
+            pass
     try:
-        _save_antigravity_tokens(tokens, account=acc_idx)
-    except Exception:
-        pass
+        code = input("Paste the authorization code or the full callback URL: ")
+    except (KeyboardInterrupt, EOFError):
+        raise AuthError("OAuth login cancelled.", provider=f"gemini-{acc_idx}") from None
+
+    creds = _exchange_gemini_oauth_code(login, code, acc_idx, timeout_seconds=min(timeout_seconds, 20.0))
+    _save_gemini_account_tokens(acc_idx, creds)
+    return {**creds, "api_key": creds["access_token"]}
 
 
 def _save_antigravity_tokens(tokens: Dict[str, Any], account: Any = 1) -> Path:

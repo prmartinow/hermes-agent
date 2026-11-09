@@ -585,6 +585,8 @@ export const en: Translations = {
     pkceStep1: "A new tab opened to claude.ai. Sign in and click Authorize.",
     pkceStep2: "Copy the authorization code shown after authorizing.",
     pkceStep3: "Paste it below and submit.",
+    geminiPkceStep1: "Open the authorization page and choose the Google account for this slot.",
+    geminiPasteCode: "Paste the authorization code or the full callback URL",
     flowLabels: {
       pkce: "Browser login (PKCE)",
       device_code: "Device code",

@@ -7,6 +7,7 @@ import { api, type OAuthProvider, type OAuthStartResponse } from "@/lib/api";
 import { copyTextToClipboard } from "@/lib/clipboard";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { useI18n } from "@/i18n";
+import { en } from "@/i18n/en";
 import { cn, themedBody } from "@/lib/utils";
 import { errorMessage } from "@/lib/api-error";
 
@@ -40,6 +41,13 @@ export function OAuthLoginModal({ provider, accountId, onClose, onSuccess }: Pro
   const pollTimer = useRef<number | null>(null);
   const copyResetTimer = useRef<number | null>(null);
   const { t } = useI18n();
+  const isGemini = provider.id.startsWith("gemini-");
+  const pkceStep1 = isGemini
+    ? (t.oauth.geminiPkceStep1 ?? en.oauth.geminiPkceStep1)
+    : t.oauth.pkceStep1;
+  const pasteCode = isGemini
+    ? (t.oauth.geminiPasteCode ?? en.oauth.geminiPasteCode)
+    : t.oauth.pasteCode;
 
   // Initiate flow on mount
   useEffect(() => {
@@ -269,7 +277,7 @@ export function OAuthLoginModal({ provider, accountId, onClose, onSuccess }: Pro
           {start?.flow === "pkce" && phase === "awaiting_user" && (
             <>
               <ol className="text-sm space-y-2 list-decimal list-inside text-muted-foreground">
-                <li>{t.oauth.pkceStep1}</li>
+                <li>{pkceStep1}</li>
                 <li>{t.oauth.pkceStep2}</li>
                 <li>{t.oauth.pkceStep3}</li>
               </ol>
@@ -277,7 +285,7 @@ export function OAuthLoginModal({ provider, accountId, onClose, onSuccess }: Pro
                 <Input
                   value={pkceCode}
                   onChange={(e) => setPkceCode(e.target.value)}
-                  placeholder={t.oauth.pasteCode}
+                  placeholder={pasteCode}
                   onKeyDown={(e) => e.key === "Enter" && handleSubmitPkceCode()}
                   autoFocus
                 />

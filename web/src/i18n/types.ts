@@ -597,6 +597,8 @@ export interface Translations {
     pkceStep1: string;
     pkceStep2: string;
     pkceStep3: string;
+    geminiPkceStep1?: string;
+    geminiPasteCode?: string;
     flowLabels: {
       pkce: string;
       device_code: string;

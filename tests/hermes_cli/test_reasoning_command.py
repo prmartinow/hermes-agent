@@ -414,6 +414,35 @@ class TestExtractReasoningFormats(unittest.TestCase):
         result = extract(None, msg)
         self.assertIn("async/await", result)
 
+    def test_native_assistant_carrier_ignored_in_extract_reasoning(self):
+        """Native assistant replay carriers (e.g. google.native_assistant) carry structured
+        payload dictionaries in content; extract_reasoning must safely ignore them without
+        raising TypeError: sequence item 0: expected str instance, dict found."""
+        extract = self._get_extractor()
+        msg = SimpleNamespace(
+            reasoning=None,
+            reasoning_content=None,
+            reasoning_details=[
+                {
+                    "type": "google.native_assistant",
+                    "version": 1,
+                    "source_model": "gemini-3.8-flash",
+                    "content": {
+                        "role": "model",
+                        "parts": [{"text": "internal thought signature"}],
+                    },
+                }
+            ],
+            content=None,
+        )
+        result = extract(None, msg)
+        self.assertIsNone(result)
+
+        # When paired with genuine reasoning summary text, the summary is returned cleanly
+        msg.reasoning_details.append({"type": "reasoning.summary", "summary": "Human thought"})
+        result_with_summary = extract(None, msg)
+        self.assertEqual(result_with_summary, "Human thought")
+
 
 
 # ---------------------------------------------------------------------------

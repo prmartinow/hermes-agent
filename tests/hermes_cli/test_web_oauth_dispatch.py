@@ -22,10 +22,14 @@ The fix:
 These tests pin the corrected behavior.
 """
 import asyncio
+import base64
+import hashlib
 import json
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 import pytest
@@ -856,8 +860,81 @@ def test_gemini_oauth_catalog_and_start_dispatch():
     assert start_resp.status_code == 200, start_resp.text
     data = start_resp.json()
     assert data["flow"] == "pkce"
-    assert "accounts.google.com" in data["auth_url"]
+    url = urlsplit(data["auth_url"])
+    params = parse_qs(url.query)
+    assert (url.hostname, url.path) == ("accounts.google.com", "/o/oauth2/auth")
+    assert params["redirect_uri"] == ["https://antigravity.google/oauth-callback"]
+    assert params["prompt"] == ["consent select_account"]
+    assert params["code_challenge_method"] == ["S256"]
+    assert params["access_type"] == ["offline"]
+    assert set(params["scope"][0].split()) == {
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/cclog",
+        "https://www.googleapis.com/auth/experimentsandconfigs",
+        "https://www.googleapis.com/auth/aicode",
+        "openid",
+    }
     assert "session_id" in data
+
+
+@pytest.mark.parametrize("matching_state", [True, False])
+def test_gemini_dashboard_callback_preserves_other_account_slots(tmp_path, monkeypatch, matching_state):
+    from agent.credential_pool import load_pool
+    from hermes_cli import auth
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("GEMINI_HOME", str(tmp_path / "gemini"))
+    monkeypatch.delenv("HERMES_GEMINI_TOKEN_PATH", raising=False)
+    monkeypatch.setenv("HERMES_GEMINI_CLIENT_ID", "test-client")
+    monkeypatch.setenv("HERMES_GEMINI_CLIENT_SECRET", "test-secret")
+    old_tokens = {
+        "access_token": "old-access",
+        "refresh_token": "old-refresh",
+        "email": "slot1@example.test",
+    }
+    auth._save_gemini_account_tokens(1, old_tokens)
+    auth._save_gemini_account_tokens(3, {**old_tokens, "email": "previous@example.test"})
+
+    started = client.post("/api/providers/oauth/gemini-oauth/start?account=3", headers=HEADERS)
+    assert started.status_code == 200
+    data = started.json()
+    params = parse_qs(urlsplit(data["auth_url"]).query)
+    state = params["state"][0] if matching_state else "different-session"
+    callback = f"{params['redirect_uri'][0]}?{urlencode({'code': 'test-code', 'state': state})}"
+    token_response = httpx.Response(200, json={"access_token": "new-access", "refresh_token": "new-refresh"})
+    user_response = httpx.Response(200, json={"email": "slot3@example.test"})
+
+    with patch("httpx.post", return_value=token_response) as post, patch("httpx.get", return_value=user_response):
+        submitted = client.post(
+            "/api/providers/oauth/gemini-oauth/submit", headers=HEADERS,
+            json={"session_id": data["session_id"], "code": callback},
+        )
+
+    assert submitted.status_code == 200
+    result = submitted.json()
+    assert auth._read_gemini_account_tokens(1)["refresh_token"] == "old-refresh"
+    if matching_state:
+        assert result == {"ok": True, "status": "approved", "email": "slot3@example.test"}
+        assert auth._read_gemini_account_tokens(3)["refresh_token"] == "new-refresh"
+        with patch("hermes_cli.auth.prime_all_sleeping_gemini_accounts"):
+            pool = load_pool("gemini-oauth")
+        assert {entry.source: entry.refresh_token for entry in pool.entries()} == {
+            "gemini_account_1": "old-refresh",
+            "gemini_account_3": "new-refresh",
+        }
+        exchanged = post.call_args.kwargs["data"]
+        assert exchanged["redirect_uri"] == params["redirect_uri"][0]
+        assert exchanged["client_secret"] == "test-secret"
+        assert exchanged["code"] == "test-code"
+        digest = hashlib.sha256(exchanged["code_verifier"].encode()).digest()
+        assert base64.urlsafe_b64encode(digest).decode().rstrip("=") == params["code_challenge"][0]
+    else:
+        assert result["status"] == "error"
+        assert "different sign-in" in result["message"]
+        post.assert_not_called()
+        assert auth._read_gemini_account_tokens(3)["refresh_token"] == "old-refresh"
 
 
 

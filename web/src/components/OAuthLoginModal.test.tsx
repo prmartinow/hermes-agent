@@ -165,6 +165,28 @@ describe("OAuthLoginModal local expiry", () => {
     expect(apiMocks.pollOAuthSession).not.toHaveBeenCalled();
   });
 
+  it("starts Gemini sign-in for the selected account and prompts for a callback URL", async () => {
+    apiMocks.startOAuthLogin.mockResolvedValue({
+      auth_url: "https://accounts.google.com/o/oauth2/auth",
+      expires_in: 60,
+      flow: "pkce",
+      session_id: "gemini-slot",
+    });
+    await render(
+      <OAuthLoginModal
+        provider={{ ...provider, id: "gemini-oauth", name: "Google Gemini", flow: "pkce" }}
+        accountId={3}
+        onClose={() => {}}
+        onSuccess={() => {}}
+        onError={() => {}}
+      />,
+    );
+
+    expect(apiMocks.startOAuthLogin).toHaveBeenCalledWith("gemini-oauth", 3);
+    expect(container.textContent).toContain("choose the Google account for this slot");
+    expect(container.querySelector("input")?.placeholder).toContain("full callback URL");
+  });
+
   it("a Retry after expiry starts fresh instead of insta-lapsing", async () => {
     apiMocks.startOAuthLogin.mockResolvedValueOnce(deviceStart(2));
     await render(

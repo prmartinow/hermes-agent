@@ -423,7 +423,11 @@ def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCre
         try:
             creds = auth_mod.resolve_gemini_oauth_runtime_credentials(account=acc_idx, refresh_if_expiring=False)
         except Exception:
-            creds = auth_mod._gemini_oauth_pkce_login(account=acc_idx)
+            creds = auth_mod._gemini_oauth_pkce_login(
+                account=acc_idx,
+                timeout_seconds=getattr(args, "timeout", None) or 120.0,
+                no_browser=bool(getattr(args, "no_browser", False)),
+            )
         auth_mod._mark_gemini_oauth_active(creds, account=acc_idx)
         label = (getattr(args, "label", None) or "").strip() or creds.get("email") or label_from_token(
             creds["api_key"],
