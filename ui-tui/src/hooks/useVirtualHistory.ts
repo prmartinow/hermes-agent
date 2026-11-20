@@ -10,6 +10,8 @@ import {
   useSyncExternalStore
 } from 'react'
 
+import { INLINE_MODE } from '../config/env.js'
+
 const ESTIMATE = 4
 // Overscan was 40 (= viewport) which is way more than needed when heights
 // are well-estimated.  Cutting in half saves ~20 mounted items per scroll
@@ -149,6 +151,75 @@ export const ensureVirtualItemHeight = (
   return seeded
 }
 
+function scaleMeasuredHeights(heights: Map<string, number>, ratio: number): void {
+  for (const [key, height] of heights) {
+    const scaled = Math.round(height * ratio)
+
+    if (validMeasuredHeight(scaled)) {
+      heights.set(key, scaled)
+    } else {
+      heights.delete(key)
+    }
+  }
+}
+
+function coverViewport(
+  start: number,
+  end: number,
+  items: readonly { key: string }[],
+  heights: Map<string, number>,
+  estimateHeight: VirtualHistoryOptions['estimateHeight'],
+  needed: number,
+  maxMounted: number,
+  sticky: boolean
+): readonly [number, number] {
+  let coverage = 0
+
+  for (let i = start; i < end; i++) {
+    coverage += ensureVirtualItemHeight(heights, items[i]!.key, i, PESSIMISTIC, estimateHeight)
+  }
+
+  if (sticky) {
+    const minStart = Math.max(0, end - maxMounted)
+
+    while (start > minStart && coverage < needed) {
+      start--
+      coverage += ensureVirtualItemHeight(heights, items[start]!.key, start, PESSIMISTIC, estimateHeight)
+    }
+  } else {
+    const maxEnd = Math.min(items.length, start + maxMounted)
+
+    while (end < maxEnd && coverage < needed) {
+      coverage += ensureVirtualItemHeight(heights, items[end]!.key, end, PESSIMISTIC, estimateHeight)
+      end++
+    }
+  }
+
+  return [start, end]
+}
+
+function setVirtualClamp(
+  scroll: ScrollBoxHandle,
+  offsets: Float64Array,
+  start: number,
+  end: number,
+  count: number,
+  total: number,
+  viewportHeight: number
+): void {
+  const top = offsets[start] ?? 0
+  const bottom = offsets[end] ?? total
+  const min = start === 0 ? 0 : top
+  // An open tail lets newly grown content extend beyond cached estimates.
+  const max = end === count ? Number.POSITIVE_INFINITY : Math.max(top, bottom - viewportHeight)
+
+  if (safeUnsignedGeometry(min, -1) >= 0 && (max === Number.POSITIVE_INFINITY || safeUnsignedGeometry(max, -1) >= min)) {
+    scroll.setClampBounds(min, max)
+  } else {
+    scroll.setClampBounds(undefined, undefined)
+  }
+}
+
 export function useVirtualHistory(
   scrollRef: RefObject<ScrollBoxHandle | null>,
   items: readonly { key: string }[],
@@ -163,7 +234,8 @@ export function useVirtualHistory(
     overscan = OVERSCAN,
     maxMounted = MAX_MOUNTED,
     coldStartCount = COLD_START,
-    nativeMode = false
+    nativeMode = false,
+    inline = INLINE_MODE
   }: VirtualHistoryOptions = {}
 ) {
   const nodes = useRef(new Map<string, unknown>())
@@ -233,15 +305,7 @@ export function useVirtualHistory(
 
     prevColumns.current = columns
 
-    for (const [k, h] of heights.current) {
-      const scaled = Math.round(h * ratio)
-
-      if (validMeasuredHeight(scaled)) {
-        heights.current.set(k, scaled)
-      } else {
-        heights.current.delete(k)
-      }
-    }
+    scaleMeasuredHeights(heights.current, ratio)
 
     offsetVersion.current++
     skipMeasurement.current = true
@@ -337,6 +401,8 @@ export function useVirtualHistory(
     return rangeTop <= visibleTop && rangeBottom >= visibleBottom ? frozenRangeCandidate : null
   })()
 
+  const isInline = inline && !nativeMode
+
   let start = 0
   let end = n
 
@@ -345,6 +411,9 @@ export function useVirtualHistory(
     // flow. The terminal owns scrollback; there is no viewport window to
     // virtualize or reconcile against.
     start = 0
+    end = n
+  } else if (isInline) {
+    start = Math.max(0, n - maxMounted)
     end = n
   } else if (frozenRange) {
     start = frozenRange[0]
@@ -390,28 +459,7 @@ export function useVirtualHistory(
   // items are tiny. Pessimistic because uncached items use a floor of 1 —
   // over-mounts when items are large, never leaves blank spacer showing.
   if (!nativeMode && n > 0 && vp > 0 && !frozenRange) {
-    const needed = vp + 2 * overscan
-    let coverage = 0
-
-    for (let i = start; i < end; i++) {
-      coverage += ensureVirtualItemHeight(heights.current, items[i]!.key, i, PESSIMISTIC, estimateHeight)
-    }
-
-    if (sticky) {
-      const minStart = Math.max(0, end - maxMounted)
-
-      while (start > minStart && coverage < needed) {
-        start--
-        coverage += ensureVirtualItemHeight(heights.current, items[start]!.key, start, PESSIMISTIC, estimateHeight)
-      }
-    } else {
-      const maxEnd = Math.min(n, start + maxMounted)
-
-      while (end < maxEnd && coverage < needed) {
-        coverage += ensureVirtualItemHeight(heights.current, items[end]!.key, end, PESSIMISTIC, estimateHeight)
-        end++
-      }
-    }
+    ;[start, end] = coverViewport(start, end, items, heights.current, estimateHeight, vp + 2 * overscan, maxMounted, sticky)
   }
 
   // Slide cap: limit how many NEW items mount this commit. Gates on scroll
@@ -462,7 +510,7 @@ export function useVirtualHistory(
   // Inverted range (large jump with deferred value lagging) or sticky snap
   // (scrollToBottom needs the tail mounted NOW so maxScroll lands on content,
   // not bottomSpacer) — skip deferral.
-  if (effStart > effEnd || sticky) {
+  if (isInline || effStart > effEnd || sticky) {
     effStart = start
     effEnd = end
   }
@@ -587,23 +635,7 @@ export function useVirtualHistory(
     // would drain past the deferred children's span → viewport lands in
     // spacer → white flash.
     if (s && shouldSetVirtualClamp({ itemCount: n, liveTailActive, sticky, viewportHeight: vp })) {
-      const effTopSpacer = offsets[effStart] ?? 0
-      const effBottom = offsets[effEnd] ?? total
-      const clampMin = effStart === 0 ? 0 : effTopSpacer
-      // Preserve the intentional open tail: when the mounted range reaches
-      // the final row, Yoga may already know about growth that the measured
-      // height cache has not reconciled yet. A finite estimated clamp would
-      // trap a manual, non-sticky viewport above that newly grown tail.
-      const clampMax = effEnd === n ? Number.POSITIVE_INFINITY : Math.max(effTopSpacer, effBottom - vp)
-
-      if (
-        safeUnsignedGeometry(clampMin, -1) >= 0 &&
-        (clampMax === Number.POSITIVE_INFINITY || safeUnsignedGeometry(clampMax, -1) >= clampMin)
-      ) {
-        s.setClampBounds(clampMin, clampMax)
-      } else {
-        s.setClampBounds(undefined, undefined)
-      }
+      setVirtualClamp(s, offsets, effStart, effEnd, n, total, vp)
     } else {
       s?.setClampBounds(undefined, undefined)
     }
@@ -625,8 +657,11 @@ export function useVirtualHistory(
 
     if (skipMeasurement.current) {
       skipMeasurement.current = false
-      bumpMeasuredHeightVersion(n => n + 1)
-    } else {
+
+      if (!isInline) {
+        bumpMeasuredHeightVersion(n => n + 1)
+      }
+    } else if (!isInline) {
       for (let i = effStart; i < effEnd; i++) {
         const k = items[i]?.key
 
@@ -687,6 +722,7 @@ export function useVirtualHistory(
   }, [
     effEnd,
     effStart,
+    isInline,
     items,
     liveTailActive,
     measuredHeightVersion,
@@ -700,13 +736,15 @@ export function useVirtualHistory(
     vp
   ])
 
+  const inlineStart = Math.max(0, n - maxMounted)
+
   return {
-    bottomSpacer: Math.max(0, total - (offsets[effEnd] ?? total)),
-    end: effEnd,
+    bottomSpacer: isInline ? 0 : Math.max(0, total - (offsets[effEnd] ?? total)),
+    end: isInline ? n : effEnd,
     measureRef,
     offsets,
-    start: effStart,
-    topSpacer: offsets[effStart] ?? 0
+    start: isInline ? inlineStart : effStart,
+    topSpacer: isInline ? 0 : (offsets[effStart] ?? 0)
   }
 }
 
@@ -725,4 +763,5 @@ interface VirtualHistoryOptions {
   onHeightsChange?: (heights: ReadonlyMap<string, number>) => void
   overscan?: number
   nativeMode?: boolean
+  inline?: boolean
 }

@@ -40,9 +40,10 @@ from agent.context_compressor_typed_input import TYPED_TURNS_POINTER, typed_summ
 from agent.conversation_compression_scaffolding import is_user_role_scaffolding
 from agent.context_compressor_tail import (
     demote_stale_tail_tools, lean_tail_budget, is_demoted_stub, skill_view_names_by_call_id, tail_cut_pricer,
-    elide_keeping_skill_safety_rule, with_skill_safety_rule, without_skill_safety_rule, tail_cut_progress_floor,
+    with_skill_safety_rule, without_skill_safety_rule, tail_cut_progress_floor,
 )
 from agent.context_compressor_telemetry import CompressionTelemetryMixin
+from agent.compaction_budget import CompactionBudgetMixin, _normalize_exempt_models
 from agent.error_classifier import ClassifiedError, FailoverReason, classify_api_error
 from agent.micro_compaction import MicroCompactionMixin
 from agent.prompt_builder import STEER_DISPLAY_KIND
@@ -585,7 +586,10 @@ def salvage_grown_transcript(
             and len(content) > _SALVAGE_SUMMARY_MAX_CHARS
             and _looks_like_compaction_summary(msg, content)
         ):
-            msg["content"] = elide_keeping_skill_safety_rule(content, _SALVAGE_SUMMARY_MAX_CHARS) + "\n\n" + _SUMMARY_END_MARKER
+            from agent.context_compressor_salvage import trim_summary
+            trimmed = trim_summary(content, _SALVAGE_SUMMARY_MAX_CHARS)
+            if trimmed is not None:
+                msg["content"] = trimmed
     _prune_stale_reasoning_replay(out)
     if estimate_messages_tokens_rough(out) >= budget:
         _salvage_reduce_todo_snapshot(out)
@@ -2033,7 +2037,8 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 
 
 class ContextCompressor(
-    SummaryDispatchMixin, SummaryInputSamplingMixin, PreLlmSkipMixin, CompressionTelemetryMixin, MicroCompactionMixin,
+    SummaryDispatchMixin, SummaryInputSamplingMixin, PreLlmSkipMixin, CompressionTelemetryMixin,
+    CompactionBudgetMixin, MicroCompactionMixin,
     ProactivePruneMixin, CompactionWindowMixin, DurableStateMixin, ContextEngine,
 ):
     """Default context engine: prune tool results, protect head/tail, summarize the middle
@@ -2057,19 +2062,6 @@ class ContextCompressor(
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
 
-    def _emit_init_summary_once(self) -> None:
-        """Emit the init log line once, on first context-length resolution (keeps __init__ non-blocking)."""
-        if not getattr(self, "_log_init_summary", False):
-            return
-        self._log_init_summary = False
-        logger.info(
-            "Context compressor initialized: model=%s context_length=%d threshold=%d (%.0f%%) "
-            "target_ratio=%.0f%% tail_budget=%d provider=%s base_url=%s",
-            self.model, self._resolved_context_length, self.threshold_tokens,
-            self.threshold_percent * 100, self.summary_target_ratio * 100,
-            self.tail_token_budget,
-            self.provider or "none", self.base_url or "none",
-        )
 
     def _resolve_context_length(self) -> int:
         """Resolve and cache the model's context length on first access."""
@@ -2077,6 +2069,7 @@ class ContextCompressor(
             self._resolved_context_length = get_model_context_length(
                 self.model, base_url=self.base_url, api_key=self.api_key, config_context_length=self._config_context_length,
                 provider=self.provider, custom_providers=self.custom_providers)
+            self._resolved_endpoint_output_limit = self._cached_endpoint_output_limit(self.model, self.provider)
             self._context_default = (self.model, self.base_url, last_defaulted_context_length())  # agent.context_pin label
             # Raise-only small-context floor; must run after context_length resolves and before threshold_tokens derives.
             self.threshold_percent = self._effective_threshold_percent(self._resolved_context_length, self._base_threshold_percent)
@@ -2105,7 +2098,14 @@ class ContextCompressor(
         if self._threshold_tokens is None:
             # Resolve the window first: it may floor threshold_percent as a side effect.
             _ctx = self.context_length
-            self._threshold_tokens = self._compute_threshold_tokens(_ctx, self.threshold_percent, self.max_tokens)
+            self._threshold_tokens = self._compute_threshold_tokens(
+                _ctx,
+                self.threshold_percent,
+                self.max_tokens,
+                model=getattr(self, "model", "") or "",
+                provider=getattr(self, "provider", "") or "",
+                endpoint_output_limit=self._cached_endpoint_output_limit(self.model, self.provider),
+            )
             self._apply_threshold_tokens_cap()
         return self._threshold_tokens
 
@@ -2508,24 +2508,7 @@ class ContextCompressor(
             logger.debug("compression cancellation check failed", exc_info=True)
             return False
 
-    def _derive_trigger(self, model: str, context_length: int, provider: str) -> tuple[float, float, int]:
-        """``(base_percent, effective_percent, threshold_tokens)`` for a model/window, from the raw config
-        value so a switch away from an overridden model falls back correctly. Pure: the one place the
-        trigger math lives, shared by ``update_model`` and the switch guard's preview so the number the
-        guard quotes is the number the compressor installs (#83450). Excludes the auxiliary-summariser
-        ceiling, which the feasibility probe re-derives per runtime."""
-        base_percent = resolve_model_threshold(model, self.model_thresholds, self._config_threshold_percent, provider)
-        effective_percent = self._effective_threshold_percent(context_length, base_percent)
-        threshold = self._compute_threshold_tokens(context_length, effective_percent, self.max_tokens)
-        cap = self._effective_threshold_cap(context_length)
-        if cap is not None:
-            threshold = min(threshold, cap)
-        return base_percent, effective_percent, threshold
 
-    def _effective_threshold_cap(self, context_length: int) -> int | None:
-        """The configured ``threshold_tokens`` cap clamped to the window; None when no cap is configured."""
-        cap = self.threshold_tokens_cap
-        return min(cap, context_length) if cap is not None and cap > 0 else None
 
     def preview_threshold_tokens(self, model: str, context_length: int, provider: str = "") -> int:
         """The trigger ``update_model`` would install, without mutating state."""
@@ -2537,7 +2520,10 @@ class ContextCompressor(
     ) -> None:
         """Update model info after a model switch or fallback activation."""
         runtime_changed = (model, provider, base_url, api_mode) != (self.model, self.provider, self.base_url, self.api_mode)
+        metadata_route_changed = runtime_changed or api_key != self.api_key
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
+        if metadata_route_changed:
+            self._resolved_endpoint_output_limit = None
         self.context_length = context_length
         # max_tokens=None means "unspecified": keep the existing output reservation.
         # A switch that genuinely changes the output budget passes the new value explicitly. (#43547)
@@ -2548,6 +2534,8 @@ class ContextCompressor(
             # main model); the caller re-runs the feasibility probe. A same-runtime recompute (overflow-reported
             # window, grown local window, tier cap) keeps it: the summariser did not change (#114707).
             self._aux_context_ceiling = None
+        if metadata_route_changed:
+            self._resolved_endpoint_output_limit = self._cached_endpoint_output_limit(model, provider)
         self._base_threshold_percent, self.threshold_percent, self.threshold_tokens = self._derive_trigger(
             model, context_length, provider)
         self._apply_threshold_tokens_cap()
@@ -2574,6 +2562,12 @@ class ContextCompressor(
         self._reset_proactive_prune_rearm()
         self._clear_durable_proactive_prune_rearm()
 
+        self._log_updated_budget(model, context_length, provider)
+
+    def preview_model_threshold(self, model: str, context_length: int, provider: str = "") -> int:
+        """Resolve a switch's trigger without mutating live compression state."""
+        return self.preview_threshold_tokens(model, context_length, provider)
+
     # When the MINIMUM_CONTEXT_LENGTH floor binds on a small window, trigger near the top instead.
     _MIN_CTX_TRIGGER_RATIO = 0.85
 
@@ -2590,7 +2584,7 @@ class ContextCompressor(
 
     @staticmethod
     def _coerce_max_tokens(value: Any) -> int | None:
-        """Normalize max_tokens to a positive int, or None for "no reservation"."""
+        """Normalize max_tokens to a positive int, or None for \"no reservation\"."""
         try:
             ivalue = int(value) if value is not None else 0
         except (TypeError, ValueError):
@@ -2600,16 +2594,6 @@ class ContextCompressor(
     # Same normalization: a threshold_tokens cap is a positive int, or None for "no cap".
     _coerce_threshold_tokens_cap = _coerce_max_tokens
 
-    def _apply_threshold_tokens_cap(self) -> None:
-        """Clamp threshold_tokens to the configured cap (itself clamped to the context length) and to the
-        auxiliary summariser's window when the feasibility probe installed one."""
-        cap = self._effective_threshold_cap(self.context_length)
-        if cap is not None and cap < self.threshold_tokens:
-            self.threshold_tokens = cap
-        # Durable, so every recomputation honours it rather than a one-time assignment (#114707).
-        _aux_ceiling = getattr(self, "_aux_context_ceiling", None)
-        if isinstance(_aux_ceiling, int) and 0 < _aux_ceiling < self.threshold_tokens:
-            self.threshold_tokens = _aux_ceiling
 
     @staticmethod
     def _effective_threshold_percent(context_length: int, threshold_percent: float) -> float:
@@ -2627,38 +2611,42 @@ class ContextCompressor(
 
     @staticmethod
     def _compute_threshold_tokens(
-        context_length: int, threshold_percent: float, max_tokens: int | None = None,
+        context_length: int,
+        threshold_percent: float,
+        max_tokens: int | None = None,
+        model: str = "",
+        provider: str = "",
+        endpoint_output_limit: int = 0,
     ) -> int:
         """Compute the compaction trigger in tokens from the effective input budget.
         Base is ``(context_length - max_tokens) * threshold_percent`` floored at MINIMUM_CONTEXT_LENGTH;
         when the floor binds it is capped at 85% of the budget so small windows can still fire.
 
-        The base value is ``effective_input_budget * threshold_percent``, floored at
-        ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress prematurely at 50%. BUT that floor
-        degenerates at small windows: for a model whose ``context_length`` is at/below the minimum (e.g. a
-        64K local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold equal the ENTIRE window —
-        auto-compression can never fire because the provider rejects the request before usage reaches 100%
-        (#14690).
-        The provider reserves ``max_tokens`` of output space out of the same window, so the usable INPUT
-        budget is ``context_length - max_tokens``. With a large ``max_tokens`` (e.g. 65536 on a custom
-        provider) the input budget is materially smaller than the raw window, and a threshold based on the
-        full window lets the session hit a provider 400 before compaction fires (#43547). The percentage and
-        the degenerate-window check below both operate on the effective input budget. ``max_tokens=None``
-        (provider default) conservatively assumes no reservation (full window).
+        The base value is ``usable_input_budget * threshold_percent``, floored
+        at ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress
+        prematurely at 50%. BUT that floor degenerates at small windows: for a
+        model whose ``context_length`` is at/below the minimum (e.g. a 64K
+        local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold
+        equal the ENTIRE window — auto-compression can never fire because the
+        provider rejects the request before usage reaches 100% (#14690).
+
+        When the floor would meet or exceed the usable input budget, trigger at
+        ``_MIN_CTX_TRIGGER_RATIO`` (85%) of the budget — high enough that a
+        small model uses most of its context before compacting, but below
+        100% so compaction fires before the provider rejects the request.
+
+        The provider reserves ``max_tokens`` of output space out of the same
+        window, so the usable INPUT budget is ``context_length - output_reservation``.
+        When ``max_tokens`` is None and model/provider are provided, we resolve
+        the authoritative native output ceiling via ``get_model_max_output_tokens``.
+        A hard invariant ceiling additionally preserves 1024 safety headroom for
+        system prompts and tool schemas.
         """
-        effective_window = ContextCompressor._effective_input_window(context_length, max_tokens)
-        pct_value = int(effective_window * threshold_percent)
-        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
-        # The floor must not consume output headroom: cap at 85% when it is the binding term. Near-minimum windows
-        # otherwise trigger at ~98%, and providers that silently clip over-window prompts (ollama) never raise the
-        # overflow backstop, so the session wedges. An explicit threshold_percent above 85% is user intent; not capped.
-        trigger_cap = int(effective_window * ContextCompressor._MIN_CTX_TRIGGER_RATIO)
-        if effective_window > 0 and floored > pct_value and floored > trigger_cap:
-            floored = max(pct_value, trigger_cap)
-        # A percentage at/above the window is unreachable; trigger at 85% instead.
-        if effective_window > 0 and floored >= effective_window:
-            return max(1, min(trigger_cap, effective_window - 1))
-        return floored
+        return ContextCompressor.compute_budget_report(
+            context_length=context_length, threshold_percent=threshold_percent, max_tokens=max_tokens,
+            model=model, provider=provider, threshold_tokens_cap=None, aux_context_ceiling=None,
+            base_threshold_percent=threshold_percent, apply_ratio_floor=False, endpoint_output_limit=endpoint_output_limit,
+        )["actual_trigger"]
 
     def __init__(
         self, model: str, threshold_percent: float = 0.50, protect_first_n: int = 3, protect_last_n: int = 20,
@@ -2669,6 +2657,8 @@ class ContextCompressor(
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
         custom_providers: list | None = None,
+        threshold_tokens_exempt_models: Any = None,
+        threshold_tokens_exempt_families: Any = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
@@ -2684,6 +2674,9 @@ class ContextCompressor(
         self.threshold_percent = self._base_threshold_percent
         # Effective trigger = min(ratio threshold, cap); re-applied in update_model().
         self.threshold_tokens_cap = self._coerce_threshold_tokens_cap(threshold_tokens_cap)
+        self.threshold_tokens_exempt_models = _normalize_exempt_models(
+            threshold_tokens_exempt_models if threshold_tokens_exempt_models is not None else threshold_tokens_exempt_families
+        )
         # Aux summariser window installed by the feasibility probe; None until it runs.
         self._aux_context_ceiling: int | None = None
         self.protect_first_n, self.protect_last_n = protect_first_n, protect_last_n
@@ -2735,6 +2728,7 @@ class ContextCompressor(
         self._config_context_length = config_context_length
         self._configured_threshold_percent = self.threshold_percent
         self._resolved_context_length: int | None = None
+        self._resolved_endpoint_output_limit: int | None = None
         self._threshold_tokens = self._tail_token_budget = self._max_summary_tokens = None
         self.compression_count = 0
         # The init log reports resolved budgets; emit it on first resolution to keep construction non-blocking.
@@ -3530,20 +3524,23 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             with aux_interrupt_protection():
                 response = call_llm(**call_kwargs)
         finally:
-            route_known = bool(_aux_route.get("provider") and _aux_route.get("model"))
+            _aux_provider = _aux_route.get("provider") or None
             _aux_model = _aux_route.get("model") or self.summary_model or self.model or ""
+            route_known = bool(_aux_provider and _aux_model)
+            _aux_reasoning = _aux_route.get("reasoning")
             # Remember the resolved model for the failure path: an ``auto`` route picks one per call
             # without setting ``summary_model``, so only this names it in the user warning (#116472).
             self._last_aux_resolved_model = _aux_model or None
             self._record_aux_compression_call(
                 prompt_messages=call_kwargs["messages"],
-                # max_tokens is intentionally absent; .get() keeps the telemetry hook from breaking the call.
                 max_tokens=call_kwargs.get("max_tokens"),
                 duration_ms=int((time.monotonic() - _aux_call_start) * 1000),
-                aux_provider=_aux_route.get("provider") or self.provider or "",
-                aux_model=_aux_model,
+                aux_provider=_aux_provider,
+                aux_model=_aux_route.get("model") or None,
                 effective_aux_context=self.context_length if route_known and _aux_model == self.model else None,
                 phase_timings=_latency_info,
+                response=response if "response" in locals() else None,
+                reasoning=_aux_reasoning,
             )
         if self._compression_cancelled():
             raise AuxiliaryExplicitCancellation()
@@ -4770,7 +4767,6 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Do NOT reset the *_failure flags: the cooldown early-return doesn't re-assert them, so a
         # reset would fall through to the destructive static fallback (#29559). Success clears them.
         telemetry = self._begin_compression_telemetry(current_tokens=current_tokens)
-        telemetry["chunk_count"] = 0
         # Manual /compress bypasses the failure cooldown and the structural no-op backoff (#93022).
         if force:
             self._clear_compression_failure_cooldown()
@@ -5088,6 +5084,7 @@ Write only the summary body. Do not include any preamble or prefix."""
             head_messages=messages[:compress_start], middle_messages=turns_to_summarize, tail_messages=messages[compress_end:],
         )
         telemetry["chunk_count"] = 1 if turns_to_summarize else 0
+        telemetry["chunking"] = False
         if not turns_to_summarize:
             # Window is only handoff rows (#59496): skip the aux call; _previous_summary is KEPT —
             # it came from this transcript.
@@ -5133,6 +5130,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         messages, pruned_count = self._commit_window(canonical_messages, plan, pruned_count, compress_start, compress_end)
         compressed = self._assemble_with_archive_list(messages, compress_start, compress_end, scan, summary)
         return self._finalize_compressed(compressed, canonical_messages, n_messages, spare_pending_images, pruned_count)
+
 
     def _assemble_compressed(
         self, messages: list[dict[str, Any]], compress_start: int, compress_end: int, scan: _HandoffScan, summary: str,

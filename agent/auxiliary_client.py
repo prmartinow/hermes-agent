@@ -140,6 +140,7 @@ from agent.auxiliary_health import (
 from agent.auxiliary_unavailable import (
     AuxiliaryClientUnavailable, clear_nous_credential_failure, missing_provider_credentials_message,
     nous_credential_failure_detail, record_nous_credential_failure)
+from agent.provider_route_hooks import default_gemini_client, is_gemini_native_route
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
 from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, normalize_proxy_env_vars
 
@@ -828,11 +829,10 @@ def _get_aux_model_for_provider(provider_id: str, *, prefer_fast: bool = False) 
 # Fallback for providers without ProviderProfile.default_aux_model (plus some pinned here).
 # New providers should set default_aux_model instead.
 _API_KEY_PROVIDER_AUX_MODELS_FALLBACK: dict[str, str] = {
-    "gemini": "gemini-3.6-flash", "zai": "glm-4.5-flash", "kimi-coding": "kimi-k2-turbo-preview",
+    "zai": "glm-4.5-flash", "kimi-coding": "kimi-k2-turbo-preview",
     "stepfun": "step-3.5-flash", "kimi-coding-cn": "kimi-k2-turbo-preview",
-    "gmi": "google/gemini-3.1-flash-lite-preview", "anthropic": "claude-haiku-4-5-20251001",
-    "ai-gateway": "google/gemini-3-flash", "opencode-zen": "gemini-3-flash", "opencode-go": "glm-5",
-    "kilocode": "google/gemini-3.6-flash", "ollama-cloud": "nemotron-3-nano:30b",
+    "anthropic": "claude-haiku-4-5-20251001", "opencode-go": "glm-5",
+    "ollama-cloud": "nemotron-3-nano:30b",
     "tencent-tokenhub": "hy4-preview", "tencent-tokenplan": "hy4-preview",
     # No "deepinfra": its aux model lives on the ProviderProfile (read first).
 }
@@ -959,7 +959,7 @@ from agent.portal_tags import nous_portal_tags as _nous_portal_tags
 # silently, and a paid default meant spend the user never opted into. User-configured values
 # are honored untouched (_warn_paid_lane_once fires).
 _OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
-_NOUS_MODEL = "google/gemini-3.6-flash"
+_NOUS_MODEL = "anthropic/claude-haiku-4.5"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 _AUTH_JSON_PATH = get_hermes_home() / "auth.json"
@@ -2162,12 +2162,10 @@ def _resolve_api_key_provider() -> tuple[Optional[OpenAI], Optional[str]]:
                 api_key = runtime["api_key"]
             via = " (session endpoint)"
         logger.debug("Auxiliary text client: %s (%s)%s", pconfig.name, model, via)
-        # Native Gemini, else OpenAI-wire + Anthropic rewrap.
         base_url = _to_openai_base_url(raw_base_url)
-        if provider_id == "gemini":
-            from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
-            if is_native_gemini_base_url(base_url):
-                return _tag_backend(GeminiNativeClient(api_key=api_key, base_url=base_url), provider_id), model
+        native_client = default_gemini_client(provider_id, api_key, base_url)
+        if native_client is not None:
+            return _tag_backend(native_client, provider_id), model
         if base_url_host_matches(base_url, "api.kimi.com"):
             headers = {"User-Agent": "claude-code/0.1.0"}
         elif base_url_host_matches(base_url, "integrate.api.nvidia.com"):
@@ -3546,6 +3544,7 @@ def _prepare_same_provider_retry(
     max_tokens: Optional[int], tools: Optional[list], effective_timeout: float,
     effective_extra_body: dict, reasoning_config: Optional[dict], async_mode: bool,
     extra_headers: Optional[dict[str, str]] = None, repairs: tuple = (),
+    no_progress_timeout: Optional[float] = None,
 ) -> tuple[Any, dict[str, Any]]:
     """Rebuild (client, request kwargs) for a same-provider retry after credential recovery. ``repairs``: the
     parameter rungs' strips the failed request already carried, re-applied so a stripped field stays stripped."""
@@ -3565,11 +3564,19 @@ def _prepare_same_provider_retry(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
     retry_base = str(getattr(retry_client, "base_url", "") or "")
+    if no_progress_timeout is None and task:
+        no_progress_timeout = _get_task_no_progress_timeout(task)
+    is_codex = isinstance(retry_client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)) or (
+        str(effective_provider or resolved_provider or "").strip().lower() in {"openai-codex", "codex", "openai_codex"}
+        or resolved_api_mode == "codex_responses"
+    )
+    effective_no_progress = no_progress_timeout if is_codex else None
     retry_kwargs = _build_call_kwargs(
         effective_provider or resolved_provider, retry_model or final_model, messages,
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url, task=task,
+        no_progress_timeout=effective_no_progress,
     )
     # Preserve per-request attribution headers (a profile's ``request_headers``) across the rebuilt-client
     # retry: dropping them would let a recovery retry silently lose capability gating (#60293).
@@ -3819,6 +3826,7 @@ def _fallback_request_kwargs(
     tools: Optional[list], temperature: Optional[float], max_tokens: Optional[int],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
     fallback_entry: dict, task_config: dict, apply_fast_lane: bool,
+    client: Optional[Any] = None, no_progress_timeout: Optional[float] = None,
 ) -> dict[str, Any]:
     """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap)."""
     fallback_max_tokens, fallback_extra_body = max_tokens, effective_extra_body
@@ -3830,10 +3838,16 @@ def _fallback_request_kwargs(
             leak_guard_config=task_config, max_tokens=max_tokens, extra_body=effective_extra_body,
         )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(messages, tools, destination=destination)
+    if no_progress_timeout is None and task:
+        no_progress_timeout = _get_task_no_progress_timeout(task)
+    from agent.auxiliary_codex_response import is_codex_destination
+    is_codex = is_codex_destination(destination, client=client)
+    effective_no_progress = no_progress_timeout if is_codex else None
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task)
+        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task,
+        no_progress_timeout=effective_no_progress)
     return fb_kwargs
 
 
@@ -3868,9 +3882,9 @@ def _plan_fallback_candidate(
             provider, destination.base_url or str(getattr(client, "base_url", "") or ""),
             destination.api_mode, model or destination.model,
         )
-        return retry_destination, _fallback_request_kwargs(retry_destination, **common)
+        return retry_destination, _fallback_request_kwargs(retry_destination, client=client, **common)
 
-    return destination, _fallback_request_kwargs(destination, **common), _rebuild
+    return destination, _fallback_request_kwargs(destination, client=fb_client, **common), _rebuild
 
 
 def _quarantine_fallback_candidate(
@@ -3949,6 +3963,7 @@ def _call_fallback_candidate_sync(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    no_progress_timeout: Optional[float] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery (``_fallback_candidate_ladder``).
 
@@ -3960,7 +3975,7 @@ def _call_fallback_candidate_sync(
         fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
         apply_fast_lane=True, messages=messages, tools=tools, temperature=temperature,
         max_tokens=max_tokens, effective_extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
+        reasoning_config=reasoning_config, no_progress_timeout=no_progress_timeout,
     )
     provider = _candidate_classification_provider(fb_client, fb_model, fb_label, task)
 
@@ -3991,13 +4006,14 @@ async def _call_fallback_candidate_async(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict], classify_as: str,
+    no_progress_timeout: Optional[float] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync` (no fast-lane cap on this wire)."""
     destination, fb_kwargs, rebuild = _plan_fallback_candidate(
         fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
         apply_fast_lane=False, messages=messages, tools=tools, temperature=temperature,
         max_tokens=max_tokens, effective_extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
+        reasoning_config=reasoning_config, no_progress_timeout=no_progress_timeout,
     )
     provider = classify_as
 
@@ -4649,7 +4665,7 @@ def _build_bedrock_client(provider: str, model: Optional[str], *, raw_codex: boo
 
 
 def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[Any], Optional[str]]:
-    """Google Vertex AI: Gemini via the OpenAI-compatible endpoint with an OAuth2 bearer (standard OpenAI client)."""
+    """Google Vertex AI via its OpenAI-compatible endpoint and OAuth2 bearer."""
     try:
         from agent.vertex_adapter import get_vertex_config, has_vertex_credentials
     except ImportError:
@@ -4662,7 +4678,7 @@ def _build_vertex_client(provider: str, model: Optional[str]) -> tuple[Optional[
     if not token or not base_url:
         logger.warning("resolve_provider_client: vertex requested but could not mint token / resolve project")
         return None, None
-    final_model = _normalize_resolved_model(model or "google/gemini-3-flash-preview", provider)
+    final_model = _normalize_resolved_model(model or "claude-haiku-4-5", provider)
     try:
         # Aliased import: a bare `from openai import OpenAI` would shadow the module-level lazy proxy.
         from openai import OpenAI as _VertexOpenAI
@@ -5105,17 +5121,14 @@ def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: C
     if req.explicit_base_url and provider != "actual":
         base_url = _to_openai_base_url(req.explicit_base_url.strip().rstrip("/"))
     final_model = _normalize_resolved_model(req.model or _get_aux_model_for_provider(provider), provider)
-    # Consulted before the built-in gemini/OpenAI ladder so a registered native transport wins (#112384).
     profile_client = _api_key_profile_supplied_client(provider, api_key=api_key, base_url=base_url)
     if profile_client is not None:
         logger.debug("resolve_provider_client: %s native client from provider profile (%s)", provider, final_model)
         return _route_client(req, profile_client, final_model)
-    if provider == "gemini":
-        from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
-        if is_native_gemini_base_url(base_url):
-            client = GeminiNativeClient(api_key=api_key, base_url=base_url)
-            logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
-            return _route_client(req, client, final_model)
+    client = default_gemini_client(provider, api_key, base_url)
+    if client is not None:
+        logger.debug("resolve_provider_client: %s (%s)", provider, final_model)
+        return _route_client(req, client, final_model)
     headers = _endpoint_default_headers(base_url, provider, is_vision=req.is_vision, xai=True)
     client = _create_openai_client(api_key=api_key, base_url=base_url, **({"default_headers": headers} if headers else {}))
     from agent.provider_route_hooks import model_api_mode  # a Responses-only model: call_llm() streams responses
@@ -6347,20 +6360,6 @@ def _nous_on_messages_wire(provider_norm: str, model: str) -> bool:
 
 
 _NVIDIA_PROVIDER_NAMES = {"nvidia", "nvidia-nim", "nim", "build-nvidia", "nemotron"}
-_GEMINI_NATIVE_PROVIDER_NAMES = {"gemini", "google", "google-gemini", "google-ai-studio"}
-
-
-def _is_gemini_native_route(provider_norm: str, effective_base: str) -> bool:
-    """Gemini native by provider name, else (best-effort) by base URL shape."""
-    if provider_norm in _GEMINI_NATIVE_PROVIDER_NAMES:
-        return True
-    if not effective_base:
-        return False
-    try:
-        from agent.gemini_native_adapter import is_native_gemini_base_url
-        return is_native_gemini_base_url(effective_base)
-    except Exception:
-        return False
 
 
 def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str]) -> bool:
@@ -6379,7 +6378,7 @@ def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effectiv
         or provider_norm in _NVIDIA_PROVIDER_NAMES
         or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
         or str(task) == "moa_reference"
-        or _is_gemini_native_route(provider_norm, effective_base)
+        or is_gemini_native_route(provider_norm, effective_base)
         or provider_norm == "openrouter"
         or base_url_host_matches(effective_base, "openrouter.ai")
         or _is_managed_local_endpoint(effective_base)
@@ -7940,6 +7939,7 @@ def _plan_aux_call(
         task=task, messages=messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, effective_timeout=req.effective_timeout,
         effective_extra_body=req.effective_extra_body, reasoning_config=reasoning_config,
+        no_progress_timeout=_get_task_no_progress_timeout(task) if task else None,
     )
     retry_kwargs = dict(
         candidate_kwargs, resolved_base_url=req.resolved_base_url,

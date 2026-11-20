@@ -57,6 +57,9 @@ def _stop_response():
 def _make_agent(monkeypatch, tmp_path: Path, *, max_attempts) -> AIAgent:
     from hermes_cli import config as config_mod
 
+    monkeypatch.setattr("agent.model_metadata.fetch_model_metadata", lambda **_: {
+        "test/model": {"context_length": 100_000},
+    })
     monkeypatch.setattr(
         config_mod, "load_config", lambda: _config(max_attempts)
     )
@@ -102,9 +105,8 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
     # makes material (~10% > the 5% progress floor) headway.
     compressor = agent.context_compressor
     compressor.threshold_tokens = 50_000
-    # This is the attempt-cap invariant, not first-request deferral: the provider
-    # is already known to omit usage, so its heuristic fallback may compact.
-    compressor.note_usage_less_response()
+    # The upstream preflight guard requires a provider-backed pressure signal.
+    compressor.last_real_prompt_tokens = 50_000
 
     estimate_state = {"tokens": 1_000_000.0, "calls": 0}
 
@@ -116,8 +118,8 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
 
     compress_calls = []
 
-    def _fake_compress(messages, system_message, **_kwargs):
-        compress_calls.append(len(messages))
+    def _fake_compress(messages, system_message, **kwargs):
+        compress_calls.append(kwargs.get("trigger"))
         return messages, "compressed prompt"
 
     # 60 messages > protect_first_n + protect_last_n + 1, so the cheap
@@ -137,16 +139,18 @@ def test_preflight_runs_fourth_compaction_pass_at_cap_six(monkeypatch, tmp_path)
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.turn_context.start_deferred_title_upgrade"),
     ):
         result = agent.run_conversation("hello", conversation_history=history)
 
     assert result["completed"] is True
     # The old hardcoded range(3) made a 4th pass impossible; cap=6 must
     # deliver it (and, with steady progress over threshold, all six).
-    assert len(compress_calls) >= 4, (
+    preflight_calls = compress_calls.count("turn_start_threshold")
+    assert preflight_calls >= 4, (
         f"expected a 4th preflight compaction pass at cap=6, "
-        f"got {len(compress_calls)} passes"
+        f"got {preflight_calls} passes"
     )
-    assert len(compress_calls) == 6
+    assert preflight_calls == 6
 
 

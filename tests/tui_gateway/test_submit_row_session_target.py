@@ -13,6 +13,8 @@ mints the continuation) and asserts one turn's rows stay in ONE session.
 
 from types import SimpleNamespace
 
+import pytest
+
 from agent.turn_context import _stage_turn_user_message
 from persistence.conversation.lineage import CompressionChild
 from persistence.conversation.messages import (
@@ -257,7 +259,9 @@ def test_message_react_targets_the_row_in_the_session_that_owns_it(monkeypatch, 
         db.close()
 
 
-def test_session_history_reads_the_continuation_after_a_rotation(monkeypatch, tmp_path):
+@pytest.mark.parametrize("paging", [{}, {"tail_limit": 100}, {"cursor": 0, "limit": 100},
+                                    {"after_row_id": 0, "limit": 100}, {"before_index": 100, "limit": 100}])
+def test_session_history_reads_the_continuation_after_a_rotation(monkeypatch, tmp_path, paging):
     """``session.history`` addresses the durable transcript by session. ``include_ancestors`` walks PARENT
     pointers, so a stale ``session_key`` materializes root..parent and never the continuation — a
     reconnect in the post-rotation window renders a transcript missing every turn since the rotation."""
@@ -265,7 +269,7 @@ def test_session_history_reads_the_continuation_after_a_rotation(monkeypatch, tm
     sid, key, _session, _agent, child = _rotated_session(monkeypatch, db)
     try:
         seed_messages(db, child, {"role": "user", "content": "sent after the rotation"})
-        got = server.handle_request({"id": "h1", "method": "session.history", "params": {"session_id": sid}})
+        got = server.handle_request({"id": "h1", "method": "session.history", "params": {"session_id": sid, **paging}})
         assert "result" in got, got
         texts = [m.get("text") or m.get("content") for m in got["result"]["messages"]]
         assert "sent after the rotation" in texts, (
@@ -367,6 +371,23 @@ def test_busy_queue_accept_row_lands_with_the_turn_and_is_addressed_there(monkey
         active = [r for r in conversation(db, child, ConversationRequest(include_row_ids=True))
                   if "QUEUED-A" in str(r["content"])]
         assert len(active) == 1, f"deactivation missed the row's session: {len(active)} still active"
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
+def test_hydration_snapshot_rejects_a_rotated_live_session(monkeypatch, tmp_path):
+    db = open_persistence(profile_scope(home=tmp_path))
+    sid, key, _session, agent, child = _rotated_session(monkeypatch, db)
+    try:
+        seed_messages(db, child, {"role": "user", "content": "new continuation"})
+        first = server.handle_request({"id": "h1", "method": "session.history",
+                                       "params": {"session_id": sid, "cursor": 0, "limit": 1}})
+        token = first["result"]["snapshot_token"]
+        agent.session_id = key
+        resumed = server.handle_request({"id": "h2", "method": "session.history",
+                                         "params": {"session_id": sid, "snapshot_token": token, "cursor": 1}})
+        assert resumed["error"]["code"] == 4004
     finally:
         server._sessions.pop(sid, None)
         db.close()

@@ -5,9 +5,10 @@ import { applyCompletion } from '@hermes/shared/slash-input'
 import { useStore } from '@nanostores/react'
 import { useEffect, useRef } from 'react'
 
-import { DASHBOARD_TUI_MODE, NATIVE_MODE } from '../config/env.js'
+import { DASHBOARD_TUI_MODE, NATIVE_MODE, TERMUX_TUI_MODE } from '../config/env.js'
 import { DOUBLE_ESC_MS, TYPING_IDLE_MS } from '../config/timing.js'
 import { t } from '../i18n/runtime.js'
+import { composerPromptWidth, cursorLayout, inputVisualHeight, stableComposerColumns } from '../lib/inputMetrics.js'
 import { isAction, isCopyShortcut, isMac, isMacActionFallback, isVoiceToggleKey } from '../lib/platform.js'
 import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
@@ -458,6 +459,70 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     terminal.scrollWithSelection(delta)
   }
 
+  const handleTranscriptScroll = (key: Key): boolean => {
+    if (key.wheelUp || key.wheelDown) {
+      const dir: -1 | 1 = key.wheelUp ? -1 : 1
+      const now = Date.now()
+      // Modifier-held wheel = precision mode: one row per frame, no accel.
+      // Smooth mice / trackpads emit tiny same-frame bursts; coalesce those
+      // without the old 80ms throttle that made opt-scroll feel stepped.
+      // SGR/X10 mouse encoding only carries shift/meta/ctrl bits; Cmd on
+      // macOS is intercepted by the terminal, so we honor Option (meta) on
+      // Mac / Alt (meta) on Win+Linux / Ctrl as a portable fallback. Shift
+      // is reserved for selection extension.
+      const hasModifier = key.meta || key.ctrl
+      const precision = computePrecisionWheelStep(precisionWheelRef.current, dir, hasModifier, now)
+
+      if (precision.active) {
+        // Entering precision mode must discard any accelerated wheel state;
+        // otherwise the next normal wheel event inherits stale momentum.
+        if (precision.entered) {
+          wheelAccelRef.current = initWheelAccelForHost()
+        }
+
+        if (precision.rows) {
+          scrollTranscript(dir * wheelStep)
+        }
+
+        return true
+      }
+
+      // 0 = direction-flip bounce deferred; skip the no-op scroll.
+      const rows = computeWheelStep(wheelAccelRef.current, dir, now)
+
+      if (rows) {
+        scrollTranscript(dir * rows * wheelStep)
+      }
+
+      return true
+    }
+
+    if (key.shift && key.upArrow) {
+      scrollTranscript(-1)
+
+      return true
+    }
+
+    if (key.shift && key.downArrow) {
+      scrollTranscript(1)
+
+      return true
+    }
+
+    if (key.pageUp || key.pageDown) {
+      // Half-viewport keeps 50% continuity and stays under Ink's
+      // `delta < innerHeight` DECSTBM fast-path threshold.
+      const viewport = terminal.scrollRef.current?.getViewportHeight() ?? Math.max(6, (terminal.stdout?.rows ?? 24) - 8)
+      const step = Math.max(4, Math.floor(viewport / 2))
+
+      scrollTranscript(key.pageUp ? -step : step)
+
+      return true
+    }
+
+    return false
+  }
+
   const copySelection = () => {
     // ink's copySelection() already calls setClipboard() which handles
     // pbcopy (macOS), wl-copy/xclip (Linux), tmux, and OSC 52 fallback.
@@ -791,50 +856,8 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return
     }
 
-    if (key.wheelUp || key.wheelDown) {
-      const dir: -1 | 1 = key.wheelUp ? -1 : 1
-      const now = Date.now()
-      // Modifier-held wheel = precision mode: one row per frame, no accel.
-      // Smooth mice / trackpads emit tiny same-frame bursts; coalesce those
-      // without the old 80ms throttle that made opt-scroll feel stepped.
-      // SGR/X10 mouse encoding only carries shift/meta/ctrl bits; Cmd on
-      // macOS is intercepted by the terminal, so we honor Option (meta) on
-      // Mac / Alt (meta) on Win+Linux / Ctrl as a portable fallback. Shift
-      // is reserved for selection extension.
-      const hasModifier = key.meta || key.ctrl
-      const precision = computePrecisionWheelStep(precisionWheelRef.current, dir, hasModifier, now)
-
-      if (precision.active) {
-        // Entering precision mode must discard any accelerated wheel state;
-        // otherwise the next normal wheel event inherits stale momentum.
-        if (precision.entered) {
-          wheelAccelRef.current = initWheelAccelForHost()
-        }
-
-        return precision.rows ? scrollTranscript(dir * wheelStep) : undefined
-      }
-
-      // 0 = direction-flip bounce deferred; skip the no-op scroll.
-      const rows = computeWheelStep(wheelAccelRef.current, dir, now)
-
-      return rows ? scrollTranscript(dir * rows * wheelStep) : undefined
-    }
-
-    if (key.shift && key.upArrow) {
-      return scrollTranscript(-1)
-    }
-
-    if (key.shift && key.downArrow) {
-      return scrollTranscript(1)
-    }
-
-    if (key.pageUp || key.pageDown) {
-      // Half-viewport keeps 50% continuity and stays under Ink's
-      // `delta < innerHeight` DECSTBM fast-path threshold.
-      const viewport = terminal.scrollRef.current?.getViewportHeight() ?? Math.max(6, (terminal.stdout?.rows ?? 24) - 8)
-      const step = Math.max(4, Math.floor(viewport / 2))
-
-      return scrollTranscript(key.pageUp ? -step : step)
+    if (handleTranscriptScroll(key)) {
+      return
     }
 
     // Escape-based voice bindings (ctrl/alt/super+escape) must win before the
@@ -857,13 +880,21 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (key.upArrow && !cState.inputBuf.length) {
+      if (!cState.input) {
+        cycleQueue(1) || cycleHistory(-1)
+
+        return
+      }
+
       const inputSel = getInputSelection()
       const cursor = inputSel && inputSel.start === inputSel.end ? inputSel.start : null
+      const totalCols = terminal.stdout?.columns ?? 80
+      const promptWidth = composerPromptWidth('›')
+      const inputCols = stableComposerColumns(totalCols, promptWidth, TERMUX_TUI_MODE)
 
-      const noLineAbove =
-        !cState.input || (cursor !== null && cState.input.lastIndexOf('\n', Math.max(0, cursor - 1)) < 0)
+      const hasLineAbove = cursor !== null && cursorLayout(cState.input, cursor, inputCols).line > 0
 
-      if (noLineAbove) {
+      if (!hasLineAbove) {
         cycleQueue(1) || cycleHistory(-1)
 
         return
@@ -871,11 +902,23 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (key.downArrow && !cState.inputBuf.length) {
+      if (!cState.input) {
+        cycleQueue(-1) || cycleHistory(1)
+
+        return
+      }
+
       const inputSel = getInputSelection()
       const cursor = inputSel && inputSel.start === inputSel.end ? inputSel.start : null
-      const noLineBelow = !cState.input || (cursor !== null && cState.input.indexOf('\n', cursor) < 0)
+      const totalCols = terminal.stdout?.columns ?? 80
+      const promptWidth = composerPromptWidth('›')
+      const inputCols = stableComposerColumns(totalCols, promptWidth, TERMUX_TUI_MODE)
 
-      if (noLineBelow || cState.historyIdx !== null) {
+      const hasLineBelow =
+        cursor !== null &&
+        cursorLayout(cState.input, cursor, inputCols).line < inputVisualHeight(cState.input, inputCols) - 1
+
+      if (!hasLineBelow || cState.historyIdx !== null) {
         cycleQueue(-1) || cycleHistory(1)
 
         return
@@ -957,7 +1000,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       }
 
       // An armed edit whose text was erased: this press cancels it and never exits.
-      if (cancelPendingRewind(actions.sys)) {
+      if (cancelPendingRewind(actions.sys) || DASHBOARD_TUI_MODE) {
         return
       }
 
@@ -982,9 +1025,10 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       })
     }
 
-    if (isAction(key, ch, 'l')) {
+    if (isAction(key, ch, 'l') || isCtrl(key, ch, 'l')) {
       clearSelection()
       forceRedraw(terminal.stdout ?? process.stdout)
+      event.stopImmediatePropagation()
 
       return
     }

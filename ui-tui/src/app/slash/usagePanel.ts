@@ -13,6 +13,7 @@ export interface UsageTotals {
   context_used?: null | number
   input?: null | number
   model?: null | string
+  reasoning?: null | number
   output?: null | number
   total?: null | number
 }
@@ -27,6 +28,8 @@ export function usageTotalsSections(r: UsageTotals): PanelSection[] {
     [t('slashCmd.session.usage.rowTotalTokens'), f(r.total)],
     [t('slashCmd.session.usage.rowApiCalls'), f(r.calls)]
   ]
+
+  if (r.reasoning) {rows.splice(3, 0, ['Reasoning tokens', f(r.reasoning)])}
 
   const sections: PanelSection[] = [{ rows }]
 

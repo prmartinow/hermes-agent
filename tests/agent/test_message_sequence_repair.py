@@ -74,69 +74,6 @@ def test_repair_preserves_user_content_when_one_side_empty():
     assert messages == [{"role": "user", "content": "real message"}]
 
 
-def test_repair_marker_user_merge_keeps_plain_row_addressable():
-    """#94486: a display-marker user row (model-switch marker, persisted as
-    role=user on purpose per #48338) merging with the plain user row after it
-    must keep the pair addressable — the merged row drops the display
-    classification and carries the plain row's durable id, so rewind/submit
-    addressing (which indexes non-display user turns) can still resolve it.
-    """
-    agent = _bare_agent()
-    messages = [
-        {"role": "assistant", "content": "reply"},
-        {
-            "role": "user",
-            "display_kind": "model_switch",
-            "_row_id": 12134,
-            "content": "[System: The active model for this chat has changed to ds4.]",
-        },
-        {"role": "user", "_row_id": 12135, "content": "the user's real prompt"},
-    ]
-
-    repairs = AIAgent._repair_message_sequence(agent, messages)
-
-    assert repairs == 1
-    assert len(messages) == 2
-    merged = messages[1]
-    assert merged["role"] == "user"
-    assert not merged.get("display_kind")
-    assert merged["_row_id"] == 12135
-    assert "the user's real prompt" in merged["content"]
-    assert "[System:" in merged["content"]
-
-
-def test_repair_plain_user_then_marker_stays_addressable():
-    """The mirror shape (plain user, then a display marker) already keeps the
-    plain row's identity; pin that the merge does not resurrect a display
-    classification or swap in the marker's id.
-    """
-    agent = _bare_agent()
-    messages = [
-        {"role": "user", "_row_id": 12134, "content": "the user's real prompt"},
-        {
-            "role": "user",
-            "display_kind": "model_switch",
-            "_row_id": 12135,
-            "content": "[System: The active model for this chat has changed to ds4.]",
-        },
-    ]
-
-    repairs = AIAgent._repair_message_sequence(agent, messages)
-
-    assert repairs == 1
-    assert len(messages) == 1
-    survivor = messages[0]
-    # The plain row keeps its own identity; the marker's id is retired onto
-    # the absorbed list and no display classification is resurrected.
-    assert survivor["role"] == "user"
-    assert survivor["_row_id"] == 12134
-    assert not survivor.get("display_kind")
-    assert survivor["content"] == (
-        "the user's real prompt\n\n[System: The active model for this chat has changed to ds4.]"
-    )
-    assert 12135 in (survivor.get("_absorbed_row_ids") or [])
-
-
 def test_repair_does_not_rewind_ongoing_dialog_tool_pair():
     """assistant(tool_calls) + tool + user is a VALID pattern (user redirect
     before the model gets its continuation turn). Repair must not touch it —
@@ -1718,3 +1655,58 @@ def test_repair_records_dropped_tool_row_on_survivor(dropped, ahead):
     assert repairs == 1
     assert len(messages) == 1
     assert messages[0]["_absorbed_row_ids"] == [21]
+
+
+def test_repair_does_not_merge_timeline_markers_with_user_prompt():
+    """repair_message_sequence must not merge user-role timeline markers (model_switch,
+    personality_switch, async_delegation_complete, etc.) into real user prompts.
+    Doing so corrupts the timeline marker, deletes the user prompt from in-memory history,
+    and causes in-memory user_originated_turn_view count to mismatch state.db during /undo."""
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from agent.context_compressor import user_originated_turn_view
+
+    messages = [
+        {
+            "role": "user",
+            "content": "[System: The active model for this chat has changed to gemini-3.8-flash-high via provider gemini-oauth. From this point forward, use this runtime metadata when answering questions about what model/provider is active.]",
+            "display_kind": "model_switch",
+        },
+        {"role": "user", "content": "we gotta update fix and update the acc history page."},
+    ]
+
+    repairs = repair_message_sequence(None, messages)
+    assert repairs == 0
+    assert len(messages) == 2
+    assert messages[0]["display_kind"] == "model_switch"
+    assert messages[1]["content"] == "we gotta update fix and update the acc history page."
+
+    # In-memory user-originated turn counting must find exactly 1 user turn (the real ask)
+    user_views = [user_originated_turn_view(m) for m in messages]
+    assert user_views[0] is None
+    assert user_views[1] is not None
+    assert user_views[1]["content"] == "we gotta update fix and update the acc history page."
+
+
+def test_repair_does_not_merge_other_display_kinds():
+    """All display_kind timeline events must remain unmerged from user messages."""
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    for kind in ["personality_switch", "async_delegation_complete", "auto_continue", "hidden"]:
+        messages = [
+            {"role": "user", "content": f"marker {kind}", "display_kind": kind},
+            {"role": "user", "content": "human question"},
+        ]
+        repairs = repair_message_sequence(None, messages)
+        assert repairs == 0
+        assert len(messages) == 2
+        assert messages[0]["display_kind"] == kind
+
+        # Also reverse order: user prompt followed by timeline marker
+        messages_rev = [
+            {"role": "user", "content": "human question"},
+            {"role": "user", "content": f"marker {kind}", "display_kind": kind},
+        ]
+        repairs_rev = repair_message_sequence(None, messages_rev)
+        assert repairs_rev == 0
+        assert len(messages_rev) == 2
+        assert messages_rev[1]["display_kind"] == kind

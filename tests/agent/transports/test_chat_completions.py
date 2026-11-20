@@ -354,67 +354,8 @@ class TestChatCompletionsBuildKwargs:
 
 
 
-    def test_gemini_openai_compat_flash_reasoning_maps_to_nested_google_thinking_config(self, transport):
-        msgs = [{"role": "user", "content": "Hi"}]
-        kw = transport.build_kwargs(
-            model="gemini-3-flash-preview",
-            messages=msgs,
-            provider_name="gemini",
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-            reasoning_config={"enabled": True, "effort": "high"},
-        )
-        assert "thinking_config" not in kw["extra_body"]
-        assert kw["extra_body"]["extra_body"]["google"]["thinking_config"] == {
-            "include_thoughts": True,
-            "thinking_level": "high",
-        }
 
-    def test_gemini_ultra_thinking_raises_first_request_max_tokens(self, transport):
-        from agent.gemini_native_adapter import GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
-        from providers import get_provider_profile
 
-        profile = get_provider_profile("gemini")
-        kw = transport.build_kwargs(
-            model="gemini-3.7-flash",
-            messages=[{"role": "user", "content": "Hi"}],
-            provider_profile=profile,
-            provider_name="gemini",
-            base_url=profile.base_url,
-            max_tokens=4096,
-            max_tokens_param_fn=lambda n: {"max_tokens": n},
-            reasoning_config={"enabled": True, "effort": "ultra"},
-        )
-        assert kw["max_tokens"] == GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
-        assert kw["extra_body"]["thinking_config"]["thinkingLevel"] == "high"
-
-        # Also verify gemini-3.8-flash gets headroom and correct thinking level
-        kw38 = transport.build_kwargs(
-            model="gemini-3.8-flash",
-            messages=[{"role": "user", "content": "Hi"}],
-            provider_profile=profile,
-            provider_name="gemini",
-            base_url=profile.base_url,
-            max_tokens=4096,
-            max_tokens_param_fn=lambda n: {"max_tokens": n},
-            reasoning_config={"enabled": True, "effort": "medium"},
-        )
-        assert kw38["max_tokens"] == GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
-        assert kw38["extra_body"]["thinking_config"]["thinkingLevel"] == "medium"
-
-    def test_gemini_without_thinking_keeps_explicit_max_tokens(self, transport):
-        from providers import get_provider_profile
-
-        profile = get_provider_profile("gemini")
-        kw = transport.build_kwargs(
-            model="gemini-3.7-flash",
-            messages=[{"role": "user", "content": "Hi"}],
-            provider_profile=profile,
-            provider_name="gemini",
-            base_url=profile.base_url,
-            max_tokens=4096,
-            max_tokens_param_fn=lambda n: {"max_tokens": n},
-        )
-        assert kw["max_tokens"] == 4096
 
 
 
@@ -681,54 +622,6 @@ class TestChatCompletionsCacheStats:
 
 
 
-class TestChatCompletionsGeminiNativeExtraBodyStrip:
-    """Profile extra_body (e.g. Nous portal tags) must not reach a native
-    Gemini endpoint — Google's REST API rejects unknown fields with HTTP 400.
-    """
-
-    def _nous_profile(self):
-        from providers import get_provider_profile
-        return get_provider_profile("nous")
-
-    def test_tags_stripped_when_endpoint_is_native_gemini(self, transport):
-        kw = transport.build_kwargs(
-            "anthropic/claude-sonnet-4.6",
-            [{"role": "user", "content": "hi"}],
-            None,
-            provider_profile=self._nous_profile(),
-            base_url="https://generativelanguage.googleapis.com/v1beta",
-            session_id="s1",
-            max_tokens=None,
-        )
-        eb = kw.get("extra_body")
-        assert not eb or "tags" not in eb
-
-    def test_tags_preserved_on_nous_endpoint(self, transport):
-        kw = transport.build_kwargs(
-            "hermes-3-405b",
-            [{"role": "user", "content": "hi"}],
-            None,
-            provider_profile=self._nous_profile(),
-            base_url="https://inference.nousresearch.com/v1",
-            session_id="s1",
-            max_tokens=None,
-        )
-        eb = kw.get("extra_body")
-        assert eb and "tags" in eb
-
-    def test_tags_pass_through_on_gemini_openai_compat(self, transport):
-        # /openai compat endpoint is not "native" — unchanged behavior.
-        kw = transport.build_kwargs(
-            "anthropic/claude-sonnet-4.6",
-            [{"role": "user", "content": "hi"}],
-            None,
-            provider_profile=self._nous_profile(),
-            base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-            session_id="s1",
-            max_tokens=None,
-        )
-        eb = kw.get("extra_body")
-        assert eb and "tags" in eb
 
 
 class TestPromptCacheKeyCapability:

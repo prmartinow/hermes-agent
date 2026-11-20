@@ -39,6 +39,22 @@ describe('hasLeadGap', () => {
     expect(hasLeadGap(note, note)).toBe(false)
   })
 
+  it('gaps distinct thinking step cards and thinking <-> tool boundaries', () => {
+    const thinkingStep1 = m({ role: 'system', kind: 'trail', thinking: 'Step 1: Diagnostic Profiling' })
+    const thinkingStep2 = m({ role: 'system', kind: 'trail', thinking: 'Step 2: Execution Planning' })
+    const toolCard = m({ role: 'system', kind: 'trail', tools: ['Terminal("git status") (0.1s) ✓'] })
+
+    // Thinking -> Thinking (discrete step cards)
+    expect(hasLeadGap(thinkingStep1, thinkingStep2)).toBe(true)
+    // Thinking -> Tool card
+    expect(hasLeadGap(thinkingStep2, toolCard)).toBe(true)
+    // Tool card -> Thinking
+    expect(hasLeadGap(toolCard, thinkingStep1)).toBe(true)
+    // Tool card -> Tool card without thinking (stays flush)
+    const toolCard2 = m({ role: 'system', kind: 'trail', tools: ['Read File("foo.ts") (0.0s) ✓'] })
+    expect(hasLeadGap(toolCard, toolCard2)).toBe(false)
+  })
+
   it('never gaps the first block (no predecessor)', () => {
     expect(hasLeadGap(undefined, model)).toBe(false)
     expect(hasLeadGap(undefined, trail)).toBe(false)

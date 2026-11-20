@@ -721,23 +721,88 @@ export default class App extends PureComponent<Props, State> {
 
 // Helper to process all keys within a single discrete update context.
 // discreteUpdates expects (fn, a, b, c, d) -> fn(a, b, c, d)
+function isPlainPrintableKey(item: ParsedInput): item is ParsedKey & { sequence: string } {
+  return (
+    item.kind === 'key' &&
+    !item.ctrl &&
+    !item.meta &&
+    !item.shift &&
+    !item.option &&
+    !item.super &&
+    !item.fn &&
+    !item.isPasted &&
+    typeof item.sequence === 'string' &&
+    item.sequence.length === 1 &&
+    item.sequence >= ' ' &&
+    item.sequence <= '~'
+  )
+}
+
+function coalescePrintableKeys(items: ParsedInput[]): ParsedInput[] {
+  const coalesced: ParsedInput[] = []
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!
+
+    if (isPlainPrintableKey(item)) {
+      let batchSequence: string = item.sequence
+
+      while (i + 1 < items.length) {
+        const next = items[i + 1]
+
+        if (next && isPlainPrintableKey(next)) {
+          batchSequence += next.sequence
+          i++
+        } else {
+          break
+        }
+      }
+
+      if (batchSequence.length > 1) {
+        coalesced.push({
+          ...item,
+          name: batchSequence,
+          raw: batchSequence,
+          sequence: batchSequence
+        })
+      } else {
+        coalesced.push(item)
+      }
+    } else {
+      coalesced.push(item)
+    }
+  }
+
+  return coalesced
+}
+
+function isUserInteraction(item: ParsedInput): boolean {
+  // Mode-1003 motion with no button held is passive cursor drift.
+  return item.kind === 'key' || (item.kind === 'mouse' && !((item.button & 0x20) !== 0 && (item.button & 0x03) === 3))
+}
+
 function processKeysInBatch(app: App, items: ParsedInput[], _unused1: undefined, _unused2: undefined): void {
-  // Update interaction time for notification timeout tracking.
-  // This is called from the central input handler to avoid having multiple
-  // stdin listeners that can cause race conditions and dropped input.
-  // Terminal responses (kind: 'response') are automated, not user input.
-  // Mode-1003 no-button motion is also excluded — passive cursor drift is
-  // not engagement (would suppress idle notifications + defer housekeeping).
-  if (
-    items.some(i => i.kind === 'key' || (i.kind === 'mouse' && !((i.button & 0x20) !== 0 && (i.button & 0x03) === 3)))
-  ) {
+  // Terminal responses and passive mouse motion must not suppress idle notifications.
+  if (items.some(isUserInteraction)) {
     updateLastInteractionTime()
   }
 
-  for (const item of items) {
+  for (const item of coalescePrintableKeys(items)) {
     // Terminal responses (DECRPM, DA1, OSC replies, etc.) are not user
     // input — route them to the querier to resolve pending promises.
     if (item.kind === 'response') {
+      if (item.response.type === 'osc' && item.response.code === 777) {
+        const match = /^hermes-replay;request;([a-f0-9-]{36})$/.exec(item.response.data)
+        if (match) {
+          const generation = match[1]!
+          const ink = instances.get(app.props.stdout)
+          if (ink) {
+            ink.requestRedraw(generation)
+          }
+          continue
+        }
+      }
+
       app.querier.onResponse(item.response)
 
       continue

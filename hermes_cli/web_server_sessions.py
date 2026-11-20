@@ -1,6 +1,7 @@
 """Read-only session browsing, latest-descendant lookup and owner maintenance.
 """
 
+import json
 import logging
 import asyncio
 import time

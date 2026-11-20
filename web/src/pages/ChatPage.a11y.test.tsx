@@ -42,7 +42,7 @@ class FakeTerminal {
   rows = 24;
   cols = 80;
   parser = {
-    registerOscHandler: vi.fn(),
+    registerOscHandler: vi.fn(() => ({ dispose() {} })),
   };
   unicode = { activeVersion: "" };
 
@@ -59,6 +59,8 @@ class FakeTerminal {
   attachCustomWheelEventHandler() {
     return true;
   }
+
+  hasSelection() { return false; }
 
   clearSelection() {}
 
@@ -102,6 +104,7 @@ class FakeTerminal {
 }
 
 const apiMocks = vi.hoisted(() => ({
+  buildWsUrlSync: vi.fn(() => null),
   buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
 }));
 

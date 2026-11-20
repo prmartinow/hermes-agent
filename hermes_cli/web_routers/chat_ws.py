@@ -10,6 +10,7 @@ import contextlib
 import json
 import logging
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -30,6 +31,8 @@ router = APIRouter()
 
 # Late-bound so a test's monkeypatch on the owning module wins at call time.
 _active_session_file_for_channel = late("_active_session_file_for_channel", "hermes_cli.web_server_chat")
+
+
 _profile_scope = late("_profile_scope", "hermes_cli.web_server_profiles")
 _resolve_chat_argv_async = late("_resolve_chat_argv_async", "hermes_cli.web_server_chat")
 _resolve_profile_dir = late("_resolve_profile_dir", "hermes_cli.web_server_profiles")
@@ -437,9 +440,9 @@ async def _pump_keepalive_input(ws: WebSocket, session: Any) -> None:
             session.resize(ws, cols=int(match.group(1)), rows=int(match.group(2)))
             continue
         if not await session.write(ws, raw):
-            # Only a stalled or exited child marks the session dead; a takeover just cancelled
-            # this write, and the new viewer closes this socket as superseded.
-            if not session.alive:
+            # Backpressure ends this viewer, not the working PTY. A takeover already
+            # transferred leadership and closes the old socket as superseded.
+            if session.is_leader(ws):
                 await _close_stalled_pty_input(ws, path="keepalive")
             break
 
@@ -470,6 +473,22 @@ async def _pty_channel_marker_state(
     elif not resume:
         resume = _read_active_session_file(active_session_file)
     return active_session_file, marker_preexisting, resume
+
+
+def _canonical_pty_attach_token(registry, raw_token, profile, registry_resume):
+    if raw_token is None or not (registry_resume or profile):
+        return raw_token
+    token = f"{raw_token}\0{profile or ''}\0{registry_resume or ''}"
+    if not registry_resume or token in registry._sessions:
+        return token
+    # Compaction can advance the durable id while the same PTY owns it.
+    # Reuse only this device/profile's owner whose marker names that tip.
+    prefix = f"{raw_token}\0{profile or ''}\0"
+    for key, existing in registry._sessions.items():
+        if (key.startswith(prefix) and existing.alive and existing.active_session_file
+                and _read_active_session_file(existing.active_session_file) == registry_resume):
+            return key
+    return token
 
 
 @router.websocket("/api/pty")
@@ -540,13 +559,11 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     raw_attach_token = ws.query_params.get("attach") or None
-    attach_token = raw_attach_token
-    registry_resume = raw_resume
-    if raw_resume and env:
+    registry_resume = None if force_fresh else raw_resume
+    if registry_resume and env:
         registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
-    if attach_token is not None and (registry_resume or profile):
-        # Key explicit resumes on their canonical target, never the active-session fallback.
-        attach_token = f"{attach_token}\0{profile or ''}\0{registry_resume or ''}"
+    # Key explicit resumes on their canonical target, never the active-session fallback.
+    attach_token = _canonical_pty_attach_token(PTY_REGISTRY, raw_attach_token, profile, registry_resume)
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env)
@@ -593,25 +610,34 @@ async def pty_ws(ws: WebSocket) -> None:
         await _pty_fail(ws, exc)
         return
 
-    if _created:
+    if _created and channel and active_session_file is not None:
         # This PTY now owns this marker for its entire keep-alive lifetime.
-        if channel and active_session_file is not None:
-            session.active_session_cleanup = (
-                lambda app=ws.app, ch=channel, path=active_session_file:
-                _discard_active_session_file(app, ch, path)
-            )
-    elif not marker_preexisting:
+        session.active_session_cleanup = (
+            lambda app=ws.app, ch=channel, path=active_session_file:
+            _discard_active_session_file(app, ch, path)
+        )
+    elif not _created and not marker_preexisting:
         # A different channel attached to an already-existing PTY. The marker
         # just allocated for this channel is not owned by that PTY.
         _discard_active_session_file(ws.app, channel, active_session_file)
 
+    replay_generation: Optional[str] = None
+    if not _created:
+        replay_generation = str(uuid.uuid4())
+        try:
+            await ws.send_json({"type": "replay-start", "generation": replay_generation})
+        except Exception:  # health: allow BLE001 -- log and detach the failed replay socket without stopping its owner
+            _log.exception("Could not start PTY replay")
+            PTY_REGISTRY.detach(attach_token, ws)
+            return
+
     # A fresh xterm can't rebuild the TUI from an arbitrary tail of alternate-
     # screen differential output; reused PTYs emit a full frame after replay.
-    if not await session.attach(ws, force_redraw=not _created):
+    if not await session.attach(ws, force_redraw=False, generation=replay_generation, multi_viewer=True):
         # attach() detaches itself when the client dropped mid-replay, and a socket
         # superseded during replay is already closed by its replacement; only a
         # stalled redraw write leaves THIS socket attached and worth closing.
-        if session._ws is ws:
+        if ws in session._viewers:
             await _close_stalled_pty_input(ws, path="keepalive-redraw")
         PTY_REGISTRY.detach(attach_token, ws)
         return

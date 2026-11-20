@@ -30,7 +30,3 @@ def test_exhausted_pool_skips_rotation():
     p = MagicMock()
     p.has_available.return_value = False
     assert _pool_may_recover_from_rate_limit(p) is False
-
-
-
-

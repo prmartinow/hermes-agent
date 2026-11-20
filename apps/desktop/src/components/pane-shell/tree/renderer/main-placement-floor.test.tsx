@@ -4,6 +4,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { registry } from '@/contrib/registry'
 import { stubResizeObserver } from '@/test/jsdom'
 
+import { setWorkspaceScope } from '../../workspace-scope'
 import { group, split } from '../model'
 import { $hiddenTreePanes, $layoutTree } from '../store'
 
@@ -41,6 +42,7 @@ afterEach(() => {
   cleanup()
   $hiddenTreePanes.set(new Set())
   $layoutTree.set(null)
+  setWorkspaceScope('sessions')
   disposers.splice(0).forEach(dispose => dispose())
 })
 
@@ -74,6 +76,27 @@ describe('subtreeGone', () => {
 })
 
 describe('the main placement floor in the renderer', () => {
+  it('keeps registered panes visible after switching to Bot Mode', () => {
+    const legacyPane = {
+      area: 'panes',
+      id: 'legacy-sidebar',
+      workspaceMode: 'sessions' as const,
+      data: { placement: 'left', width: '237px' },
+      render: () => null,
+      title: 'Legacy sidebar'
+    }
+    disposers.push(registry.register(legacyPane))
+    setWorkspaceScope('bots', 'bot:writer')
+    const tree = split('row', [group(['legacy-sidebar'], { id: 'grp-legacy' }), group(['workspace'], { id: 'grp-main' })])
+
+    $layoutTree.set(tree)
+
+    render(<TreeSplit node={tree} root rootRow />)
+
+    expect(zoneWrapper('grp-legacy')?.style.display).not.toBe('none')
+    expect(zoneWrapper('grp-main')?.style.display).not.toBe('none')
+  })
+
   it('renders the main zone with every main tab hidden, and leaves tool zones absorbable', () => {
     const tree = split('row', [
       group(['sessions'], { id: 'grp-sessions' }),

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Text-to-speech tool: config resolution, built-in provider dispatch, output policy, registration.
 
-Built-ins: Edge (free default), ElevenLabs, OpenAI, DeepInfra, MiniMax, Mistral, Gemini, xAI,
+Built-ins: Edge (free default), ElevenLabs, OpenAI, DeepInfra, MiniMax, Mistral, xAI,
 local NeuTTS / KittenTTS / Piper; plus ``type: command`` providers under ``tts.providers.<name>``
 and plugin-registered ones. Output is Opus (.ogg) on voice-bubble platforms, MP3 elsewhere.
 Sibling ``tts_tool_*`` modules hold backends/delivery/lifecycle; they read the seams defined
@@ -43,7 +43,7 @@ from tools.tts_tool_delivery import (
     _resolve_max_text_length, _build_audio_delivery_files, _convert_to_opus, _remove_quietly,
     _repair_ogg_container, _resolve_audio_delivery_profile, _split_text_for_tts)
 from tools.tts_tool_providers import (
-    _generate_edge_tts, _generate_elevenlabs, _generate_gemini_tts, _generate_minimax_tts,
+    _generate_edge_tts, _generate_elevenlabs, _generate_minimax_tts,
     _generate_mistral_tts, _generate_xai_tts, _resolve_minimax_tts_runtime)
 from tools.tts_tool_local import _generate_kittentts, _generate_neutts, _generate_piper_tts
 from tools.tts_tool_plugins import (
@@ -151,7 +151,7 @@ OPUS_VOICE_PLATFORMS = frozenset({"telegram", "matrix", "feishu", "whatsapp", "s
 _MEDIA_DIRECTIVE_RE = re.compile(r"media:\s*[`'\"*_]*(?:[`'\"]|[a-z]:[/\\]|~?/)", re.IGNORECASE)
 
 # Built-ins that emit Opus natively when asked for .ogg; the rest need ffmpeg for voice bubbles.
-_NATIVE_OPUS_PROVIDERS = frozenset({"openai", "elevenlabs", "mistral", "gemini"})
+_NATIVE_OPUS_PROVIDERS = frozenset({"openai", "elevenlabs", "mistral"})
 _FFMPEG_OPUS_PROVIDERS = frozenset({"edge", "neutts", "minimax", "xai", "kittentts", "piper"})
 
 
@@ -171,7 +171,6 @@ _BUILTIN_DISPATCH: dict[str, tuple] = {
     "mistral": (lambda: _importable(_import_mistral_client), "Mistral Voxtral TTS", "_generate_mistral_tts",
                 "Mistral provider selected but 'mistralai' package not installed. "
                 "Run `hermes setup` to install Mistral support."),
-    "gemini": (None, "Google Gemini TTS", "_generate_gemini_tts", None),
     "neutts": (lambda: _check_neutts_available(), "NeuTTS (local)", "_generate_neutts",
                "NeuTTS provider selected but neutts is not installed. "
                "Run hermes setup tts and choose NeuTTS; espeak-ng is also required."),
@@ -571,7 +570,6 @@ _BUILTIN_REQUIREMENTS: dict[str, Callable[[], bool]] = {
     "deepinfra": lambda: _package_installed("openai") and bool(_resolve_provider_key("DEEPINFRA_API_KEY", "deepinfra")),
     "minimax": _minimax_requirements,
     "xai": _xai_requirements,
-    "gemini": lambda: bool(_resolve_provider_key("GEMINI_API_KEY", "gemini") or _resolve_provider_key("GOOGLE_API_KEY", "gemini")),
     "mistral": lambda: _pm_extra_available(_SDK_ON_DEMAND["mistral"][0]) and bool(_resolve_provider_key("MISTRAL_API_KEY", "mistral")),
     "neutts": lambda: _check_neutts_available(),
     "kittentts": lambda: _check_kittentts_available(),

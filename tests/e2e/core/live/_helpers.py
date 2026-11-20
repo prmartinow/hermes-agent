@@ -30,7 +30,7 @@ import pytest
 # Snapshot BEFORE tests/conftest.py::_hermetic_environment strips credentials.
 LIVE_KEY_VARS = (
     "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "NOUS_API_KEY",
-    "OPENAI_API_KEY", "GEMINI_API_KEY", "XAI_API_KEY",
+    "OPENAI_API_KEY", "XAI_API_KEY",
 )
 _LIVE_KEYS: dict[str, str] = {
     name: os.environ[name].strip() for name in LIVE_KEY_VARS if os.environ.get(name, "").strip()
@@ -109,9 +109,6 @@ LIVE_CASES: tuple[LiveCase, ...] = (
              cache_expected=True, pad_tokens=4600, native_anthropic=True),
     LiveCase("openai-direct", "openai", "OPENAI_API_KEY",
              ("gpt-5-nano", "gpt-5.4-nano", "gpt-4.1-nano"), ("api.openai.com",), 0.05, 0.40),
-    LiveCase("gemini-direct", "gemini", "GEMINI_API_KEY",
-             ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-flash-lite-latest"),
-             ("generativelanguage.googleapis.com",), 0.25, 1.50),
     LiveCase("xai-direct", "xai", "XAI_API_KEY",
              ("grok-4.3", "grok-4.20-0309-reasoning", "grok-build-0.1"), ("api.x.ai",), 1.25, 2.50),
 )

@@ -339,86 +339,15 @@ def test_fireworks_router_fast_tier_prices_distinctly():
 
 
 
-def test_google_and_vertex_routes_share_official_pricing_snapshot():
-    """Direct Gemini, Vertex, and Vertex's OpenAI-compatible hostname must
-    all normalize to the Google official-pricing route.
-    """
-    routes = (
-        resolve_billing_route("model", provider="gemini"),
-        resolve_billing_route("google/model", provider="vertex"),
-        resolve_billing_route(
-            "google/model",
-            provider="custom",
-            base_url="https://aiplatform.googleapis.com/v1/projects/example",
-        ),
-    )
-
-    assert all(route.provider == "google" for route in routes)
-    assert all(route.billing_mode == "official_docs_snapshot" for route in routes)
-
-
-def test_vertex_default_model_estimates_cached_usage(monkeypatch):
-    """The bundled Vertex profile's default auxiliary model must fall back to
-    Google snapshot pricing when the OpenAI-compatible endpoint has no model
-    metadata, including for cache-read accounting.
-    """
-    from providers import get_provider_profile
-
-    monkeypatch.setattr(
-        "agent.usage_pricing.fetch_endpoint_model_metadata",
-        lambda *_args, **_kwargs: {},
-    )
-    vertex = get_provider_profile("vertex")
-    result = estimate_usage_cost(
-        vertex.default_aux_model,
-        CanonicalUsage(input_tokens=100, output_tokens=100, cache_read_tokens=100),
-        provider=vertex.name,
-        base_url=vertex.base_url,
-    )
-
-    assert result.status == "estimated"
-    assert result.amount_usd is not None and result.amount_usd > 0
-
-
-def test_curated_google_flash_models_resolve_official_snapshot_pricing(monkeypatch):
-    """Every ``google/gemini-*-flash`` model curated for the OpenRouter and Nous
-    pickers must also bill through the Google official-docs snapshot on the
-    direct Gemini and Vertex routes — a model pickable via the aggregators but
-    ``unknown`` to Google-route accounting is a catalog/pricing drift.
-    """
-    from hermes_cli.models_catalog_static import OPENROUTER_MODELS, _PROVIDER_MODELS
-
-    monkeypatch.setattr(
-        "agent.usage_pricing.fetch_endpoint_model_metadata",
-        lambda *_args, **_kwargs: {},
-    )
-    curated = {m for m, _desc in OPENROUTER_MODELS} | set(_PROVIDER_MODELS["nous"])
-    flash = sorted(m for m in curated if m.startswith("google/gemini-") and m.endswith("-flash"))
-    assert flash, "expected curated google/gemini-*-flash picker entries"
-    usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
-    for model in flash:
-        bare = model.split("/", 1)[1]
-        gemini = estimate_usage_cost(bare, usage, provider="gemini")
-        vertex = estimate_usage_cost(model, usage, provider="vertex")
-        assert gemini.status == "estimated", (model, gemini.status)
-        assert gemini.source == "official_docs_snapshot", model
-        assert vertex.amount_usd == gemini.amount_usd, model
-        # Direct-route models the picker offers must also be pickable directly.
-        assert bare in _PROVIDER_MODELS["gemini"], model
-        assert model in _PROVIDER_MODELS["vertex"], model
-
-
 def test_gemini_4_neon_is_pickable_and_priced(monkeypatch):
     from hermes_cli.models_catalog_static import _PROVIDER_MODELS
 
     monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_args, **_kwargs: {})
     usage = CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000)
     cost = estimate_usage_cost("gemini-4-neon", usage, provider="gemini")
-    vertex_cost = estimate_usage_cost("google/gemini-4-neon", usage, provider="vertex")
     assert "gemini-4-neon" in _PROVIDER_MODELS["gemini"] and _PROVIDER_MODELS["gemini"][0] == "gemini-3.8-flash"
     assert (cost.status, cost.source) == ("estimated", "official_docs_snapshot")
     assert str(cost.amount_usd) == "18.15"  # 3.00 + 15.00 + 0.15
-    assert vertex_cost.amount_usd == cost.amount_usd
 
 
 def test_gemini_4_hydrogen_is_pickable_and_priced(monkeypatch):
@@ -444,8 +373,16 @@ def test_gemini_4_carbon_is_pickable_and_prices_like_argon(monkeypatch):
     assert carbon.amount_usd == argon.amount_usd and carbon.amount_usd > 0
 
 
-
-
+def test_vertex_unknown_pricing_is_not_estimated_from_another_provider(monkeypatch):
+    monkeypatch.setattr("agent.usage_pricing.fetch_endpoint_model_metadata", lambda *_args, **_kwargs: {})
+    route = resolve_billing_route("partner-model", provider="vertex",
+                                  base_url="https://aiplatform.googleapis.com/v1/projects/example")
+    assert route.provider == "vertex"
+    assert route.billing_mode == "unknown"
+    result = estimate_usage_cost("partner-model", CanonicalUsage(input_tokens=100, output_tokens=100),
+                                 provider="vertex", base_url=route.base_url)
+    assert result.status == "unknown"
+    assert result.amount_usd is None
 
 
 # ---------------------------------------------------------------------------
@@ -823,107 +760,6 @@ def test_normalize_usage_nested_details_win_over_qwen_flat_top_level():
 
     assert normalized.cache_read_tokens == 900
     assert normalized.input_tokens == 1100
-
-
-# ── Context-tiered pricing (Gemini Pro >200k prompts, #93469) ─────────────
-
-
-def test_gemini_31_pro_below_tier_threshold_uses_base_rates():
-    """Prompts at or below 200k tokens bill at the base rates — the tier
-    fields must not change any below-threshold estimate."""
-    result = estimate_usage_cost(
-        "gemini-3.1-pro",
-        CanonicalUsage(input_tokens=100_000, output_tokens=10_000),
-        provider="google",
-    )
-    # 100k * $2/M + 10k * $12/M
-    assert result.amount_usd == Decimal("0.32")
-
-    at_threshold = estimate_usage_cost(
-        "gemini-3.1-pro",
-        CanonicalUsage(input_tokens=200_000, output_tokens=10_000),
-        provider="google",
-    )
-    # Exactly 200k is still the lower tier (Google bills "> 200k" higher).
-    # 200k * $2/M + 10k * $12/M
-    assert at_threshold.amount_usd == Decimal("0.52")
-
-
-def test_gemini_31_pro_above_tier_threshold_uses_tiered_rates_whole_request():
-    """Once the prompt exceeds 200k tokens the >200k rates ($4 input /
-    $18 output per million) apply to the ENTIRE request, not just the
-    marginal tokens — matching Google's billing semantics (#93469).
-
-    Before the fix this request priced at 250k*$2/M + 10k*$12/M = $0.62,
-    under-counting input 2x and output 1.5x."""
-    result = estimate_usage_cost(
-        "gemini-3.1-pro",
-        CanonicalUsage(input_tokens=250_000, output_tokens=10_000),
-        provider="google",
-    )
-    # 250k * $4/M + 10k * $18/M
-    assert result.amount_usd == Decimal("1.18")
-    assert result.status == "estimated"
-
-
-def test_gemini_31_pro_cache_read_tokens_count_toward_tier_and_tier_rate():
-    """prompt_tokens (input + cache read + cache write) drives tier selection,
-    and cache reads above the threshold bill at the $0.40/M tier rate."""
-    result = estimate_usage_cost(
-        "gemini-3.1-pro",
-        CanonicalUsage(input_tokens=150_000, cache_read_tokens=100_000),
-        provider="google",
-    )
-    # prompt = 250k > 200k → 150k * $4/M + 100k * $0.40/M
-    assert result.amount_usd == Decimal("0.64")
-
-
-def test_gemini_31_pro_preview_alias_shares_tiered_pricing():
-    """The provider-emitted preview id aliases the canonical row, so it must
-    pick up the tier fields too."""
-    result = estimate_usage_cost(
-        "gemini-3.1-pro-preview",
-        CanonicalUsage(input_tokens=250_000, output_tokens=10_000),
-        provider="google",
-    )
-    assert result.amount_usd == Decimal("1.18")
-
-
-def test_gemini_25_pro_tiered_rates_with_cache_read_fallback():
-    """gemini-2.5-pro tiers at the same 200k threshold ($2.50 input / $15
-    output above). Its snapshot has no tiered cache-read rate, so cache reads
-    fall back to the base $0.125/M even above the threshold."""
-    result = estimate_usage_cost(
-        "gemini-2.5-pro",
-        CanonicalUsage(input_tokens=250_000, output_tokens=10_000),
-        provider="google",
-    )
-    # 250k * $2.50/M + 10k * $15/M
-    assert result.amount_usd == Decimal("0.775")
-
-    with_cache = estimate_usage_cost(
-        "gemini-2.5-pro",
-        CanonicalUsage(input_tokens=150_000, cache_read_tokens=100_000),
-        provider="google",
-    )
-    # prompt = 250k > 200k → 150k * $2.50/M + 100k * $0.125/M (base fallback)
-    assert with_cache.amount_usd == Decimal("0.3875")
-
-
-def test_flat_entries_unaffected_by_tier_machinery():
-    """Entries without tier fields keep pricing every token at the flat rate
-    no matter how large the prompt is."""
-    entry = get_pricing_entry("gemini-3.1-flash-lite", provider="google")
-    assert entry is not None
-    assert entry.tier_threshold_tokens is None
-
-    result = estimate_usage_cost(
-        "gemini-3.1-flash-lite",
-        CanonicalUsage(input_tokens=250_000, output_tokens=10_000),
-        provider="google",
-    )
-    # 250k * $0.25/M + 10k * $1.50/M
-    assert result.amount_usd == Decimal("0.0775")
 
 
 def _anthropic_usage(speed=None):

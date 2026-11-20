@@ -10053,182 +10053,6 @@
    ]
   }
  },
- "solstice": {
-  "api_mode": "chat_completions",
-  "base_url": "https://generativelanguage.googleapis.com/v1alpha",
-  "high": {
-   "messages": [
-    {
-     "content": "You are a test agent.",
-     "role": "system"
-    },
-    {
-     "content": "list files",
-     "role": "user"
-    },
-    {
-     "content": "",
-     "role": "assistant",
-     "tool_calls": [
-      {
-       "function": {
-        "arguments": "{\"command\": \"ls\"}",
-        "name": "terminal"
-       },
-       "id": "call_1",
-       "type": "function"
-      }
-     ]
-    },
-    {
-     "content": "a.txt\nb.txt",
-     "role": "tool",
-     "tool_call_id": "call_1"
-    },
-    {
-     "content": "thanks, now summarize",
-     "role": "user"
-    }
-   ],
-   "model": "gemini-3.1-pro",
-   "timeout": 1800.0,
-   "tools": [
-    {
-     "function": {
-      "description": "Run a shell command.",
-      "name": "terminal",
-      "parameters": {
-       "properties": {
-        "command": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "command"
-       ],
-       "type": "object"
-      }
-     },
-     "type": "function"
-    }
-   ]
-  },
-  "model": "gemini-3.1-pro",
-  "off": {
-   "messages": [
-    {
-     "content": "You are a test agent.",
-     "role": "system"
-    },
-    {
-     "content": "list files",
-     "role": "user"
-    },
-    {
-     "content": "",
-     "role": "assistant",
-     "tool_calls": [
-      {
-       "function": {
-        "arguments": "{\"command\": \"ls\"}",
-        "name": "terminal"
-       },
-       "id": "call_1",
-       "type": "function"
-      }
-     ]
-    },
-    {
-     "content": "a.txt\nb.txt",
-     "role": "tool",
-     "tool_call_id": "call_1"
-    },
-    {
-     "content": "thanks, now summarize",
-     "role": "user"
-    }
-   ],
-   "model": "gemini-3.1-pro",
-   "timeout": 1800.0,
-   "tools": [
-    {
-     "function": {
-      "description": "Run a shell command.",
-      "name": "terminal",
-      "parameters": {
-       "properties": {
-        "command": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "command"
-       ],
-       "type": "object"
-      }
-     },
-     "type": "function"
-    }
-   ]
-  },
-  "unset": {
-   "messages": [
-    {
-     "content": "You are a test agent.",
-     "role": "system"
-    },
-    {
-     "content": "list files",
-     "role": "user"
-    },
-    {
-     "content": "",
-     "role": "assistant",
-     "tool_calls": [
-      {
-       "function": {
-        "arguments": "{\"command\": \"ls\"}",
-        "name": "terminal"
-       },
-       "id": "call_1",
-       "type": "function"
-      }
-     ]
-    },
-    {
-     "content": "a.txt\nb.txt",
-     "role": "tool",
-     "tool_call_id": "call_1"
-    },
-    {
-     "content": "thanks, now summarize",
-     "role": "user"
-    }
-   ],
-   "model": "gemini-3.1-pro",
-   "timeout": 1800.0,
-   "tools": [
-    {
-     "function": {
-      "description": "Run a shell command.",
-      "name": "terminal",
-      "parameters": {
-       "properties": {
-        "command": {
-         "type": "string"
-        }
-       },
-       "required": [
-        "command"
-       ],
-       "type": "object"
-      }
-     },
-     "type": "function"
-    }
-   ]
-  }
- },
  "stepfun": {
   "api_mode": "chat_completions",
   "base_url": "https://api.stepfun.ai/step_plan/v1",
@@ -10954,7 +10778,7 @@
      "google": {
       "thinking_config": {
        "include_thoughts": true,
-       "thinking_level": "high"
+       "thinking_budget": 16384
       }
      }
     }
@@ -10992,7 +10816,7 @@
      "role": "user"
     }
    ],
-   "model": "gemini-3-pro",
+   "model": "claude-sonnet-4-5",
    "timeout": 1800.0,
    "tools": [
     {
@@ -11015,14 +10839,13 @@
     }
    ]
   },
-  "model": "gemini-3-pro",
+  "model": "claude-sonnet-4-5",
   "off": {
    "extra_body": {
     "extra_body": {
      "google": {
       "thinking_config": {
-       "include_thoughts": false,
-       "thinking_level": "low"
+       "include_thoughts": false
       }
      }
     }
@@ -11060,7 +10883,7 @@
      "role": "user"
     }
    ],
-   "model": "gemini-3-pro",
+   "model": "claude-sonnet-4-5",
    "timeout": 1800.0,
    "tools": [
     {
@@ -11117,7 +10940,7 @@
      "role": "user"
     }
    ],
-   "model": "gemini-3-pro",
+   "model": "claude-sonnet-4-5",
    "timeout": 1800.0,
    "tools": [
     {

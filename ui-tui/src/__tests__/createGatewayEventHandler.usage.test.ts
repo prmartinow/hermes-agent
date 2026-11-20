@@ -1,7 +1,7 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { createGatewayEventHandler } from '../app/createGatewayEventHandler.js'
-import { getUiState, patchUiState } from '../app/uiStore.js'
+import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
 import { usageFromTick, ZERO } from '../domain/usage.js'
 
 const ref = <T>(current: T) => ({ current })
@@ -90,5 +90,47 @@ describe('canonical session.usage tick', () => {
     })
     expect(usageFromTick({ input_tokens: 0, prompt_tokens: 1000 })).toEqual({ input: 1000, prompt: 1000 })
     expect(usageFromTick({ model: 'only-a-model' })).toBeUndefined()
+  })
+})
+
+describe('legacy session.usage tick', () => {
+  beforeEach(resetUiState)
+  it('merges a live usage tick into uiState (payload.usage shape, see tui_gateway _start_usage_ticker)', () => {
+    patchUiState({ sid: 'sess-1' })
+    const onEvent = createGatewayEventHandler(ctx())
+
+    onEvent({
+      payload: { usage: { calls: 3, context_percent: 42, input: 1200, output: 80, total: 1280 } },
+      session_id: 'sess-1',
+      type: 'session.usage'
+    } as any)
+
+    expect(getUiState().usage).toMatchObject({ context_percent: 42, input: 1200, total: 1280 })
+  })
+
+  it('keeps existing usage fields when the tick only carries a subset', () => {
+    patchUiState({ sid: 'sess-1', usage: { calls: 2, input: 500, output: 40, total: 540 } })
+    const onEvent = createGatewayEventHandler(ctx())
+
+    onEvent({
+      payload: { usage: { context_percent: 55 } },
+      session_id: 'sess-1',
+      type: 'session.usage'
+    } as any)
+
+    expect(getUiState().usage).toMatchObject({ context_percent: 55, input: 500, total: 540 })
+  })
+
+  it('drops a tick for a non-focused session', () => {
+    patchUiState({ sid: 'focused', usage: ZERO })
+    const onEvent = createGatewayEventHandler(ctx())
+
+    onEvent({
+      payload: { usage: { input: 9999, total: 9999 } },
+      session_id: 'background',
+      type: 'session.usage'
+    } as any)
+
+    expect(getUiState().usage).toEqual(ZERO)
   })
 })

@@ -191,3 +191,37 @@ def test_a_child_store_closed_before_any_turn_finishes_its_execution_and_ends_it
         assert get_session(holder, child.reserved_session_id)['end_reason'] == 'agent_close'
     finally:
         parent.close()
+
+
+def test_parent_worker_captures_only_its_closed_stamped_child(ledger, tmp_path):
+    from types import SimpleNamespace
+
+    from tests.persistence_sqlite.workers._runtime_worker import worker_store
+    from tools.delegation_context_continuation import stamp_child_terminal_state, validate_and_capture_prior_worker
+
+    holder, epoch = ledger
+    spec = _reserve(holder, epoch, 1)['child']
+    child_id = spec['session_id']
+    _child_append(holder, epoch, spec, 1, 'Recovered child result')
+    parent_store = worker_store(holder, dict(epoch=epoch, execution_id='worker', session_id='parent', generation=0),
+                                tmp_path / 'parent')
+    parent_store.journal['next_sequence'] = 2  # reservation was made on the same receipt stream
+    child_store = worker_store(holder, dict(epoch=epoch, execution_id=spec['execution_id'], session_id=child_id,
+                                            generation=0), tmp_path / 'child')
+    child_store.journal['next_sequence'] = 2
+    try:
+        child = SimpleNamespace(session_id=child_id, _session_db=child_store, _session_init_model_config={})
+        assert stamp_child_terminal_state(child, {'status': 'completed', 'exit_reason': 'completed'})
+        assert parent_store.capture_terminal_child_session(child_id, 'parent') == {'found': False}
+        child_store.finish()
+        parent = SimpleNamespace(session_id='parent', _session_db=parent_store, _active_children=[])
+        result = validate_and_capture_prior_worker(parent, child_id)
+        assert [message['content'] for message in result.active_messages] == ['Recovered child result']
+        assert parent_store.capture_terminal_child_session('other', 'parent') == {'found': False}
+        parent_store.finish()
+        with holder._read_ctx() as conn:
+            assert not conn.execute("SELECT 1 FROM worker_receipts WHERE execution_id='worker' "
+                                    "AND result_json LIKE '%Recovered child result%'").fetchone()
+    finally:
+        child_store.close()
+        parent_store.close()

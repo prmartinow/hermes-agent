@@ -8,6 +8,12 @@ import { DEFAULT_THEME } from '../theme.js'
 
 import { DEFAULT_INDICATOR_STYLE, type UiState } from './interfaces.js'
 
+declare module './interfaces.js' {
+  interface UiState {
+    sessionKey: string | null
+  }
+}
+
 const buildUiState = (): UiState => ({
   battery: false,
   batteryStatus: null,
@@ -30,6 +36,7 @@ const buildUiState = (): UiState => ({
   pasteCollapseLines: 5,
   pasteCollapseChars: 2000,
   sections: {},
+  sessionKey: null,
   sessionTitle: '',
   showReasoning: false,
   sid: null,
@@ -50,6 +57,9 @@ export const $uiState = atom<UiState>(buildUiState())
 export const $uiTheme = computed($uiState, state => state.theme)
 export const $uiSessionId = computed($uiState, state => state.sid)
 export const $uiInlineImages = computed($uiState, state => state.inlineImages)
+export const $uiSessionKey = computed($uiState, state => state.sessionKey)
+
+export type { UiState }
 
 export const getUiState = () => $uiState.get()
 

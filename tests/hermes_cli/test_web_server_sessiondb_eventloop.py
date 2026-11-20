@@ -17,6 +17,9 @@ from tests.gateway.fixtures.storage_handles import close_storage_handles, storag
 import hermes_cli.web_models as _web_models
 import hermes_cli.web_routers.sessions as _rt_sessions
 import hermes_cli.web_server_sessions as _web_server_sessions
+from hermes_cli import web_server_sessions
+from hermes_cli.web_routers import analytics as web_analytics
+from hermes_cli.web_routers import sessions as web_sessions
 
 
 def test_bulk_delete_sessiondb_work_runs_off_event_loop(monkeypatch):

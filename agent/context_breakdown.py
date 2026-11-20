@@ -8,10 +8,13 @@ provenance; category estimates are not exact tokenizer counts or gate authority.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from agent.i18n import t
+
+logger = logging.getLogger(__name__)
 
 _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DOTALL)
 _SUBAGENT_TOOL_NAMES = frozenset({"delegate_task"})
@@ -216,8 +219,21 @@ def compute_session_context_breakdown(agent: Any, messages: Optional[list[dict]]
     if context_max:
         context_used = min(context_used, context_max)
 
+    budget_report = None
+    if comp is not None or agent is not None:
+        get_budget = getattr(comp, "get_budget_report", None) or getattr(agent, "get_budget_report", None)
+        if callable(get_budget):
+            try:
+                r = get_budget()
+                if isinstance(r, dict):
+                    budget_report = r
+            except Exception:
+                logger.debug("Could not read the context budget for display", exc_info=True)
+                budget_report = None
+
     return {
         **breakdown,
+        "budget_report": budget_report,
         "context_max": context_max,
         "context_percent": max(0, min(100, round(context_used / context_max * 100))) if context_max else 0,
         "context_used": context_used,
@@ -338,11 +354,50 @@ def render_context_details_lines(details: dict[str, Any]) -> list[str]:
     return lines
 
 
+def format_compaction_budget_lines(report: dict[str, Any]) -> list[str]:
+    """Render human-readable compaction budget lines from a get_budget_report() dict.
+
+    Shared between messaging gateway, TUI live context output, and CLI context breakdown.
+    Exposes context limit, output reservation, usable budget, ratio, requested cap,
+    effective exempt cap, actual trigger, and limiting reason/source without duplicating formulas.
+    """
+    if not isinstance(report, dict) or not report:
+        return []
+
+    ctx_limit = report.get("context_limit") or report.get("context_length") or 0
+    out_res = report.get("output_reservation", 0) or 0
+    usable = report.get("usable_tokens") or report.get("usable_input_budget") or 0
+    ratio_val = report.get("effective_model_ratio", report.get("effective_threshold_percent"))
+    usable_ratio_str = f"{ratio_val * 100:.0f}%" if ratio_val is not None else "n/a"
+    req_cap_raw = report.get("requested_cap")
+    eff_cap_raw = report.get("effective_cap")
+    is_exempt = bool(report.get("cap_exempt") or report.get("is_cap_exempt"))
+    exempt_reason = report.get("exemption_reason") or report.get("cap_exemption_reason")
+    act_trigger = report.get("actual_trigger") or report.get("threshold_tokens") or 0
+    lim_reason = report.get("limiting_reason") or report.get("limiting_source") or "unknown"
+
+    req_cap_str = f"{req_cap_raw:,}" if req_cap_raw is not None else "none"
+    if is_exempt:
+        eff_cap_str = f"none (exempt: {exempt_reason})" if exempt_reason else "none (exempt)"
+    elif eff_cap_raw is not None:
+        eff_cap_str = f"{eff_cap_raw:,}"
+    else:
+        eff_cap_str = "none"
+
+    return [
+        f"Compaction budget: context limit {ctx_limit:,} · output reservation {out_res:,} · "
+        f"usable ratio {usable_ratio_str} ({usable:,} tokens)",
+        f"Requested cap: {req_cap_str} · Effective cap: {eff_cap_str} · "
+        f"Actual trigger: {act_trigger:,} · Limiting reason: {lim_reason}",
+    ]
+
+
 def render_context_breakdown_lines(
     payload: dict[str, Any],
     *,
     details: Optional[dict[str, Any]] = None,
     grid: bool = True,
+    budget_report: Optional[dict[str, Any]] = None,
 ) -> list[str]:
     """Full /context view. ``grid`` prepends the glyph grid (CLI; the gateway
     keeps its own gauge); ``details`` appends the expanded listings."""
@@ -361,6 +416,12 @@ def render_context_breakdown_lines(
     from agent.prompt_cache_clock import render_prompt_cache_line
     if cache_line := render_prompt_cache_line(payload.get("prompt_cache")):
         lines.append(cache_line)
+
+    report = budget_report if budget_report is not None else payload.get("budget_report")
+    if report:
+        budget_lines = format_compaction_budget_lines(report)
+        if budget_lines:
+            lines.extend(["", *budget_lines])
 
     if details is None:
         lines.extend(["", t("gateway.context.hint_all")])

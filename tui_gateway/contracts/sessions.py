@@ -1,4 +1,4 @@
-"""Session lifecycle contracts (``tui_gateway/methods_session.py``): create / resume / activate /
+"""Session lifecycle contracts (``tui_gateway/methods_session/``): create / resume / activate /
 close, the live-session snapshot those share, history + compression + undo, mid-turn corrections,
 listing/browsing stored rows, spawn-tree snapshots, event replay and the stateless one-shot LLM call.
 """
@@ -490,12 +490,30 @@ method("session.status", params=SessionStatusParams, result=SessionStatusResult,
 
 
 class SessionHistoryParams(SessionParams):
-    pass
+    after_row_id: int | None = None
+    before_index: int | None = None
+    cursor: int | None = None
+    limit: int | None = None
+    snapshot_max_row_id: int | None = None
+    snapshot_token: str | None = None
+    tail_limit: int | None = None
 
 
 class SessionHistoryResult(Result):
+    after_row_id: int | None = None
     count: int
+    cursor: int | None = None
+    end_index: int | None = None
+    has_more: bool | None = None
+    has_more_before: bool | None = None
     messages: list[TranscriptMessage]
+    next_after_row_id: int | None = None
+    next_cursor: int | None = None
+    session_id: str | None = None
+    snapshot_max_row_id: int | None = None
+    snapshot_token: str | None = None
+    start_index: int | None = None
+    total: int | None = None
 
 
 method("session.history", params=SessionHistoryParams, result=SessionHistoryResult,
@@ -575,6 +593,7 @@ class SessionContextBreakdownResult(Result):
     model: str
     context_files: list[ContextFileSource] = []
     prompt_cache: PromptCacheWindow | None = None
+    budget_report: dict[str, JsonValue] | None = None
 
 
 method("session.context_breakdown", params=SessionContextBreakdownParams, result=SessionContextBreakdownResult,

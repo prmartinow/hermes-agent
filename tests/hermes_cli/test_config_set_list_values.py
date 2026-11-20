@@ -44,9 +44,9 @@ def test_mapping_literal_is_parsed_to_dict(user_home):
 def test_yaml_flow_list_is_parsed(user_home):
     from hermes_cli.config import set_config_value, read_raw_config
 
-    set_config_value("plugins.enabled", "[model-providers/gemini]")
+    set_config_value("plugins.enabled", "[model-providers/anthropic]")
     raw = read_raw_config()
-    assert raw["plugins"]["enabled"] == ["model-providers/gemini"]
+    assert raw["plugins"]["enabled"] == ["model-providers/anthropic"]
 
 
 def test_invalid_list_literal_is_refused_and_nothing_written(user_home, capsys):

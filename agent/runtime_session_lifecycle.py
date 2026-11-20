@@ -91,3 +91,15 @@ class RuntimeSessionLifecycleMixin:
         if not ids:
             return {}
         return {self.scope['session_id']: self._apply('session.lifecycle', {})['value']}
+
+    def stamp_child_terminal_session(self, session_id, status, exit_reason):
+        self._session(session_id)
+        return self._apply('continuation.stamp', {'status': status, 'exit_reason': exit_reason})['value']
+
+    def capture_terminal_child_session(self, session_id, expected_parent_id, *, include_compacted=False):
+        self._session(expected_parent_id)
+        return self._apply('continuation.capture', {'child': session_id, 'include_compacted': include_compacted})['recovery']
+
+    def get_compaction_recovery_messages(self, session_id):
+        self._session(session_id)
+        return self._apply('continuation.recover_compaction', {})['recovery']

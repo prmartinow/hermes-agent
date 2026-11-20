@@ -169,6 +169,9 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
         # next access (construction's deferred resolution); re-applies the small-context floor too.
         set_config_context_length(agent, None)
         cc._resolved_context_length = None
+    exempt_raw = compression.get("threshold_tokens_exempt_models")
+    from agent.compaction_budget import _normalize_exempt_models
+    cc.threshold_tokens_exempt_models = _normalize_exempt_models(exempt_raw) if exempt_raw is not None else ()
     cc.threshold_tokens_cap = cc._coerce_threshold_tokens_cap(
         compression.get("threshold_tokens", _default_threshold_tokens_cap())
     )

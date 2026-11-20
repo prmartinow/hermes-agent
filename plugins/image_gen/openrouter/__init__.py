@@ -26,16 +26,14 @@ from plugins.image_gen._common import error_factory, load_image_gen_config, post
 
 logger = logging.getLogger(__name__)
 
-# Quality-first default chain: OpenAI first, Gemini 3 Pro Image when it is gated /
-# unavailable / times out. Any explicit override is exact — no auto fallback.
+# Do not silently route a failed image request to a different provider.
 DEFAULT_MODEL = "openai/gpt-5.4-image-2"
-_FALLBACK_MODEL = "google/gemini-3-pro-image"
-_DEFAULT_MODEL_CHAIN = (DEFAULT_MODEL, _FALLBACK_MODEL)
-_MODEL_PRIORITY = {DEFAULT_MODEL: 0, _FALLBACK_MODEL: 1}
+_DEFAULT_MODEL_CHAIN = (DEFAULT_MODEL,)
+_MODEL_PRIORITY = {DEFAULT_MODEL: 0}
 
 # Semantic aspect ratio → OpenRouter ``image_config.aspect_ratio``.
 _ASPECT_RATIOS = {"square": "1:1", "landscape": "16:9", "portrait": "9:16"}
-_MAX_REFERENCE_IMAGES = 3  # Gemini Flash Image accepts up to 3 input images per prompt.
+_MAX_REFERENCE_IMAGES = 3  # Default for models without a declared reference-image limit.
 _REQUEST_TIMEOUT = 300.0  # per image call; a cold quality-first row can run past 3 minutes.
 
 # Curated metadata for well-known chat-completions image models.
@@ -43,10 +41,6 @@ _KNOWN_MODEL_META = {
     DEFAULT_MODEL: {
         "display": "OpenAI GPT-5.4 Image 2",
         "strengths": "Highest fidelity; best prompt adherence; slower on OpenRouter",
-    },
-    _FALLBACK_MODEL: {
-        "display": "Gemini 3 Pro Image",
-        "strengths": "Fast, reliable fallback with good layout adherence",
     },
 }
 _EXCLUDED_MODEL_PREFIXES = ("openrouter/auto",)  # router pseudo-models advertise image output
@@ -68,9 +62,6 @@ _IMAGE_API_CONNECT_TIMEOUT = 20.0
 _CATALOG_TTL_SECONDS = 900.0
 _CATALOG_CACHE: dict[tuple[str, Optional[str]], tuple[float, frozenset]] = {}
 
-_GEMINI_RATIOS = (
-    "1:1", "1:4", "1:8", "2:3", "3:2", "3:4", "4:1", "4:3", "4:5", "5:4", "8:1", "9:16", "16:9", "21:9",
-)
 _MAI_RATIOS = ("1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "auto")
 _KREA_RATIOS = ("1:1", "4:3", "3:2", "16:9", "4:5", "2:3", "9:16")
 _OPENAI_QUALITY = ("auto", "low", "medium", "high")
@@ -86,14 +77,6 @@ def _image_api_model(display: str, strengths: str, **spec: Any) -> dict[str, Any
 # id missing here still works (no per-model knob filtering; one cached catalog probe).
 # Keys mirror the payload field they gate; an empty tuple means "no such knob".
 _IMAGE_API_MODELS: dict[str, dict[str, Any]] = {
-    "google/gemini-3.1-flash-lite-image": _image_api_model(
-        "Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)",
-        "Cheap and fast; 14 exact aspect ratios; 14 reference images",
-        aspect_ratios=_GEMINI_RATIOS, resolutions=("1K",), max_n=1, max_refs=14),
-    "google/gemini-3.1-flash-image": _image_api_model(
-        "Nano Banana 2 (Gemini 3.1 Flash Image)",
-        "Same ratios as Lite plus resolution control (512/1K/2K/4K)",
-        aspect_ratios=_GEMINI_RATIOS, resolutions=("512", "1K", "2K", "4K"), max_n=1, max_refs=14),
     "openai/gpt-image-2": _image_api_model(
         "OpenAI GPT Image 2",
         "Best editing fidelity; up to 16 references; strongest prompt adherence",
@@ -107,7 +90,7 @@ _IMAGE_API_MODELS: dict[str, dict[str, Any]] = {
         quality=_OPENAI_QUALITY, background=("auto", "transparent", "opaque"), compression=True,
         max_n=10, max_refs=16),
     "microsoft/mai-image-2.5": _image_api_model(
-        "Microsoft MAI-Image-2.5", "Standard ratios; a good second opinion next to Gemini",
+        "Microsoft MAI-Image-2.5", "Standard image aspect ratios",
         aspect_ratios=_MAI_RATIOS, max_n=1, max_refs=1),
     "microsoft/mai-image-2.5-pro": _image_api_model(
         "Microsoft MAI-Image-2.5 Pro", "Reach for it when gpt-image-2 misses the brief",
@@ -157,7 +140,7 @@ _MEDIA_TYPE_EXTENSIONS = {
 _IMAGE_API_FALLBACK_STATUSES = frozenset({402, 404, 408, 409, 425, 429, 500, 502, 503, 504})
 
 # Stay on ``/chat/completions`` whatever the image catalog says — the tested defaults.
-_CHAT_ONLY_MODELS = frozenset({DEFAULT_MODEL, _FALLBACK_MODEL})
+_CHAT_ONLY_MODELS = frozenset({DEFAULT_MODEL})
 
 _IMAGE_API_EXTRA_KEYS = ("resolution", "quality", "background", "output_format", "seed", "n")
 
@@ -230,7 +213,7 @@ def _access_error_hint(display: str, model_id: str, env_var: str, status: int, e
         return None
     return (
         f"{display} can't reach image model '{model_id}' ({status}) — enable OpenAI "
-        f"image access in your {display} account, or set {env_var}={_FALLBACK_MODEL}.")
+        f"image access in your {display} account, or select another model with {env_var}.")
 
 
 def _get_catalog(base_url: str, path: str, api_key: str, timeout: Any) -> list[tuple[str, dict[str, Any]]]:
@@ -605,7 +588,7 @@ class OpenRouterCompatImageProvider(ImageGenProvider):
 
     def _resolve_model_chain(self, explicit: Optional[str] = None) -> list[str]:
         """``model`` kwarg → ``*_IMAGE_MODEL`` env → ``image_gen.<provider>.model`` →
-        ``image_gen.model`` → default chain. Only the bare default chain carries a fallback."""
+        ``image_gen.model`` → default model."""
         for candidate in (explicit, os.environ.get(self._model_env_var)):
             if isinstance(candidate, str) and candidate.strip():
                 return [candidate.strip()]
@@ -814,7 +797,7 @@ def _build_providers() -> list[OpenRouterCompatImageProvider]:
             setup_schema={
                 "name": "OpenRouter (image)",
                 "badge": "paid",
-                "tag": "Gemini Flash Image, gpt-image-2, Krea 2, Qwen Image 3 & more via OpenRouter; uses OPENROUTER_API_KEY",
+                "tag": "gpt-image-2, Krea 2, Qwen Image 3 & more via OpenRouter; uses OPENROUTER_API_KEY",
                 "env_vars": [{
                     "key": "OPENROUTER_API_KEY", "prompt": "OpenRouter API key", "url": "https://openrouter.ai/keys",
                 }],

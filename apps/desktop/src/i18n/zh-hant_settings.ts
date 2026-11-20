@@ -571,10 +571,6 @@ export const zhHantSettings = {
           model: 'Mistral TTS 模型',
           voiceId: 'Mistral 語音'
         },
-        gemini: {
-          model: 'Gemini TTS 模型',
-          voice: 'Gemini 語音'
-        },
         neutts: {
           model: 'NeuTTS 模型',
           device: 'NeuTTS 裝置'

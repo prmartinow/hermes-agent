@@ -23,6 +23,37 @@ def test_ringbuffer_drops_oldest_over_capacity():
     assert rb.truncated is True
 
 
+def test_ringbuffer_clears_prior_bytes_on_scrollback_wipe():
+    rb = RingBuffer(1024)
+    rb.append(b"Stale run line 1\nStale run line 2\n")
+    assert b"Stale run" in rb.snapshot()
+    # Emitting clearTerminal (\x1b[3J) must discard stale runs
+    rb.append(b"\x1b[2J\x1b[3J\x1b[HFresh run line 1\n")
+    snap = rb.snapshot()
+    assert b"Stale run" not in snap
+    assert b"Fresh run" in snap
+
+
+
+
+@pytest.mark.parametrize("split", range(1, 4))
+def test_scrollback_wipe_survives_every_read_boundary(split):
+    rb = RingBuffer(128)
+    rb.append(b"old-history")
+    marker = b"\x1b[3J"
+    rb.append(marker[:split])
+    rb.append(marker[split:] + b"new-history")
+    assert rb.snapshot() == marker + b"new-history"
+    assert not rb.truncated
+
+
+def test_split_wipe_does_not_duplicate_partial_sequences():
+    rb = RingBuffer(128)
+    for chunk in [b"old", b"\x1b", b"[", b"3", b"J", b"new", b"\x1b[", b"2J"]:
+        rb.append(chunk)
+    assert rb.snapshot() == b"\x1b[3Jnew\x1b[2J"
+
+
 class FakeBridge:
     """Implements the bridge contract PtySession depends on."""
 
@@ -46,6 +77,9 @@ class FakeBridge:
 
     def resize(self, cols, rows):
         self.resized = (cols, rows)
+
+    def retire_if_idle(self):
+        return True
 
     def close(self):
         self.closed = True
@@ -146,7 +180,7 @@ async def test_drain_send_failure_detaches_current_socket_but_not_a_replacement(
     stale.release.set()
     await asyncio.sleep(0.05)
     assert s.attached is True
-    assert s._ws is replacement
+    assert replacement in s._viewers
     assert s.last_detached_at is None
     await s.close()
 
@@ -400,6 +434,7 @@ async def test_failed_redraw_marks_session_dead_for_replacement():
     from hermes_cli.pty_session import PtySession
 
     bridge = FakeBridge([b""], write_result=False)
+    bridge.is_alive = lambda: False  # Confirmed exit, not merely input backpressure.
     s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
     await s.start()
     ws = FakeWS()
@@ -476,10 +511,10 @@ async def test_superseded_failed_write_does_not_kill_replacement_session():
     await bridge.old_write_started.wait()
     new_attach = asyncio.create_task(s.attach(new_ws, force_redraw=True))
     for _ in range(10):
-        if s._ws is new_ws:
+        if new_ws in s._viewers:
             break
         await asyncio.sleep(0)
-    assert s._ws is new_ws
+    assert new_ws in s._viewers
 
     bridge.release_old_write.set()
     assert await old_write is False
@@ -511,7 +546,7 @@ async def test_detach_keeps_draining_into_buffer():
     await s.close()
 
 
-@pytest.mark.asyncio
+@pytest.mark.anyio
 async def test_eof_marks_dead_and_closes_socket_4410():
     from hermes_cli.pty_session import PtySession
     bridge = FakeBridge([b"bye", None])
@@ -534,6 +569,48 @@ def make_registry(ttl=1800.0, max_sessions=16):
 
 
 @pytest.mark.asyncio
+async def test_dashboard_retains_detached_terminal_for_one_hour():
+    from hermes_cli.web_server_chat import PTY_REGISTRY
+
+    reg = PtySessionRegistry(
+        ttl=PTY_REGISTRY._ttl, max_sessions=PTY_REGISTRY._max,
+        buffer_cap=PTY_REGISTRY._buffer_cap, read_timeout=0.01)
+    bridge = FakeBridge([])
+    session, _ = await reg.attach_or_spawn("retention", spawn=lambda: bridge)
+    ws = FakeWS()
+    try:
+        await session.attach(ws)
+        reg.detach("retention", ws)
+        detached_at = session.last_detached_at
+        await reg.reap_idle(now=detached_at + 3599)
+        assert reg._sessions["retention"] is session
+        assert not bridge.closed
+        resumed, created = await reg.attach_or_spawn(
+            "retention", spawn=lambda: pytest.fail("warm session must not respawn"))
+        assert resumed is session and not created
+        await reg.reap_idle(now=detached_at + 3601)
+        assert not reg._sessions
+        assert bridge.closed
+    finally:
+        await reg.close_all()
+
+
+def test_dashboard_output_buffer_preserves_history_beyond_old_limit():
+    from hermes_cli.web_server_chat import PTY_REGISTRY
+
+    rb = RingBuffer(PTY_REGISTRY._buffer_cap)
+    block = b"x" * (1024 * 1024)
+    rb.append(b"first-message\n")
+    for _ in range(199):
+        rb.append(block)
+    assert not rb.truncated
+    assert rb.snapshot().startswith(b"first-message\n")
+    rb.append(block)
+    assert rb.truncated
+    assert len(rb.snapshot()) == 200 * 1024 * 1024
+
+
+@pytest.mark.anyio
 async def test_same_key_reattaches_same_session():
     reg = make_registry()
     b1 = FakeBridge([b"", b"", b""])
@@ -587,15 +664,38 @@ async def test_concurrent_attach_on_one_token_forks_one_pty():
     assert s1.bridge is spawned[0]
     assert list(reg._sessions.values()) == [s1]  # every handed-out session is tracked
 
-    # Whichever socket attached last owns the terminal; the loser is superseded
-    # by contract, so no viewer is left writing into an untracked PTY.
+    # Both connections attach to the same shared session as concurrent viewers;
+    # neither is superseded or closed with 4409.
     ws_a, ws_b = FakeWS(), FakeWS()
-    await s1.attach(ws_a)
-    await s2.attach(ws_b)
+    await s1.attach(ws_a, multi_viewer=True)
+    await s2.attach(ws_b, multi_viewer=True)
     assert reg._sessions["tok"] is s1
-    assert s1._ws is ws_b and ws_b.close_code is None
-    assert ws_a.close_code == WS_CLOSE_SUPERSEDED
+    assert len(spawned) == 1
+    assert ws_a in s1._viewers and ws_b in s1._viewers
+    assert ws_a.close_code is None and ws_a.close_code != WS_CLOSE_SUPERSEDED and ws_a.close_code != 4409
+    assert ws_b.close_code is None and ws_b.close_code != WS_CLOSE_SUPERSEDED and ws_b.close_code != 4409
+    assert s1._ws is ws_b
     await reg.close_all()
+
+
+@pytest.mark.anyio
+async def test_reaper_loop_invokes_reap(monkeypatch):
+    from hermes_cli.pty_session import run_reaper
+    reg = make_registry()
+    calls = {"n": 0}
+
+    async def fake_reap(now=None):
+        calls["n"] += 1
+
+    monkeypatch.setattr(reg, "reap_idle", fake_reap)
+    task = asyncio.create_task(run_reaper(reg, interval=0.01))
+    await async_wait_until(lambda: calls["n"] >= 2, timeout=5)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert calls["n"] >= 2
 
 
 async def _two_idle_sessions_first_close_gated(reg):
@@ -634,10 +734,11 @@ async def test_concurrent_reap_idle_is_idempotent():
     far_future = time.monotonic() + 10_000    # both idle past ttl → doomed
     first = asyncio.create_task(reg.reap_idle(now=far_future))
     await entered.wait()                      # k0 popped; first reap parked in close()
-    await reg.reap_idle(now=far_future)       # second reap takes k1
-
+    second = asyncio.create_task(reg.reap_idle(now=far_future))
+    await asyncio.sleep(0)
+    assert not second.done()  # Retirement/admission is serialized.
     release.set()
-    await first                               # first reap reaches the taken k1
+    await asyncio.gather(first, second)
     assert not reg._sessions
     assert all(b.closed for b in bridges)
 
@@ -667,9 +768,10 @@ async def test_close_all_survives_key_popped_by_concurrent_reap():
 
     closer = asyncio.create_task(reg.close_all())
     await entered.wait()                      # close_all popped k0, parked in close()
-    await reg.reap_idle(now=time.monotonic() + 10_000)   # pops k1 meanwhile
+    reaper = asyncio.create_task(reg.reap_idle(now=time.monotonic() + 10_000))
+    await asyncio.sleep(0)
     release.set()
-    await closer                              # k1 of the snapshot is already gone
+    await asyncio.gather(closer, reaper)
 
     assert not reg._sessions
     assert all(b.closed for b in bridges)
@@ -983,3 +1085,16 @@ async def test_reap_keeps_live_attached_session():
     await reg.close_all()
 
 
+
+
+@pytest.mark.anyio
+async def test_attach_with_generation_emits_private_replay_request():
+    from hermes_cli.pty_session import PtySession, make_replay_request
+    bridge = FakeBridge([b""])
+    s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    await s.start()
+    ws = FakeWS()
+    gen = "11111111-1111-1111-1111-111111111111"
+    assert await s.attach(ws, generation=gen) is True
+    assert bytes(bridge.written) == f"\x1b]777;hermes-replay;request;{gen}\x07".encode("ascii")
+    await s.close()

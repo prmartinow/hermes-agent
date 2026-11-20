@@ -106,17 +106,10 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None, toolchain
     # delegate_task children are marked by a ContextVar, not os.environ, and the sandbox crosses
     # a process boundary: strip dispatcher-owned Kanban vars AFTER the scrub so an explicit
     # passthrough cannot re-grant a delegated child the parent's board mutation capability.
-    from agent.delegation_context import (
-        DELEGATED_CHILD_ENV_MARKER, delegated_child_subprocess_env,
-    )
-    scoped = delegated_child_subprocess_env(source_env)
-    # Preserve location only when carrying the descendant fence, not for arbitrary
-    # non-allowlisted HERMES_* values in otherwise ordinary execution environments.
-    if scoped.get(DELEGATED_CHILD_ENV_MARKER):
-        for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
-            if key in scoped:
-                scrubbed[key] = scoped[key]
-    return delegated_child_subprocess_env(scrubbed)
+    from agent.delegation_context import is_delegated_child_process_context, scrub_kanban_env
+    if is_delegated_child_process_context():
+        scrubbed = scrub_kanban_env(scrubbed)
+    return scrubbed
 
 
 def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
@@ -127,6 +120,7 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     # A local session's client toolchain replaces the daemon's PATH / venv, then the whole scrub (secret
     # names, delegated-child restrictions) runs over the merged environment.
     child_env = _scrub_child_env(toolchain_environ(), toolchain=frozenset(tool_env()))
+    child_env["HERMES_ACTIVE_TURN"] = "1"
     child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
     child_env["HERMES_RPC_TOKEN"] = rpc_token
     child_env["PYTHONDONTWRITEBYTECODE"] = "1"

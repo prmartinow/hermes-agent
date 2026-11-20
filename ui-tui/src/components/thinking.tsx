@@ -686,6 +686,16 @@ interface Group {
   label: string
 }
 
+function hasTrailContent(
+  busy: boolean,
+  reasoningActive: boolean,
+  cot: string,
+  outcome: string,
+  collections: readonly (readonly unknown[])[]
+): boolean {
+  return busy || reasoningActive || Boolean(cot) || Boolean(outcome) || collections.some(items => items.length > 0)
+}
+
 export const ToolTrail = memo(function ToolTrail({
   busy = false,
   commandOverride = false,
@@ -695,6 +705,7 @@ export const ToolTrail = memo(function ToolTrail({
   reasoningActive = false,
   reasoning = '',
   reasoningAlwaysVisible = false,
+  thinkingTitle,
   reasoningTokens,
   reasoningStreaming = false,
   sections,
@@ -712,6 +723,7 @@ export const ToolTrail = memo(function ToolTrail({
   preferExpandedThinking?: boolean
   reasoningActive?: boolean
   reasoning?: string
+  thinkingTitle?: string
   // MoA reference blocks (see Msg.isMoaReference) stay visible even when
   // `visible.thinking === 'hidden'` — they're the mixture-of-agents process
   // the user opted into, not private model reasoning (#64657).
@@ -818,16 +830,7 @@ export const ToolTrail = memo(function ToolTrail({
   const spawnSpark = useMemo(() => sparkline(spawnWidths), [spawnWidths])
   const spawnSummaryLabel = useMemo(() => formatSpawnSummary(spawnTotals), [spawnTotals])
 
-  if (
-    !busy &&
-    !trail.length &&
-    !tools.length &&
-    !subagents.length &&
-    !activity.length &&
-    !cot &&
-    !reasoningActive &&
-    !outcome
-  ) {
+  if (!hasTrailContent(busy, reasoningActive, cot, outcome, [trail, tools, subagents, activity])) {
     return null
   }
 
@@ -1050,6 +1053,7 @@ export const ToolTrail = memo(function ToolTrail({
   }[] = []
 
   if (hasThinking && (visible.thinking !== 'hidden' || reasoningAlwaysVisible)) {
+    const titleLabel = thinkingTitle ? `${T.thinking}: ${thinkingTitle}` : T.thinking
     panels.push({
       header: (
         <Box
@@ -1065,11 +1069,11 @@ export const ToolTrail = memo(function ToolTrail({
             <Text color={t.color.accent}>{openThinking ? '▾ ' : '▸ '}</Text>
             {thinkingLive ? (
               <Text bold color={t.color.text}>
-                {T.thinking}
+                {titleLabel}
               </Text>
             ) : (
               <Text color={t.color.muted} dim>
-                {T.thinking}
+                {titleLabel}
               </Text>
             )}
             {thinkingTokensLabel ? (

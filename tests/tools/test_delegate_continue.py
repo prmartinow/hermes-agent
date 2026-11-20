@@ -200,7 +200,10 @@ def test_one_shot_sessions_are_not_offered_continue():
     assert "continue" in full["parameters"]["properties"]["action"]["enum"]
     oneshot = oneshot_delegate_function(full)
     assert "action" not in oneshot["parameters"]["properties"]
-    assert "continue" not in json.dumps(oneshot["parameters"])
+    # The distinct continue_from spawn option supplies bounded prior-worker
+    # evidence; it does not offer the live-control action to one-shot sessions.
+    task_properties = oneshot["parameters"]["properties"]["tasks"]["items"]["properties"]
+    assert "action" not in task_properties
 
 
 def test_one_shot_sessions_refuse_continue_without_consuming_it(monkeypatch):

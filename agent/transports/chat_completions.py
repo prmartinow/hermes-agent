@@ -289,13 +289,15 @@ def _model_consumes_thought_signature(model: Any, base_url: Any = None, provider
     """
     from utils import base_url_host_matches
 
+    name = str(provider or "").strip().lower()
+    if name in _GEMINI_SIGNATURE_PROVIDERS or _profile_replays_tool_call_signatures(provider):
+        return True
+    if any(base_url_host_matches(base_url, host) for host in _GEMINI_SIGNATURE_HOSTS):
+        return True
+    if name == "custom" or name.startswith("custom:"):
+        return False  # A generic Bridge endpoint does not consume native Google signatures.
     m = str(model or "").lower()
-    return (
-        "gemini" in m or "gemma" in m
-        or (provider or "").strip().lower() in _GEMINI_SIGNATURE_PROVIDERS
-        or _profile_replays_tool_call_signatures(provider)
-        or any(base_url_host_matches(base_url, host) for host in _GEMINI_SIGNATURE_HOSTS)
-    )
+    return "gemini" in m or "gemma" in m
 
 
 def _wire_reasoning_carriers(provider: Any, base_url: Any) -> frozenset:
@@ -375,15 +377,25 @@ def _swap_developer_role(sanitized: list, model_lower: str) -> list:
     return sanitized
 
 
+def _provider_output_tokens(model: str, reasoning_config: Any, requested: Any, params: dict) -> Any:
+    if params.get("provider_name") in {"vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"}:
+        from agent.vertex_adapter import vertex_output_tokens
+        return vertex_output_tokens(model, reasoning_config, requested)
+    provider = str(params.get("provider_name") or "").lower()
+    if provider == "custom" or provider.startswith("custom:"):
+        return requested
+    return _raise_gemini_thinking_max_tokens(model, reasoning_config, requested)
+
+
 def _apply_max_tokens(api_kwargs: dict, model: str, reasoning_config: Any, params: dict, profile_max: Any = None) -> None:
     """Preserve internal task/recovery budgets and provider protocol exceptions."""
     max_tokens_fn = params.get("max_tokens_param_fn")
     for candidate in (params.get("ephemeral_max_output_tokens"), params.get("max_tokens")):
         if candidate is not None and max_tokens_fn:
-            api_kwargs.update(max_tokens_fn(_raise_gemini_thinking_max_tokens(model, reasoning_config, candidate)))
+            api_kwargs.update(max_tokens_fn(_provider_output_tokens(model, reasoning_config, candidate, params)))
             return
     if profile_max and max_tokens_fn:
-        api_kwargs.update(max_tokens_fn(_raise_gemini_thinking_max_tokens(model, reasoning_config, profile_max)))
+        api_kwargs.update(max_tokens_fn(_provider_output_tokens(model, reasoning_config, profile_max, params)))
 
 
 
@@ -516,10 +528,14 @@ def _sanitize_message(
                 keys.append("extra_content")
             key = coalesce_tool_call_id(tc) if mistral_tool_ids else ""
             mapped = _mistral_tool_id(key) if key else None
-            if keys or (mapped is not None and mapped != tc.get("id")):
+            function = tc.get("function")
+            legacy_signature = strip_extra_content and isinstance(function, dict) and "thought_signature" in function
+            if keys or legacy_signature or (mapped is not None and mapped != tc.get("id")):
                 if copied_tool_calls is None:
                     copied_tool_calls = list(tool_calls)
                 copied_tool_calls[tc_idx] = {k: v for k, v in tc.items() if k not in keys}
+                if legacy_signature:
+                    copied_tool_calls[tc_idx]["function"] = {k: v for k, v in function.items() if k != "thought_signature"}
                 if mapped is not None:
                     copied_tool_calls[tc_idx]["id"] = mapped
         if copied_tool_calls is not None:

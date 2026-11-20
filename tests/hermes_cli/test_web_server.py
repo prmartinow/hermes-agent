@@ -976,7 +976,6 @@ CONFIG_SCHEMA = ProviderConfigSchema(
         assert resp.status_code == 200
         assert resp.json()["session_id"] == "primary-cont"
 
-
     def test_update_hermes_returns_docker_guidance_without_spawning(self, monkeypatch):
 
         spawned = False

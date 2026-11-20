@@ -54,7 +54,6 @@ MODELS = {
 SURFACES = (
     ("cli.claude", "cli", "claude", False),
     ("cli.gpt", "cli", "gpt", False),
-    ("cli.gemini", "cli", "gemini", False),
     ("cli.hermes", "cli", "hermes", False),
     ("cli-code.claude", "cli", "claude", True),
     ("desktop.claude", "desktop", "claude", False),

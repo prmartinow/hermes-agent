@@ -171,3 +171,41 @@ def model_forces_max_completion_tokens(model: str) -> bool:
     """True for OpenAI families that reject ``max_tokens`` (HTTP 400 ``unsupported_parameter``)."""
     m = (model or "").strip().lower().rsplit("/", 1)[-1]
     return m.startswith(("gpt-4o", "gpt-4.1", "gpt-5", "o1", "o3", "o4"))
+
+
+GEMINI_NATIVE_PROVIDER_NAMES = {"gemini", "google", "google-gemini", "google-ai-studio"}
+
+
+def is_gemini_native_route(provider_norm: str, effective_base: str) -> bool:
+    """Gemini native by provider name or by base URL shape."""
+    from agent.gemini_native_adapter import is_native_gemini_base_url
+    return provider_norm in GEMINI_NATIVE_PROVIDER_NAMES or is_native_gemini_base_url(effective_base)
+
+
+def gemini_native_client(agent, client_kwargs: dict, httpx_verify, *, reason: str, shared: bool):
+    """Native Gemini client when the base_url is the Gemini API, else None."""
+    from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+    base_url = str(client_kwargs.get("base_url", "") or "")
+    if not is_native_gemini_base_url(base_url):
+        return None
+    safe_kwargs = {
+        k: v for k, v in client_kwargs.items()
+        if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+    }
+    if "http_client" not in safe_kwargs:
+        keepalive_http = agent._build_keepalive_http_client(base_url, verify=httpx_verify)
+        if keepalive_http is not None:
+            safe_kwargs["http_client"] = keepalive_http
+    client = GeminiNativeClient(**safe_kwargs)
+    logger.info(
+        "Gemini native client created (%s, shared=%s) %s", reason, shared, agent._client_log_context()
+    )
+    return client
+
+
+def default_gemini_client(provider: str, api_key: str, base_url: str):
+    if provider == "gemini":
+        from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+        if is_native_gemini_base_url(base_url):
+            return GeminiNativeClient(api_key=api_key, base_url=base_url)
+    return None

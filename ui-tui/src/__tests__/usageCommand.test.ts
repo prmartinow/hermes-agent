@@ -156,4 +156,36 @@ describe('/usage slash command', () => {
     expect(body).toContain('$12.00')
     expect(body.toLowerCase()).not.toContain('credits')
   })
+
+  it('shows the free-models upsell for a free account', async () => {
+    const { panel, run } = buildCtx({
+      'session.usage': baseUsage({ usage: { available: true, status: 'free', plan_name: null } })
+    })
+
+    await run('')
+
+    const body = balancePanel(panel)
+    expect(body).toContain('free models only')
+    expect(body).toContain('/subscription')
+  })
+
+  it('renders model usage and reasoning tokens', async () => {
+    const { panel, run } = buildCtx({
+      'session.usage': baseUsage({
+        calls: 5,
+        input: 10000,
+        model: 'example/model',
+        output: 2000,
+        reasoning: 800,
+        total: 12000
+      })
+    })
+    await run('')
+
+    const usageCall = panel.mock.calls.find(c => c[0] === 'Usage')
+    expect(usageCall).toBeDefined()
+    const usageRows = usageCall?.[1]?.[0]?.rows as [string, string][]
+    expect(usageRows).toContainEqual(['Reasoning tokens', '800'])
+    expect(usageRows).toContainEqual(['Model', 'example/model'])
+  })
 })

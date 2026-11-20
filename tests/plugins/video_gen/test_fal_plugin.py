@@ -272,16 +272,25 @@ class TestFamilyRouting:
         assert with_fake_fal["endpoint"] == expected_endpoint
 
 
-    def test_unknown_family_falls_back_to_default(self, with_fake_fal):
-        from plugins.video_gen.fal import FALVideoGenProvider, FAL_FAMILIES, DEFAULT_MODEL
+    def test_unknown_family_does_not_submit_a_different_paid_model(self, with_fake_fal):
+        from plugins.video_gen.fal import FALVideoGenProvider
 
         result = FALVideoGenProvider().generate(
             "x",
             model="not-a-real-family",
         )
-        assert result["success"] is True
-        expected_endpoint = FAL_FAMILIES[DEFAULT_MODEL]["text_endpoint"]
-        assert with_fake_fal["endpoint"] == expected_endpoint
+        assert result["success"] is False
+        assert "not-a-real-family" in result["error"]
+        assert with_fake_fal["endpoint"] is None
+
+    def test_unknown_configured_family_does_not_submit_a_different_paid_model(self, with_fake_fal, monkeypatch):
+        from plugins.video_gen.fal import FALVideoGenProvider
+
+        monkeypatch.setenv("FAL_VIDEO_MODEL", "retired-family")
+        result = FALVideoGenProvider().generate("x")
+        assert result["success"] is False
+        assert "retired-family" in result["error"]
+        assert with_fake_fal["endpoint"] is None
 
 
 class TestFamilyKeyNormalization:
@@ -313,7 +322,6 @@ class TestFamilyKeyNormalization:
         assert _normalize_family_key("bytedance/seedance-2.0") == "seedance-2.0"
         assert _normalize_family_key("minimax/h3") == "minimax-h3"
         assert _normalize_family_key("xai/grok-imagine-video/v1.5") == "grok-imagine-1.5"
-        assert _normalize_family_key("google/gemini-omni-flash") == "gemini-omni-flash"
         assert _normalize_family_key("blackforestlabs/flux-3") == "flux-3"
 
     def test_capabilities_span_longest_family_duration(self):
@@ -384,7 +392,6 @@ class TestPayloadBuilder:
             "minimax-h3",
             "flux-3",
             "grok-imagine-1.5",
-            "gemini-omni-flash",
         ],
     )
     def test_seed_dropped_for_families_without_seed_support(self, family_id):
@@ -410,7 +417,7 @@ class TestPayloadBuilder:
         """minimax-h3 and the i2v-only families have no generate_audio field."""
         from plugins.video_gen.fal import FAL_FAMILIES, _build_payload
 
-        for family_id in ("minimax-h3", "grok-imagine-1.5", "gemini-omni-flash"):
+        for family_id in ("minimax-h3", "grok-imagine-1.5"):
             p = _build_payload(
                 FAL_FAMILIES[family_id],
                 prompt="x", image_url="https://i.png", duration=None,
@@ -426,7 +433,6 @@ class TestPayloadBuilder:
             ("minimax-h3", 7),          # FAL types duration as an integer
             ("flux-3", 7),              # mixed ["auto", 5, 6, ...] literal enum
             ("grok-imagine-1.5", 7),
-            ("gemini-omni-flash", 7),
             ("seedance-2.5", "7"),      # FAL enum is strings: "auto","4",...
             ("seedance-2.0-mini", "7"),
             ("pixverse-v6", "7"),       # unchanged legacy string form
@@ -445,8 +451,7 @@ class TestPayloadBuilder:
         assert type(p["duration"]) is type(expected)
 
     def test_every_family_declares_both_endpoints(self):
-        """Catalog invariant: since Gemini Omni Flash 1.1 every family is
-        dual-modality — both endpoints must be non-empty strings."""
+        """Catalog families support both text and image input."""
         from plugins.video_gen.fal import FAL_FAMILIES
 
         for fid, meta in FAL_FAMILIES.items():

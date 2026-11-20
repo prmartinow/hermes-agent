@@ -3627,10 +3627,29 @@ export interface SessionStatusResult {
 export interface SessionHistoryParams {
   session_id: string
   profile?: string | null
+  after_row_id?: number | null
+  before_index?: number | null
+  cursor?: number | null
+  limit?: number | null
+  snapshot_max_row_id?: number | null
+  snapshot_token?: string | null
+  tail_limit?: number | null
 }
 export interface SessionHistoryResult {
+  after_row_id?: number | null
   count: number
+  cursor?: number | null
+  end_index?: number | null
+  has_more?: boolean | null
+  has_more_before?: boolean | null
   messages: TranscriptMessage[]
+  next_after_row_id?: number | null
+  next_cursor?: number | null
+  session_id?: string | null
+  snapshot_max_row_id?: number | null
+  snapshot_token?: string | null
+  start_index?: number | null
+  total?: number | null
 }
 export interface SessionUsageParams {
   session_id: string
@@ -3682,6 +3701,7 @@ export interface SessionContextBreakdownResult {
   model: string
   context_files?: ContextFileSource[]
   prompt_cache?: PromptCacheWindow | null
+  budget_report?: Record<string, unknown> | null
 }
 export interface ContextCategory {
   color: string
@@ -5974,6 +5994,16 @@ export interface ErrorPayload {
 export interface NoticePayload {
   message: string
 }
+/** ``methods_prompt`` announces a newly submitted prompt to connected viewers. */
+export interface PromptSubmittedPayload {
+  session_id: string
+  text: string
+}
+/** ``session_auto_continue`` reports a correction accepted by a running turn. */
+export interface TurnSteerPayload {
+  text: string
+  timestamp: number
+}
 /** ``message.start``. Empty from the TUI gateway's emitters and for an ordinary admission; ``gateway/session_authority._stamp_claim`` adds an automation admission's async-result card (``session_automation.admission_display``: a background-process completion) and its model text, so a viewer that did not submit the turn paints the same header the submitter would. */
 export interface MessageStartPayload {
   display_kind?: string | null
@@ -7484,6 +7514,8 @@ export interface BackendGatewayEventMap {
   'preview.restart.progress': PreviewRestartProgressPayload
   /** projects.db moved; refetch the project list + tree. */
   'projects.changed': ChangeSignalPayload
+  /** A prompt was submitted in the named session. */
+  'prompt.submitted': PromptSubmittedPayload
   /** Affection reaction detected in the user's message (hearts etc.). */
   reaction: ReactionPayload
   /** A completed reasoning block (non-streaming providers). */
@@ -7546,6 +7578,8 @@ export interface BackendGatewayEventMap {
   'tool.progress': ToolProgressPayload
   /** A tool call began (stable id + full args). */
   'tool.start': ToolStartPayload
+  /** A running turn accepted a user correction. */
+  'turn.steer': TurnSteerPayload
   /** Barge-in: the spoken interjection interrupted the turn; no payload. */
   'voice.interrupted': Record<string, never>
   /** Live STT text so far while the user is still speaking. */
@@ -7602,6 +7636,7 @@ export const GATEWAY_EVENT_TYPES = [
   'preview.restart.complete',
   'preview.restart.progress',
   'projects.changed',
+  'prompt.submitted',
   'reaction',
   'reasoning.available',
   'reasoning.delta',
@@ -7633,6 +7668,7 @@ export const GATEWAY_EVENT_TYPES = [
   'tool.output_risk',
   'tool.progress',
   'tool.start',
+  'turn.steer',
   'voice.interrupted',
   'voice.partial',
   'voice.status',

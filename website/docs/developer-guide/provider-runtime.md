@@ -64,7 +64,6 @@ Current provider families include (see `plugins/model-providers/` for the comple
 - Nous Portal
 - OpenAI Codex
 - Anthropic (native)
-- Google / Gemini (`gemini`)
 - Alibaba / DashScope (`alibaba`, `alibaba-coding-plan`)
 - DeepSeek
 - Z.AI

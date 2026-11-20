@@ -85,15 +85,6 @@ def run_ladder(error, *, provider="openrouter", retries=1, is_async=False, fallb
                            unhealthy=bool(marks), rotated=bool(rotations), refreshed=refreshes, result=result)
 
 
-def _gemini_prompt_block():
-    """The native Gemini adapter's error for a 200 answer carrying ``promptFeedback.blockReason``."""
-    from agent.gemini_native_adapter import raise_on_prompt_block
-
-    try:
-        raise_on_prompt_block({"promptFeedback": {"blockReason": "SAFETY"}})
-    except Exception as exc:  # the adapter's own error, not a hand-built one
-        return exc
-    raise AssertionError("the adapter did not raise on a prompt block")
 
 
 # (case id, error, route provider, expected outcome): the approved behaviour decisions.
@@ -147,7 +138,6 @@ BEHAVIOUR = [
         "raw": '{"error": {"message": "Quota exceeded for this model"}}', "provider_name": "DeepInfra"}),
      "openrouter", dict(fell_back=True, unhealthy=False, rotated=False)),
     # A safety refusal is of the content itself: it is never resent to another provider.
-    ("gemini-prompt-blocked", _gemini_prompt_block(), "gemini", dict(attempts=1, fell_back=False)),
     ("400-content-policy", sdk(400, "Your request was flagged by our safety system"), "openrouter",
      dict(attempts=1, fell_back=False)),
     # An interrupted task stops: no same-provider retry, no other provider.
@@ -163,9 +153,8 @@ def test_behaviour(case, error, provider, expected):
 
 
 # (case id, summary request's error, compression aborts with the transcript intact): the ladder hands a safety
-# refusal back to the compressor; only Gemini's prompt block aborts, other refusals keep the fallback summary.
+# refusal back to the compressor; a generic content-policy error keeps the fallback summary.
 COMPRESSION_BEHAVIOUR = [
-    ("gemini-prompt-blocked", _gemini_prompt_block(), True),
     ("400-content-policy", sdk(400, "Your request was flagged by our safety system"), False),
 ]
 
@@ -175,10 +164,10 @@ def test_compression_behaviour(case, error, aborted):
     from agent.context_compressor import ContextCompressor
 
     with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-        compressor = ContextCompressor(model="gemini-2.5-flash", provider="gemini", quiet_mode=True, protect_first_n=2,
+        compressor = ContextCompressor(model="test", provider="openrouter", quiet_mode=True, protect_first_n=2,
                                        protect_last_n=2, abort_on_summary_failure=False)
     msgs = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"} for i in range(12)]
-    outcome = run_ladder(error, provider="gemini",
+    outcome = run_ladder(error, provider="openrouter",
                          call=lambda: compressor.compress(msgs, current_tokens=999999, force=True))
     assert (outcome.fell_back, outcome.result == msgs, compressor._last_compress_aborted) == (False, aborted, aborted)
 

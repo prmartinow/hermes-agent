@@ -552,9 +552,11 @@ export interface GatewayEventHandlerContext {
     colsRef: MutableRefObject<number>
     newSession: (msg?: string, title?: string) => void
     // Session carried across a transport loss or child exit, cleared after resume.
+    recoverSessionKeyRef?: MutableRefObject<null | string>
     recoverSidRef?: MutableRefObject<null | string>
     resetSession: () => void
-    resumeById: (id: string) => Promise<void>
+    resumeById: (id: string, targetRecoveryRef?: { current: string | null }, retryAttempt?: number,
+      options?: { gapReason?: string; mode?: 'transport-recovery' | 'transport-gap-recovery' | 'cold-resume' }) => Promise<void>
     setCatalog: (catalog: null | SlashCatalog) => void
   }
   submission: {
@@ -640,7 +642,7 @@ export interface SlashHandlerContext {
       submitOpts?: { attachments?: Array<{ path: string; mime: string }> }) => void
     setHistoryItems: StateSetter<Msg[]>
     sys: (text: string) => void
-    trimLastExchange: (items: Msg[]) => Msg[]
+    trimLastExchange: (items: Msg[], turns?: number) => Msg[]
   }
   voice: {
     setVoiceEnabled: StateSetter<boolean>

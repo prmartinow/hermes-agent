@@ -1000,10 +1000,6 @@ export const zhOverrides = {
           model: 'Mistral TTS 模型',
           voiceId: 'Mistral 语音'
         },
-        gemini: {
-          model: 'Gemini TTS 模型',
-          voice: 'Gemini 语音'
-        },
         neutts: {
           model: 'NeuTTS 模型',
           device: 'NeuTTS 设备'

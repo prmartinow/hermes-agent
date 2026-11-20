@@ -1620,3 +1620,18 @@ class TestSanePathIncludesHomebrew:
             result = _make_run_env({})
         assert result["Path"] == windows_env["Path"]
         assert "PATH" not in result
+
+
+def test_sandbox_environment_fails_closed_when_delegation_scrub_fails(monkeypatch):
+    from agent import delegation_context
+    from tools.code_execution_env import _scrub_child_env
+
+    monkeypatch.setattr(delegation_context, "is_delegated_child_process_context", lambda: True)
+    def broken_scrub(_env):
+        raise RuntimeError("synthetic scrub failure")
+    monkeypatch.setattr(delegation_context, "scrub_kanban_env", broken_scrub)
+    with pytest.raises(RuntimeError, match="synthetic scrub failure"):
+        _scrub_child_env({"PATH": "/usr/bin"})
+    from tools.environments import local
+    with pytest.raises(RuntimeError, match="synthetic scrub failure"):
+        local._finalize_child_env({"PATH": "/usr/bin"})

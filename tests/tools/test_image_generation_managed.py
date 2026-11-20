@@ -21,7 +21,7 @@ def test_union_catalog_lists_each_model_once():
             "nous": [
                 {"id": "microsoft/mai-image-2.5-pro"},   # same id as a FAL entry
                 {"id": "krea/krea-2-medium"},            # Krea 2 under its Portal id
-                {"id": "google/gemini-3-pro-image"},     # Nano Banana Pro under its Portal id
+                {"id": "openai/gpt-image-2"},            # GPT Image 2 under its Portal id
                 {"id": "vendor/portal-only"},
             ],
         }[name]

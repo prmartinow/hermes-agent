@@ -11,6 +11,8 @@ from unittest.mock import patch
 from tools.budget_config import (
     DEFAULT_BUDGET,
     DEFAULT_RESULT_SIZE_CHARS,
+    DEFAULT_TURN_BUDGET_CHARS,
+    DEFAULT_TOOL_THRESHOLDS,
     PINNED_THRESHOLDS,
     BudgetConfig,
     budget_for_context_window,
@@ -24,6 +26,11 @@ from tools.budget_config import (
 
 
 
+def test_default_execution_thresholds_follow_the_declared_mapping():
+    for tool in ("terminal", "execute_code", "code_execution"):
+        assert DEFAULT_BUDGET.resolve_threshold(tool) == DEFAULT_TOOL_THRESHOLDS[tool]
+        assert BudgetConfig(tool_overrides={tool: 42}).resolve_threshold(tool) == 42
+    assert DEFAULT_BUDGET.resolve_threshold("read_file") == float("inf")
 
 
 # ---------------------------------------------------------------------------

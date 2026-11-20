@@ -44,9 +44,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
         "openai/gpt-6-astra-pro-fast", "openai/gpt-6-astra-pro-flex",
         "openai/gpt-6.1-sol", "openai/gpt-6.1-sol-pro", "openai/gpt-6.1-terra", "openai/gpt-6-sol", "openai/gpt-6-sol-pro",
         "openai/gpt-6-luna", "openai/gpt-6-luna-pro",
-        "openai/gpt-5.5", "openai/gpt-5.5-pro", "openai/gpt-5.4-mini", "google/gemini-4-argon",
-        "google/gemini-3.1-pro-preview",
-        "google/gemini-3.8-flash", "google/gemini-3.7-flash", "x-ai/grok-4.7", "x-ai/grok-4.6",
+        "openai/gpt-5.5", "openai/gpt-5.5-pro", "openai/gpt-5.4-mini", "x-ai/grok-4.7", "x-ai/grok-4.6",
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-pro-0813", "deepseek/deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash-1017",
         "deepseek/deepseek-v4-flash-0731",
@@ -80,8 +78,7 @@ VERCEL_AI_GATEWAY_MODELS: list[tuple[str, str]] = [("moonshotai/kimi-k2.6", "rec
     (mid, "") for mid in (
         "alibaba/qwen3.6-plus", "zai/glm-5.1", "minimax/minimax-m2.7", "anthropic/claude-sonnet-4.6",
         "anthropic/claude-opus-4.7", "anthropic/claude-opus-4.6", "anthropic/claude-haiku-4.5",
-        "openai/gpt-5.4", "openai/gpt-5.4-mini", "openai/gpt-5.3-codex", "google/gemini-3.1-pro-preview",
-        "google/gemini-3-flash", "google/gemini-3.1-flash-lite-preview", "xai/grok-4.20-reasoning",
+        "openai/gpt-5.4", "openai/gpt-5.4-mini", "openai/gpt-5.3-codex", "xai/grok-4.20-reasoning",
     )
 ]
 
@@ -283,7 +280,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = _CuratedCatalog({
     "arcee": ["trinity-large-thinking", "trinity-large-preview", "trinity-mini"],
     "gmi": [
         "zai-org/GLM-5.1-FP8", "deepseek-ai/DeepSeek-V3.2", "moonshotai/Kimi-K2.5",
-        "google/gemini-3.1-flash-lite-preview", "anthropic/claude-sonnet-5",
+        "anthropic/claude-sonnet-5",
         "anthropic/claude-sonnet-4.6", "openai/gpt-5.4",
     ],
     # Synced against opencode.ai/docs/zen + live GET /zen/v1/models. Zen/Go are
@@ -295,8 +292,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = _CuratedCatalog({
         "gpt-5.3-codex-spark", "gpt-5.2", "gpt-5.2-codex", "gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-max",
         "gpt-5.1-codex-mini", "gpt-5", "gpt-5-codex", "gpt-5-nano", "claude-fable-5", "claude-opus-5",
         "claude-sonnet-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5",
-        "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4", "claude-haiku-4-5", "gemini-3.8-flash",
-        "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.1-pro", "gemini-3-flash",
+        "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4", "claude-haiku-4-5",
         "grok-4.6", "grok-4.5", "grok-build-0.1", "muse-spark-1.2", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
         "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5", "kimi-k2.7-code", "deepseek-v4-pro",
         "deepseek-v4-flash", "qwen3.6-plus", "qwen3.5-plus", "big-pickle", "mimo-v2.5-free",
@@ -315,7 +311,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = _CuratedCatalog({
     ],
     "kilocode": [
         "anthropic/claude-opus-4.6", "anthropic/claude-sonnet-4.6", "openai/gpt-5.4",
-        "google/gemini-3-pro-preview", "google/gemini-3-flash-preview",
     ],
     "alibaba": list(_ALIBABA_MODELS),
     "alibaba-cn": list(_ALIBABA_MODELS),
@@ -343,17 +338,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = _CuratedCatalog({
     ],
     # Azure Foundry models depend on the user's endpoint configuration.
     "azure-foundry": [],
-    # Vertex's OpenAI-compatible endpoint has no /models route, so without this the /model picker
-    # only shows the configured model. IDs carry the "google/" publisher prefix Vertex expects
-    # (see hermes_cli/model_setup_flows.py); validated live against a GCP project (global region).
-    "vertex": [
-        "google/gemini-3.8-flash",  # [0] = silent default; Gemini 4 after it, in the direct gemini list's order
-        "google/gemini-4-neon", "google/gemini-4-hydrogen", "google/gemini-4-carbon", "google/gemini-4-argon",
-        "google/gemini-3.7-flash",
-        "google/gemini-3.1-pro-preview", "google/gemini-3-pro-preview", "google/gemini-3.6-flash",
-        "google/gemini-3.5-flash", "google/gemini-3.5-flash-lite", "google/gemini-3-flash-preview",
-        "google/gemini-3.1-flash-lite-preview", "google/gemini-3.1-flash-lite",
-    ],
+    # Vertex's OpenAI-compatible endpoint has no /models route.
+    "vertex": ["claude-sonnet-4-5", "claude-haiku-4-5"],
     "novita": [
         "moonshotai/kimi-k2.5", "minimax/minimax-m2.7", "zai-org/glm-5", "deepseek/deepseek-v3-0324",
         "deepseek/deepseek-r1-0528", "qwen/qwen3-235b-a22b-fp8",
@@ -394,7 +380,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [ProviderEntry(*row) for row in (
     ("nvidia", "NVIDIA NIM", "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ("huggingface", "Hugging Face", "Hugging Face Inference Providers"),
     ("gemini", "Google AI Studio", "Google AI Studio (Native Gemini API)"),
-    ("vertex", "Google Vertex AI", "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
+    ("vertex", "Google Vertex AI", "Google Vertex AI (partner models via GCP; OAuth2 service account or ADC)"),
     ("deepseek", "DeepSeek", "DeepSeek (V3, R1, coder, direct API)"), ("xai", "xAI", "xAI Grok (Direct API)"),
     ("zai", "Z.AI / GLM", "Z.AI / GLM (Zhipu direct API)"),
     ("kimi-coding", "Kimi / Kimi Coding Plan", "Kimi Coding Plan (api.kimi.com & Moonshot API)"),
@@ -496,7 +482,8 @@ def listed_canonical_providers() -> list[ProviderEntry]:
     from hermes_cli import models  # the binding every list consumer read before this filter existed
     from providers import unlisted_provider_names
     hidden = unlisted_provider_names()
-    return [p for p in models.CANONICAL_PROVIDERS if p.slug not in hidden]
+    from hermes_cli.providers import provider_removed
+    return [p for p in models.CANONICAL_PROVIDERS if p.slug not in hidden and not provider_removed(p.slug)]
 
 
 # ---------------------------------------------------------------------------

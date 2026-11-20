@@ -37,6 +37,8 @@ interface ChatSessionListProps {
   activeSessionId: string | null;
   /** Whether the Chat route is visible and should refresh its session list. */
   isActive?: boolean;
+  /** Live active account alias from gateway session.info for instantaneous badge synchronization. */
+
   /** Management profile from the dashboard switcher — scopes the listing. */
   profile?: string;
   className?: string;
@@ -70,6 +72,7 @@ function rowLabel(session: SessionInfo, untitled: string): string {
 export function ChatSessionList({
   activeSessionId,
   isActive = true,
+
   profile,
   className,
   onPicked,
@@ -210,6 +213,7 @@ export function ChatSessionList({
       <div className="flex flex-col gap-0.5">
         {sessions.map((s) => {
           const isActive = s.id === activeSessionId;
+
           return (
             <ListItem
               key={s.id}
@@ -226,20 +230,30 @@ export function ChatSessionList({
               <span className="w-full truncate text-sm font-medium">
                 {rowLabel(s, t.sessions.untitledSession)}
               </span>
-              <span className="flex w-full items-center gap-1.5 text-[0.6875rem] text-text-tertiary">
-                <span>{timeAgo(s.last_active)}</span>
-                {s.message_count > 0 && (
+              <span className="flex w-full min-w-0 items-center gap-1.5 whitespace-nowrap overflow-hidden text-[0.6875rem] text-text-tertiary">
+                <span className="shrink-0 whitespace-nowrap">{timeAgo(s.last_active)}</span>
+                {(s.total_message_count ?? s.message_count) > 0 && (
                   <>
-                    <span aria-hidden>·</span>
-                    <span>{s.message_count} msgs</span>
+                    <span aria-hidden className="shrink-0">·</span>
+                    <span
+                      className="shrink-0 whitespace-nowrap"
+                      title={
+                        s.total_message_count && s.total_message_count > s.message_count
+                          ? `${s.total_message_count} total msgs (${s.message_count} active in context)`
+                          : undefined
+                      }
+                    >
+                      {s.total_message_count ?? s.message_count} msgs
+                    </span>
                   </>
                 )}
                 {s.source && s.source !== "cli" && (
                   <>
-                    <span aria-hidden>·</span>
-                    <span className="truncate">{s.source}</span>
+                    <span aria-hidden className="shrink-0">·</span>
+                    <span className="truncate shrink min-w-0">{s.source}</span>
                   </>
                 )}
+
               </span>
             </ListItem>
           );

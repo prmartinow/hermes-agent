@@ -613,6 +613,7 @@ def test_splice_carries_the_passs_main_model_fallback_and_call_telemetry(monkeyp
         calls.append(threading.current_thread().name)
         if len(calls) == 1:
             raise RuntimeError("model not found")  # the configured summary model is broken
+        kwargs["route_info"].update(provider="test-provider", model="test/model")
         message = SimpleNamespace(content="Recovered summary.", reasoning_content=None, reasoning=None)
         return SimpleNamespace(choices=[SimpleNamespace(message=message, finish_reason="stop")])
 

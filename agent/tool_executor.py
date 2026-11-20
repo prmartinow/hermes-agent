@@ -1047,6 +1047,9 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
             _safe_callback(agent.tool_progress_callback, "Tool progress", "tool.started", function_name, preview, display_args)
     _safe_callback(agent.tool_start_callback, "Tool start", tool_call_id, function_name, display_args)
 
+    from agent.live_session_stream import publish_tool_start
+    publish_tool_start(agent, tool_call_id, function_name, display_args)
+
     if not agent._checkpoint_mgr.enabled:
         return
     with contextlib.suppress(Exception):
@@ -1071,6 +1074,8 @@ def _emit_tool_complete_and_risk(agent, ref: _ToolCallRef, result, risk_metadata
             logging.debug("Tool complete callback error: %s", cb_err)
         else:
             _safe_callback(agent.tool_complete_callback, "Tool complete", ref.call_id, ref.name, display_args, result)
+    from agent.live_session_stream import publish_tool_complete
+    publish_tool_complete(agent, ref, result, blocked)
     if risk_metadata is not None and risk_metadata.get("risk") != "low":
         _safe_callback(
             agent.tool_progress_callback, "Tool output risk",

@@ -759,8 +759,8 @@ def _stage_turn_user_message(
     # row; the model still receives role/content unchanged (api_messages strips both).
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
-    if persist_user_display_metadata:
-        user_msg["display_metadata"] = persist_user_display_metadata
+        if persist_user_display_metadata:
+            user_msg["display_metadata"] = persist_user_display_metadata
     # The platform message id survives the turn-start flush; restart drain-window
     # recovery dedups via ``has_platform_message_id`` against this row.
     if persist_user_platform_id is not None:
@@ -817,11 +817,13 @@ def _hydrate_from_history(agent: Any, conversation_history: Optional[list[Any]])
 
 def _tick_memory_nudge(agent: Any) -> bool:
     """Advance the turn-based memory nudge counter; ``True`` when the review should fire."""
-    if (agent._memory_nudge_interval > 0
+    _raw_nudge = getattr(agent, "_memory_nudge_interval", 0)
+    _nudge_int = _raw_nudge if isinstance(_raw_nudge, int) else 0
+    if (_nudge_int > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
-        if agent._turns_since_memory >= agent._memory_nudge_interval:
+        if agent._turns_since_memory >= _nudge_int:
             agent._turns_since_memory = 0
             return True
     return False

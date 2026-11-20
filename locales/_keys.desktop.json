@@ -3507,8 +3507,6 @@
     "settings.fieldLabels.tts.edge.voice",
     "settings.fieldLabels.tts.elevenlabs.modelId",
     "settings.fieldLabels.tts.elevenlabs.voiceId",
-    "settings.fieldLabels.tts.gemini.model",
-    "settings.fieldLabels.tts.gemini.voice",
     "settings.fieldLabels.tts.kittentts.model",
     "settings.fieldLabels.tts.kittentts.voice",
     "settings.fieldLabels.tts.minimax.model",

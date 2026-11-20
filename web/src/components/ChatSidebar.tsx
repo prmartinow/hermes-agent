@@ -61,6 +61,7 @@ interface SessionInfo {
   cwd?: string
   model?: string
   provider?: string
+
   credential_warning?: string
   title?: string
 }
@@ -114,6 +115,7 @@ interface ChatSidebarProps {
   className?: string
   onDashboardNewSessionRequest?: () => void
   onSessionTitleChange?: (title: string | null) => void
+
 }
 
 /** Build the ``session.create`` params for the sidecar session.
@@ -136,7 +138,8 @@ export function ChatSidebar({
   profile,
   className,
   onDashboardNewSessionRequest,
-  onSessionTitleChange
+  onSessionTitleChange,
+
 }: ChatSidebarProps) {
   const navigate = useNavigate()
   // `version` bumps on reconnect (manual button, profile/channel switch) and
@@ -481,6 +484,7 @@ export function ChatSidebar({
     })
 
     const offSessionInfo = feed.on('session.info', ev => {
+
       const title = titleFromSessionInfoPayload(ev.payload)
       if (title !== undefined) {
         onSessionTitleChange?.(title)

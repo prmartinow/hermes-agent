@@ -457,8 +457,8 @@ class TestNousTagsScoping:
             "base_url": "https://inference-api.nousresearch.com/v1", "api_key": "nous-key",
         }):
             kwargs = aux._build_call_kwargs(
-                provider="gemini",
-                model="gemini-2.5-flash",
+                provider="openai-api",
+                model="gpt-4.1",
                 messages=[{"role": "user", "content": "hi"}],
             )
 
@@ -4069,7 +4069,7 @@ class TestBuildCallKwargsToolDedup:
             self._make_tool("lcm_describe"),  # duplicate
         ]
         kwargs = _build_call_kwargs(
-            provider="google", model="gemini-2.5-pro", messages=[], tools=tools,
+            provider="openrouter", model="google/gemini-2.5-pro", messages=[], tools=tools,
         )
         result_tools = kwargs["tools"]
         names = [t["function"]["name"] for t in result_tools]

@@ -114,3 +114,17 @@ def test_persisted_carrier_keys_of_an_uninstalled_plugin_never_reach_the_wire():
     wire = shape_wire_carriers([assistant], model="m", base_url=RELAY)[0]
     assert wire == {"role": "assistant", "content": "x"}
     assert assistant["reasoning_details"] == [record]  # history is never mutated
+
+
+def test_profile_controls_tool_metadata_replay(relay):
+    from agent.transports.chat_completions import ChatCompletionsTransport
+
+    relay.replays_tool_call_signatures = True
+    original = [{"role": "assistant", "tool_calls": [{"id": "c", "type": "function",
+                 "function": {"name": "tool", "arguments": "{}"}, "extra_content": {"vendor": "opaque"}}]}]
+    transport = ChatCompletionsTransport()
+    allowed = transport.convert_messages(original, provider="relay-fake")
+    denied = transport.convert_messages(original, provider="custom")
+    assert allowed[0]["tool_calls"][0]["extra_content"] == {"vendor": "opaque"}
+    assert "extra_content" not in denied[0]["tool_calls"][0]
+    assert original[0]["tool_calls"][0]["extra_content"] == {"vendor": "opaque"}

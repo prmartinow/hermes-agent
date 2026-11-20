@@ -15,6 +15,7 @@ import type { HermesSkin } from './skin.js'
  *  plus the canonical-authority fields the legacy contract does not carry yet
  *  (`gateway/session_events.py` owner stamps and the durable admission FIFO). */
 export interface SessionInfo extends SessionLiveInfo {
+
   execution_epoch?: string
   execution_generation?: number
   execution_state?: string
@@ -75,7 +76,13 @@ export interface CanonicalGatewayEventMap {
   'clarify.settled': Pick<CanonicalSharedPrompt, 'execution_generation' | 'prompt_id'>
 }
 
-export type AnyGatewayEventMap = CanonicalGatewayEventMap & GatewayEventMap
+export interface ForkGatewayEventMap {
+  'turn.steer': { text?: string; timestamp?: number; user_message?: string }
+  'session.rewound': { notice?: string; session_id?: string }
+  'prompt.submitted': { session_id: string; text: string }
+}
+
+export type AnyGatewayEventMap = CanonicalGatewayEventMap & GatewayEventMap & ForkGatewayEventMap
 export type AnyGatewayEventName = keyof AnyGatewayEventMap & string
 
 /** Distributive form of the shared `GatewayEvent<K>` (plus the canonical events above) so
@@ -83,6 +90,9 @@ export type AnyGatewayEventName = keyof AnyGatewayEventMap & string
 export type AnyGatewayEvent = {
   [K in AnyGatewayEventName]: Omit<GatewayEvent, 'payload' | 'type'> & { payload?: AnyGatewayEventMap[K]; type: K }
 }[AnyGatewayEventName]
+
+export interface SessionViewportMeta { end_index: number; has_more_before: boolean; start_index: number; total: number }
+export interface SessionHistoryResponse { count?: number; end_index?: number; has_more_before?: boolean; messages: TranscriptMessage[]; session_id?: string; start_index?: number }
 
 export interface GatewayCompletionItem {
   display: string
@@ -323,11 +333,14 @@ export interface UndoRollbackHint {
 }
 
 export interface SessionUndoResponse {
+  prefill?: string
   removed?: number
   undo_hint?: UndoRollbackHint | null
+  turns_undone?: number
 }
 
 export interface SessionUsageResponse {
+  account_lines?: string[]
   active_subagents?: number
   avg_latency_s?: number
   avg_tps?: number
@@ -335,6 +348,7 @@ export interface SessionUsageResponse {
   cache_read?: number
   cache_write?: number
   calls?: number
+  completion?: number
   compressions?: number
   context_max?: number
   context_percent?: number
@@ -345,11 +359,17 @@ export interface SessionUsageResponse {
   cost_usd?: number
   credits_lines?: string[]
   credits_usage_window?: boolean
+
   input?: number
   model?: string
   // The route is Nous inference: the /topup CTA applies (the balance shows whenever Nous is signed in).
   nous_route?: boolean
   output?: number
+  prompt?: number
+
+  quota_rows?: any[]
+  quota_title?: string
+  reasoning?: number
   total?: number
   // Shared dollar usage model (two-bar view) so /usage renders the same bars
   // as /subscription. Dollars only — never "credits".

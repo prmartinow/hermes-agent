@@ -1499,27 +1499,6 @@ def _ensure_route_client_headers(client_kwargs: dict, provider: str) -> None:
     client_kwargs["default_headers"] = existing
 
 
-def _gemini_native_client(agent, client_kwargs: dict, httpx_verify, *, reason: str, shared: bool):
-    """Native Gemini client when the base_url is the Gemini API, else None."""
-    from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
-    base_url = str(client_kwargs.get("base_url", "") or "")
-    if not is_native_gemini_base_url(base_url):
-        return None
-    safe_kwargs = {
-        k: v for k, v in client_kwargs.items()
-        if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
-    }
-    if "http_client" not in safe_kwargs:
-        keepalive_http = agent._build_keepalive_http_client(base_url, verify=httpx_verify)
-        if keepalive_http is not None:
-            safe_kwargs["http_client"] = keepalive_http
-    client = GeminiNativeClient(**safe_kwargs)
-    _ra().logger.info(
-        "Gemini native client created (%s, shared=%s) %s", reason, shared, agent._client_log_context()
-    )
-    return client
-
-
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
     from agent.auxiliary_client import (
         _to_openai_base_url,
@@ -1579,9 +1558,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent.provider, reason, shared, agent._client_log_context(),
         )
         return provider_client
-    from agent.auxiliary_client import _GEMINI_NATIVE_PROVIDER_NAMES
-    if agent.provider in _GEMINI_NATIVE_PROVIDER_NAMES:
-        client = _gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
+    from agent.provider_route_hooks import GEMINI_NATIVE_PROVIDER_NAMES, gemini_native_client
+    if agent.provider in GEMINI_NATIVE_PROVIDER_NAMES:
+        client = gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
         if client is not None:
             return client
     # TCP keepalives so dead provider connections are detected (~60s) instead of hanging in
@@ -1670,6 +1649,7 @@ _SWITCH_SNAPSHOT_FIELDS = (
     "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
     "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
     "_credential_pool", "_credential_pool_entry_id", *ROUTE_VERDICT_FIELDS,
+    "_usage_anchor", "_turn_base_usage_anchor",
 )
 _MISSING = object()
 
@@ -1681,6 +1661,10 @@ def _snapshot_switch_state(agent) -> dict[str, Any]:
     snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
     # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
     snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    if isinstance(snapshot.get("_usage_anchor"), dict):
+        snapshot["_usage_anchor"] = copy.deepcopy(snapshot["_usage_anchor"])
+    if isinstance(snapshot.get("_turn_base_usage_anchor"), dict):
+        snapshot["_turn_base_usage_anchor"] = copy.deepcopy(snapshot["_turn_base_usage_anchor"])
     return snapshot
 
 
@@ -1690,6 +1674,10 @@ def _restore_switch_snapshot(agent, snapshot: dict[str, Any]) -> None:
             continue  # attribute did not exist before the swap; don't fabricate it
         with contextlib.suppress(Exception):
             setattr(agent, name, value)
+    if "_usage_anchor" in snapshot and snapshot["_usage_anchor"] is not _MISSING:
+        with contextlib.suppress(Exception):
+            from agent.usage_anchor import persist_usage_anchor
+            persist_usage_anchor(agent, snapshot["_usage_anchor"])
 
 
 def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm):
@@ -1973,6 +1961,7 @@ def switch_model(
     snapshot and re-raises (callers catch)."""
     old_model = agent.model
     old_provider = agent.provider
+    old_context_length = getattr(getattr(agent, "context_compressor", None), "context_length", None)
     # ── Reload credential pool for the new provider (issue #52727) ── Without this,
     # ``recover_with_credential_pool`` sees a ``pool.provider != agent.provider`` mismatch and
     # short-circuits, leaving the new provider with no rotation/recovery on 401/429 and burning the original
@@ -2029,6 +2018,8 @@ def switch_model(
         old_model, old_provider, new_model, new_provider,
     )
     _persist_switch_billing_route(agent)
+    from agent.usage_anchor import clear_usage_anchor_on_route_change
+    clear_usage_anchor_on_route_change(agent, old_model, new_model, old_norm, new_norm, old_context_length)
 
 
 def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
@@ -3202,6 +3193,9 @@ def extract_api_error_context(error: Exception) -> dict[str, Any]:
             context["reset_at"] = ratelimit_reset
         if "reset_at" not in context:
             _set_reset_from_vendor_headers(context, headers)
+
+    from agent.api_error_summary import fill_provider_retry_context
+    fill_provider_retry_context(error, context)
     if "message" not in context and str(error).strip():
         context["message"] = str(error).strip()[:500]
     if "reset_at" not in context and isinstance(context.get("message") or "", str):

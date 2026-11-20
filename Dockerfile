@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Debian 13 still ships SQLite 3.46.1, which contains the upstream WAL-reset
 # corruption bug. Build a pinned shared library for the runtime image instead
 # of relying on a distro backport that trixie does not currently provide.
@@ -8,7 +9,9 @@
 FROM debian:trixie-20261020@sha256:4c25275446ca371766b8b093c696782eabce06263fccacb8d5d813b3dc44b308 AS sqlite_build
 ARG SQLITE_AUTOCONF_VERSION=3530400
 ARG SQLITE_SHA256=0e9483900e92cd5de8fd48d16bf9200145a61f7fd5be542a5ac81d8a9516eb9c
-RUN apt-get -o Acquire::Retries=3 update && \
+RUN (sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+     sed -i "s|deb.debian.org|mirror.biznetgio.com|g" /etc/apt/sources.list 2>/dev/null || true) && \
+    apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
         build-essential ca-certificates curl && \
     rm -rf /var/lib/apt/lists/* && \
@@ -78,7 +81,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/tools
 # user cannot apt-get it later (no root, and the root fs resets on restart).
 RUN apt-get -o Acquire::Retries=3 update && \
     apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-    ca-certificates curl iputils-ping python3 python-is-python3 gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils tmux \
+    ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev libatomic1 procps git openssh-client docker-cli xz-utils tmux \
     libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 libcairo2 libcups2t64 libdbus-1-3 libgbm1 libglib2.0-0t64 libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 && \
     rm -rf /var/lib/apt/lists/*
 
@@ -446,14 +449,20 @@ RUN mkdir -p /opt/hermes/bin && \
 # checkout) and /opt/data (the mutable HERMES_HOME volume).  Its `revision`
 # is read from the install stamp; the fallback stamp's all-zero commit maps
 # to null.
+ARG HERMES_VERSION=local
+ARG HERMES_GIT_SHA=
+LABEL org.opencontainers.image.title="hermes-agent" \
+      org.opencontainers.image.version="${HERMES_VERSION}" \
+      org.opencontainers.image.revision="${HERMES_GIT_SHA}"
+ENV HERMES_BUILD_COMMIT=${HERMES_GIT_SHA} HERMES_BUILD_VERSION=${HERMES_VERSION}
 RUN set -eu; \
     if [ ! -f /opt/hermes/install-stamp.json ]; then \
         printf '{"schemaVersion":2,"commit":"0000000000000000000000000000000000000000","distribution":"docker","source":"fallback","updateMechanism":"external"}\n' \
             > /opt/hermes/install-stamp.json; \
     fi; \
-    python3 -c 'import json; from pathlib import Path; path = Path("/opt/hermes/install-stamp.json"); stamp = json.loads(path.read_text()); stamp["pmRuntime"] = "/opt/hermes/pm-runtime"; path.write_text(json.dumps(stamp) + "\n")'; \
+    python3 -c 'import json, os, re; from pathlib import Path; path = Path("/opt/hermes/install-stamp.json"); stamp = json.loads(path.read_text()); revision = os.environ.get("HERMES_BUILD_COMMIT", ""); stored = stamp.get("commit"); assert not revision or (re.fullmatch("[0-9a-f]{40}", revision) and set(revision) != {"0"}), "HERMES_GIT_SHA must be a full commit SHA"; assert not revision or not stored or set(stored) == {"0"} or stored == revision, "build SHA disagrees with install stamp"; stamp.update({"pmRuntime": "/opt/hermes/pm-runtime", **({"commit": revision} if revision else {})}); path.write_text(json.dumps(stamp) + "\n"); Path("/opt/hermes/.hermes_container_version").write_text(os.environ["HERMES_BUILD_VERSION"] + "\n"); Path("/opt/hermes/.hermes_build_sha").write_text(revision + "\n") if revision else None'; \
     mkdir -p /etc/hermes; \
-    python3 -c 'import json, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text(encoding="utf-8")); commit = stamp.get("commit"); revision = commit if commit and set(commit) != {"0"} else None; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": project["version"], "revision": revision}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
+    python3 -c 'import json, pathlib, tomllib; project = tomllib.loads(pathlib.Path("/opt/hermes/pyproject.toml").read_text(encoding="utf-8"))["project"]; stamp = json.loads(pathlib.Path("/opt/hermes/install-stamp.json").read_text(encoding="utf-8")); commit = stamp.get("commit"); revision = commit if commit and set(commit) != {"0"} else None; marker = pathlib.Path("/etc/hermes/image-provenance.json"); marker.write_text(json.dumps({"schema": 1, "deployment_kind": "image", "manager": "docker", "image": "nousresearch/hermes-agent", "version": project["version"], "container_version": pathlib.Path("/opt/hermes/.hermes_container_version").read_text().strip(), "revision": revision}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8"); marker.chmod(0o444)'
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes, dashboard and
@@ -523,6 +532,9 @@ ENV XDG_RUNTIME_DIR=/tmp/hermes-runtime
 # absolute path (/opt/hermes/.venv/bin/hermes). See the shim source for
 # the opt-out env var (HERMES_DOCKER_EXEC_AS_ROOT=1).
 COPY --chmod=0755 docker/hermes-exec-shim.sh /opt/hermes/bin/hermes
+RUN ln -sf /opt/hermes/bin/hermes /opt/hermes/bin/python && \
+    ln -sf /opt/hermes/bin/hermes /opt/hermes/bin/python3 && \
+    ln -sf /opt/hermes/bin/hermes /opt/hermes/bin/node
 COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-dispatch.sh
 
 # Pre-s6 entrypoint.sh did `source .venv/bin/activate` which exported

@@ -205,6 +205,7 @@ export interface Translations {
     noMatch: string;
     startConversation: string;
     noMessages: string;
+    loadEarlierMessages?: string;
     untitledSession: string;
     deleteSession: string;
     confirmDeleteTitle: string;

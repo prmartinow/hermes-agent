@@ -29,7 +29,7 @@ def _clear_provider_env(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def _write_aux_config(task="compression", provider="gemini", model_name="gemini-2.5-flash"):
+def _write_aux_config(task="compression", provider="openrouter", model_name="google/gemini-2.5-flash"):
     """Simulate the aux picker writing a task override to disk."""
     cfg = load_config()
     aux = cfg.setdefault("auxiliary", {})
@@ -48,7 +48,7 @@ def test_setup_model_provider_preserves_auxiliary_choices_written_by_picker(tmp_
     assert config["auxiliary"]["compression"]["provider"] == "auto"
 
     def fake_select():
-        _write_aux_config("compression", "gemini", "gemini-2.5-flash")
+        _write_aux_config("compression", "openrouter", "google/gemini-2.5-flash")
 
     monkeypatch.setattr("hermes_cli.main.select_provider_and_model", fake_select)
 
@@ -57,8 +57,8 @@ def test_setup_model_provider_preserves_auxiliary_choices_written_by_picker(tmp_
 
     reloaded = load_config()
     compression = reloaded["auxiliary"]["compression"]
-    assert compression["provider"] == "gemini"
-    assert compression["model"] == "gemini-2.5-flash"
+    assert compression["provider"] == "openrouter"
+    assert compression["model"] == "google/gemini-2.5-flash"
 
 
 def test_setup_summary_local_browser_unavailable_without_chromium(

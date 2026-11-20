@@ -91,6 +91,7 @@ def _emit_compression_attempt_telemetry(
     agent: Any, *, started_at: float, commit_status: str, split_status: str, failure_class: str | None = None,
     commit_started_at: float | None = None, include_last_telemetry: bool = True,
     attempt_seed: dict[str, Any] | None = None, history_rewritten: bool | None = None,
+    attempt_telemetry: dict[str, Any] | None = None,
 ) -> None:
     """Emit one content-free JSON log line for a compression attempt.
 
@@ -103,6 +104,9 @@ def _emit_compression_attempt_telemetry(
         compressor = agent.context_compressor
         telemetry = getattr(compressor, "_last_compression_telemetry", None) if include_last_telemetry else None
         seed = _attempt_seed(agent, attempt_began=include_last_telemetry, attempt_seed=attempt_seed)
+        live_own = isinstance(telemetry, dict) and telemetry.get("attempt_id") == seed["attempt_id"]
+        if isinstance(attempt_telemetry, dict) and attempt_telemetry.get("attempt_id") == seed["attempt_id"]:
+            telemetry = attempt_telemetry
         own = isinstance(telemetry, dict) and telemetry.get("attempt_id") == seed["attempt_id"]
         if not own:
             # Before dispatch the compressor still holds the previous attempt's dict, a pre-commit restore puts
@@ -115,7 +119,7 @@ def _emit_compression_attempt_telemetry(
         payload.setdefault("attempt_id", seed["attempt_id"])
         payload.setdefault("session_id", seed["session_id"])
         payload.update(
-            total_duration_ms=int((time.monotonic() - started_at) * 1000), commit_status=commit_status,
+            total_duration_ms=max(0, int((time.monotonic() - started_at) * 1000)), commit_status=commit_status,
             split_status=split_status,
         )
         if history_rewritten is not None:
@@ -134,7 +138,7 @@ def _emit_compression_attempt_telemetry(
         # The compressor's fallback flags are this attempt's only when its telemetry is.
         payload["fallback_used"] = bool(
             payload.get("fallback_used")
-            or own and (
+            or live_own and (
                 getattr(compressor, "_last_summary_fallback_used", False)
                 or getattr(compressor, "_last_aux_model_failure_model", None)
             )
@@ -159,10 +163,11 @@ def _emit_compression_attempt_telemetry(
 
 def _emit_aborted_attempt_telemetry(
     agent: Any, started_at: float, failure_class: str | None, attempt_seed: dict[str, Any] | None = None,
+    *, attempt_telemetry: dict[str, Any] | None = None,
 ) -> None:
     _emit_compression_attempt_telemetry(
         agent, started_at=started_at, commit_status="aborted", split_status="aborted", failure_class=failure_class,
-        attempt_seed=attempt_seed,
+        attempt_seed=attempt_seed, attempt_telemetry=attempt_telemetry,
     )
 
 

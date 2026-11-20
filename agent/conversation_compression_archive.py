@@ -14,6 +14,15 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from persistence.conversation.messages import HeldCoverage, HeldMessage, NewMessage, Watermark, stamp_live
 from persistence.core.identity import MessageId, SessionId
 
+
+def strip_marker_for_comparison(msgs: Any) -> Any:
+    """Ignore database persistence markers when comparing compression results."""
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+
+    if not isinstance(msgs, list):
+        return msgs
+    return [{k: v for k, v in m.items() if k != _DB_PERSISTED_MARKER} if isinstance(m, dict) else m for m in msgs]
+
 ABSORBED_ROW_IDS = "_absorbed_row_ids"
 # How many durable rows an alternation repair folded into one user dict. A reload without row ids
 # has no other way to tell that dict from a prompt that was never persisted.

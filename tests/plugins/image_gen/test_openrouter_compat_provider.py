@@ -105,8 +105,8 @@ class TestProviderClass:
     def test_explicit_model_kwarg_wins_over_config(self):
         cfg = {"model": "openai/gpt-image-2"}
         with patch("plugins.image_gen.openrouter._load_image_gen_config", return_value=cfg):
-            assert _openrouter()._resolve_model_chain("google/gemini-3-pro-image") == [
-                "google/gemini-3-pro-image"
+            assert _openrouter()._resolve_model_chain("vendor/other-image") == [
+                "vendor/other-image"
             ]
 
 
@@ -164,9 +164,9 @@ class TestLiveCatalog:
         provider = _openrouter()
         with patch(_RUNTIME, side_effect=RuntimeError("no creds")):
             models = provider.list_models()
-        from plugins.image_gen.openrouter import DEFAULT_MODEL, _FALLBACK_MODEL
+        from plugins.image_gen.openrouter import DEFAULT_MODEL
 
-        assert [m["id"] for m in models] == [DEFAULT_MODEL, _FALLBACK_MODEL]
+        assert [m["id"] for m in models] == [DEFAULT_MODEL]
 
     def test_live_catalog_is_cached(self):
         provider = _openrouter()
@@ -207,7 +207,7 @@ class TestLiveCatalog:
                     {"id": "openai/gpt-5.4-image-2",
                      "architecture": {"output_modalities": ["image"],
                                       "input_modalities": ["text", "image"]}},
-                    {"id": "google/gemini-3-pro-image",
+                    {"id": "vendor/other-image",
                      "architecture": {"output_modalities": ["image"],
                                       "input_modalities": ["text", "image"]}},
                 ]}
@@ -217,7 +217,7 @@ class TestLiveCatalog:
             ids = [m["id"] for m in orp.list_models()]
         assert ids[0] == "openai/gpt-5.4-image-2"          # default first
         assert "bytedance-seed/seedream-4.5" in ids        # Image-API-only model present
-        assert "google/gemini-3-pro-image" in ids          # chat-catalog model present
+        assert "vendor/other-image" in ids          # chat-catalog model present
         assert len(ids) == len(set(ids))                   # deduped
 
     def test_nous_portal_picker_excludes_image_api_catalog(self):
@@ -228,9 +228,9 @@ class TestLiveCatalog:
         nous = {p.name: p for p in _build_providers()}["nous"]
         with patch(_RUNTIME, side_effect=RuntimeError("no creds")):
             ids = [m["id"] for m in nous.list_models()]
-        from plugins.image_gen.openrouter import DEFAULT_MODEL, _FALLBACK_MODEL
+        from plugins.image_gen.openrouter import DEFAULT_MODEL
 
-        assert ids == [DEFAULT_MODEL, _FALLBACK_MODEL]
+        assert ids == [DEFAULT_MODEL]
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +271,7 @@ class TestHelpers:
 
 
     def test_access_error_hint_for_gated_openai_model(self):
-        from plugins.image_gen.openrouter import _FALLBACK_MODEL, _access_error_hint
+        from plugins.image_gen.openrouter import _access_error_hint
 
         hint = _access_error_hint(
             "OpenRouter", "openai/gpt-5.4-image-2", "OPENROUTER_IMAGE_MODEL", 404, "No endpoints found"
@@ -279,7 +279,7 @@ class TestHelpers:
         assert hint is not None
         assert "openai/gpt-5.4-image-2" in hint
         assert "OPENROUTER_IMAGE_MODEL" in hint
-        assert _FALLBACK_MODEL in hint
+        assert "select another model" in hint
         # Stays a single line under the humanizer's 200-char truncation.
         assert "\n" not in hint and len(hint) <= 200
 
@@ -395,14 +395,17 @@ class TestGenerate:
         assert result["error_type"] == "api_error"
         assert mock_post.call_count == 1
 
-    def test_timeout(self):
+    def test_timeout_does_not_switch_models(self, monkeypatch):
         import requests as req_lib
 
+        monkeypatch.delenv("OPENROUTER_IMAGE_MODEL", raising=False)
+        monkeypatch.setattr("plugins.image_gen.openrouter._load_image_gen_config", dict)
         with patch(_RUNTIME, return_value=_runtime_ok()), \
-             patch("requests.post", side_effect=req_lib.Timeout()):
+             patch("requests.post", side_effect=req_lib.Timeout()) as post:
             result = _openrouter().generate(prompt="a pet")
         assert result["success"] is False
         assert result["error_type"] == "timeout"
+        assert post.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -461,22 +464,20 @@ class TestImageApiSurface:
 
     def test_chat_defaults_stay_on_chat_even_though_the_catalog_lists_them(self):
         """The regression this guards: /images/models is a superset that
-        includes DEFAULT_MODEL and _FALLBACK_MODEL. Routing on catalog
+        includes DEFAULT_MODEL. Routing on catalog
         membership would silently move every existing default call."""
         from plugins.image_gen.openrouter import (
             DEFAULT_MODEL,
-            _FALLBACK_MODEL,
             _select_surface,
         )
 
         catalog = MagicMock()
         catalog.raise_for_status = MagicMock()
         catalog.json.return_value = {
-            "data": [{"id": DEFAULT_MODEL}, {"id": _FALLBACK_MODEL}]
+            "data": [{"id": DEFAULT_MODEL}]
         }
         with patch("requests.get", return_value=catalog):
             assert _select_surface(DEFAULT_MODEL, "https://x/api/v1", "k", "openrouter") == "chat"
-            assert _select_surface(_FALLBACK_MODEL, "https://x/api/v1", "k", "openrouter") == "chat"
 
     def test_unknown_catalog_model_routes_to_image_api(self):
         """An id past the curated snapshot but in the live catalog is served
@@ -573,8 +574,8 @@ class TestImageApiSurface:
     def test_aspect_ratio_is_mapped_per_model(self):
         from plugins.image_gen.openrouter import _build_image_api_payload
 
-        gemini, _ = _build_image_api_payload(
-            model_id="google/gemini-3.1-flash-lite-image", prompt="p",
+        gpt, _ = _build_image_api_payload(
+            model_id="openai/gpt-image-2", prompt="p",
             semantic_aspect="landscape", references=[], config_key="openrouter", kwargs={},
         )
         mini, _ = _build_image_api_payload(
@@ -582,7 +583,7 @@ class TestImageApiSurface:
             semantic_aspect="landscape", references=[], config_key="openrouter", kwargs={},
         )
         # gpt-image-1-mini has no 16:9 at all, so landscape degrades to 3:2.
-        assert gemini["aspect_ratio"] == "16:9"
+        assert gpt["aspect_ratio"] == "16:9"
         assert mini["aspect_ratio"] == "3:2"
 
     def test_unsupported_parameter_is_dropped_and_explained(self):

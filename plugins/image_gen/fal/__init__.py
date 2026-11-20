@@ -25,7 +25,7 @@ class FalImageGenProvider(StaticImageGenProvider):
     label = "FAL.ai"
     setup = dict(
         name="FAL.ai", badge="paid",
-        tag="Pick from flux-2-klein, flux-2-pro, gpt-image, nano-banana-2, nano-banana-pro, etc. — text-to-image & image editing",
+        tag="Pick from flux-2-klein, flux-2-pro, gpt-image, qwen-image, etc. — text-to-image & image editing",
         key="FAL_KEY", prompt="FAL API key", url="https://fal.ai/dashboard/keys")
 
     def is_available(self) -> bool:

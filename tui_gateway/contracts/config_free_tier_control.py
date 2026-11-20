@@ -5,7 +5,7 @@ Handlers: ``tui_gateway/methods_config.py`` (``config.get``, ``setup.*``, ``diag
 ``methods_config_set.py`` (``config.set``), ``methods_free_tier.py``, ``methods_shared_metrics.py``,
 ``methods_complete.py``
 (``model.options``), ``methods_connectors.py``, ``methods_images.py``, ``methods_session_control.py``
-and ``methods_session.py`` (``verification.status``).
+and ``methods_session/`` (``verification.status``).
 """
 
 from __future__ import annotations

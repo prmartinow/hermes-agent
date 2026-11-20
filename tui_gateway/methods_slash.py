@@ -304,6 +304,27 @@ def _format_live_context_output(sid: str, session: dict, arg: str) -> str:
         lines.append(f"Context usage: {mark}{context_used:,} tokens")
     if usage.get("compressions"):
         lines.append(f"Compressions: {int(usage.get('compressions') or 0):,}")
+
+    agent = session.get("agent")
+    report = None
+    if agent is not None:
+        ctx = getattr(agent, "context_compressor", None)
+        get_budget = getattr(ctx, "get_budget_report", None) or getattr(agent, "get_budget_report", None)
+        if callable(get_budget):
+            try:
+                r = get_budget()
+                if isinstance(r, dict):
+                    report = r
+            except Exception:  # health: allow BLE001 -- budget display is optional and logs the traceback
+                logger.exception("Could not calculate the live session compaction budget")
+                report = None
+
+    if report:
+        from agent.context_breakdown import format_compaction_budget_lines
+        budget_lines = format_compaction_budget_lines(report)
+        if budget_lines:
+            lines.extend(budget_lines)
+
     if (agent := session.get("agent")) is not None:
         from agent.context_file_sources import context_file_sources_for_agent, render_context_file_lines
         # RPC thread: bind the session cwd or the discovery walk keys on the backend's cwd, not the workspace.

@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import shutil
-import shlex
 import threading
 import time
 import webbrowser
@@ -36,6 +35,7 @@ from utils import atomic_json_write, env_float, file_cache_version, is_truthy_va
 from hermes_cli.auth_zai_kimi import (
     KIMI_CODE_BASE_URL, ZAI_ENDPOINTS, _normalize_lmstudio_runtime_base_url, _resolve_kimi_base_url,
     _resolve_zai_base_url, detect_zai_endpoint)
+from hermes_cli.auth_external_process import external_process_spec
 from hermes_cli.auth_declared_providers import (
     default_api_key_base_url, provider_env_base_url, resolve_declared_api_key_provider)
 from hermes_cli.auth_model_picker import (
@@ -938,14 +938,19 @@ def read_credential_pool(provider_id: Optional[str] = None) -> dict[str, Any]:
 
     In profile mode the global-root ``auth.json`` is a read-only fallback applied per provider ONLY
     when the profile has zero entries for it (``hermes auth add`` in the profile shadows global)."""
+    from hermes_cli.providers import provider_removed
+    if provider_id is not None and provider_removed(provider_id):
+        return []
     pool = _load_auth_store().get("credential_pool")
     pool = pool if isinstance(pool, dict) else {}
     global_pool = _load_global_auth_store().get("credential_pool")
     global_pool = global_pool if isinstance(global_pool, dict) else {}
 
     if provider_id is None:
-        merged = dict(pool)
+        merged = {key: entries for key, entries in pool.items() if not provider_removed(key)}
         for gp_key, gp_entries in global_pool.items():
+            if provider_removed(gp_key):
+                continue
             existing = merged.get(gp_key)
             if not (isinstance(gp_entries, list) and gp_entries):
                 continue
@@ -1094,6 +1099,9 @@ def write_credential_pool(
     *status_cleared_ids* were cleared deliberately (``hermes auth reset``) and skip the
     recency merge, which would otherwise read their cleared ``last_status_at`` (None ->
     epoch 0) as a stale snapshot and copy a still-binding cooldown back."""
+    from hermes_cli.providers import provider_removed
+    if provider_removed(provider_id):
+        raise AuthError("Direct Gemini providers are unavailable.", code="invalid_provider")
     removed = {rid for rid in (removed_ids or ()) if rid}
     bases = token_bases or {}
     with _auth_store_lock():
@@ -1544,6 +1552,9 @@ def _config_model_provider() -> tuple[Any, Optional[str]]:
         provider = model_cfg.get("provider") if isinstance(model_cfg, dict) else None
         provider = provider.strip().lower() if isinstance(provider, str) else ""
         provider = _plugin_aliases().get(provider, provider)
+        from hermes_cli.providers import provider_removed
+        if provider_removed(provider):
+            return model_cfg, provider
         if provider == "custom" or provider.startswith("custom:"):
             return model_cfg, "custom"
         # openrouter is absent from PROVIDER_REGISTRY on purpose, so it needs its own rung (#109397);
@@ -1631,6 +1642,9 @@ def resolve_provider(
     """
     normalized = (requested or "auto").strip().lower()
     normalized = _plugin_aliases().get(normalized, normalized)
+    from hermes_cli.providers import provider_removed
+    if provider_removed(normalized):
+        raise AuthError("Direct Gemini providers are unavailable. Configure a custom endpoint instead.", code="invalid_provider")
 
     if normalized in ("openrouter", "custom") or _registry_lookup(normalized) is not None:
         return normalized
@@ -1646,6 +1660,8 @@ def resolve_provider(
 
     _model_cfg, cfg_provider = _config_model_provider()
     if cfg_provider:
+        if provider_removed(cfg_provider):
+            raise AuthError("Direct Gemini providers are unavailable. Configure a custom endpoint instead.", code="invalid_provider")
         return cfg_provider
 
     _scoped_key_env = _scoped_key_env_reader()
@@ -2063,27 +2079,6 @@ def _external_process_auth_evidence(provider_id: str, resolved_command: Optional
     return (True, f"command: {resolved_command}") if resolved_command else (False, None)
 
 
-def _external_process_spec(
-    pconfig: ProviderConfig) -> tuple[str, list[str], str, Optional[str], tuple[str, ...]]:
-    """``(command, args, base_url, resolved_command, command_env_vars)`` for an ACP provider.
-
-    Launch details come from the provider's own profile (``process_command`` and its env overrides),
-    so out-of-tree providers describe their binary."""
-    base_url = provider_env_base_url(pconfig) or pconfig.inference_base_url
-    try:
-        from providers import get_provider_profile as _get_provider_profile
-        profile = _get_provider_profile(pconfig.id)
-    except Exception:
-        profile = None
-    command_env_vars = tuple(getattr(profile, "process_command_env_vars", ()) or ())
-    args_env_var = str(getattr(profile, "process_args_env_var", "") or "")
-    from hermes_cli.auth_external_process import external_process_command, resolve_external_process_command
-    command = external_process_command(profile)
-    raw_args = os.getenv(args_env_var, "").strip() if args_env_var else ""
-    args = shlex.split(raw_args) if raw_args else list(getattr(profile, "process_args", ()) or [])
-    return command, args, base_url, resolve_external_process_command(command), command_env_vars
-
-
 def get_external_process_provider_status(provider_id: str) -> dict[str, Any]:
     """Status snapshot for providers that run a local subprocess.
 
@@ -2092,7 +2087,7 @@ def get_external_process_provider_status(provider_id: str) -> dict[str, Any]:
     pconfig = _registry_lookup(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
-    command, args, base_url, resolved_command, _ = _external_process_spec(pconfig)
+    command, args, base_url, resolved_command, _ = external_process_spec(pconfig)
     available = bool(resolved_command or base_url.startswith("acp+tcp://"))
     auth_verified, auth_source = _external_process_auth_evidence(provider_id, resolved_command)
     return {
@@ -2244,7 +2239,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> dict[str,
             f"Provider '{provider_id}' is not an external-process provider.",
             provider=provider_id, code="invalid_provider")
 
-    command, args, base_url, resolved_command, command_env_vars = _external_process_spec(pconfig)
+    command, args, base_url, resolved_command, command_env_vars = external_process_spec(pconfig)
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         _hint = " or set " + "/".join(command_env_vars) if command_env_vars else ""
         raise AuthError(

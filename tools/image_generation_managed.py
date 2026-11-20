@@ -26,9 +26,6 @@ FAL, KREA, PORTAL = "fal", "krea", "portal"
 # Portal. Only cross-id duplicates live here — identical ids collapse by key.
 _PORTAL_DUPLICATE_OF = {
     "openai/gpt-image-2": "fal-ai/gpt-image-2",
-    "google/gemini-3-pro-image": "fal-ai/nano-banana-pro",
-    "google/gemini-3.1-flash-image": "fal-ai/nano-banana-2",
-    "google/gemini-3.1-flash-lite-image": "google/nano-banana-2-lite",
     "krea/krea-2-medium": "krea-2-medium",
     "krea/krea-2-medium-turbo": "krea-2-medium-turbo",
     "krea/krea-2-large": "krea-2-large",

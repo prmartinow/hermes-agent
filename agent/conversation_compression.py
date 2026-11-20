@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_compressor_summary import accepts_keyword_argument
 from agent.context_engine import CompactionProgressText, automatic_compaction_status_message, sanitize_memory_context
+from agent.conversation_compression_archive import strip_marker_for_comparison
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
 from agent.conversation_compression_deadline import resolve_context_compression_timeouts
 from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_FLAGS, _message_text, is_user_role_scaffolding
@@ -85,16 +86,6 @@ COMPACTION_HEARTBEAT_STATUS = CompactionProgressText(
 )
 
 COMPACTION_DONE_STATUS = "✓ Context compaction complete — continuing turn..."
-
-
-def _strip_marker_for_comparison(msgs: Any) -> Any:
-    """Copy ``msgs`` with the ``_db_persisted`` marker removed for no-op comparison.
-    Live dicts carry the marker while ``compress()`` output is swept, so a raw ``==`` would misclassify an
-    identical no-op copy as progress. Non-list inputs and non-dict entries pass through unchanged."""
-    from agent.context_compressor import _DB_PERSISTED_MARKER
-    if not isinstance(msgs, list):
-        return msgs
-    return [{k: v for k, v in m.items() if k != _DB_PERSISTED_MARKER} if isinstance(m, dict) else m for m in msgs]
 
 
 def _emit_compaction_done(agent: Any) -> None:
@@ -1896,6 +1887,8 @@ def _lower_threshold_to_aux_context(
         recomputed_threshold = _CC._compute_threshold_tokens(
             main_ctx, _CC._effective_threshold_percent(main_ctx, safe_pct / 100),
             getattr(compressor, "max_tokens", None),
+            model=getattr(agent, "model", "") or "",
+            provider=getattr(agent, "provider", "") or "",
         )
     threshold_suggestion_viable = recomputed_threshold is None or recomputed_threshold <= aux_context
     # "model (provider)" labels for both sides; empty/"auto" provider falls back to the client's base_url hostname.
@@ -3445,7 +3438,7 @@ def _candidate_rejected(
     # (#92231) then covers the cold-resume shape where the stamped snapshot differs from the marker-swept
     # compress() output only by ``_db_persisted``.
     if compressed == messages_before_compression or (
-        _strip_marker_for_comparison(compressed) == _strip_marker_for_comparison(messages_before_compression)
+        strip_marker_for_comparison(compressed) == strip_marker_for_comparison(messages_before_compression)
     ):
         logger.info(
             "Compression made no progress (session=%s) — skipping boundary rewrite.", agent.session_id or "none"
@@ -3794,7 +3787,8 @@ def _run_summary_phase(
             _stop_heartbeat("context compression rollback failed")
             lease.release()
             _emit_aborted_attempt_telemetry(
-                agent, attempt.started_at, f"rollback:{type(_rollback_exc).__name__}", attempt.seed
+                agent, attempt.started_at, f"rollback:{type(_rollback_exc).__name__}", attempt.seed,
+                attempt_telemetry=attempt.telemetry,
             )
             raise
         _restore_messages_snapshot(messages, messages_before_compression)
@@ -3815,6 +3809,7 @@ def _run_summary_phase(
             agent, attempt.started_at,
             STALL_INTERRUPTED_FAILURE_CLASS if _stall_backoff
             else "commit_fence_cancelled" if _host_cancel else "explicit_interrupt", attempt.seed,
+            attempt_telemetry=attempt.telemetry,
         )
         return _SummaryPhase(messages=messages, abort_prompt=_existing_system_prompt(agent, system_message))
     except BaseException as _compress_exc:
@@ -3843,11 +3838,15 @@ class _Attempt:
     # This attempt's id, start session and trigger. Its emits pass it explicitly: the agent's copy is replaced
     # when a stall fallback begins while this attempt is still unwinding.
     seed: dict[str, Any]
+    telemetry: Optional[dict[str, Any]] = None
     durable_cooldown_authoritative: Optional[bool] = None
     durable_cooldown_state: Optional[dict[str, Any]] = None
 
     def restore_compressor(self, compressor: Any) -> None:
-        """Roll the compressor back to this attempt's snapshot (durable cooldown included)."""
+        """Roll back state while retaining only this attempt's measured telemetry."""
+        telemetry = getattr(compressor, "_last_compression_telemetry", None)
+        if isinstance(telemetry, dict) and telemetry.get("attempt_id") == self.seed["attempt_id"]:
+            self.telemetry = dict(telemetry)
         _restore_compressor_attempt_state(
             compressor, self.snapshot, durable_cooldown_authoritative=self.durable_cooldown_authoritative,
             durable_cooldown_state=self.durable_cooldown_state, attempt_generation=self.generation,

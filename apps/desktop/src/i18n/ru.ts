@@ -751,10 +751,6 @@ export const ruOverrides = {
           model: 'Модель TTS Mistral',
           voiceId: 'Голос Mistral'
         },
-        gemini: {
-          model: 'Модель TTS Gemini',
-          voice: 'Голос Gemini'
-        },
         neutts: {
           model: 'Модель NeuTTS',
           device: 'Устройство NeuTTS'

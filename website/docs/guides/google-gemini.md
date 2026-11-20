@@ -106,8 +106,7 @@ GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta
 Host-root base URLs on the Google host are normalized automatically: if the URL
 doesn't end with an API version segment (`v1beta`, `v1alpha`, `v1`, ...), Hermes
 appends `/v1beta` for you, so `GEMINI_BASE_URL=https://generativelanguage.googleapis.com`
-works the same as spelling out the `/v1beta` suffix. The same normalization
-applies to the Gemini TTS base URL (`tts.gemini.base_url`). Chat requests only
+works the same as spelling out the `/v1beta` suffix. Chat requests only
 take the native Gemini path when the base URL points at
 `generativelanguage.googleapis.com` or the Vertex AI express host below; a proxy on
 another host is treated as an OpenAI-compatible endpoint, so configure it with its
@@ -172,7 +171,7 @@ Earlier Hermes releases detected the `AQ.` prefix and rerouted such keys to
 `aiplatform.googleapis.com` automatically, so the documented setup was "set
 `GEMINI_API_KEY` to the express key and leave `GEMINI_BASE_URL` unset". That
 automatic reroute is gone: with `GEMINI_BASE_URL` unset, every request — chat,
-`hermes doctor`, TTS — now goes to the AI Studio host and a Vertex express key
+`hermes doctor` — now goes to the AI Studio host and a Vertex express key
 gets `403 PERMISSION_DENIED` there. Add `GEMINI_BASE_URL=https://aiplatform.googleapis.com`
 to `~/.hermes/.env` (or set `base_url` on the provider) once and restart.
 :::

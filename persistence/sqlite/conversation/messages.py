@@ -16,7 +16,7 @@ from persistence.conversation.messages import (
     HeldCoverage, HeldMessage, MarkerPurgeReport, MessageRecord, MessageStorageState, NewMessage, PagedMessage, PromptPage,
     PrUrlHit, PrunedRowChange, PruneRewriteResult, Reaction, ReadCheck, ReplaceMode, ReplaceResult, ResumeConversations,
     RewindPlan, RowDisposition, RowOutcome, RowStamp, RowUids, SegmentPage, SessionTimeline, TimelineEntry, TranscriptRead, TranscriptRow,
-    TranscriptView,
+    TranscriptHydrationPage, TranscriptView,
     UnseenReaction, UserTurnRewind, Watermark,
 )
 from persistence.core.identity import JsonValue, MessageId, SessionId
@@ -51,7 +51,7 @@ from ._store.search import get_anchored_view
 from ._store.todo import get_latest_todo_result
 from ._store.transcript_repair import _active_logical_message_row, transcript_row_snapshot
 from ._errors import refusals
-from ._store import stored_reads, timeline
+from ._store import hydration, stored_reads, timeline, worker_continuation
 
 __all__ = ["SQLiteMessageRepository"]
 
@@ -539,6 +539,32 @@ class SQLiteMessageRepository:
                 include_inactive=request.view is TranscriptView.ALL, repair_alternation=request.repair_alternation,
                 include_row_ids=request.include_row_ids, include_compacted=request.view is TranscriptView.DISPLAY)
         return _conversation(messages)
+
+    def get_compaction_recovery_messages(self, session_id: SessionId) -> dict[str, Any]:
+        holder = self._store.holder()
+        with _refusals(holder, session_id):
+            return hydration.get_compaction_recovery_messages(holder, session_id)
+
+    def stamp_child_terminal_session(self, session_id: SessionId, status: str, exit_reason: str) -> Optional[dict[str, Any]]:
+        holder = self._store.holder()
+        with _refusals(holder, session_id):
+            return worker_continuation.stamp_child_terminal_session(holder, session_id, status, exit_reason)
+
+    def capture_terminal_child_session(self, session_id: SessionId, expected_parent_id: SessionId, *,
+                                       include_compacted: bool = False) -> dict[str, Any]:
+        holder = self._store.holder()
+        with _refusals(holder, session_id):
+            return worker_continuation.capture_terminal_child_session(
+                holder, session_id, expected_parent_id, include_compacted=include_compacted)
+
+    def read_hydration_page(self, session_id: SessionId, *, limit: int, offset: int = 0,
+                            after_row_id: Optional[int] = None, high_watermark: Optional[int] = None) -> TranscriptHydrationPage:
+        holder = self._store.holder()
+        with _refusals(holder, session_id):
+            rows, high_watermark, last_row = hydration.read_hydration_page(
+                holder, session_id, limit=limit, offset=offset, after_row_id=after_row_id,
+                high_watermark=high_watermark)
+        return TranscriptHydrationPage(_conversation(rows), high_watermark, last_row)
 
     def read_resume_conversations(self, session_id: SessionId) -> ResumeConversations:
         holder = self._store.holder()

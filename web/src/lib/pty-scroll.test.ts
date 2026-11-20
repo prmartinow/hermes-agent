@@ -31,11 +31,15 @@ describe("isViewportPinnedToBottom", () => {
 describe("shouldFollowPtyOutput", () => {
 	it("follows replayed output while resuming and stuck to the bottom", () => {
 		// The core #59591 fix: scroll to bottom as each replay chunk commits.
-		expect(shouldFollowPtyOutput("sess-123", true)).toBe(true);
+		expect(shouldFollowPtyOutput("sess-123", true, true)).toBe(true);
 	});
 
 	it("stops following once the user has scrolled up mid-replay", () => {
-		expect(shouldFollowPtyOutput("sess-123", false)).toBe(false);
+		expect(shouldFollowPtyOutput("sess-123", false, true)).toBe(false);
+	});
+
+	it("stops following once replay hydration has completed", () => {
+		expect(shouldFollowPtyOutput("sess-123", true, false)).toBe(false);
 	});
 
 	it("does not follow a fresh (non-resume) session", () => {

@@ -1,0 +1,820 @@
+"""Faithful bounded evaluation runner for compaction summary usefulness.
+
+Exercises the actual production ContextCompressor.compress() pipeline:
+  compress -> _compress_window -> _sample_summary_records -> _build_summary_prompt
+  -> _call_summary_llm -> _assemble_compressed -> _salvage_or_refuse_grown_transcript
+
+Guarantees:
+- Default offline: zero accidental live network or inference calls unless allow_live=True.
+- Input guard: reject when the counter or whole-prompt estimate exceeds max_input_tokens (8,000).
+- Explicit max output budget: opt-in experimental cap vs production default honest (unbounded).
+- Bounded physical calls: fail closed if physical auxiliary calls exceed bound (no unbounded loops).
+- Faithful length handling: length finish_reason triggers production truncation abort,
+  preserving the original transcript without generating an augmentation stub.
+- Actual production growth guard: runs commit-site _salvage_or_refuse_grown_transcript.
+- Distinct artifact recording: original, candidate, and final accepted messages are captured;
+  scoring scores the final accepted state distinctly from raw output.
+- Refusal honesty: refusal/abort preserves the original transcript; never falsely scored as a compaction success.
+- Exclusive scratch directory: defaults to compaction-eval-fidelity-fix under TMPDIR/scratch.
+- Zero secret/endpoint leakage: client endpoints, keys, and URLs are strictly omitted.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+import time
+from contextlib import ExitStack
+from dataclasses import asdict
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from unittest.mock import MagicMock, patch
+
+from agent.agent_runtime_helpers import strip_think_blocks
+from agent.auxiliary_client import (
+    call_llm as real_call_llm,
+    _get_auxiliary_task_config,
+    _resolve_call_client,
+    _resolve_task_provider_model,
+)
+from agent.context_compressor import (
+    ContextCompressor,
+    _redact_compaction_text,
+    _reinject_pruned_skill_markers,
+)
+from agent.conversation_compression import _Attempt, _salvage_or_refuse_grown_transcript
+from agent.message_content import flatten_message_text
+from agent.model_metadata import estimate_messages_tokens_rough
+from evals.compaction.summary_usefulness.fixtures import (
+    MIGRATION_CASE_GROUND_TRUTH,
+    SYNTHETIC_MIGRATION_TRANSCRIPT_EXPANDED,
+    SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER,
+)
+from evals.compaction.summary_usefulness.harness import transcript_to_text
+from evals.compaction.summary_usefulness.rubric import (
+    SummaryUsefulnessRubric,
+    SummaryUsefulnessScore,
+)
+
+MAX_INPUT_TOKENS = 8000
+DEFAULT_MAX_OUTPUT_TOKENS = 1500
+logger = logging.getLogger(__name__)
+
+# Alias for backwards compatibility / mock patching
+call_llm = real_call_llm
+
+
+def get_default_scratch_dir() -> Path:
+    """Resolve dynamic scratch directory via TMPDIR runtime or canonical get_scratch_dir()."""
+    tmpdir = os.environ.get("TMPDIR")
+    if tmpdir:
+        return Path(tmpdir) / "compaction-stream-eval-fix"
+    from hermes_constants import get_scratch_dir
+    return get_scratch_dir() / "compaction-stream-eval-fix"
+
+
+DEFAULT_SCRATCH_DIR = get_default_scratch_dir()
+
+
+def _extract_usage_tokens(usage: Any) -> tuple[Optional[int], Optional[int], Optional[int], Optional[int]]:
+    """Extract (prompt, completion, total, reasoning) token counts from provider usage object.
+
+    Guarantees:
+    - Returns None (never false 0) when usage or individual token fields are missing.
+    - Inspects completion_tokens_details and direct reasoning_tokens fields across providers.
+    """
+    if usage is None:
+        return None, None, None, None
+
+    prompt_tokens = getattr(usage, "prompt_tokens", None)
+    completion_tokens = getattr(usage, "completion_tokens", None)
+    total_tokens = getattr(usage, "total_tokens", None)
+
+    reasoning_tokens = None
+    comp_details = getattr(usage, "completion_tokens_details", None)
+    if comp_details is not None:
+        reasoning_tokens = getattr(comp_details, "reasoning_tokens", None)
+    if reasoning_tokens is None:
+        output_details = getattr(usage, "output_tokens_details", None)
+        if output_details is not None:
+            reasoning_tokens = getattr(output_details, "reasoning_tokens", None)
+    if reasoning_tokens is None:
+        reasoning_tokens = getattr(usage, "reasoning_tokens", None)
+    if reasoning_tokens is None:
+        reasoning_tokens = getattr(usage, "thoughts_tokens", None)
+    if reasoning_tokens is None:
+        reasoning_tokens = getattr(usage, "thoughts_token_count", None)
+
+    # Handle dictionary representation if returned by adapter
+    if isinstance(usage, dict):
+        prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+        completion_tokens = usage.get("completion_tokens", completion_tokens)
+        total_tokens = usage.get("total_tokens", total_tokens)
+        if reasoning_tokens is None:
+            comp_dict = usage.get("completion_tokens_details")
+            if isinstance(comp_dict, dict):
+                reasoning_tokens = comp_dict.get("reasoning_tokens")
+        if reasoning_tokens is None:
+            reasoning_tokens = (
+                usage.get("reasoning_tokens")
+                or usage.get("thoughtsTokenCount")
+                or usage.get("thoughts_token_count")
+            )
+
+    def _coerce_int(val: Any) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return None
+
+    return (
+        _coerce_int(prompt_tokens),
+        _coerce_int(completion_tokens),
+        _coerce_int(total_tokens),
+        _coerce_int(reasoning_tokens),
+    )
+
+
+def _clean_visible_text(text: str) -> str:
+    """Strip think blocks from visible text while preserving visible prose."""
+    if not text:
+        return ""
+    try:
+        return strip_think_blocks(None, text)
+    except Exception:
+        logger.exception("Could not sanitize visible evaluation text")
+        return ""
+
+
+class TransparentStreamObserver:
+    """Transparent stream observer wrapping an auxiliary chat stream iterator.
+
+    Guarantees:
+    - Exact passthrough: yields exact chunks once with zero drift, mutation, or reordering.
+    - Preserves close and error propagation: .close() triggers underlying .close();
+      underlying exceptions are raised without being swallowed.
+    - Zero eager exhaustion: chunks are fetched strictly on downstream demand.
+    - Telemetry capture:
+      * Visible delta content only (never captures raw reasoning/thinking).
+      * Finish reason from choice.finish_reason if emitted.
+      * Provider usage from chunk.usage (prompt_tokens, completion_tokens, total_tokens).
+      * Provider reasoning/thinking tokens (completion_tokens_details.reasoning_tokens or usage.reasoning_tokens).
+      * If usage/thinking are not returned by the provider, records None (never false 0).
+      * Elapsed seconds includes full stream consumption duration (not just generator creation).
+    """
+
+    def __init__(self, stream: Any, call_record: dict[str, Any], call_start: float):
+        self._raw_stream = stream
+        self._iter = iter(stream)
+        self._call_record = call_record
+        self._call_start = call_start
+        self._visible_parts: list[str] = []
+        self._finish_reason: Optional[str] = None
+        self._usage: Optional[Any] = None
+        self._finalized = False
+        self._closed = False
+        self._chunks_yielded = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            chunk = next(self._iter)
+        except StopIteration:
+            self._finalize()
+            raise
+        except BaseException:
+            self._finalize()
+            raise
+
+        self._chunks_yielded += 1
+        self._observe_chunk(chunk)
+        return chunk
+
+    def _observe_chunk(self, chunk: Any) -> None:
+        # 1. Provider usage
+        u = getattr(chunk, "usage", None)
+        if u is not None:
+            self._usage = u
+
+        # 2. Choices, finish_reason, and VISIBLE delta content ONLY
+        choices = getattr(chunk, "choices", None) or []
+        if choices:
+            ch = choices[0]
+            fr = getattr(ch, "finish_reason", None)
+            if fr:
+                self._finish_reason = str(fr)
+            delta = getattr(ch, "delta", None)
+            if delta is not None:
+                # Capture visible delta content ONLY - NEVER raw reasoning / reasoning_content / details
+                content = getattr(delta, "content", None)
+                if content:
+                    piece = flatten_message_text(content, sep="")
+                    if piece:
+                        self._visible_parts.append(piece)
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            close_fn = getattr(self._raw_stream, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    logger.exception("Could not close evaluation response stream")
+            self._finalize()
+
+    def _finalize(self) -> None:
+        if self._finalized:
+            return
+        self._finalized = True
+        elapsed = time.monotonic() - self._call_start
+
+        prompt_tokens, completion_tokens, total_tokens, reasoning_tokens = _extract_usage_tokens(self._usage)
+
+        raw_visible = "".join(self._visible_parts)
+        if "<think" in raw_visible:
+            raw_visible = _clean_visible_text(raw_visible)
+
+        if self._finish_reason:
+            fr = self._finish_reason
+        elif self._chunks_yielded > 0:
+            fr = "stop"
+        else:
+            fr = "not_called"
+
+        self._call_record["elapsed_seconds"] = elapsed
+        self._call_record["finish_reason"] = fr
+        self._call_record["raw_content"] = raw_visible
+        self._call_record["prompt_tokens"] = prompt_tokens
+        self._call_record["completion_tokens"] = completion_tokens
+        self._call_record["total_tokens"] = total_tokens
+        self._call_record["reasoning_tokens"] = reasoning_tokens
+        self._call_record["is_closed"] = self._closed
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw_stream, name)
+
+
+
+def resolve_actual_configured_auxiliary() -> dict[str, Any]:
+    """Read actual configured compression auxiliary model and provider through the normal API.
+
+    Returns sanitized metadata only — never prints or returns credentials, secrets, or endpoints.
+    Endpoints are completely omitted rather than relying on bespoke scrubbing.
+    """
+    cfg = _get_auxiliary_task_config("compression")
+    res = _resolve_task_provider_model("compression")
+    provider, model, base_url, api_key, api_mode = res
+
+    route = _resolve_call_client(
+        "compression",
+        provider=None,
+        model=None,
+        base_url=None,
+        api_key=None,
+        resolved_provider=provider,
+        resolved_model=model,
+        resolved_base_url=base_url,
+        resolved_api_key=api_key,
+        resolved_api_mode=api_mode,
+        main_runtime=None,
+        async_mode=False,
+    )
+
+    client_class = type(route.client).__name__
+
+    return {
+        "configured_provider": cfg.get("provider", "auto"),
+        "configured_model": cfg.get("model") or "(default)",
+        "configured_timeout": cfg.get("timeout", 120),
+        "resolved_provider": route.resolved_provider,
+        "effective_provider": route.effective_provider,
+        "resolved_model": route.final_model,
+        "client_class": client_class,
+        "auth_type": "API Client",
+    }
+
+
+def _prompt_for_counting(prompt: Any) -> str:
+    """Include every message and role in the input bound, including structured prompts."""
+    if isinstance(prompt, str):
+        return prompt
+
+    def jsonable(value: Any) -> Any:
+        model_dump = getattr(value, "model_dump", None)
+        if callable(model_dump):
+            return model_dump(mode="json")
+        raise TypeError(f"Unsupported prompt value: {type(value).__name__}")
+
+    return json.dumps(prompt, ensure_ascii=False, default=jsonable)
+
+
+def build_production_prompt_and_metadata(
+    transcript: list[dict[str, Any]],
+    model_name: str,
+    provider_name: str,
+) -> tuple[Any, dict[str, Any]]:
+    """Construct the exact production summary prompt on the actual selected window.
+
+    Follows ContextCompressor window selection: _compress_window protects head and token-budget tail.
+    """
+    compressor = ContextCompressor(model=model_name, provider=provider_name, tail_mode="lean", quiet_mode=True)
+    c_start, c_end = compressor._compress_window(transcript)
+    turns = transcript[c_start:c_end]
+    scan = compressor._scan_window_handoffs(transcript, c_start, c_end, turns)
+    turns_to_summarize = scan.turns_to_summarize
+
+    prompt_started_at = time.monotonic()
+    records = compressor._serialize_records_for_summary(turns_to_summarize)
+    slices: list = []
+    _, coverage = compressor._sample_summary_records(records, slices)
+    from agent.context_compressor_typed_input import TYPED_TURNS_POINTER, typed_summary_messages
+    from agent.conversation_compression_scaffolding import is_user_role_scaffolding
+
+    typed_turns = typed_summary_messages(
+        turns_to_summarize, records, slices,
+        lambda m: compressor._is_real_user_turn(m) and not is_user_role_scaffolding(m),
+        compressor._render_tool_args_for_summary,
+    )
+    summary_budget = compressor._compute_summary_budget(turns_to_summarize)
+    has_user_turn = compressor._transcript_has_real_user_turn(turns_to_summarize)
+
+    prompt = compressor._build_summary_prompt(
+        content_to_summarize=TYPED_TURNS_POINTER,
+        summary_budget=summary_budget,
+        focus_topic=None,
+        memory_context="",
+        has_user_turn=has_user_turn,
+    )
+    prompt[1:1] = typed_turns
+
+    metadata = {
+        "prompt_chars": len(_prompt_for_counting(prompt)),
+        "compress_window": [c_start, c_end],
+        "input_turns_count": len(turns_to_summarize),
+        "total_transcript_turns": len(transcript),
+        "coverage": coverage,
+        "summary_budget": summary_budget,
+        "has_user_turn": has_user_turn,
+        "prompt_build_ms": int((time.monotonic() - prompt_started_at) * 1000),
+    }
+    return prompt, metadata
+
+
+def _compaction_lifecycle(
+    transcript: list[dict[str, Any]],
+    candidate_messages: list[dict[str, Any]],
+    accepted_messages: Optional[list[dict[str, Any]]],
+    *,
+    truncated: bool,
+    refusal: bool,
+    empty: bool,
+    refused_growth: bool,
+    salvaged: bool,
+) -> tuple[list[dict[str, Any]], bool, str]:
+    """Choose the state to score and the corresponding production outcome."""
+    aborted = truncated or refusal or empty or candidate_messages == transcript
+    preserved = aborted or accepted_messages is None
+    final_messages = transcript if preserved else accepted_messages
+    if truncated:
+        status = "length_truncated_aborted"
+    elif refusal:
+        status = "refusal_aborted"
+    elif empty:
+        status = "empty_content_aborted"
+    elif refused_growth:
+        status = "growth_guard_refused"
+    elif salvaged:
+        status = "salvaged_accepted"
+    elif not preserved:
+        status = "normal_accepted"
+    else:
+        status = "preserved_original"
+    return final_messages, preserved, status
+
+
+def execute_live_compaction_request(
+    transcript: Optional[list[dict[str, Any]]] = None,
+    ground_truth: Optional[dict[str, Any]] = None,
+    scratch_dir: Optional[Path] = None,
+    max_output_tokens: Optional[int] = None,
+    allow_live: bool = False,
+    mock_response: Optional[Any] = None,
+    max_input_tokens: int = MAX_INPUT_TOKENS,
+    max_auxiliary_calls: int = 1,
+    token_counter: Optional[Callable[[str], int]] = None,
+) -> dict[str, Any]:
+    """Execute compaction evaluation exercising the actual production compress pipeline.
+
+    Intercepts ONLY the auxiliary transport for explicit bounds checking:
+    1. Default offline: fails closed unless allow_live=True or mock_response is provided.
+    2. Input token verification: counts the whole prompt with the provided counter or an estimate;
+       fails closed if the result exceeds max_input_tokens.
+    3. Physical calls bounding: tracks physical transport calls; fails closed if > max_auxiliary_calls.
+    4. Experimental output cap: injects max_tokens only if explicitly requested; otherwise leaves honest production default.
+    5. Production lifecycle: exercises ContextCompressor.compress() -> commit-site growth guard.
+    6. Refusal & Length honesty: preserves original transcript on truncation or refusal without augmentation stubs.
+    7. Distinct capture: saves original, candidate, and final accepted messages; scores final state distinct from raw.
+    """
+    # 0. Check offline authorization before ANY route resolution, config load, token counting, or network.
+    # Default offline: fail closed unless allow_live=True or an explicit mock fixture (mock_response) is passed.
+    # Note: monkeypatching call_llm alias does NOT authorize offline execution without an explicit mock_response fixture.
+    if not allow_live and mock_response is None:
+        raise RuntimeError(
+            "Live auxiliary inference is not authorized (default offline / no accidental inference). "
+            "Pass allow_live=True or provide mock_response."
+        )
+
+    # Check physical call budget before starting
+    if max_auxiliary_calls <= 0:
+        raise RuntimeError(
+            f"Auxiliary physical call bound exceeded ({max_auxiliary_calls} budget). Failing closed with no unbounded fallback."
+        )
+
+    if transcript is None:
+        transcript = SYNTHETIC_MIGRATION_TRANSCRIPT_LONGER
+    if ground_truth is None:
+        ground_truth = MIGRATION_CASE_GROUND_TRUTH
+    if scratch_dir is None:
+        scratch_dir = get_default_scratch_dir()
+
+    scratch_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Resolve configured auxiliary route metadata
+    aux_info = resolve_actual_configured_auxiliary()
+    resolved_model = aux_info["resolved_model"]
+    effective_provider = aux_info["effective_provider"]
+    resolved_provider = aux_info["resolved_provider"]
+
+    if not resolved_model:
+        raise RuntimeError(f"No configured model resolved for compression route: {aux_info}")
+
+    # 2. Build exact production prompt on the selected window to verify input token bounds
+    prompt, prompt_meta = build_production_prompt_and_metadata(
+        transcript, resolved_model, effective_provider
+    )
+
+    compressor = ContextCompressor(
+        model=resolved_model,
+        provider=effective_provider,
+        tail_mode="lean",
+        quiet_mode=True,
+    )
+    main_rt = {
+        "model": compressor.model,
+        "provider": compressor.provider,
+        "base_url": compressor.base_url,
+        "api_key": compressor.api_key,
+        "api_mode": compressor.api_mode,
+    }
+    route = _resolve_call_client(
+        "compression",
+        provider=None,
+        model=None,
+        base_url=None,
+        api_key=None,
+        resolved_provider=resolved_provider,
+        resolved_model=resolved_model,
+        resolved_base_url=None,
+        resolved_api_key=None,
+        resolved_api_mode=None,
+        main_runtime=main_rt,
+        async_mode=False,
+    )
+
+    def count_prompt_tokens(prompt_text: str) -> int:
+        if token_counter is not None:
+            return token_counter(prompt_text)
+        if allow_live:
+            try:
+                return route.client.count_tokens(contents=prompt_text, model=resolved_model)
+            except Exception:
+                logger.exception("Could not count evaluation prompt tokens; using an estimate")
+                return estimate_messages_tokens_rough([{"role": "user", "content": prompt_text}])
+        # Offline deterministic counting: zero network
+        return estimate_messages_tokens_rough([{"role": "user", "content": prompt_text}])
+
+    estimated_input_tokens = count_prompt_tokens(_prompt_for_counting(prompt))
+    prompt_meta["estimated_input_tokens"] = estimated_input_tokens
+
+    # Verify input token bounds: fail closed if input tokens exceed limit
+    if estimated_input_tokens > max_input_tokens:
+        raise ValueError(
+            f"Input token count {estimated_input_tokens} exceeds maximum allowed limit of {max_input_tokens} tokens (fail closed)."
+        )
+
+    # 3. Intercept auxiliary transport at verified SDK send seam
+    physical_calls_count = 0
+    physical_calls_exceeded = False
+    actual_prompt_error: Optional[Exception] = None
+    intercepted_calls: list[dict[str, Any]] = []
+
+    def make_send_interceptor(original_create):
+        def physical_send_interceptor(*args, **kwargs):
+            nonlocal physical_calls_count, physical_calls_exceeded, actual_prompt_error
+            physical_calls_count += 1
+            if physical_calls_count > max_auxiliary_calls:
+                physical_calls_exceeded = True
+                raise RuntimeError(
+                    f"Auxiliary physical call bound exceeded ({physical_calls_count} > {max_auxiliary_calls}). "
+                    f"Failing closed with no unbounded fallback."
+                )
+
+            # The SDK merges extra_body after its transform; it can carry the actual messages
+            # while the required top-level slot contains only an empty placeholder.
+            extra_body = kwargs.get("extra_body")
+            messages = extra_body.get("messages", kwargs.get("messages", [])) if isinstance(extra_body, dict) else kwargs.get("messages", [])
+            if not isinstance(messages, (list, tuple)) or not messages:
+                actual_prompt_error = ValueError("Cannot verify an empty or unsupported prompt at dispatch")
+                raise actual_prompt_error
+            try:
+                actual_prompt = _prompt_for_counting(messages)
+            except (TypeError, ValueError) as exc:
+                actual_prompt_error = ValueError("Cannot verify the prompt at dispatch")
+                raise actual_prompt_error from exc
+            actual_input_tokens = count_prompt_tokens(actual_prompt)
+            if actual_input_tokens > max_input_tokens:
+                actual_prompt_error = ValueError(
+                    f"Input token count {actual_input_tokens} exceeds maximum allowed limit of {max_input_tokens} tokens (fail closed)."
+                )
+                raise actual_prompt_error
+
+            # Enforce experimental output cap or keep production default honest
+            if max_output_tokens is not None:
+                kwargs["max_tokens"] = max_output_tokens
+            else:
+                kwargs.pop("max_tokens", None)
+
+            call_start = time.monotonic()
+            if mock_response is not None:
+                if callable(mock_response):
+                    resp = mock_response(*args, **kwargs)
+                elif isinstance(mock_response, Exception):
+                    raise mock_response
+                else:
+                    resp = mock_response
+            else:
+                resp = original_create(*args, **kwargs)
+
+            # Check if resp is a streaming chunk iterator or non-streaming completion
+            is_stream = not hasattr(resp, "choices") and (hasattr(resp, "__iter__") or hasattr(resp, "__next__"))
+            if not is_stream:
+                elapsed = time.monotonic() - call_start
+                raw_content = ""
+                finish_reason = "not_called"
+
+                choices = getattr(resp, "choices", [])
+                if choices:
+                    ch = choices[0]
+                    finish_reason = getattr(ch, "finish_reason", "unknown")
+                    m = getattr(ch, "message", None)
+                    if m is not None:
+                        content = getattr(m, "content", "")
+                        raw_content = _clean_visible_text(content) if content else ""
+
+                prompt_tokens, completion_tokens, total_tokens, reasoning_tokens = _extract_usage_tokens(
+                    getattr(resp, "usage", None)
+                )
+
+                call_record = {
+                    "estimated_input_tokens": actual_input_tokens,
+                    "max_tokens_passed": kwargs.get("max_tokens"),
+                    "elapsed_seconds": elapsed,
+                    "finish_reason": finish_reason,
+                    "raw_content": raw_content,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "reasoning_tokens": reasoning_tokens,
+                    "is_streaming": False,
+                    "response": resp,
+                }
+                intercepted_calls.append(call_record)
+                return resp
+            else:
+                call_record = {
+                    "estimated_input_tokens": actual_input_tokens,
+                    "max_tokens_passed": kwargs.get("max_tokens"),
+                    "elapsed_seconds": 0.0,
+                    "finish_reason": "not_called",
+                    "raw_content": "",
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                    "reasoning_tokens": None,
+                    "is_streaming": True,
+                    "response": resp,
+                }
+                intercepted_calls.append(call_record)
+                return TransparentStreamObserver(resp, call_record, call_start)
+
+        return physical_send_interceptor
+
+    clients_to_patch = set()
+    if hasattr(route, "client") and route.client is not None:
+        clients_to_patch.add(route.client)
+    from agent.auxiliary_client import _client_cache
+    for entry in list(_client_cache.values()):
+        if isinstance(entry, tuple) and len(entry) >= 1 and entry[0] is not None:
+            clients_to_patch.add(entry[0])
+
+    with ExitStack() as stack:
+        for cl in clients_to_patch:
+            if hasattr(cl, "chat") and hasattr(cl.chat, "completions"):
+                stack.enter_context(
+                    patch.object(cl.chat.completions, "create", side_effect=make_send_interceptor(cl.chat.completions.create))
+                )
+        candidate_messages = compressor.compress(transcript, force=True)
+
+    if actual_prompt_error is not None:
+        raise actual_prompt_error
+
+    if physical_calls_exceeded:
+        raise RuntimeError(
+            f"Auxiliary physical call bound exceeded ({physical_calls_count} > {max_auxiliary_calls}). "
+            f"Failing closed with no unbounded fallback."
+        )
+
+    # 6. Extract status from compressor and response
+    aborted_truncated = getattr(compressor, "_last_summary_truncated_failure", False)
+    last_err = getattr(compressor, "_last_summary_error", None)
+    aborted_refusal = bool(last_err and "refusal" in str(last_err).lower())
+    aborted_empty = getattr(compressor, "_last_summary_empty_content_failure", False)
+
+    raw_content = ""
+    finish_reason = "not_called"
+    prompt_tokens = None
+    completion_tokens = None
+    total_tokens = None
+    reasoning_tokens = None
+    elapsed_seconds = 0.0
+
+    if intercepted_calls:
+        rec = intercepted_calls[-1]
+        elapsed_seconds = rec.get("elapsed_seconds", 0.0)
+        raw_content = rec.get("raw_content", "")
+        finish_reason = rec.get("finish_reason", "not_called")
+        prompt_tokens = rec.get("prompt_tokens")
+        completion_tokens = rec.get("completion_tokens")
+        total_tokens = rec.get("total_tokens")
+        reasoning_tokens = rec.get("reasoning_tokens")
+
+    # 7. Execute actual production growth guard
+    rough_in = estimate_messages_tokens_rough(transcript)
+    rough_cand = estimate_messages_tokens_rough(candidate_messages)
+
+    mock_agent = MagicMock()
+    mock_agent.session_id = "compaction-stream-eval-fix"
+    mock_agent.context_compressor = compressor
+
+    accepted_messages, _refused_sp = _salvage_or_refuse_grown_transcript(
+        mock_agent,
+        transcript,
+        candidate_messages,
+        system_message="",
+        attempt=_Attempt(snapshot={}, generation=0, started_at=time.monotonic(), seed={}),
+    )
+
+    refused_would_grow = getattr(compressor, "_last_compress_refused_would_grow", False)
+    salvaged = (accepted_messages is not None and rough_cand > rough_in)
+
+    final_accepted_messages, original_preserved, lifecycle_status = _compaction_lifecycle(
+        transcript, candidate_messages, accepted_messages,
+        truncated=aborted_truncated, refusal=aborted_refusal, empty=aborted_empty,
+        refused_growth=refused_would_grow, salvaged=salvaged,
+    )
+
+    rough_final = estimate_messages_tokens_rough(final_accepted_messages)
+
+    # 9. Evaluate with rubric
+    rubric = SummaryUsefulnessRubric(ground_truth)
+    raw_transcript_text = transcript_to_text(transcript)
+    final_accepted_text = transcript_to_text(final_accepted_messages)
+
+    eval_score_final: SummaryUsefulnessScore = rubric.evaluate(final_accepted_text, raw_transcript_text)
+    if original_preserved:
+        eval_score_final.diagnostic_notes.append(
+            f"Compaction aborted/refused (lifecycle: {lifecycle_status}); scored final state is preserved original transcript."
+        )
+
+    eval_score_raw: Optional[SummaryUsefulnessScore] = None
+    if raw_content:
+        eval_score_raw = rubric.evaluate(raw_content, raw_transcript_text)
+
+    # 10. Save artifacts to exclusive scratch directory
+    orig_file = scratch_dir / "original_messages.json"
+    orig_file.write_text(json.dumps(transcript, indent=2, default=str), encoding="utf-8")
+
+    cand_file = scratch_dir / "candidate_messages.json"
+    cand_file.write_text(json.dumps(candidate_messages, indent=2, default=str), encoding="utf-8")
+
+    final_file = scratch_dir / "final_accepted_messages.json"
+    final_file.write_text(json.dumps(final_accepted_messages, indent=2, default=str), encoding="utf-8")
+
+    raw_file = scratch_dir / "raw_summary_output.md"
+    raw_file.write_text(raw_content or "(no raw LLM content produced)", encoding="utf-8")
+
+    final_txt_file = scratch_dir / "final_accepted_transcript.md"
+    final_txt_file.write_text(final_accepted_text, encoding="utf-8")
+
+    gt_file = scratch_dir / "ground_truth.json"
+    gt_file.write_text(json.dumps(ground_truth, indent=2), encoding="utf-8")
+
+    score_final_file = scratch_dir / "evaluation_score_final.json"
+    score_final_file.write_text(json.dumps(asdict(eval_score_final), indent=2, default=str), encoding="utf-8")
+
+    score_raw_file = scratch_dir / "evaluation_score_raw.json"
+    if eval_score_raw:
+        score_raw_file.write_text(json.dumps(asdict(eval_score_raw), indent=2, default=str), encoding="utf-8")
+
+    metadata = {
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "model": resolved_model,
+        "provider": effective_provider,
+        "client_class": aux_info["client_class"],
+        "auth_type": aux_info["auth_type"],
+        "lifecycle_status": lifecycle_status,
+        "original_preserved": original_preserved,
+        "refused_would_grow": refused_would_grow,
+        "salvaged": salvaged,
+        "aborted_truncated": aborted_truncated,
+        "aborted_refusal": aborted_refusal,
+        "finish_reason": finish_reason,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "physical_auxiliary_calls": physical_calls_count,
+        "sdk_auxiliary_attempts": physical_calls_count,
+        "max_output_tokens_configured": max_output_tokens if max_output_tokens is not None else DEFAULT_MAX_OUTPUT_TOKENS,
+        "max_output_tokens_budget": max_output_tokens if max_output_tokens is not None else "production_default_honest",
+        "usage": {
+            "estimated_prompt_tokens": intercepted_calls[0]["estimated_input_tokens"] if intercepted_calls else estimated_input_tokens,
+            "provider_prompt_tokens": prompt_tokens,
+            "provider_completion_tokens": completion_tokens,
+            "provider_total_tokens": total_tokens,
+            "provider_reasoning_tokens": reasoning_tokens,
+        },
+        "thoughts_token_count": reasoning_tokens,
+        "tokens": {
+            "original_tokens_rough": rough_in,
+            "candidate_tokens_rough": rough_cand,
+            "final_tokens_rough": rough_final,
+            "shrink_ratio_final": round(rough_final / max(1, rough_in), 4),
+        },
+        "artifact_paths": {
+            "original_messages": str(orig_file),
+            "candidate_messages": str(cand_file),
+            "final_accepted_messages": str(final_file),
+            "raw_summary": str(raw_file),
+            "final_accepted_transcript": str(final_txt_file),
+            "evaluation_score_final": str(score_final_file),
+            "ground_truth": str(gt_file),
+        },
+    }
+
+    metadata_file = scratch_dir / "sanitized_metadata.json"
+    metadata_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+
+    return {
+        "metadata": metadata,
+        "lifecycle_status": lifecycle_status,
+        "eval_score": eval_score_final,
+        "eval_score_final": eval_score_final,
+        "eval_score_raw": eval_score_raw,
+        "raw_content": raw_content,
+        "candidate_summary": raw_content,
+        "original_messages": transcript,
+        "candidate_messages": candidate_messages,
+        "final_accepted_messages": final_accepted_messages,
+        "artifact_dir": str(scratch_dir),
+    }
+
+
+if __name__ == "__main__":
+    print("=== Hermes Bounded Live Compaction Evaluation Runner ===")
+    print("Resolving configured compression auxiliary route...")
+    aux = resolve_actual_configured_auxiliary()
+    print(f"  • Model:            {aux['resolved_model']}")
+    print(f"  • Provider:         {aux['effective_provider']}")
+    print(f"  • Client Class:     {aux['client_class']}")
+    print(f"  • Auth Gateway:     {aux['auth_type']}")
+
+    if "--live" not in sys.argv:
+        print("\nNOTICE: Default offline mode. Pass --live to authorize live auxiliary inference.")
+        print("Exiting without live inference.")
+        sys.exit(0)
+
+    print("\nExecuting authorized live compaction evaluation...")
+    res = execute_live_compaction_request(allow_live=True)
+    meta = res["metadata"]
+    score = res["eval_score"]
+    print(f"\n=== Compaction Lifecycle Status: {res['lifecycle_status']} ===")
+    print(f"  • Original Preserved: {meta['original_preserved']}")
+    print(f"  • Final Rough Tokens: {meta['tokens']['final_tokens_rough']} (from {meta['tokens']['original_tokens_rough']})")
+    print(f"  • Usefulness Score:   {score.usefulness_score:.4f}")
+    print(f"  • Artifacts saved in: {res['artifact_dir']}")
