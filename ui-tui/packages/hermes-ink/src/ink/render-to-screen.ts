@@ -4,11 +4,12 @@ import { LegacyRoot } from 'react-reconciler/constants.js'
 
 import { logForDebugging } from '../utils/debug.js'
 
-import { createNode, type DOMElement } from './dom.js'
+import { createNode, type DOMElement, markDirty } from './dom.js'
 import { FocusManager } from './focus.js'
 import Output from './output.js'
 import reconciler from './reconciler.js'
 import renderNodeToOutput, { resetLayoutShifted } from './render-node-to-output.js'
+import type { Hyperlink } from './screen.js'
 import {
   cellAtIndex,
   CellWidth,
@@ -19,6 +20,7 @@ import {
   setCellStyleId,
   StylePool
 } from './screen.js'
+import { LINK_END, link as oscLink } from './termio/osc.js'
 
 /** Position of a match within a rendered message, relative to the message's
  *  own bounding box (row 0 = message top). Stable across scroll — to
@@ -233,4 +235,161 @@ export function applyPositionedHighlight(
   }
 
   return true
+}
+
+const STYLE_SHIFT = 17
+const HYPERLINK_SHIFT = 2
+const HYPERLINK_MASK = 0x7fff
+const WIDTH_MASK = 3
+
+/**
+ * Serialize a rendered Screen into ANSI-styled lines for static terminal output.
+ */
+export function serializeScreenToAnsi(screen: Screen, pool?: StylePool): string {
+  const p = pool || stylePool
+  const lines: string[] = []
+
+  const cells = screen.cells
+  const charPool = screen.charPool
+  const hyperlinkPool = screen.hyperlinkPool
+  const hasDirectCells = Boolean(cells && charPool && hyperlinkPool)
+  const width = screen.width
+  const height = screen.height
+
+  let currentStyleId: number = p ? p.none : -1
+  let currentHyperlink: Hyperlink = undefined
+
+  for (let y = 0; y < height; y++) {
+    let line = ''
+    const rowOffset = y * width
+
+    for (let x = 0; x < width; x++) {
+      let char: string
+      let styleId: number
+      let cellWidth: number
+      let hyperlink: Hyperlink
+
+      if (hasDirectCells) {
+        const ci = (rowOffset + x) << 1
+        const word1 = cells[ci + 1]!
+        cellWidth = word1 & WIDTH_MASK
+        if (cellWidth === CellWidth.SpacerTail) {
+          continue
+        }
+        const hid = (word1 >>> HYPERLINK_SHIFT) & HYPERLINK_MASK
+        styleId = word1 >>> STYLE_SHIFT
+        char = charPool.get(cells[ci]!)
+        hyperlink = hid === 0 ? undefined : hyperlinkPool.get(hid)
+      } else {
+        const cell = cellAtIndex(screen, rowOffset + x)
+        if (!cell || cell.width === CellWidth.SpacerTail) {
+          continue
+        }
+        cellWidth = cell.width
+        styleId = cell.styleId
+        char = cell.char
+        hyperlink = cell.hyperlink
+      }
+
+      if (hyperlink !== currentHyperlink) {
+        if (currentHyperlink !== undefined) {line += LINK_END}
+        if (hyperlink !== undefined) {line += oscLink(hyperlink)}
+        currentHyperlink = hyperlink
+      }
+
+      if (p && styleId !== currentStyleId) {
+        line += p.transition(currentStyleId, styleId)
+        currentStyleId = styleId
+      }
+      line += char
+    }
+
+    if (currentHyperlink !== undefined) {
+      line += LINK_END
+      currentHyperlink = undefined
+    }
+
+    if (p && currentStyleId !== p.none) {
+      line += p.transition(currentStyleId, p.none)
+      currentStyleId = p.none
+    }
+
+    lines.push(line.trimEnd())
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Render any React Ink element directly into ANSI-styled terminal output without
+ * touching the live terminal cursor or wiping scrollback.
+ */
+export function renderNodeToAnsi(node: ReactElement, width: number): string {
+  const { screen } = renderToScreen(node, width)
+  return serializeScreenToAnsi(screen, stylePool)
+}
+
+/** Paint an EXISTING DOM subtree to a fresh Screen at its natural
+ *  height, scan for query. Returns positions relative to the element's
+ *  bounding box (row 0 = element top).
+ *
+ *  The element comes from the MAIN tree — built with all real
+ *  providers, yoga already computed. We paint it to a fresh buffer
+ *  with offsets so it lands at (0,0). Same paint path as the main
+ *  render. Zero drift. No second React root, no context bridge.
+ *
+ *  ~1-2ms (paint only, no reconcile — the DOM is already built). */
+export function scanElementSubtree(
+  el: DOMElement,
+  query: string,
+  stylePool: StylePool,
+  charPool: CharPool,
+  hyperlinkPool: HyperlinkPool
+): MatchPosition[] {
+  if (!query || !el.yogaNode) {
+    return []
+  }
+
+  const width = Math.ceil(el.yogaNode.getComputedWidth())
+  const height = Math.ceil(el.yogaNode.getComputedHeight())
+
+  if (width <= 0 || height <= 0) {
+    return []
+  }
+
+  // renderNodeToOutput adds el's OWN computedLeft/Top to offsetX/Y.
+  // Passing -elLeft/-elTop nets to 0 → paints at (0,0) in our buffer.
+  const elLeft = el.yogaNode.getComputedLeft()
+  const elTop = el.yogaNode.getComputedTop()
+  const screen = createScreen(width, height, stylePool, charPool, hyperlinkPool)
+
+  const output = new Output({
+    width,
+    height,
+    stylePool,
+    screen
+  })
+
+  renderNodeToOutput(el, output, {
+    offsetX: -elLeft,
+    offsetY: -elTop,
+    prevScreen: undefined
+  })
+  const rendered = output.get()
+  // renderNodeToOutput wrote our offset positions to nodeCache —
+  // corrupts the main render (it'd blit from wrong coords). Mark the
+  // subtree dirty so the next main render repaints + re-caches
+  // correctly. One extra paint of this message, but correct > fast.
+  markDirty(el)
+  const positions = scanPositions(rendered, query)
+  logForDebugging(
+    `scanElementSubtree: q='${query}' ` +
+      `el=${width}x${height}@(${elLeft},${elTop}) n=${positions.length} ` +
+      `[${positions
+        .slice(0, 10)
+        .map(p => `${p.row}:${p.col}`)
+        .join(',')}` +
+      `${positions.length > 10 ? ',…' : ''}]`
+  )
+
+  return positions
 }

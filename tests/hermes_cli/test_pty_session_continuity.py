@@ -36,6 +36,9 @@ class Bridge:
     def is_alive(self):
         return not self.closed
 
+    def retire_if_idle(self):
+        return True
+
 
 class Socket:
     def __init__(self):

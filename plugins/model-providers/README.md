@@ -65,6 +65,4 @@ chat_completions transport all auto-wire from the registry.
 
 Override the `ProviderProfile` hooks in a subclass for per-provider
 quirks — see `plugins/model-providers/openrouter/__init__.py` for
-`build_extra_body` and `build_api_kwargs_extras` examples, and
-`plugins/model-providers/gemini/__init__.py` for `thinking_config`
-translation.
+`build_extra_body` and `build_api_kwargs_extras` examples.

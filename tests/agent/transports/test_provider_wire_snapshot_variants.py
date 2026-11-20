@@ -89,9 +89,6 @@ MODEL_VARIANTS: list[tuple[str, str, str, str, dict[str, Any]]] = [
      {"max_tokens": 4096}),
     # Explicit max_tokens on a generic endpoint -> plain max_tokens.
     ("variant:custom-max-tokens", "custom", "my-local-model", "http://127.0.0.1:8080/v1", {"max_tokens": 4096}),
-    # Explicit small max_tokens on Gemini thinking: raised for the thinking budget when enabled.
-    ("variant:gemini-max-tokens", "gemini", "gemini-3-pro", "https://generativelanguage.googleapis.com/v1beta",
-     {"max_tokens": 1024}),
 ]
 
 # (key, provider, model, base_url, agent attributes set after construction).
@@ -101,11 +98,6 @@ STREAM_CELLS: list[tuple[str, str, str, str, dict[str, Any]]] = [
     ("stream:custom", "custom", "my-local-model", "http://127.0.0.1:8080/v1", {}),
     # llama-server: prompt-progress chunks requested (with_prompt_progress) on every stream.
     ("stream:llamacpp", "llamacpp", "qwen3-8b", "http://127.0.0.1:8080/v1", {}),
-    # Native Gemini REST host: no stream_options.
-    ("stream:gemini-native", "gemini", "gemini-3-pro", "https://generativelanguage.googleapis.com/v1beta", {}),
-    # Gemini's OpenAI-compatible surface keeps stream_options.
-    ("stream:gemini-openai", "gemini", "gemini-3-pro",
-     "https://generativelanguage.googleapis.com/v1beta/openai", {}),
     # An endpoint that already rejected stream_options this session.
     ("stream:custom-stream-options-rejected", "custom", "my-local-model", "http://127.0.0.1:8080/v1",
      {"_stream_options_unsupported": True}),
@@ -143,7 +135,6 @@ AUX_CELLS: list[tuple[str, str, str, str | None, dict[str, Any]]] = [
     # in _build_call_kwargs is what keeps ``ultra`` off this profile's wire (custom clamps itself).
     ("aux:openrouter-task-ultra", "openrouter", "anthropic/claude-opus-5.5", "https://openrouter.ai/api/v1", {
         "task": "compression", "config": "auxiliary:\n  compression:\n    reasoning_effort: ultra\n"}),
-    ("aux:gemini", "gemini", "gemini-3-flash", "https://generativelanguage.googleapis.com/v1beta", {}),
 ]
 
 CELL_KEYS = frozenset(c[0] for cells in (MODEL_VARIANTS, STREAM_CELLS, AUX_CELLS) for c in cells)

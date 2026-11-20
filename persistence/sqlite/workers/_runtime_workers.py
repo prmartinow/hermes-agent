@@ -104,7 +104,8 @@ def compact_terminal_receipts(conn, execution_id):
 def _compact(conn, execution_id):
     conn.execute("UPDATE worker_receipts SET result_json=? WHERE execution_id=? AND json_valid(result_json) "
                  "AND (json_type(result_json, '$.messages') IS NOT NULL "
-                 "OR json_type(result_json, '$.session') IS NOT NULL)",
+                 "OR json_type(result_json, '$.session') IS NOT NULL "
+                 "OR json_type(result_json, '$.recovery') IS NOT NULL)",
                  (json.dumps(RETIRED_RECEIPT), execution_id))
 
 

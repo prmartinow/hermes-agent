@@ -1,7 +1,7 @@
 """Adopting a pre-authority chat that ran on an external-process provider.
 
 Such a provider runs a local CLI. The runtime takes its address from the provider's own profile
-(``_external_process_spec``), never from ``model.base_url``, and the old surfaces still persisted
+(``external_process_spec``), never from ``model.base_url``, and the old surfaces still persisted
 that address (``process://<provider>``) as the row's route. Adoption replayed it as an explicit
 ``base_url`` launch override, which only accepts http(s) endpoints, so the chat could never be opened
 and every bot-to-bot delivery into a Bot Chat holding it was refused with ``invalid_params``.

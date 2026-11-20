@@ -1058,6 +1058,9 @@ def _begin_tool_execution(agent, ref: _ToolCallRef, display_index: int | None) -
             _safe_callback(agent.tool_progress_callback, "Tool progress", "tool.started", function_name, preview, display_args)
     _safe_callback(agent.tool_start_callback, "Tool start", tool_call_id, function_name, display_args)
 
+    from agent.live_session_stream import publish_tool_start
+    publish_tool_start(agent, tool_call_id, function_name, display_args)
+
     if not agent._checkpoint_mgr.enabled:
         return
     with contextlib.suppress(Exception):
@@ -1082,6 +1085,8 @@ def _emit_tool_complete_and_risk(agent, ref: _ToolCallRef, result, risk_metadata
             logging.debug("Tool complete callback error: %s", cb_err)
         else:
             _safe_callback(agent.tool_complete_callback, "Tool complete", ref.call_id, ref.name, display_args, result)
+    from agent.live_session_stream import publish_tool_complete
+    publish_tool_complete(agent, ref, result, blocked)
     if risk_metadata is not None and risk_metadata.get("risk") != "low":
         _safe_callback(
             agent.tool_progress_callback, "Tool output risk",
@@ -1851,10 +1856,8 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     result; False when the incremental flush failed (the caller must stop the batch)."""
     ref.args, ref.trace, function_result = managed.args, managed.middleware_trace, managed.result
     _execution_timed_out = isinstance(function_result, (_ToolTimeoutResult, _ToolCancelledResult))
-    # Inline-dispatched runtime tools never reach handle_function_call, so the
-    # executor owns the one terminal post_tool_call per tool_call_id (the inner
-    # observer is suppressed); also stops an abandoned timeout worker reporting late.
-    # transform_tool_result follows the observer, unless the dispatch already fired it.
+    # Inline dispatch owns the sole terminal post_tool_call and suppresses late timeout observers.
+    # Transform after observing, unless dispatch already transformed the result.
     if not managed.blocked and not _execution_timed_out:
         ref.emit_post(agent, function_result, duration_ms=int(tool_duration * 1000))
         if not transform_applied:

@@ -5,8 +5,6 @@ globals at install time (method_ctx.bind_module), so they reference server.py gl
 
 from __future__ import annotations
 
-import logging
-
 import contextlib
 
 from .method_ctx import bind_module
@@ -478,7 +476,7 @@ def _lock_vault_managers(session: dict) -> None:
         if sid := session.get("_sid"):
             unlock.release_session(sid)
     except Exception:
-        logging.getLogger(__name__).debug("vault manager lock on session end failed", exc_info=True)
+        logger.debug("vault manager lock on session end failed", exc_info=True)
 
 
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
@@ -932,6 +930,54 @@ def _session_has_active_delegations(sid: str, session: dict | None = None) -> bo
         return True  # a transient registry/import failure must not become destructive cleanup
 
 
+def _session_work_in_flight(sid: str, session: dict | None = None) -> bool:
+    """True when a session is actively working, has queued turns, is building its agent,
+    owns live background delegations, or is waiting on tool/human input. Such sessions
+    must NEVER be automatically interrupted or reaped while clientless."""
+    if session is None:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+    if not session:
+        return False
+    if session.get("running"):
+        return True
+    if session.get("queued_prompt") or session.get("queued_prompts"):
+        return True
+    if session.get("_auto_continue_scheduled"):
+        return True
+    for key in ("_run_thread", "_agent_build_thread"):
+        thread = session.get(key)
+        if thread is not None:
+            try:
+                if thread.is_alive():
+                    return True
+            except Exception:
+                logger.debug("Cannot determine worker liveness for session %s", sid, exc_info=True)
+                return True  # Unknown worker liveness is not proof of idleness.
+    if _session_has_active_delegations(sid, session):
+        return True
+    ready = session.get("agent_ready")
+    if (ready is not None and hasattr(ready, "is_set") and not ready.is_set()
+            and session.get("agent_build_started") and not session.get("lazy")):
+        return True
+    try:
+        if _session_pending_kind(sid):
+            return True
+    except Exception:
+        logger.debug("Cannot determine pending input for session %s", sid, exc_info=True)
+        return True  # Unreadable input state cannot authorize destructive cleanup.
+    try:
+        session_key = str(session.get("session_key") or "")
+        if session_key:
+            from tools.approval import has_blocking_approval
+            if has_blocking_approval(session_key):
+                return True
+    except Exception:
+        logger.debug("Cannot determine approval state for session %s", sid, exc_info=True)
+        return True  # Preserve work when approval state cannot be determined.
+    return False
+
+
 # One pending WS-orphan reap Timer per live sid; guarded by _sessions_lock. Cancelled by _cancel_ws_orphan_reap from
 # every resume/reuse/transport-rebind path — else a reap on a reattached session triggers a reap->broadcast->resume storm.
 _pending_ws_reaps: dict[str, threading.Timer] = {}
@@ -952,9 +998,9 @@ def _reattach_refusal(rid, sid: str, session: dict) -> dict | None:
     ``session`` — it is stale, or a client-gone interrupt is still settling and the reap Timer must keep
     polling. None when the reattach may proceed."""
     if _sessions.get(sid) is not session:
-        return _err(rid, 4007, "session no longer live; retry resume")
+        return _err(rid, 4007, "session no longer live; retry resume", {"reason": "runtime_replaced", "retryable": True})
     if session.get("_client_gone_interrupt_requested"):
-        return _err(rid, 4009, "session disconnect interrupt settling")
+        return _err(rid, 4009, "session disconnect interrupt settling", {"reason": "disconnect_interrupt_settling", "retryable": True, "retry_after_ms": 1000})
     return None
 
 
@@ -980,9 +1026,9 @@ def _rebind_live_transport(sid: str, session: dict, transport: Transport) -> Non
 
 
 def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:
-    """Whether a detached RUNNING turn's activity clock (``_touch_activity``) is still fresh — the reaper must NOT
-    interrupt healthy detached work (closed laptop). Conservative: disabled threshold, missing/opaque agent, unreadable
-    summary or never-stamped clock all report NOT fresh (eligible for interrupt-at-grace) to keep the wedged-turn net.
+    """Diagnostic freshness of a detached turn's activity clock (``_touch_activity``).
+    Missing/stale telemetry reports False, but is never permission for viewer-loss
+    cleanup to interrupt a running turn; cleanup uses _session_work_in_flight.
 
     Reuses the agent's existing activity summary (``_touch_activity`` is stamped by API waits, stream
     tokens, and tool heartbeats — the same clock the turn-liveness watchdog samples; see
@@ -1046,7 +1092,7 @@ def _schedule_ws_orphan_reap(
                 return
         # Serialize the re-check against session.resume (rebinds under _session_resume_lock). Claim teardown by popping
         # under both locks, then release the resume lock before slow finalization. Order: resume_lock -> sessions_lock.
-        reschedule_delay = interrupt_session = session = None
+        reschedule_delay = session = None
         with _session_resume_lock, _sessions_lock:
             # Keep ownership through interrupt I/O and continuation registration. A cancelled
             # callback may already be dispatched, but cannot act on a later detachment.
@@ -1065,51 +1111,20 @@ def _schedule_ws_orphan_reap(
                 current.pop("_client_gone_interrupt_polls", None)
                 _pending_ws_reaps.pop(sid, None)
                 return
-            if _session_has_active_delegations(sid, current) or (
-                    not current.get("running")
-                    and not current.get("_client_gone_interrupt_requested")
-                    and (_session_owns_live_wakeup_schedule(current)
-                         or _session_owns_pending_process_notification(current))):
-                # Live background work, or a wake-up only this process's poller can deliver: an active /loop or
-                # /heartbeat, or a running process that will notify this session. A settled client-gone interrupt
-                # wins over both: its latches block every tick and reattach.
-                reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
-            elif not current.get("running"):
-                session = _pop_session_by_id(sid)
-            elif not current.get("_client_gone_interrupt_requested") and _ws_orphan_turn_activity_is_fresh(current):
-                # Client-absent but producing: keep running detached (the sentinel buffers emits), re-check each grace.
-                logger.debug("client_gone sid=%s action=defer (turn activity fresh; stale threshold %.0fs)",
-                             sid, _WS_ORPHAN_ACTIVITY_STALE_S)
-                reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
-            else:
-                # Mid-turn detached sessions must never drop the single Timer: interrupt once after grace, then poll
-                # until turn-finalization settles.
-                polls = current["_client_gone_interrupt_polls"] = int(current.get("_client_gone_interrupt_polls") or 0) + 1
-                # See #85578.
-                if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
-                    # Never settled inside the budget — force-reap rather than park forever.
-                    logger.error(
-                        "client_gone sid=%s: turn did not settle after %d interrupt polls (%.0fs) — force-reaping detached session",
-                        sid, polls - 1, (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S)
-                    session = _pop_session_by_id(sid)
-                else:
-                    if not current.get("_client_gone_interrupt_requested"):
-                        current["_client_gone_interrupt_requested"] = True
-                        interrupt_session = current
+            if (_session_work_in_flight(sid, current)
+                    or _session_owns_live_wakeup_schedule(current)
+                    or _session_owns_pending_process_notification(current)):
+                # Actively running agents must NEVER be interrupted by tab focus / disconnect / autocleanup;
+                # tools, delegations, and background work continue uninterrupted. Reschedule safe checks instead.
+                logger.debug("client_gone sid=%s action=defer (work in flight)", sid)
+                if current.get("_client_gone_interrupt_requested"):
                     reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
+                else:
+                    reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+            else:
+                session = _pop_session_by_id(sid)
             if reschedule_delay is None:
                 _pending_ws_reaps.pop(sid, None)
-        if interrupt_session is not None:
-            try:
-                isolated = _interrupt_session_turn(
-                    sid, interrupt_session, request_id=f"client-gone-{sid}", orphan=True)
-                logger.info("client_gone sid=%s action=interrupt turn_isolation=%s", sid, isolated)
-            except Exception:
-                logger.exception("client_gone interrupt failed sid=%s", sid)
-                with _sessions_lock:
-                    if (_sessions.get(sid) is interrupt_session
-                            and _pending_ws_reaps.get(sid) is timer):
-                        interrupt_session.pop("_client_gone_interrupt_requested", None)
         if reschedule_delay is not None:
             _schedule_ws_orphan_reap(sid, delay_s=reschedule_delay, _expected_timer=timer)
             return
@@ -1131,14 +1146,14 @@ def _schedule_ws_orphan_reap(
 
 
 def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect") -> tuple[int, int]:
-    """Single WS-disconnect teardown entry point: reap close_on_disconnect sessions (sidecar/dashboard) immediately;
+    """Single WS-disconnect teardown entry point: reap idle close_on_disconnect sessions immediately;
     re-point the rest at the detached transport (later emits miss the dead socket) for the grace-windowed WS-orphan
     reaper. Returns ``(reaped, detached)`` counts.
 
     Multi-client fan-out: the departing transport is DETACHED from every session first. A session that still has
     another client attached keeps streaming and is neither parked nor reaped — a watcher leaving must not end the
     turn the remaining client is reading. Only the sessions left clientless take the historical
-    close_on_disconnect / park-sentinel path, so a single-client disconnect behaves exactly as it always has."""
+    close_on_disconnect / park-sentinel path, without cancelling protected work."""
     clientless = _detach_transport_from_sessions(transport)
     reaped = detached = 0
     for sid, session in clientless:
@@ -1162,7 +1177,7 @@ def _close_sessions_for_transport(transport, *, end_reason: str = "ws_disconnect
             with _session_transport_lock:
                 if _session_has_live_transport(current, excluding=transport):
                     continue
-            if current.get("close_on_disconnect"):
+            if current.get("close_on_disconnect") and not _session_work_in_flight(sid, current):
                 claimed_for_teardown = _pop_session_by_id(sid)
             else:
                 # Point at the drop sentinel (NOT real stdio) so _ws_session_is_orphaned recognizes it; standalone

@@ -322,8 +322,10 @@ def _finalize_child_env(env: dict) -> dict:
     _strip_hermes_owned_pythonpath_and_runtime_markers(env)
     strip_supervised_process_identity(env)
     _apply_windows_msys_bash_env_defaults(env)
-    from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    from agent.delegation_context import is_delegated_child_process_context, scrub_kanban_env
+    if is_delegated_child_process_context():
+        return scrub_kanban_env(env)
+    return env
 
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
@@ -873,6 +875,39 @@ def routed_terminal_base() -> dict:
     return base
 
 
+def _is_already_in_host_namespace() -> bool:
+    """Return True if the current process is already in the host (PID 1) mount namespace.
+
+    When Hermes runs inside a container with HERMES_USE_NSENTER=1, it enters
+    PID 1's namespaces via nsenter. If a child process is spawned on the host
+    (or if Hermes is already running on the host), it should not attempt to
+    re-run nsenter (which will fail with 'Operation not permitted' for unprivileged users).
+    """
+    if _IS_WINDOWS:
+        return False
+    try:
+        if os.path.exists("/proc/self/ns/mnt") and os.path.exists("/proc/1/ns/mnt"):
+            return os.stat("/proc/self/ns/mnt").st_ino == os.stat("/proc/1/ns/mnt").st_ino
+    except OSError:
+        logger.debug("Could not compare mount namespaces", exc_info=True)
+    try:
+        # Fallback check: if /proc/1/comm is systemd/init and not running in a container
+        if os.path.exists("/proc/1/comm"):
+            with open("/proc/1/comm", "r", encoding="utf-8", errors="replace") as f:
+                comm = f.read().strip().lower()
+            if comm in ("systemd", "init") and not os.path.exists("/.dockerenv") and not os.path.exists("/run/.containerenv"):
+                return True
+    except OSError:
+        logger.debug("Could not inspect the host init process", exc_info=True)
+    return False
+
+
+def _use_host_namespace() -> bool:
+    # health: allow HX002 -- existing container opt-in shared with docker/stage2-hook.sh
+    requested = os.getenv("HERMES_USE_NSENTER", "").lower() in ("1", "true", "yes")
+    return requested and not _is_already_in_host_namespace()
+
+
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping, from
     :func:`routed_terminal_base` so the backend's own ``env`` and the served profile's own names
@@ -900,6 +935,7 @@ def _make_run_env(env: dict) -> dict:
     if published:
         run_env.update(published)
         run_env.pop("WAYLAND_DISPLAY", None)  # X11 desktop; a leaked Wayland socket flips GTK/Chromium backends
+    run_env["HERMES_ACTIVE_TURN"] = "1"
     return run_env
 
 
@@ -1135,6 +1171,8 @@ def _kill_process_windows(proc) -> None:
         proc.wait(timeout=2.0)
 
 
+
+
 class LocalEnvironment(BaseEnvironment):
     """Run commands directly on the host: every execute() spawns a fresh bash;
     the session snapshot preserves exported env vars across calls (unless
@@ -1200,6 +1238,18 @@ class LocalEnvironment(BaseEnvironment):
             cache_dir.mkdir(parents=True, exist_ok=True)
             _prune_terminal_temp_once()
             return str(cache_dir).replace("\\", "/")
+        if _use_host_namespace():
+            # no-tmp: ok — the command runs in the host mount namespace, where container scratch paths may not exist.
+            temp_dir = Path("/tmp/hermes_terminal")
+            try:
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                os.chmod(temp_dir, 0o777)
+                return str(temp_dir)
+            except OSError:
+                logger.warning("Could not prepare host namespace terminal temp directory", exc_info=True)
+                # no-tmp: ok — host namespace fallback when the dedicated host directory is unavailable.
+                return "/tmp"
+
         def _posix(p: str) -> str:
             return p.rstrip("/") or "/"
         for env_var in ("TERMINAL_TEMP_DIR", "TMPDIR", "TMP", "TEMP"):
@@ -1280,19 +1330,46 @@ class LocalEnvironment(BaseEnvironment):
         # Login invocations (init_session's env snapshot) source the user's rc /
         # custom init files so nvm/asdf/pyenv land on PATH in the snapshot; then the
         # spawn env's dirs a resetting profile dropped are re-appended (#56634).
-        if login:
+        use_nsenter = _use_host_namespace()
+        if login and not use_nsenter:
             cmd_string = _append_dropped_path_entries(cmd_string, run_env.get("PATH", ""))
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
-        args = [bash, *(["-l"] if login else []), "-c", cmd_string]
         # Not spawn_owned: an awaited command needs no spawn-ledger entry; own_process_groups below hands
         # its group to the owner-death supervisor and _wait_for_process releases it.
+        if use_nsenter and not _IS_WINDOWS:
+            import shlex
+            host_user = os.getenv("HERMES_HOST_USER", "").strip()  # health: allow HX002 -- container host account identity paired with HERMES_UID and HERMES_GID
+            host_uid = os.getenv("HERMES_UID", "1000")
+            host_gid = os.getenv("HERMES_GID", "1000")
+            home_dir = f"/home/{host_user}" if host_user else "/root"
+            from hermes_constants import get_hermes_home
+            hermes_home = str(get_hermes_home())
+            runtime_dir = f"/run/user/{host_uid}"
+            dbus_address = f"unix:path={runtime_dir}/bus"
+            env_prefix = f"export HERMES_ACTIVE_TURN=1 HERMES_USE_NSENTER=0 HERMES_HOME={shlex.quote(hermes_home)} HOME={shlex.quote(home_dir)} USER={shlex.quote(host_user or 'root')} LOGNAME={shlex.quote(host_user or 'root')} XDG_RUNTIME_DIR={shlex.quote(runtime_dir)} DBUS_SESSION_BUS_ADDRESS={shlex.quote(dbus_address)}; "
+            if self.cwd:
+                wrapped_cmd = f"{env_prefix}cd {shlex.quote(self.cwd)} && {cmd_string}"
+            else:
+                wrapped_cmd = f"{env_prefix}{cmd_string}"
+            if host_user:
+                args = [
+                    "nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p",
+                    "--", "setpriv", "--reuid", host_uid, "--regid", host_gid, "--init-groups",
+                    "/bin/bash", "-lc", wrapped_cmd
+                ]
+            else:
+                args = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "/bin/bash", "-lc", wrapped_cmd]
+            _popen_cwd = None
+        else:
+            args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+            _popen_cwd = self._spawn_cwd()
         try:
             proc = subprocess.Popen(
                 args, text=True, env=run_env, encoding="utf-8", errors="replace",
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                 # detached-spawn: ok — owned via own_process_groups right below
-                start_new_session=True, cwd=self._spawn_cwd(),
+                start_new_session=True, cwd=_popen_cwd,
                 pass_fds=tuple(fd for fd in (secret_fd, source_fd, restore_fd) if fd >= 0),
                 creationflags=windows_hide_flags() if _IS_WINDOWS else 0)
         finally:

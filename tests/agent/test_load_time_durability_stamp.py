@@ -168,7 +168,7 @@ def test_noop_progress_check_is_marker_insensitive(tmp_path: Path) -> None:
     marker-swept — a raw ``==`` would misclassify the semantically-identical
     no-op as progress and rotate the session for nothing.
     """
-    from agent.conversation_compression import _strip_marker_for_comparison
+    from agent.conversation_compression_archive import strip_marker_for_comparison
 
     db = storage_handle(tmp_path)
     _seed_session(db, "NOOP", turns=2)
@@ -181,16 +181,16 @@ def test_noop_progress_check_is_marker_insensitive(tmp_path: Path) -> None:
         for m in stamped
     ]
     assert swept != stamped  # raw == is marker-sensitive — the bug shape
-    assert _strip_marker_for_comparison(swept) == _strip_marker_for_comparison(
+    assert strip_marker_for_comparison(swept) == strip_marker_for_comparison(
         stamped
     )
 
     # Genuine progress must still register as inequality.
     compacted = swept[:-1]
-    assert _strip_marker_for_comparison(compacted) != _strip_marker_for_comparison(
+    assert strip_marker_for_comparison(compacted) != strip_marker_for_comparison(
         stamped
     )
 
     # Defensive passthrough shapes.
-    assert _strip_marker_for_comparison(None) is None
-    assert _strip_marker_for_comparison(["not-a-dict"]) == ["not-a-dict"]
+    assert strip_marker_for_comparison(None) is None
+    assert strip_marker_for_comparison(["not-a-dict"]) == ["not-a-dict"]

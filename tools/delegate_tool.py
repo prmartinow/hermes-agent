@@ -49,7 +49,14 @@ from tools.delegate_tool_registry import (
     steer_subagent,
 )
 from tools.delegate_tool_tasks import (
-    _MAX_TASK_IMAGES, _coerce_task_images, _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
+    _MAX_TASK_IMAGES, _coerce_task_continue_from, _coerce_task_images, _coerce_task_inherit_compacted_history, _coerce_task_inherit_context, _coerce_task_inherit_context_mode, _coerce_task_inherit_max_tokens,
+    _coerce_task_schemas, _normalize_task_images, _normalize_task_list,
+)
+from tools.delegation_context import (
+    ContextInheritanceError, build_batch_context_snapshots, build_delegation_context_snapshot,
+)
+from tools.delegation_context_budget import (
+    preflight_children_budget,
 )
 from tools.delegate_tool_tuning import pin_child_service_tier
 from tools.delegate_tool_toolsets import (
@@ -222,6 +229,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[dict[str, Any]] = None,
 
+    override_max_tokens: Optional[int] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[list[str]] = None,
@@ -286,7 +294,7 @@ def _build_child_agent(
             parent_agent, delegation_cfg, parent_api_key, model=model, override_provider=override_provider,
             override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
             override_acp_command=override_acp_command,
-            override_acp_args=override_acp_args,
+            override_acp_args=override_acp_args, override_max_tokens=override_max_tokens,
             routing_cfg=routing_cfg, override_reasoning_effort=override_reasoning_effort,
         )
         # An inherited route re-resolves from the parent, which may have switched provider since: its transcript
@@ -441,6 +449,7 @@ def _run_single_child(
     # Set when a timed-out Future still owns the child: closing it from this
     # thread before the worker settles races the conversation's finally path.
     _child_close_deferred = False
+    entry = None
     try:
         heartbeat.start()
         _safe_progress(child_progress_cb, "subagent.start", preview=goal)
@@ -453,7 +462,9 @@ def _run_single_child(
             return run.settle(run.finish_failed(entry, run.close_steering(), preview=cancelled, summary=cancelled))
         result, failure_entry, _child_close_deferred = run.await_child()
         if failure_entry is not None:
-            return run.settle(failure_entry)
+            entry = failure_entry
+            entry["continuation_available"] = False
+            return run.settle(entry)
         run.turn_exit_reason = result.get("turn_exit_reason") if isinstance(result, dict) else None
 
         schema = _validate_child_output_schema(child, result, task_index, run.child_task_id, run.relay_text)
@@ -465,21 +476,64 @@ def _run_single_child(
 
         duration = run.elapsed()
         entry = _build_result_entry(child, result, task_index, duration, schema)
+        entry["continuation_available"] = False
+        if not _child_close_deferred:
+            from tools.delegation_context_continuation import stamp_child_terminal_state
+            stamp_child_terminal_state(child, entry)
         run.append_sibling_write_reminder(entry)
-        run.account_background_processes(entry)
         run.emit_complete(result, entry, duration)
-        return run.settle(run.attach_worktree(entry))
+        entry = run.attach_worktree(entry)
+        return run.settle(entry)
     except Exception as exc:
         # Close steer acceptance before any completion callback (see _merge_late_steer).
         _late_pending_steer = run.close_steering()
         logging.exception(f"[subagent-{task_index}] failed")
         # Entry status "error" (contract), progress event status "failed" (UI vocabulary).
-        return run.settle(run.finish_failed(
+        entry = run.finish_failed(
             _fabricated_entry(task_index, "error", str(exc), child, run.elapsed()), _late_pending_steer,
             preview=str(exc), summary=str(exc), status="failed",
-        ))
+        )
+        entry["continuation_available"] = False
+        return run.settle(entry)
     finally:
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
+        if (
+            entry is not None
+            and not _child_close_deferred
+            and entry.get("status") in {"completed", "failed", "interrupted"}
+        ):
+            from tools.delegation_context_continuation import verify_child_terminal_readback
+            child_sid = entry.get("child_session_id") or getattr(child, "session_id", None)
+            target_db = getattr(parent_agent, "_session_db", None) or getattr(child, "_session_db", None)
+            parent_sid = getattr(parent_agent, "session_id", None)
+            if child_sid and target_db:
+                entry["continuation_available"] = verify_child_terminal_readback(
+                    target_db, child_sid, expected_parent_id=parent_sid
+                )
+
+
+def _cleanup_constructed_children(parent_agent: Any, children: list[tuple]) -> None:
+    """Clean up and close any constructed child agents after a preflight or build error."""
+    parent_sid = getattr(parent_agent, "session_id", None) if parent_agent else None
+    for item in children:
+        child = item[2] if len(item) > 2 else None
+        if child is not None:
+            if parent_agent is not None:
+                _detach_child(parent_agent, child)
+            _close_child(child, "Cleaning up unrun child after preflight failure")
+            with _quiet("subagent_stop hook invocation failed during preflight cleanup", exc_info=True):
+                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+                _invoke_hook(
+                    "subagent_stop",
+                    parent_session_id=parent_sid,
+                    parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                    parent_subagent_id=getattr(parent_agent, "_subagent_id", None),
+                    child_session_id=getattr(child, "session_id", None),
+                    child_subagent_id=getattr(child, "_subagent_id", None),
+                    child_role=getattr(child, "_delegate_role", None),
+                    child_goal=getattr(child, "_goal", "") or "",
+                    child_status="failed",
+                )
 
 
 def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -488,7 +542,7 @@ def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) ->
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
         "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
-        "override_acp_command": creds.get("command"),
+        "override_max_tokens": creds.get("max_output_tokens"), "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
         "override_service_tier": creds.get("service_tier"),
         "routing_cfg": routing_cfg,
@@ -508,6 +562,7 @@ def _build_children(
     top_role: str, max_iterations: int, parent_agent,
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[list[Optional[list[str]]]] = None,
     rebuild: Optional[list[dict[str, Any]]] = None,
+    batch_snapshots: Optional[dict[int, Any]] = None,
 ) -> tuple[list[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe), each on its task's route;
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure. ``rebuild`` (action='continue')
@@ -532,10 +587,7 @@ def _build_children(
                 **{"toolsets": None, "model": route.creds["model"], **(rebuild[i] if rebuild else {})},
             )
         except ValueError as exc:
-            # An owner refusal can land mid-batch: the siblings built so far hold reservations.
-            for _, _, built in children:
-                _detach_child(parent_agent, built)
-                _close_child(built, "Failed to close child after a refused sibling")
+            _cleanup_constructed_children(parent_agent, children)
             return [], str(exc)
         pin_child_service_tier(child, route.creds)
         if isinstance(getattr(child, "_delegate_resume", None), dict):
@@ -548,6 +600,10 @@ def _build_children(
         if _t_images:
             with _quiet("Could not attach images to child %d", i):
                 child._delegate_images = _t_images
+        snapshot = batch_snapshots.get(i) if batch_snapshots else None
+        if snapshot is not None:
+            child._inherited_context_snapshot = snapshot
+            child._inherited_context_manifest = snapshot.manifest.to_dict()
         # Tee progress events into the live transcript (wrapper keeps the
         # _flush contract and swallows writer failures).
         _writer = live_writers[i] if i < len(live_writers) else None
@@ -610,6 +666,68 @@ def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
     return None
 
 
+def _refund_oneshot_spawn_budget(parent_agent: Any, count: int) -> None:
+    from agent.oneshot_footprint import is_single_query_session
+    if is_single_query_session() and _get_oneshot_max_children() > 0:
+        spent = getattr(parent_agent, "_oneshot_children_spawned", 0)
+        parent_agent._oneshot_children_spawned = max(0, spent - count)
+
+
+def _prepare_task_options(task_list, output_schema, images):
+    """Validate task options in order, stopping before any route or spawn on error."""
+    options = {}
+    for name, validate, extra in (
+        ("schemas", _coerce_task_schemas, output_schema),
+        ("images", _coerce_task_images, images),
+    ):
+        options[name], error = validate(task_list, extra)
+        if error:
+            return None, error
+    options["inherited"], error = _coerce_task_inherit_context(task_list)
+    if error:
+        return None, error
+    for name, validate in (
+        ("ceilings", _coerce_task_inherit_max_tokens),
+        ("modes", _coerce_task_inherit_context_mode),
+        ("histories", _coerce_task_inherit_compacted_history),
+        ("continuations", _coerce_task_continue_from),
+    ):
+        options[name], error = validate(task_list, options["inherited"])
+        if error:
+            return None, error
+    return options, None
+
+
+def _build_route_snapshots(parent_agent, routes, task_list, inherited, ceilings, modes, histories, continuations):
+    """Build inherited context against each child's actual route and context window."""
+    route_groups = {}
+    for i, route in enumerate(routes):
+        if route.error or not inherited[i]:
+            continue
+        destination = tuple(route.creds.get(field) or getattr(parent_agent, field, None)
+                            for field in ("model", "base_url", "api_key", "provider"))
+        route_groups.setdefault(destination, []).append(i)
+    batch_snapshots = {}
+    for (model, base_url, api_key, provider), indices in route_groups.items():
+        overrides = [ceilings[i] for i in indices]
+        kwargs = dict(child_model=model, child_base_url=base_url, child_api_key=api_key, child_provider=provider)
+        selected_modes = [modes[i] for i in indices]
+        selected_histories = [histories[i] for i in indices]
+        selected_continuations = [continuations[i] for i in indices]
+        if any(value is not None for value in overrides) or "bounded" in selected_modes or any(selected_histories) or any(selected_continuations):
+            snapshots = build_batch_context_snapshots(
+                parent_agent, [True] * len(indices), overrides, task_inherit_context_modes=selected_modes,
+                task_inherit_compacted_histories=selected_histories, task_continue_from=selected_continuations,
+                task_goals=[task_list[i].get("goal", "") for i in indices],
+                task_contexts=[task_list[i].get("context") for i in indices], **kwargs,
+            )
+        else:
+            snapshot = build_delegation_context_snapshot(parent_agent, **kwargs)
+            snapshots = [snapshot] * len(indices)
+        batch_snapshots.update(zip(indices, snapshots))
+    return batch_snapshots
+
+
 def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
@@ -668,10 +786,15 @@ def delegate_task(
         )
     max_children = _get_max_concurrent_children()
     task_list, err = _normalize_task_list(goal, context, tasks, output_schema, top_role, max_children)
-    if not err:
-        task_schemas, err = _coerce_task_schemas(task_list, output_schema)
-    if not err:
-        task_images, err = _coerce_task_images(task_list, images)
+    if err:
+        return tool_error(err)
+    options, err = _prepare_task_options(task_list, output_schema, images)
+    if err:
+        return tool_error(err)
+    task_schemas, task_images = options["schemas"], options["images"]
+    task_inherit_contexts, task_inherit_max_tokens = options["inherited"], options["ceilings"]
+    task_inherit_context_modes, task_inherit_compacted_history = options["modes"], options["histories"]
+    task_continue_from = options["continuations"]
     if not err:
         # One route per task from the active delegation provider (delegation.backend), or from credentials_cfg
         # (internal callers only, e.g. /review → auxiliary.review: a per-call routing owner shaped like the
@@ -694,6 +817,17 @@ def delegate_task(
     err = _oneshot_spawn_budget(parent_agent, len(runnable))
     if err:
         return tool_error(err)
+
+    # Each route can have a different context window. Tasks sharing a route
+    # share the rendered snapshot, with their own ceilings checked before spawn.
+    try:
+        batch_snapshots = _build_route_snapshots(
+            parent_agent, routes, task_list, task_inherit_contexts, task_inherit_max_tokens,
+            task_inherit_context_modes, task_inherit_compacted_history, task_continue_from,
+        )
+    except ContextInheritanceError as exc:
+        _refund_oneshot_spawn_budget(parent_agent, len(runnable))
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
@@ -723,9 +857,17 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, routes, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        batch_snapshots=batch_snapshots,
     )
     if err:
+        _refund_oneshot_spawn_budget(parent_agent, len(runnable))
         return tool_error(err)
+
+    preflight_err = preflight_children_budget(children, parent_agent=parent_agent)
+    if preflight_err:
+        _cleanup_constructed_children(parent_agent, children)
+        _refund_oneshot_spawn_budget(parent_agent, len(runnable))
+        return tool_error(preflight_err)
     batch = _Batch(
         task_list, children, parent_agent, creds, context, top_role, max_children,
         live_deleg_id, live_writers, live_paths, *origin, overall_start,
@@ -900,6 +1042,42 @@ DELEGATE_TASK_SCHEMA = {
                             "Result-delivery bucket. Tasks sharing a group return together in ONE message once all of "
                             "them finish; a task with its own group returns alone when it finishes. Does not order "
                             "execution; if B needs A's output, dispatch B after A returns.",
+                        ),
+                        "inherit_context": _p(
+                            "boolean",
+                            "Optional opt-in flag (default false). When true, provides the subagent with an "
+                            "immutable, provenance-labeled historical transcript of parent conversation context, "
+                            "including current-turn user instructions and completed tool evidence (excluding "
+                            "system prompts, provider reasoning sidecars, and unresolved tool scaffolding). "
+                            "WARNING: When subagents use a different model or provider, enabling this transmits "
+                            "sanitized historical context across provider boundaries.",
+                        ),
+                        "inherit_max_tokens": _p(
+                            "integer",
+                            "Optional per-task token budget ceiling for inherited context (positive integer; requires inherit_context: true). "
+                            "When omitted, defaults to delegation.inherit_max_tokens (64,000) clamped to the child model's context window. "
+                            "Allows requesting a larger ceiling for subagents running on large-context models without changing global configuration.",
+                        ),
+                        "inherit_context_mode": _p(
+                            "string",
+                            "Optional context inheritance mode: 'full' (default) seeds the complete historical transcript; "
+                            "'bounded' seeds a prioritized subset within token budget (always preserving the latest user prompt in full "
+                            "and attaching full underlying records accessible via session_search). Requires inherit_context: true.",
+                            enum=["full", "bounded"],
+                        ),
+                        "inherit_compacted_history": _p(
+                            "boolean",
+                            "Optional opt-in flag (default false; requires inherit_context: true). When true, attempts to recover "
+                            "and stitch locally archived conversation turns (compacted in-place within the same session) before "
+                            "the visible active generation. Coverage is limited to retained readable archive rows in that exact session. "
+                            "Rewound/superseded rows and rotated lineages are excluded; opaque checkpoints still fail closed. "
+                            "Archived ordinary text may contain sensitive data and may cross provider boundaries.",
+                        ),
+                        "continue_from": _p(
+                            "string",
+                            "Optional exact prior child session ID string (requires inherit_context: true). "
+                            "When specified, captures the prior owned terminal worker's transcript as evidence "
+                            "alongside fresh parent context into a combined snapshot.",
                         ),
                     },
                     "required": ["goal"],

@@ -79,6 +79,7 @@ class TestPtyBridgeIO:
         bridge._fd = 123
         bridge._closed = False
         bridge._fd_lock = threading.Lock()
+        bridge._retirement_dir = None
         wait_started = asyncio.Event()
         release_write = asyncio.Event()
         write_calls = 0
@@ -123,6 +124,7 @@ class TestPtyBridgeIO:
         bridge._fd = 123
         bridge._closed = False
         bridge._fd_lock = threading.Lock()
+        bridge._retirement_dir = None
 
         def fake_write(_fd, _data):
             raise BlockingIOError(errno.EAGAIN, "buffer full")
@@ -282,6 +284,7 @@ class TestPtyBridgeClose:
         bridge._pgid = 12345
         bridge._closed = False
         bridge._fd_lock = threading.Lock()
+        bridge._retirement_dir = None
 
         bridge.close()
 
@@ -321,6 +324,7 @@ class TestPtyBridgeClose:
         bridge._pgid = 67890
         bridge._closed = False
         bridge._fd_lock = threading.Lock()
+        bridge._retirement_dir = None
 
         bridge.close()
 
@@ -402,6 +406,7 @@ class TestPtyBridgeClose:
             bridge._pgid = os.getpgid(popen.pid)
             bridge._closed = False
             bridge._fd_lock = threading.Lock()
+            bridge._retirement_dir = None
 
             bridge.close()
         finally:
@@ -451,3 +456,26 @@ class TestPtyBridgeEnv:
             assert str(tmp_path).encode() in output
         finally:
             bridge.close()
+
+
+def test_constructor_failure_closes_child_and_private_retirement_directory(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import pty_bridge
+    closed, directories = [], []
+    original_directory = pty_bridge.tempfile.TemporaryDirectory
+
+    def directory(**kwargs):
+        value = original_directory(dir=tmp_path, **kwargs)
+        directories.append(value.name)
+        return value
+
+    def broken_constructor(self, proc):
+        raise OSError("synthetic readiness registration failure")
+
+    monkeypatch.setattr(pty_bridge.tempfile, "TemporaryDirectory", directory)
+    monkeypatch.setattr(pty_bridge.ptyprocess.PtyProcess, "spawn", lambda *args, **kwargs: SimpleNamespace(close=lambda **kwargs: closed.append(True)))
+    monkeypatch.setattr(PtyBridge, "__init__", broken_constructor)
+    with pytest.raises(OSError, match="synthetic readiness"):
+        PtyBridge.spawn(["synthetic-child"], env={"HERMES_TUI_DASHBOARD": "1"})
+    assert closed == [True]
+    assert directories and all(not os.path.exists(path) for path in directories)

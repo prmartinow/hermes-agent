@@ -20,10 +20,13 @@ case "${HERMES_DASHBOARD:-}" in
 esac
 
 # with-contenv repopulates HOME from /init as /root. Reset it before
-# dropping privileges so HOME-anchored state lands under /opt/data.
-export HOME=/opt/data
+# dropping privileges so HOME-anchored state lands under HERMES_HOME.
+case "${HOME:-}" in
+    ""|/root) export HOME="${HERMES_HOME:-/opt/data}" ;;
+esac
+HERMES_DIR="${HERMES_HOME:-/opt/data}"
 
-cd /opt/data
+cd "$HERMES_DIR"
 
 dash_host="${HERMES_DASHBOARD_HOST:-0.0.0.0}"
 dash_port="${HERMES_DASHBOARD_PORT:-9119}"

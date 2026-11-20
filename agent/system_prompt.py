@@ -20,7 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.delegation_context import owned_kanban_task
 from agent.prompt_cache_scope import conversation_id
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GEMMA_MODEL_OPERATIONAL_GUIDANCE,
+    GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
@@ -605,7 +606,11 @@ def _guidance_parts(agent: Any) -> list[str]:
     # DeepSeek/Kimi/Qwen-class models get it even with enforcement off.
     if _model_gate(agent._tool_use_enforcement, agent.model, TOOL_USE_ENFORCEMENT_MODELS):
         parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
-        if any(g in (agent.model or "").lower() for g in ("gemini", "gemma")):
+        model_name = (agent.model or "").lower()
+        if "gemma" in model_name:
+            guidance = GOOGLE_MODEL_OPERATIONAL_GUIDANCE if getattr(agent, "provider", None) == "gemini" else GEMMA_MODEL_OPERATIONAL_GUIDANCE
+            parts.append(guidance)
+        elif "gemini" in model_name:
             parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
     if _model_gate(getattr(agent, "_execution_guidance", "auto"), agent.model, EXECUTION_GUIDANCE_MODELS):
         from agent.prompt_builder import execution_guidance_text

@@ -140,22 +140,26 @@ def test_ttl_and_cap_reapers_spare_session_with_active_desktop_loop(server, deta
     assert server._session_is_lru_evictable(sid, session)
 
 
-def test_settled_client_gone_interrupt_is_collected_despite_active_loop(server, detached, monkeypatch):
-    """A stale detached turn is interrupted at grace; once it settles the session must be collected, not re-armed.
-    Re-arming would leave the interrupt latches set forever: no tick can claim the turn and every reattach is
-    refused with 4009 while the loop never reaches its tick budget."""
+def test_running_detached_session_and_its_loop_survive_orphan_reap(server, detached, monkeypatch):
+    """Viewer disconnect never interrupts running work; the loop stays alive until cleared."""
+    from hermes_cli.loops import LoopManager
+
     sid, session, popped = detached
     _set_loop(session["session_key"])
-    monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 0)  # every running turn reads as stale
-    monkeypatch.setattr(server, "_interrupt_session_turn", lambda *a, **kw: False)
+    monkeypatch.setattr(server, "_WS_ORPHAN_ACTIVITY_STALE_S", 0)
+    interrupt = MagicMock()
+    monkeypatch.setattr(server, "_interrupt_session_turn", interrupt)
     session["running"] = True
 
     _fire_orphan_reap(server, sid)
-    assert session["_client_gone_interrupt_requested"] and server._sessions.get(sid) is session
+    assert server._sessions.get(sid) is session
+    interrupt.assert_not_called()
 
-    session["running"] = False  # the interrupted turn settles
+    session["running"] = False
     _Timer.created[-1].callback()
-
+    assert server._sessions.get(sid) is session and not popped
+    LoopManager(session["session_key"]).clear()
+    _Timer.created[-1].callback()
     assert sid not in server._sessions and popped == [session]
 
 

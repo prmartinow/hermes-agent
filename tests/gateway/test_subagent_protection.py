@@ -230,8 +230,8 @@ class TestBusyHandlerDemotesInterruptForSubagents:
             await runner._handle_active_session_busy_message(event, sk)
 
         parent.steer.assert_called_once()
-        injected = parent.steer.call_args.args[0]
-        assert injected.endswith("course-correct")
-        assert '"chat_id": "123"' in injected
+        steered_text = parent.steer.call_args.args[0]
+        assert steered_text.endswith("\n\n" + event.text)
+        assert '"user_id": "user1"' in steered_text
         parent.interrupt.assert_not_called()
 

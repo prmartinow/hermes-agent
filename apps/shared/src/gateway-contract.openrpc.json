@@ -34590,6 +34590,26 @@
         "title": "PromptSubmitStatus",
         "type": "string"
       },
+      "PromptSubmittedPayload": {
+        "additionalProperties": false,
+        "description": "``methods_prompt`` announces a newly submitted prompt to connected viewers.",
+        "properties": {
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "text"
+        ],
+        "title": "PromptSubmittedPayload",
+        "type": "object"
+      },
       "ProviderLimit": {
         "additionalProperties": false,
         "description": "``hermes_cli/inventory.py::_apply_limits`` \u2014 ``account``: the whole login is rate-limited until\n``resets_at`` (ISO, absent when unknown); ``models``: only these models are, each until its time.",
@@ -38384,6 +38404,19 @@
               }
             ],
             "default": null
+          },
+          "budget_report": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Budget Report"
           }
         },
         "required": [
@@ -39767,6 +39800,90 @@
             ],
             "default": null,
             "title": "Profile"
+          },
+          "after_row_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "After Row Id"
+          },
+          "before_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Before Index"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cursor"
+          },
+          "limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Limit"
+          },
+          "snapshot_max_row_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Snapshot Max Row Id"
+          },
+          "snapshot_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Snapshot Token"
+          },
+          "tail_limit": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tail Limit"
           }
         },
         "required": [
@@ -39778,9 +39895,69 @@
       "SessionHistoryResult": {
         "additionalProperties": false,
         "properties": {
+          "after_row_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "After Row Id"
+          },
           "count": {
             "title": "Count",
             "type": "integer"
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Cursor"
+          },
+          "end_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "End Index"
+          },
+          "has_more": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Has More"
+          },
+          "has_more_before": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Has More Before"
           },
           "messages": {
             "items": {
@@ -39788,6 +39965,90 @@
             },
             "title": "Messages",
             "type": "array"
+          },
+          "next_after_row_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Next After Row Id"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Next Cursor"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          },
+          "snapshot_max_row_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Snapshot Max Row Id"
+          },
+          "snapshot_token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Snapshot Token"
+          },
+          "start_index": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Start Index"
+          },
+          "total": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Total"
           }
         },
         "required": [
@@ -47890,6 +48151,26 @@
         "title": "TurnStatus",
         "type": "string"
       },
+      "TurnSteerPayload": {
+        "additionalProperties": false,
+        "description": "``session_auto_continue`` reports a correction accepted by a running turn.",
+        "properties": {
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "timestamp": {
+            "title": "Timestamp",
+            "type": "number"
+          }
+        },
+        "required": [
+          "text",
+          "timestamp"
+        ],
+        "title": "TurnSteerPayload",
+        "type": "object"
+      },
       "UiMetaConflict": {
         "additionalProperties": false,
         "properties": {
@@ -52546,6 +52827,18 @@
       ]
     },
     {
+      "name": "prompt.submitted",
+      "summary": "A prompt was submitted in the named session.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/PromptSubmittedPayload"
+          }
+        }
+      ]
+    },
+    {
       "name": "reaction",
       "summary": "Affection reaction detected in the user's message (hearts etc.).",
       "params": [
@@ -52913,6 +53206,18 @@
           "name": "payload",
           "schema": {
             "$ref": "#/components/schemas/ToolStartPayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "turn.steer",
+      "summary": "A running turn accepted a user correction.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/TurnSteerPayload"
           }
         }
       ]

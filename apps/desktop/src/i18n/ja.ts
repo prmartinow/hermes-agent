@@ -789,10 +789,6 @@ export const jaOverrides = {
           model: 'Mistral TTS モデル',
           voiceId: 'Mistral 音声'
         },
-        gemini: {
-          model: 'Gemini TTS モデル',
-          voice: 'Gemini 音声'
-        },
         neutts: {
           model: 'NeuTTS モデル',
           device: 'NeuTTS デバイス'

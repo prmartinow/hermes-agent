@@ -5,7 +5,7 @@
       "stable": 1829,
       "volatile": 1268
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 9988,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -36,38 +36,7 @@
       "stable": 1225,
       "volatile": 1268
     },
-    "tool_tokens": 9464,
-    "tools": [
-      "browser_cdp",
-      "browser_dialog",
-      "browser_exec",
-      "clarify",
-      "delegate_task",
-      "execute_code",
-      "memory",
-      "patch",
-      "read_file",
-      "search_files",
-      "skill_manage",
-      "skill_view",
-      "skills_list",
-      "terminal",
-      "tool_call",
-      "tool_describe",
-      "tool_search",
-      "vision_analyze",
-      "web_extract",
-      "web_search",
-      "write_file"
-    ]
-  },
-  "cli.gemini": {
-    "prompt_tokens": {
-      "context": 0,
-      "stable": 1646,
-      "volatile": 1266
-    },
-    "tool_tokens": 9464,
+    "tool_tokens": 9988,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -98,7 +67,7 @@
       "stable": 2420,
       "volatile": 1264
     },
-    "tool_tokens": 9620,
+    "tool_tokens": 10144,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -129,7 +98,7 @@
       "stable": 1225,
       "volatile": 1268
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 9988,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -160,7 +129,7 @@
       "stable": 1211,
       "volatile": 1268
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 9988,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -191,7 +160,7 @@
       "stable": 1495,
       "volatile": 1269
     },
-    "tool_tokens": 10120,
+    "tool_tokens": 10644,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -223,7 +192,7 @@
       "stable": 1244,
       "volatile": 1269
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 9988,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -254,7 +223,7 @@
       "stable": 1330,
       "volatile": 1269
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 9988,
     "tools": [
       "browser_cdp",
       "browser_dialog",

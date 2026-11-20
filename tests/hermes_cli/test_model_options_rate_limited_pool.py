@@ -54,8 +54,8 @@ def pooled_home(tmp_path, monkeypatch):
     return write
 
 
-# anthropic reaches the picker through the overlay section, gemini through the models.dev one.
-@pytest.mark.parametrize("provider", ["anthropic", "gemini"])
+# Exercise both OAuth and API-key credential pools in the picker.
+@pytest.mark.parametrize("provider", ["anthropic", "deepseek"])
 @pytest.mark.parametrize("cooldown", ["exhausted", "model_cooldown"])
 @pytest.mark.parametrize("explicit_only", [True, False])
 def test_rate_limited_pool_keeps_its_provider_row(pooled_home, provider, cooldown, explicit_only):
@@ -68,7 +68,7 @@ def test_rate_limited_pool_keeps_its_provider_row(pooled_home, provider, cooldow
     assert row["models"], "the kept row must still offer the provider's models"
 
 
-@pytest.mark.parametrize("provider", ["anthropic", "gemini"])
+@pytest.mark.parametrize("provider", ["anthropic", "deepseek"])
 def test_kept_row_says_which_limit_and_when_it_resets(pooled_home, provider):
     """The row names the limit's scope and the pool's own reset time, and a healthy pool says nothing."""
     ctx = load_picker_context()

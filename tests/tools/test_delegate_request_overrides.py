@@ -58,14 +58,19 @@ def test_direct_branch_forwards_request_overrides():
     assert creds["request_overrides"] == {
         "extra_body": {"provider": {"sort": "throughput"}},
     }
-    # Dedicated user cap controls are not part of child credentials.
-    assert "max_output_tokens" not in creds
+    assert creds["max_output_tokens"] is None
 
 
 def test_direct_branch_absent_request_overrides_stays_none():
     """No delegation.request_overrides → None, preserving the old contract."""
     creds = _resolve_delegation_credentials(_cfg(), parent_agent=None)
     assert creds["request_overrides"] is None
+
+
+def test_bare_base_url_with_parent_has_no_output_override():
+    creds = _resolve_delegation_credentials(_cfg(provider=""), parent_agent=_parent())
+    assert creds["request_overrides"] is None
+    assert creds["max_output_tokens"] is None
 
 
 def test_direct_branch_non_dict_request_overrides_stays_none():
@@ -93,7 +98,7 @@ def test_explicit_merges_over_runtime_on_provider_alongside_base_url(mock_resolv
     """Precedence on the provider-alongside-base_url path (#98237 interplay):
     explicit delegation.request_overrides merges OVER the named provider's
     runtime overrides — runtime extra_body keys survive unless redefined,
-    explicit top-level keys win, and legacy max_output_tokens is ignored."""
+    explicit top-level keys win and the endpoint's output limit is retained."""
     mock_resolve.return_value = {
         "provider": "custom",
         "base_url": "https://provider-default.example/v1",
@@ -123,7 +128,7 @@ def test_explicit_merges_over_runtime_on_provider_alongside_base_url(mock_resolv
             "provider": {"sort": "throughput"},
         },
     }
-    assert "max_output_tokens" not in creds
+    assert creds["max_output_tokens"] == 8192
 
 
 # ── Branch 2: named provider (no base_url) ─────────────────────────────────
@@ -153,6 +158,7 @@ def test_named_provider_branch_honors_explicit_key(mock_resolve):
             "provider": {"sort": "throughput"},
         }
     }
+    assert creds["max_output_tokens"] == 4096
 
 
 @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
@@ -169,6 +175,7 @@ def test_named_provider_branch_without_explicit_key_unchanged(mock_resolve):
     cfg = {"model": "m", "provider": "openrouter"}
     creds = _resolve_delegation_credentials(cfg, parent_agent=None)
     assert creds["request_overrides"] == {"extra_body": {"reasoning": {"enabled": True}}}
+    assert creds["max_output_tokens"] == 4096
 
 
 # ── Branch 3: parent-inherit (no provider, no base_url) ────────────────────

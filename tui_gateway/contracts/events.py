@@ -132,6 +132,24 @@ event("notice", NoticePayload, doc="Informational one-liner for the session (cap
 # ── turn stream ───────────────────────────────────────────────────────────────────────────────
 
 
+class PromptSubmittedPayload(Payload):
+    """``methods_prompt`` announces a newly submitted prompt to connected viewers."""
+
+    session_id: str
+    text: str
+
+
+class TurnSteerPayload(Payload):
+    """``session_auto_continue`` reports a correction accepted by a running turn."""
+
+    text: str
+    timestamp: float
+
+
+event("prompt.submitted", PromptSubmittedPayload, doc="A prompt was submitted in the named session.")
+event("turn.steer", TurnSteerPayload, doc="A running turn accepted a user correction.")
+
+
 class MessageStartPayload(Payload):
     """``message.start``. Empty from the TUI gateway's emitters and for an ordinary admission;
     ``gateway/session_authority._stamp_claim`` adds an automation admission's async-result card

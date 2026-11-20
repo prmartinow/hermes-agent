@@ -40,7 +40,7 @@ Copper → Silver → Gold → Diamond → Olympian
 
 Each card has a collapsible **What counts** section showing the exact tracked metric or requirement once the user wants details.
 
-Version `0.2.x` expands the catalog to 60+ achievements, including model/provider badges such as **Five-Model Flight**, **Provider Polyglot**, **Claude Confidant**, **Gemini Cartographer**, and **Open Weights Pilgrim**.
+Version `0.2.x` expands the catalog with model/provider badges such as **Five-Model Flight**, **Provider Polyglot**, **Claude Confidant**, and **Open Weights Pilgrim**.
 
 ## Examples
 

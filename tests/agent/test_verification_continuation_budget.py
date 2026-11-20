@@ -36,9 +36,10 @@ def agent(tmp_path, monkeypatch):
             skip_context_files=True,
             skip_memory=True,
         )
+    monkeypatch.setattr("agent.turn_api_call._should_stream", lambda _agent: False)
     instance._cached_system_prompt = "stable test prompt"
     instance._session_db = None
-
+    instance._session_json_enabled = False
     instance.save_trajectories = False
     instance.compression_enabled = False
     instance._cleanup_task_resources = lambda *_a, **_kw: None

@@ -569,7 +569,7 @@ def _model_flow_stepfun(config, current_model=""):
 
 
 def _model_flow_vertex(config, current_model=""):
-    """Google Vertex AI (Gemini via the OpenAI-compatible endpoint). Auth is OAuth2 (service-account
+    """Google Vertex AI via the OpenAI-compatible endpoint. Auth is OAuth2 (service-account
     JSON or ADC): the credential *path* lives in .env (VERTEX_CREDENTIALS_PATH /
     GOOGLE_APPLICATION_CREDENTIALS); project ID and region are non-secret, saved under ``vertex:``."""
     from hermes_cli.auth import _prompt_model_selection
@@ -598,7 +598,7 @@ def _model_flow_vertex(config, current_model=""):
         return
     project_id = project_input or current_project
 
-    # 3. Region (default global — required for the Gemini 3.x previews).
+    # 3. Region (default global).
     current_region = str(vertex_cfg.get("region") or "global").strip() or "global"
     region_input = _ask(f"  Vertex region [{current_region}]: ", cancel_msg="")
     if region_input is None:
@@ -606,7 +606,7 @@ def _model_flow_vertex(config, current_model=""):
     region = region_input or current_region
 
     # 4. Model selection (curated list — Vertex has no /models listing route).
-    model_list = _PROVIDER_MODELS.get("vertex", []) or ["google/gemini-3-pro-preview", "google/gemini-3-flash-preview"]
+    model_list = _PROVIDER_MODELS.get("vertex", []) or ["claude-sonnet-4-5", "claude-haiku-4-5"]
     host = "aiplatform.googleapis.com" if region == "global" else f"{region}-aiplatform.googleapis.com"
     base_url_preview = f"https://{host}/v1beta1/projects/<project>/locations/{region}/endpoints/openapi"
     selected = _prompt_model_selection(model_list, current_model=current_model, confirm_provider="vertex", confirm_base_url=base_url_preview)

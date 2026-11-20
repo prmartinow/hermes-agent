@@ -19,7 +19,11 @@ import sys
 import termios  # windows-footgun: ok — POSIX-only module by design (see docstring)
 import threading
 import time
+import tempfile
+from pathlib import Path
 from typing import Callable, Optional, Sequence
+
+import psutil
 
 try:
     import ptyprocess  # type: ignore
@@ -114,6 +118,13 @@ class PtyBridge:
         self._proc = proc
         self._fd: int = proc.fd
         self._closed = False
+        self._retirement_dir = None
+        self._retirement_socket = None
+        self._viewer_only = False
+        try:
+            self.process_birth_time = psutil.Process(proc.pid).create_time()
+        except psutil.Error:
+            self.process_birth_time = None
         # A fenced write runs in a worker thread; it must never reach a descriptor
         # number that close() has already released for reuse.
         self._fd_lock = threading.Lock()
@@ -158,16 +169,48 @@ class PtyBridge:
         # (xterm.js never drops frames, so under the dashboard that repaint was a visible flash on
         # every OS app-switch).
         spawn_env[PTY_HOST_ENV] = PTY_HOST_DASHBOARD
-        proc = ptyprocess.PtyProcess.spawn(list(argv), cwd=cwd, env=spawn_env, dimensions=(rows, cols))  # type: ignore[union-attr]
+        retirement_dir = None
+        spawn_env.pop("HERMES_TUI_RETIREMENT_SOCKET", None)
+        if spawn_env.get("HERMES_TUI_DASHBOARD") == "1" and not spawn_env.get("HERMES_TUI_GATEWAY_URL"):
+            retirement_dir = tempfile.TemporaryDirectory(prefix="pty-retire-")
+            spawn_env["HERMES_TUI_RETIREMENT_SOCKET"] = str(Path(retirement_dir.name) / "control.sock")
+        proc = None
         try:
-            return cls(proc)
-        except OSError:  # no safe readiness wait for the master (fd_wait): don't leak the child
-            proc.close(force=True)
+            proc = ptyprocess.PtyProcess.spawn(list(argv), cwd=cwd, env=spawn_env, dimensions=(rows, cols))
+            bridge = cls(proc)
+        except BaseException:
+            if proc is not None:
+                proc.close(force=True)
+            if retirement_dir is not None:
+                retirement_dir.cleanup()
             raise
+        bridge._retirement_dir = retirement_dir
+        bridge._retirement_socket = spawn_env.get("HERMES_TUI_RETIREMENT_SOCKET")
+        # Attached GatewayClient never spawns a private Python agent. Closing
+        # this Node process disconnects a viewer, not the shared compute owner.
+        bridge._viewer_only = (spawn_env.get("HERMES_TUI_DASHBOARD") == "1"
+                               and bool(spawn_env.get("HERMES_TUI_GATEWAY_URL", "").strip()))
+        return bridge
 
     @property
     def pid(self) -> int:
         return int(self._proc.pid)
+
+    def retire_if_idle(self) -> bool:
+        """Retire a viewer, or ask its private compute owner for idle admission."""
+        if not self.is_alive():
+            return False
+        try:
+            if psutil.Process(self.pid).create_time() != self.process_birth_time:
+                return False
+        except psutil.Error:
+            return False
+        if self._viewer_only:
+            return True
+        if not self._retirement_socket:
+            return False
+        from hermes_cli.pty_retirement import request_idle_retirement
+        return request_idle_retirement(self._retirement_socket, expected_parent_pid=self.pid)
 
     def is_alive(self) -> bool:
         try:
@@ -420,6 +463,12 @@ class PtyBridge:
         except Exception:
             pass
         self._close_waiter()
+        self._cleanup_retirement_dir()
+
+    def _cleanup_retirement_dir(self) -> None:
+        if self._retirement_dir is not None:
+            self._retirement_dir.cleanup()
+            self._retirement_dir = None
 
     def _close_waiter(self) -> None:
         if self._waiter is not None:

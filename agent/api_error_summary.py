@@ -4,9 +4,11 @@ Entitlement-failure detection, xAI subscription decoration, structured-detail co
 redaction of provider error payloads.
 Extracted from ``run_agent.py``; every method resolves through ``AIAgent``'s MRO unchanged.
 """
+import contextlib
 import functools
 import json
 import re
+import time
 from typing import Any, Dict, Optional
 
 from agent.redact import redact_sensitive_text
@@ -269,3 +271,21 @@ class ApiErrorSummaryMixin:
         if len(cleaned) > 150:
             cleaned = cleaned[:150] + "..."
         return cleaned
+
+
+def fill_provider_retry_context(error: Exception, context: dict[str, Any]) -> None:
+    """Fill missing rate-limit hints from SDK-specific exception attributes."""
+    details = getattr(error, "details", None)
+    if isinstance(details, dict):
+        if "reset_at" in details and details["reset_at"] is not None and "reset_at" not in context:
+            context["reset_at"] = details["reset_at"]
+        elif "retry_after" in details and details["retry_after"] is not None and "reset_at" not in context:
+            with contextlib.suppress(TypeError, ValueError):
+                context["reset_at"] = time.time() + float(details["retry_after"])
+        if "reason" in details and details["reason"] and "reason" not in context:
+            context["reason"] = details["reason"]
+
+    err_retry_after = getattr(error, "retry_after", None)
+    if err_retry_after is not None and "reset_at" not in context:
+        with contextlib.suppress(TypeError, ValueError):
+            context["reset_at"] = time.time() + float(err_retry_after)

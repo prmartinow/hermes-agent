@@ -128,9 +128,11 @@ def mutate_worker_execution(holder, *, epoch, execution_id, session_id, generati
     from ._context import worker_prompt, worker_row_role, worker_sidecars, worker_tail_role, worker_tool_names
     from ._compression import WORKER_COMPRESSION_HANDLERS
     from ._lifecycle import WORKER_LIFECYCLE_HANDLERS
+    from ._continuation import WORKER_CONTINUATION_HANDLERS
     handlers = {
         **WORKER_LIFECYCLE_HANDLERS,
         **WORKER_COMPRESSION_HANDLERS,
+        **WORKER_CONTINUATION_HANDLERS,
         'session.prompt': worker_prompt,
         'session.sidecars': worker_sidecars,
         'session.tools': worker_tool_names,

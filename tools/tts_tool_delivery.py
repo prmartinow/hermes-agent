@@ -50,7 +50,7 @@ PROVIDER_MAX_TEXT_LENGTH: dict[str, int] = {
     "xai": 15000,         # https://docs.x.ai/developers/model-capabilities/audio/text-to-speech
     "minimax": 10000,     # https://platform.minimax.io/docs/api-reference/speech-t2a-http (sync)
     "mistral": 4000,      # conservative; no published per-request cap
-    "gemini": 32000,      # 32k-token context window; char cap is conservative
+          # 32k-token context window; char cap is conservative
     "elevenlabs": 10000,  # fallback when model-aware lookup can't resolve (multilingual_v2)
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
@@ -98,8 +98,8 @@ def _resolve_max_text_length(provider: Optional[str], tts_config: Optional[dict[
     return FALLBACK_MAX_TEXT_LENGTH
 
 
-# PCM output specs for Gemini TTS (fixed by the API): 24kHz mono 16-bit (L16).
-GEMINI_TTS_SAMPLE_RATE, GEMINI_TTS_CHANNELS, GEMINI_TTS_SAMPLE_WIDTH = 24000, 1, 2
+# Default PCM output specs: 24kHz mono 16-bit (L16).
+PCM_SAMPLE_RATE, PCM_CHANNELS, PCM_SAMPLE_WIDTH = 24000, 1, 2
 
 # ffmpeg args producing the Ogg/Opus voice-bubble encoding Telegram & co expect.
 _OPUS_VOICE_ARGS = [
@@ -245,9 +245,9 @@ def _finalize_wav_output(wav_path: str, output_path: str) -> str:
 
 
 def _wrap_pcm_as_wav(
-    pcm_bytes: bytes, sample_rate: int = GEMINI_TTS_SAMPLE_RATE,
-    channels: int = GEMINI_TTS_CHANNELS, sample_width: int = GEMINI_TTS_SAMPLE_WIDTH) -> bytes:
-    """Wrap raw signed-little-endian PCM (e.g. Gemini's L16) with a minimal WAV RIFF header."""
+    pcm_bytes: bytes, sample_rate: int = PCM_SAMPLE_RATE,
+    channels: int = PCM_CHANNELS, sample_width: int = PCM_SAMPLE_WIDTH) -> bytes:
+    """Wrap raw signed-little-endian PCM  with a minimal WAV RIFF header."""
     block_align = channels * sample_width
     fmt_chunk = struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, channels, sample_rate,
                             sample_rate * block_align, block_align, sample_width * 8)

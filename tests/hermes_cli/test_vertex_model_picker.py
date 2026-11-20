@@ -25,8 +25,8 @@ def test_vertex_has_curated_model_list():
     """Vertex has no /models route — the picker needs a static curated list."""
     models = _PROVIDER_MODELS.get("vertex")
     assert models, "_PROVIDER_MODELS must have a non-empty 'vertex' entry"
-    # Vertex's openapi endpoint expects the google/ publisher prefix.
-    assert all(m.startswith("google/") for m in models)
+    assert models[0] == "claude-sonnet-4-5"
+    assert all(not m.startswith("google/") for m in models)
 
 
 def test_vertex_lists_every_gemini_4_model_the_direct_route_offers():

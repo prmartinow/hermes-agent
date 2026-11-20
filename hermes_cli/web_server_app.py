@@ -130,7 +130,7 @@ async def standalone_lifespan(app: "FastAPI"):
         )
         cron_thread.start()
 
-    # Reap idle/dead keep-alive PTY sessions (30-min TTL). The registry is process-wide and
+    # Reap keep-alive PTYs under the registry's retention policy. The registry is process-wide and
     # close_all() refuses new spawns, so a re-entered lifespan reopens it first.
     PTY_REGISTRY.reopen()
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))

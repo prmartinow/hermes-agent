@@ -1046,7 +1046,9 @@ def completion_event(record: dict[str, Any], result: dict[str, Any], status: str
         payload = {
             "summary": result.get("summary"), "error": result.get("error"),
             **({"api_calls": result["api_calls"]} if result.get("api_calls") is not None else {}),
-            "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2))}
+            "duration_seconds": result.get("duration_seconds", round(completed_at - dispatched_at, 2)),
+            **({"child_session_id": result["child_session_id"]} if "child_session_id" in result else {}),
+            **({"continuation_available": result["continuation_available"]} if "continuation_available" in result else {})}
     evt = {
         "type": "async_delegation", "delegation_id": record.get("delegation_id"),
         # session_key routes back to the originating gateway session; "" => CLI.

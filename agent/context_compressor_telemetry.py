@@ -6,11 +6,14 @@ must never import that module at module level (import cycle).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
 from agent.model_metadata import estimate_messages_tokens_rough
 from agent.model_metadata_token_memo import forget_message_token_memo
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_int(value: Any) -> int | None:
@@ -24,27 +27,47 @@ def _safe_int(value: Any) -> int | None:
 class CompressionTelemetryMixin:
     """Per-attempt telemetry dict: seeded at attempt start, filled by each compression phase."""
 
-    def _begin_compression_telemetry(
-        self, *, current_tokens: int | None, attempt_id: str | None = None, session_id: str | None = None,
+    def _create_compression_telemetry_payload(
+        self, *, current_tokens: int | None = None, attempt_id: str | None = None, session_id: str | None = None,
         trigger_source: str | None = None,
     ) -> dict[str, Any]:
-        """Initialize content-free per-attempt compression telemetry."""
+        """Build isolated content-free telemetry without mutating the compressor."""
         seed = getattr(self, "_compression_telemetry_seed", None)
         seed = seed if isinstance(seed, dict) else {}
         attempt_id = attempt_id or seed.get("attempt_id")
         session_id = session_id or seed.get("session_id")
         trigger_source = trigger_source or seed.get("trigger_source")
-        telemetry: dict[str, Any] = {
+        try:
+            budget_report = self.get_budget_report()
+        except Exception:
+            logger.debug("Could not read the compression budget for telemetry", exc_info=True)
+            budget_report = {}  # Observability must not block compression.
+        return {
+            "budget_context_limit": _safe_int(budget_report.get("context_limit")),
+            "budget_output_reservation": _safe_int(budget_report.get("output_reservation")),
+            "budget_usable_tokens": _safe_int(budget_report.get("usable_tokens")),
+            "budget_effective_ratio": budget_report.get("effective_model_ratio"),
+            "budget_requested_cap": _safe_int(budget_report.get("requested_cap")),
+            "budget_effective_cap": _safe_int(budget_report.get("effective_cap")),
+            "budget_proportional_trigger": _safe_int(budget_report.get("proportional_trigger")),
+            "budget_actual_trigger": _safe_int(budget_report.get("actual_trigger")),
+            "budget_limiting_reason": budget_report.get("limiting_reason"),
+            "budget_limiting_source": budget_report.get("limiting_source"),
+            "budget_cap_overrides_ratio": bool(budget_report.get("cap_overrides_ratio")),
             "event": "compression_attempt", "attempt_id": attempt_id or uuid.uuid4().hex,
             "session_id": session_id or "", "trigger_source": trigger_source or "unknown",
             "overflow_reason": seed.get("overflow_reason"),
-            "main_provider": self.provider or "", "main_model": self.model or "",
+            "main_provider": self.provider or None, "main_model": self.model or None,
             "main_context_limit": _safe_int(self.context_length),
             "current_estimated_tokens": _safe_int(current_tokens),
             "effective_threshold": _safe_int(self.threshold_tokens), "protected_head_tokens": None,
             "protected_tail_tokens": None, "middle_window_tokens": None, "prellm_skip_count": 0,
-            "aux_prompt_tokens": None, "aux_output_reservation": None, "aux_provider": "", "aux_model": "",
-            "effective_aux_context": None, "fit_margin": None, "chunking": False, "chunk_count": 0,
+            "aux_prompt_tokens": None, "aux_prompt_chars": None, "aux_prompt_bytes": None,
+            "estimated_aux_prompt_tokens": None, "aux_provider_prompt_tokens": None,
+            "aux_provider_completion_tokens": None, "aux_provider_total_tokens": None,
+            "aux_output_reservation": None, "aux_provider": None, "aux_model": None,
+            "effective_reasoning": None, "effective_aux_context": None, "fit_margin": None,
+            "chunking": None, "chunk_count": None,
             "total_duration_ms": None, "aux_call_duration_ms": None, "queue_wait_ms": None, "prompt_build_ms": None,
             "time_to_first_progress_ms": None, "summary_generation_ms": None, "commit_ms": None,
             "fallback_used": False, "commit_status": "unknown", "split_status": "unknown", "failure_class": None,
@@ -59,8 +82,30 @@ class CompressionTelemetryMixin:
             # True when the summary came from an opt-in prepared (background) pass (compression.prepare_ahead).
             "prepared_summary": False,
         }
+    def _begin_compression_telemetry(
+        self, *, current_tokens: int | None, attempt_id: str | None = None, session_id: str | None = None,
+        trigger_source: str | None = None,
+    ) -> dict[str, Any]:
+        """Initialize content-free per-attempt compression telemetry."""
+        seed = getattr(self, "_compression_telemetry_seed", None)
+        seed = seed if isinstance(seed, dict) else {}
+        attempt_id = attempt_id or seed.get("attempt_id")
+        session_id = session_id or seed.get("session_id")
+        trigger_source = trigger_source or seed.get("trigger_source")
+        existing = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(existing, dict) and attempt_id and existing.get("attempt_id") == attempt_id:
+            if current_tokens is not None and existing.get("current_estimated_tokens") is None:
+                existing["current_estimated_tokens"] = _safe_int(current_tokens)
+            return existing
+        telemetry = self._create_compression_telemetry_payload(
+            current_tokens=current_tokens,
+            attempt_id=attempt_id,
+            session_id=session_id,
+            trigger_source=trigger_source,
+        )
         self._active_compression_telemetry = self._last_compression_telemetry = telemetry
         return telemetry
+
 
     def _record_compression_regions(
         self, *, head_messages: list[dict[str, Any]], middle_messages: list[dict[str, Any]],
@@ -76,21 +121,64 @@ class CompressionTelemetryMixin:
         self, *, prompt_messages: list[dict[str, Any]], max_tokens: int | None, duration_ms: int,
         aux_provider: str | None = None, aux_model: str | None = None,
         effective_aux_context: int | None = None, phase_timings: dict[str, Any] | None = None,
+        response: Any = None, reasoning: Any = None,
     ) -> None:
         telemetry = getattr(self, "_active_compression_telemetry", None)
         if not isinstance(telemetry, dict):
             return
         telemetry["aux_prompt_tokens"] = estimate_messages_tokens_rough(prompt_messages)
-        # The summary prompt is built fresh per attempt and never estimated again; don't let the memo pin it.
+        # Fresh summary prompts need no memo after their one estimate.
         forget_message_token_memo(prompt_messages)
+        telemetry["estimated_aux_prompt_tokens"] = telemetry["aux_prompt_tokens"]
+        telemetry["aux_prompt_chars"] = sum(
+            len(m.get("content", "")) for m in prompt_messages
+            if isinstance(m, dict) and isinstance(m.get("content"), str)
+        )
+        telemetry["aux_prompt_bytes"] = sum(
+            len(m.get("content", "").encode("utf-8")) for m in prompt_messages
+            if isinstance(m, dict) and isinstance(m.get("content"), str)
+        )
+        usage = getattr(response, "usage", None) if response is not None else None
+        if usage is not None:
+            if isinstance(usage, dict):
+                telemetry["aux_provider_prompt_tokens"] = _safe_int(usage.get("prompt_tokens"))
+                telemetry["aux_provider_completion_tokens"] = _safe_int(usage.get("completion_tokens"))
+                telemetry["aux_provider_total_tokens"] = _safe_int(usage.get("total_tokens"))
+            else:
+                telemetry["aux_provider_prompt_tokens"] = _safe_int(getattr(usage, "prompt_tokens", None))
+                telemetry["aux_provider_completion_tokens"] = _safe_int(getattr(usage, "completion_tokens", None))
+                telemetry["aux_provider_total_tokens"] = _safe_int(getattr(usage, "total_tokens", None))
+        else:
+            telemetry["aux_provider_prompt_tokens"] = None
+            telemetry["aux_provider_completion_tokens"] = None
+            telemetry["aux_provider_total_tokens"] = None
         telemetry["aux_output_reservation"] = _safe_int(max_tokens)
-        if aux_provider:
-            telemetry["aux_provider"] = aux_provider
-        if aux_model:
-            telemetry["aux_model"] = aux_model
+        # Route, prompt size and provider usage describe the latest call;
+        # aux_call_duration_ms accumulates all calls made by this attempt.
+        telemetry["aux_provider"] = aux_provider or None
+        telemetry["aux_model"] = aux_model or None
+        telemetry["effective_reasoning"] = None
+        telemetry["effective_aux_context"] = None
+        telemetry["fit_margin"] = None
+        if reasoning is not None:
+            _SAFE_REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "minimal", "off", "none", "auto", "default"}
+            if isinstance(reasoning, str) and reasoning.lower() in _SAFE_REASONING_EFFORTS:
+                telemetry["effective_reasoning"] = reasoning.lower()
+            elif isinstance(reasoning, dict):
+                effort = reasoning.get("effort")
+                if isinstance(effort, str) and effort.lower() in _SAFE_REASONING_EFFORTS:
+                    telemetry["effective_reasoning"] = effort.lower()
+                elif reasoning.get("enabled") is False:
+                    telemetry["effective_reasoning"] = "off"
+                else:
+                    telemetry["effective_reasoning"] = None
+            else:
+                telemetry["effective_reasoning"] = None
+        elif "effective_reasoning" not in telemetry:
+            telemetry["effective_reasoning"] = None
         if effective_aux_context is not None:
             telemetry["effective_aux_context"] = _safe_int(effective_aux_context)
-        if telemetry["effective_aux_context"] is not None and telemetry["aux_prompt_tokens"] is not None:
+        if telemetry.get("effective_aux_context") is not None and telemetry.get("aux_prompt_tokens") is not None:
             telemetry["fit_margin"] = (telemetry["effective_aux_context"] - telemetry["aux_prompt_tokens"]
                                        - (telemetry["aux_output_reservation"] or 0))
         telemetry["aux_call_duration_ms"] = (telemetry.get("aux_call_duration_ms") or 0) + max(0, int(duration_ms))
@@ -101,6 +189,7 @@ class CompressionTelemetryMixin:
             # Wait and generation phases accumulate across retries; the rest are point readings.
             accumulate = key in {"queue_wait_ms", "summary_generation_ms"} and value is not None
             telemetry[key] = (telemetry.get(key) or 0) + value if accumulate else value
+
 
     def _note_aux_route_fallback(self, route: dict[str, str]) -> None:
         """``call_llm`` answered the summary from a fallback route after the configured one failed (dead

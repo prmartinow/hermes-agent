@@ -560,6 +560,7 @@ class SessionListEntry:
     lineage_ids: tuple[SessionId, ...] = ()
     continuation_kind: Optional[str] = None
     compact: bool = False
+    total_message_count: Optional[int] = None
 
     def as_list_row(self) -> dict[str, JsonValue]:
         row = self._head_cells()
@@ -569,6 +570,8 @@ class SessionListEntry:
             row["continuation_kind"] = self.continuation_kind
         elif self.lineage_ids:
             row["_lineage_ids"] = [str(sid) for sid in self.lineage_ids]
+        if self.total_message_count is not None:
+            row["total_message_count"] = self.total_message_count
         row["unread"] = self.unread
         return row
 

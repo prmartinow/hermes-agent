@@ -81,6 +81,8 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        # Most tests mock the non-streaming call; live-writer coverage has its own tests.
+        a._live_stream_writer = None
         return a
 
 
@@ -165,7 +167,6 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
     agent._persist_user_message_timestamp = None
     agent._persist_disabled = False
     agent._session_persist_lock = threading.RLock()
-
 
     message = {"role": "user", "content": "exactly once"}
     normal = threading.Thread(target=lambda: agent._persist_session([message], []))
@@ -6507,8 +6508,6 @@ class TestAnthropicInterruptHandler:
         Replaces the former source-reading assertion (which asserted the old,
         now-removed rebuild-on-interrupt behavior) with a behavior test.
         """
-        import time
-        from unittest.mock import MagicMock
         from agent.chat_completion_helpers import interruptible_api_call
 
         agent.api_mode = "anthropic_messages"

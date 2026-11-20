@@ -85,6 +85,11 @@ fi
 # is a no-op if the dir already exists. (#18482, salvages #18488)
 mkdir -p "$HERMES_HOME"
 
+# Host-namespace terminal mode explicitly opts into privileged namespace entry.
+case "${HERMES_USE_NSENTER:-}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) chmod 4755 /usr/bin/nsenter ;;
+esac
+
 # Numeric UID/GID validation: must be digits only, non-root, 1-65534.
 # NAS hosts such as Unraid commonly use low non-root IDs (99:100).
 validate_uid_gid() {

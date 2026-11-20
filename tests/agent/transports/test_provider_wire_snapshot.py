@@ -64,7 +64,7 @@ MODELS = {
     "ai-gateway": "anthropic/claude-opus-5.5", "opencode-zen": "claude-opus-5.5", "opencode-go": "kimi-k2.5",
     "kilocode": "anthropic/claude-opus-5.5", "xiaomi": "mimo-v2-pro", "tencent-tokenhub": "hunyuan-t1",
     "tencent-tokenplan": "hunyuan-t1", "ollama-cloud": "gpt-oss:120b",
-    "bedrock": "us.anthropic.claude-opus-5-5-v1:0", "vertex": "gemini-3-pro", "azure-foundry": "gpt-5.5",
+    "bedrock": "us.anthropic.claude-opus-5-5-v1:0", "vertex": "claude-sonnet-4-5", "azure-foundry": "gpt-5.5",
     "alibaba-cn": "qwen3.5-plus", "alibaba-token-plan": "qwen3.5-plus", "alibaba-token-plan-cn": "qwen3.5-plus",
     "alibaba-coding-plan-cn": "qwen3-coder-plus", "deepinfra": "deepseek-ai/DeepSeek-V4",
     "router": "openai/gpt-5.5", "openrouter": "anthropic/claude-opus-5.5", "custom": "my-local-model",

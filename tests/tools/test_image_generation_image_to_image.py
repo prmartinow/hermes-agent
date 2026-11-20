@@ -50,13 +50,13 @@ class TestFalEditPayload:
         from tools.image_generation_tool import _build_fal_edit_payload
 
         payload = _build_fal_edit_payload(
-            "fal-ai/nano-banana-pro", "make it night", ["https://x/y.png"],
+            "fal-ai/flux-2-pro", "make it night", ["https://x/y.png"],
             "landscape",
         )
         assert payload["prompt"] == "make it night"
         assert payload["image_urls"] == ["https://x/y.png"]
-        # nano-banana edit advertises aspect_ratio in edit_supports
-        assert payload.get("aspect_ratio") == "16:9"
+        # This edit endpoint takes image URLs but does not accept an aspect ratio.
+        assert "aspect_ratio" not in payload
 
 
     def test_singular_edit_image_param_kling_image_v3(self):
@@ -131,7 +131,7 @@ class TestFalRouting:
     def test_text_to_image_uses_base_endpoint(self, cfg_home, monkeypatch):
         import tools.image_generation_tool as image_tool
 
-        _write_cfg(cfg_home, {"image_gen": {"model": "fal-ai/nano-banana-pro"}})
+        _write_cfg(cfg_home, {"image_gen": {"model": "fal-ai/kling-image/v3/text-to-image"}})
         capture: dict = {}
         self._patch_submit(monkeypatch, image_tool, capture)
 
@@ -143,7 +143,7 @@ class TestFalRouting:
         out = json.loads(raw)
         assert out["success"] is True
         assert out["modality"] == "text"
-        assert capture["endpoint"] == "fal-ai/nano-banana-pro"
+        assert capture["endpoint"] == "fal-ai/kling-image/v3/text-to-image"
         assert "image_urls" not in capture["arguments"]
 
 

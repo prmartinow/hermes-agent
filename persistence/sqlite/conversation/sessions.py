@@ -266,6 +266,7 @@ def _list_entry(holder: StoreHolder, row: Mapping[str, Any], *, compact: bool = 
         lineage_ids=_ids(row.get("_lineage_ids") or ()),
         continuation_kind=row.get("continuation_kind"),
         compact=compact,
+        total_message_count=row.get("total_message_count"),
     )
 
 

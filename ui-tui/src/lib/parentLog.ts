@@ -49,7 +49,7 @@ export function recordParentLifecycle(line: string): void {
         : oneLine
 
     mkdirSync(logDir, { recursive: true })
-    appendFileSync(CRASH_LOG, `[tui-parent] ${new Date().toISOString()} ${capped}\n`)
+    appendFileSync(CRASH_LOG, `[tui-parent] ${new Date().toISOString()} pid=${process.pid} ${capped}\n`)
   } catch {
     if (!warned) {
       warned = true

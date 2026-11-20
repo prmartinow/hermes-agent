@@ -1695,6 +1695,9 @@ def _run_conversation_turn(
     from agent.voice_turn_route import begin_voice_turn_route
     _ctx.active_system_prompt = begin_voice_turn_route(agent, _ctx.messages, _ctx.active_system_prompt)
 
+    from agent.live_session_stream import publish_turn_start
+    publish_turn_start(agent, _ctx.user_message)
+
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not
     # the next; a SessionDB append failure (and its classified cause) halts only this turn;

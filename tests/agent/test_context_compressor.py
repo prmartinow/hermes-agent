@@ -573,9 +573,9 @@ class TestPreflightDeferral:
         for rough in (compressor.context_length, 150_000, 10_000_000):
             assert compressor.should_defer_preflight_to_real_usage(rough) is True
         compressor.note_usage_less_response()
-        assert compressor.should_defer_preflight_to_real_usage(95_000) is False
+        assert all(compressor.should_defer_preflight_to_real_usage(n) is False for n in (95_000, compressor.context_length, 150_000, 10_000_000))
         compressor.update_from_response({"prompt_tokens": 50_000})
-        assert compressor.should_defer_preflight_to_real_usage(95_000) is True
+        assert all(compressor.should_defer_preflight_to_real_usage(n) is True for n in (95_000, compressor.context_length, 150_000, 10_000_000))
 
     def test_defers_immediately_after_compaction_with_stale_real_prompt(self, compressor):
         """#36718: right after a compaction, last_real_prompt_tokens still holds

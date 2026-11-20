@@ -1285,10 +1285,6 @@ export const deOverrides = {
           model: 'Mistral-TTS-Modell',
           voiceId: 'Mistral-Stimme'
         },
-        gemini: {
-          model: 'Gemini-TTS-Modell',
-          voice: 'Gemini-Stimme'
-        },
         neutts: {
           model: 'NeuTTS-Modell',
           device: 'NeuTTS-Gerät'

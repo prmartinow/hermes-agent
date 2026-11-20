@@ -640,7 +640,7 @@ function styledCharsWithGraphemeClustering(chars: StyledChar[], stylePool: Style
   return result
 }
 
-function flushBuffer(buffer: string, styles: AnsiCode[], stylePool: StylePool, out: ClusteredChar[]): void {
+export function flushBuffer(buffer: string, styles: AnsiCode[], stylePool: StylePool, out: ClusteredChar[]): void {
   // Compute styleId + hyperlink ONCE for the whole style run.
   // Every grapheme in this buffer shares the same styles.
   //
@@ -657,6 +657,35 @@ function flushBuffer(buffer: string, styles: AnsiCode[], stylePool: StylePool, o
   const filteredStyles = hasOsc8Styles ? filterOutHyperlinkStyles(styles) : styles
 
   const styleId = stylePool.intern(filteredStyles)
+
+  const len = buffer.length
+  if (len === 0) {
+    return
+  }
+
+  // Fast path: when the WHOLE buffer is printable ASCII (0x20..0x7e),
+  // every character is an isolated 1-cell grapheme cluster. Bypass
+  // Intl.Segmenter and stringWidth entirely.
+  let isPrintableAscii = true
+  for (let i = 0; i < len; i++) {
+    const code = buffer.charCodeAt(i)
+    if (code < 0x20 || code > 0x7e) {
+      isPrintableAscii = false
+      break
+    }
+  }
+
+  if (isPrintableAscii) {
+    for (let i = 0; i < len; i++) {
+      out.push({
+        value: buffer[i]!,
+        width: 1,
+        styleId,
+        hyperlink
+      })
+    }
+    return
+  }
 
   for (const { segment: grapheme } of getGraphemeSegmenter().segment(buffer)) {
     out.push({

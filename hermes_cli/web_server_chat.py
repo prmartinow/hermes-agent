@@ -20,7 +20,8 @@ from typing import Optional
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from pathlib import Path
 from typing import Optional
-from hermes_cli.pty_session import PtySessionRegistry
+from hermes_cli.pty_session import MemoryBudgetFull, PtySessionRegistry, RegistryFull
+from hermes_cli.pty_memory import pty_memory_usage
 
 # Same logger the code used before extraction (record parity).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -49,7 +50,9 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 # A positive sleep lets other coroutines run and keeps dashboard idle CPU low (#42627).
 _PTY_IDLE_BACKOFF = 0.05
 PTY_REGISTRY = PtySessionRegistry(
-    ttl=30 * 60, max_sessions=16, buffer_cap=1 * 1024 * 1024, read_timeout=_PTY_READ_CHUNK_TIMEOUT)
+    ttl=60 * 60, max_sessions=16, buffer_cap=200 * 1024 * 1024,
+    read_timeout=_PTY_READ_CHUNK_TIMEOUT,
+    memory_budget_bytes=32 * 1024 * 1024 * 1024, memory_usage=pty_memory_usage)
 
 
 async def _close_stalled_pty_input(ws: WebSocket, *, path: str) -> None:
@@ -481,11 +484,14 @@ async def _ws_gate(ws: WebSocket, kind: str) -> Optional[tuple[str, str, str]]:
 
 
 async def _pty_fail(ws: WebSocket, exc: BaseException, *, surface: str = "Chat") -> None:
-    """Tell the user why chat could not start, then close 1011 so the SPA renders
-    "Start new session". The raw exception goes to the server log only."""
+    """Describe startup failures without discarding a conversation on admission refusal."""
     from hermes_cli.web_routers.chat_ws_errors import chat_start_failure_message
     _log.warning("pty start failed: %s: %s", type(exc).__name__, exc)
     await ws.send_text(f"\r\n\x1b[31m{chat_start_failure_message(exc, surface=surface)}\x1b[0m\r\n")
+    if isinstance(exc, RegistryFull):
+        reason = "terminal-memory" if isinstance(exc, MemoryBudgetFull) else "terminal-capacity"
+        await ws.close(code=4429, reason=reason)
+        return
     await ws.close(code=1011)
 
 
@@ -498,8 +504,9 @@ def _resolve_chat_argv(
     Tests monkeypatch this with a tiny fake command.  Env contract: resume goes
     through ``HERMES_TUI_RESUME`` (``ui-tui`` does not parse argv), resolved to
     the newest descendant; ``HERMES_TUI_GATEWAY_URL`` attaches to this process's
-    in-memory gateway but is SKIPPED for profile-scoped chats (that gateway runs
-    under the dashboard's own profile, so a scoped chat attaches to its profile's gateway);
+    in-memory gateway whenever the requested profile is the serving profile.
+    Only OTHER profiles spawn a private gateway; an explicit name for this
+    process's profile must not create a competing writer;
     ``profile`` scopes the ENTIRE chat by pointing ``HERMES_HOME`` at the profile
     dir, the same propagation ``hermes -p <name>`` performs. ``workspace_cwd``
     (an already-validated host directory, ``chat_workspaces.resolve_chat_cwd``)
@@ -508,7 +515,7 @@ def _resolve_chat_argv(
     passes as the explicit ``cwd`` of ``session.create`` when attached to the
     in-memory gateway, whose own cwd is the dashboard's launch dir).
     """
-    from hermes_cli.web_server_profiles import _config_profile_scope, _resolve_profile_dir
+    from hermes_cli.web_server_profiles import _config_profile_scope, _is_other_profile, _resolve_profile_dir
     from hermes_cli.web_server_sessions import _open_session_db_for_profile, _session_latest_descendant
     from hermes_cli.main import PROJECT_ROOT
     from hermes_cli.main_tui_launch import _apply_tui_python_env, _make_tui_argv
@@ -546,10 +553,11 @@ def _resolve_chat_argv(
         env["HERMES_TUI_CWD"] = workspace_cwd
     _apply_tui_python_env(env)
     env.setdefault("NODE_ENV", "production")
-    # Mouse tracking would swallow wheel events the browser needs for
-    # transcript scrolling; disable it for the dashboard PTY only.
-    env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
+    # Client-side wheel decoupling allows native browser scrolling while
+    # button mouse tracking (DEC 1000/1002/1006) preserves click interactivity.
+    env.pop("HERMES_TUI_DISABLE_MOUSE", None)
     env.setdefault("HERMES_TUI_INLINE", "1")
+    env.setdefault("HERMES_TUI_MOUSE_TRACKING", "buttons")
     # chalk in the child picks its color depth from the SERVER env; hosted
     # deploys have no COLORTERM, so hex colors would snap to the 256 palette.
     env.setdefault("COLORTERM", "truecolor")
@@ -560,6 +568,9 @@ def _resolve_chat_argv(
         store = _open_session_db_for_profile(resume_profile, read_only=True)
         try:
             latest_resume, _latest_path = _session_latest_descendant(resume, store)
+        except Exception:  # health: allow BLE001 -- resume fallback logs the traceback before using the requested session
+            _log.warning("Failed to resolve latest session descendant for %s", resume, exc_info=True)
+            latest_resume = None
         finally:
             store.close()
         if latest_resume:
@@ -572,10 +583,9 @@ def _resolve_chat_argv(
     if active_session_file:
         env["HERMES_TUI_ACTIVE_SESSION_FILE"] = active_session_file
 
-    # Without the attach URL, gatewayClient bootstraps through the profile's own
-    # gateway (ui-tui/scripts/gateway_bootstrap.py) under the HERMES_HOME set above;
-    # it never spawns a standalone `tui_gateway.entry` writer.
-    if profile_dir is None and (gateway_ws_url := _build_gateway_ws_url()):
+    # Other profiles attach through their profile-owned gateway bootstrap.
+    env.pop("HERMES_TUI_GATEWAY_URL", None)
+    if not _is_other_profile(profile) and (gateway_ws_url := _build_gateway_ws_url()):
         env["HERMES_TUI_GATEWAY_URL"] = gateway_ws_url
 
     return list(argv), str(cwd) if cwd else None, env

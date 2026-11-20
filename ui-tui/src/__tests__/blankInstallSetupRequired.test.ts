@@ -1,6 +1,7 @@
 import { PassThrough } from 'stream'
 
 import { renderSync } from '@hermes/ink'
+import { JsonRpcGatewayError } from '@hermes/shared/json-rpc-channel'
 import React, { useEffect } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -36,7 +37,7 @@ function mountCanonicalLifecycle({ providerConfigured, resume = 'resumes', runti
     }
 
     if (method === 'session.resume' && resume === 'fails') {
-      throw new Error('storage_unavailable')
+      throw new JsonRpcGatewayError('storage_unavailable', { code: 5000 })
     }
 
     return SESSION

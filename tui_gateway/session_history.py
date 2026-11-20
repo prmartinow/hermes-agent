@@ -294,6 +294,41 @@ def _remember_tool_call_args(tool_calls: list, tool_call_args: dict) -> None:
             tool_call_args[tc_id] = (fn["name"], args)
 
 
+def _project_history_tool(m: dict, content_text: str, tool_call_args: dict) -> dict:
+    tc_id = m.get("tool_call_id") or ""
+    tc_name, tc_args = tool_call_args.get(tc_id, (None, None))
+    if tc_name is None and m.get("tool_name") in tool_call_args:
+        tc_name, tc_args = tool_call_args[m.get("tool_name")]
+    name = tc_name or m.get("tool_name") or "tool"
+    args = tc_args or {}
+    if not args and m.get("args"):
+        raw_args = m.get("args")
+        if isinstance(raw_args, str):
+            try:
+                args = json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+        elif isinstance(raw_args, dict):
+            args = raw_args
+    # Preserve full call arguments, plus results needed by edit and clarify cards.
+    labels = _bridged_tool_labels(name, args)
+    tool_msg = {"role": "tool", "name": name, "context": _tool_ctx(name, args),
+                **({"content": m.get("content")} if name in {"write_file", "patch", "skill_manage", "clarify"} else {}),
+                **{key: m[key] for key in ("tool_call_id", "timestamp", "display_metadata") if m.get(key) is not None},
+                **({"args": args} if args else {}), **({"labels": labels} if labels else {})}
+    if name in ("todo_list", "todo"):
+        try:
+            parsed = json.loads(content_text)
+        except (ValueError, TypeError):
+            parsed = {}
+        todos = parsed.get("todos") if isinstance(parsed, dict) else None
+        if not isinstance(todos, list):
+            todos = args.get("todos")
+        if isinstance(todos, list):
+            tool_msg["todos"] = todos
+    return tool_msg
+
+
 def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: bool = True) -> list[dict]:
     """``image_urls=False`` is the ``inline_images=false`` projection (#116511): image parts render ``[image]``
     so a remote client's history read stays kilobytes instead of re-transmitting every stored attachment."""
@@ -331,18 +366,7 @@ def _history_to_messages(history: list[dict], *, profile_home=None, image_urls: 
             from agent.conversation_compression import _extract_steer_text_from_message
             content_text = _extract_steer_text_from_message(m) or content_text
         if role == "tool":
-            tc_name, tc_args = tool_call_args.get(m.get("tool_call_id") or "", (None, None))
-            name = tc_name or m.get("tool_name") or "tool"
-            args = tc_args or {}
-            # `context` is an 80-char preview; ship args so a full-call renderer isn't truncated.
-            labels = _bridged_tool_labels(name, args)
-            messages.append({"role": "tool", "name": name, "context": _tool_ctx(name, args),
-                             # Edit cards and settled clarify cards need the original result; other
-                             # tool outputs remain omitted from this compact display projection.
-                             **({"content": m.get("content")} if name in {"write_file", "patch", "skill_manage", "clarify"} else {}),
-                             **{key: m[key] for key in ("tool_call_id", "timestamp", "display_metadata")
-                                if m.get(key) is not None},
-                             **({"args": args} if args else {}), **({"labels": labels} if labels else {})})
+            messages.append(_project_history_tool(m, content_text, tool_call_args))
             continue
         # Assistant detail sidecars can carry the only visible reply or reasoning after resume/reload.
         has_assistant_detail = role == "assistant" and any(m.get(key) for key in _HISTORY_ASSISTANT_DETAIL_KEYS)

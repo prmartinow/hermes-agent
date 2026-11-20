@@ -2,6 +2,7 @@
 with intrinsic ``_DB_PERSISTED_MARKER`` dedup, ephemeral-scaffolding filtering, explicit
 trajectory export."""
 import hashlib
+import json
 
 import logging
 import re
@@ -28,6 +29,21 @@ from session_rules.turns import _EPHEMERAL_SCAFFOLDING_FLAGS, _IMAGE_PART_TYPES
 
 
 logger = logging.getLogger("run_agent")  # origin module's name: log records / caplog filters unchanged
+
+
+def initialize_session_outputs(agent) -> None:
+    """Set up the live stream and the directory for request diagnostics."""
+    from hermes_constants import get_hermes_home
+
+    agent._live_stream_writer = None
+    try:
+        from agent.live_session_stream import LiveSessionStreamWriter
+        agent._live_stream_writer = LiveSessionStreamWriter(agent.session_id)
+    except Exception:
+        logger.debug("Could not initialize the live session stream", exc_info=True)
+
+    agent.logs_dir = get_hermes_home() / "sessions"
+    agent.logs_dir.mkdir(parents=True, exist_ok=True)
 
 # Reasoning/codex fields are role-gated (assistant-only) inside _insert_message_rows.
 _ROW_REASONING_KEYS = ("reasoning", "reasoning_content", "reasoning_details", "codex_reasoning_items", "codex_message_items")
@@ -197,6 +213,7 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
         and sanitize_context(content).strip() != content.strip()
     ):
         api_content = content
+    _msg_disp_meta = msg.get("display_metadata")
     # Key order is the divert-JSONL wire order (divert_session_transcript_jsonl).
     row = {
         "role": role, "content": _durable_content(content),
@@ -207,7 +224,7 @@ def _db_flush_row(agent, msg: dict, is_current_turn_user: bool) -> dict[str, Any
         **{k: msg.get(k) for k in _ROW_REASONING_KEYS},
         "_compressed_summary": bool(msg.get(COMPRESSED_SUMMARY_METADATA_KEY)),
         "timestamp": timestamp, "api_content": api_content,
-        "display_kind": _summary_display_kind(msg), "display_metadata": msg.get("display_metadata"),
+        "display_kind": _summary_display_kind(msg), "display_metadata": _msg_disp_meta,
         # Load-bearing for restart drain-window recovery dedup.
         "platform_message_id": msg.get("platform_message_id") or msg.get("message_id"),
         "observed": bool(msg.get("observed")),

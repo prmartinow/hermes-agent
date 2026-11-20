@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
 
+from agent.compaction_budget import compressor_max_tokens
 from agent.context_compressor import ContextCompressor
 from agent.agent_init_fallback import _fallback_entries, _init_fallback_chain, recompute_init_fallback_api_mode
 from agent.agent_init_params import _CALLBACK_PARAMS, _GATEWAY_IDENTITY_PARAMS, _PASSTHROUGH_PARAMS
@@ -1065,9 +1066,9 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     agent.session_id = session_id or new_session_id(agent.session_start)
     _publish_session_id(agent.session_id)
 
-    # ~/.hermes/sessions/ — kept unconditionally for request_dump_*.json debug breadcrumbs.
-    agent.logs_dir = get_hermes_home() / "sessions"
-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    from agent.session_persistence import initialize_session_outputs
+    initialize_session_outputs(agent)
+
     _set_defaults(agent, _SESSION_STATE)
 
     # Filesystem checkpoint manager (transparent — not a tool)
@@ -1369,6 +1370,11 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     threshold_tokens = cfg.get("threshold_tokens", cfg_get(DEFAULT_CONFIG, "compression", "threshold_tokens"))
     if threshold_tokens is not None:
         threshold_tokens = _positive_int(threshold_tokens)
+    exempt_raw = cfg.get("threshold_tokens_exempt_models")
+    if exempt_raw is None:
+        exempt_raw = cfg_get(DEFAULT_CONFIG, "compression", "threshold_tokens_exempt_models", default=[])
+    from agent.compaction_budget import _normalize_exempt_models
+    threshold_tokens_exempt_models = _normalize_exempt_models(exempt_raw)
     # Non-system head messages to protect (system prompt is always protected); 0 is a
     # legitimate "system prompt + summary + tail".
     protect_first = max(0, int(cfg.get("protect_first_n", 3)))
@@ -1408,6 +1414,7 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         },
         threshold_tokens=threshold_tokens,
+        threshold_tokens_exempt_models=threshold_tokens_exempt_models,
         checkpoint_required=checkpoint_required,
         # In-place compaction: no session-id rotation. default=True MUST match DEFAULT_CONFIG
         # (a False default flipped agents into rotation mode when the key was omitted).
@@ -1668,8 +1675,18 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     except (TypeError, ValueError):
         agent._aux_compression_context_length_config = None
 
+    # model.max_tokens from config when the caller did not pass one.
     _model_cfg = _agent_cfg.get("model", {})
     _model_section = _model_cfg if isinstance(_model_cfg, dict) else {}
+    _config_max_tokens = _model_section.get("max_tokens")
+    if agent.max_tokens is None and _config_max_tokens is not None:
+        agent.max_tokens = _positive_int(_config_max_tokens, reject=(bool,))
+        if agent.max_tokens is None:
+            _warn_invalid_config_int(
+                "model.max_tokens in config.yaml", _config_max_tokens,
+                "must be a positive integer (e.g. 4096)", "provider default",
+            )
+    agent._session_init_model_config["max_tokens"] = agent.max_tokens
 
     _config_context_length = _model_section.get("context_length")
     if _config_context_length is not None:
@@ -1784,24 +1801,6 @@ def _select_context_engine(_agent_cfg):
     return _selected_engine
 
 
-def _compressor_max_tokens(agent):
-    """``agent.max_tokens``, or the native-Gemini adapter default when unset: generateContent
-    still sends maxOutputTokens=65,535 and the threshold is pct×(window − max_tokens), so
-    reserving 0 let the provider 400 before compaction fired."""
-    if agent.max_tokens is not None:
-        return agent.max_tokens
-    with suppress(Exception):
-        from agent.gemini_native_adapter import (
-            GEMINI_DEFAULT_MAX_OUTPUT_TOKENS, is_native_gemini_base_url
-        )
-        _gemini_provider = str(agent.provider or "").strip().lower() in {
-            "gemini", "google", "google-gemini", "google-ai-studio",
-        }
-        if _gemini_provider or is_native_gemini_base_url(agent.base_url):
-            return GEMINI_DEFAULT_MAX_OUTPUT_TOKENS
-    return None
-
-
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db,
                           persistence=None):
     _selected_engine = _select_context_engine(_agent_cfg)
@@ -1837,8 +1836,9 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             api_key=getattr(agent, "api_key", ""), config_context_length=_effective_context_length,
             provider=agent.provider, api_mode=agent.api_mode,
             abort_on_summary_failure=cs.abort_on_summary_failure,
-            max_tokens=_compressor_max_tokens(agent), model_thresholds=cs.model_thresholds,
+            max_tokens=compressor_max_tokens(agent), model_thresholds=cs.model_thresholds,
             threshold_tokens_cap=cs.threshold_tokens,
+            threshold_tokens_exempt_models=getattr(cs, "threshold_tokens_exempt_models", None),
             proactive_prune_tokens=cs.proactive_prune_tokens,
             proactive_prune_min_result_chars=cs.proactive_prune_min_chars,
             proactive_prune_min_reclaim_tokens=cs.proactive_prune_min_reclaim,

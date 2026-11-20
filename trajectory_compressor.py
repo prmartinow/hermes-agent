@@ -115,7 +115,7 @@ class CompressionConfig:
     protect_first_gpt: bool = True
     protect_first_tool: bool = True
     protect_last_n_turns: int = 4
-    summarization_model: str = "google/gemini-3-flash-preview"
+    summarization_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
     base_url: str = OPENROUTER_BASE_URL
     api_key_env: str = "OPENROUTER_API_KEY"
     temperature: float = 0.3

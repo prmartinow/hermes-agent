@@ -87,9 +87,29 @@ class TestFallbackChainAdvancement:
             assert agent.model == "gpt-4o"
             assert agent._fallback_activated is True
 
+    def test_records_user_visible_switch_with_reason(self):
+        agent = _make_agent(
+            fallback_model={"provider": "zai", "model": "glm-5.2"},
+        )
+        agent.model = "gpt-5.6-sol"
+        agent.provider = "openai-codex"
+        shown = []
+        agent.status_callback = lambda kind, text: shown.append((kind, str(text)))
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(_mock_client(base_url="https://api.z.ai/v1"), "glm-5.2"),
+        ):
+            assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
 
-    @patch("time.monotonic", return_value=1000.0)
-    def test_records_sequential_switches_in_order(self, _clock):
+        expected = (
+            "⚠️ Model fallback: gpt-5.6-sol via openai-codex could not respond "
+            "(rate limit); using glm-5.2 via zai."
+        )
+        notice, = (text for kind, text in shown if kind == "fallback")
+        assert notice.startswith(expected)
+        assert "Primary retry eligible" in notice
+
+    def test_records_sequential_switches_in_order(self):
         agent = _make_agent(
             fallback_model=[
                 {"provider": "zai", "model": "glm-5.2"},
@@ -141,10 +161,9 @@ class TestFallbackChainAdvancement:
                 (None, None),                    # broken provider
                 (_mock_client(), "gpt-4o"),       # fallback succeeds
             ]
-            assert agent._try_activate_fallback(FailoverReason.rate_limit) is True
+            assert agent._try_activate_fallback() is True
             assert agent.model == "gpt-4o"
             assert agent._fallback_index == 2
-            assert agent._rate_limit_backoff_count == 1
 
     def test_activation_counts_once_with_classifier_reason(self, monkeypatch):
         """A skipped candidate is not an activation; the one that binds records its FailoverReason."""

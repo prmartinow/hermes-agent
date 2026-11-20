@@ -159,3 +159,28 @@ class TestBulkDeleteCompressionChain(_SessionsCompressionEndpoints):
                 assert session_row(db, kept) is not None, kept
         finally:
             db.close()
+
+
+class TestLatestDescendant(_SessionsCompressionEndpoints):
+    def test_latest_descendant_excludes_forked_branches(self):
+        """Explicit forks/branches (_branched_from) and delegates must not
+        hijack resume of the parent session."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="parent-orig", source="tui")
+            db.create_session(
+                session_id="child-fork",
+                source="tui",
+                parent_session_id="parent-orig",
+                model_config={"_branched_from": "parent-orig"},
+            )
+        finally:
+            db.close()
+
+        resp = self.auth_client.get("/api/sessions/parent-orig/latest-descendant")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["session_id"] == "parent-orig"
+        assert data["changed"] is False

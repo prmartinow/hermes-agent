@@ -3,6 +3,7 @@ import { type AnsiCode, ansiCodesToString } from '@alcalzone/ansi-tokenize'
 import { logForDebugging } from '../utils/debug.js'
 
 import { transitionAnsiCodes } from './ansi-transition.js'
+import { inlineViewportOrigin } from './frame.js'
 import type { Diff, FlickerReason, Frame } from './frame.js'
 import type { Point } from './layout/geometry.js'
 import {
@@ -47,6 +48,21 @@ export class LogUpdate {
     this.state = {
       previousOutput: ''
     }
+  }
+
+  renderInitial(
+    next: Frame,
+    mode: 'clear-terminal' | 'append-to-existing-scrollback' = 'clear-terminal',
+    altScreen = false
+  ): Diff {
+    return fullResetSequence_CAUSES_FLICKER(
+      next,
+      'init',
+      this.options.stylePool,
+      undefined,
+      altScreen,
+      mode
+    )
   }
 
   renderPreviousOutput_DEPRECATED(prevFrame: Frame): Diff {
@@ -151,7 +167,9 @@ export class LogUpdate {
       next.viewport.height !== prev.viewport.height ||
       (prev.viewport.width !== 0 && next.viewport.width !== prev.viewport.width)
     ) {
-      return fullResetSequence_CAUSES_FLICKER(next, 'resize', stylePool)
+      return fullResetSequence_CAUSES_FLICKER(
+        next, prev.viewport.width === 0 ? 'init' : 'resize', stylePool, undefined, altScreen
+      )
     }
 
     // DECSTBM scroll optimization: when a ScrollBox's scrollTop changed,
@@ -170,28 +188,7 @@ export class LogUpdate {
     // where scrollTop moves. Falling through to the diff loop writes all
     // shifted rows: more bytes, no intermediate state. next.screen from
     // render-node-to-output's blit+shift is correct either way.
-    let scrollPatch: Diff = []
-
-    if (altScreen && next.scrollHint && decstbmSafe) {
-      const { top, bottom, delta } = next.scrollHint
-
-      // Keep DECSTBM away from the terminal's last visible row. In alt-screen
-      // layouts we reserve that lane for status/cursor parking, and scrolling
-      // it can leave transient ghosting/bleed artifacts until a later repaint.
-      if (top >= 0 && bottom < prev.screen.height - 1 && bottom < next.screen.height - 1) {
-        shiftRows(prev.screen, top, bottom, delta)
-        scrollPatch = [
-          {
-            type: 'stdout',
-            content:
-              setScrollRegion(top + 1, bottom + 1) +
-              (delta > 0 ? csiScrollUp(delta) : csiScrollDown(-delta)) +
-              RESET_SCROLL_REGION +
-              CURSOR_HOME
-          }
-        ]
-      }
-    }
+    const scrollPatch = hardwareScrollPatch(prev, next, altScreen, decstbmSafe)
 
     // We have to use purely relative operations to manipulate the cursor since
     // we don't know its starting point.
@@ -221,12 +218,12 @@ export class LogUpdate {
     // bring scrollback content into view, so we need a full reset.
     // Use <= (not <) because even when next height equals viewport height, the
     // scrollback depth from the previous render differs from a fresh render.
-    if (prevHadScrollback && nextFitsViewport && isShrinking) {
+    if (altScreen && prevHadScrollback && nextFitsViewport && isShrinking) {
       logForDebugging(
         `Full reset (shrink->below): prevHeight=${prev.screen.height}, nextHeight=${next.screen.height}, viewport=${prev.viewport.height}`
       )
 
-      return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', stylePool)
+      return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', stylePool, undefined, altScreen)
     }
 
     if (
@@ -258,7 +255,7 @@ export class LogUpdate {
           triggerY: scrollbackChangeY,
           prevLine,
           nextLine
-        })
+        }, altScreen)
       }
     }
 
@@ -277,8 +274,8 @@ export class LogUpdate {
       // eraseLines only works within the viewport - it can't clear scrollback.
       // If we need to clear more lines than fit in the viewport, some are in
       // scrollback, so we need a full reset.
-      if (linesToClear > prev.viewport.height) {
-        return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', this.options.stylePool)
+      if (altScreen && linesToClear > prev.viewport.height) {
+        return fullResetSequence_CAUSES_FLICKER(next, 'offscreen', this.options.stylePool, undefined, altScreen)
       }
 
       // clear(N) moves cursor UP by N-1 lines and to column 0
@@ -409,7 +406,7 @@ export class LogUpdate {
         triggerY: resetTriggerY,
         prevLine: readLine(prev.screen, resetTriggerY),
         nextLine: readLine(next.screen, resetTriggerY)
-      })
+      }, altScreen)
     }
 
     // Reset styles before rendering new rows (they'll set their own styles)
@@ -483,6 +480,30 @@ export class LogUpdate {
   }
 }
 
+function hardwareScrollPatch(prev: Frame, next: Frame, altScreen: boolean, decstbmSafe: boolean): Diff {
+  if (!altScreen || !next.scrollHint || !decstbmSafe) {
+    return []
+  }
+
+  const { top, bottom, delta } = next.scrollHint
+
+  // The last visible row is reserved for status and cursor parking.
+  if (!(top >= 0 && bottom < prev.screen.height - 1 && bottom < next.screen.height - 1)) {
+    return []
+  }
+
+  shiftRows(prev.screen, top, bottom, delta)
+
+  return [{
+    type: 'stdout',
+    content:
+      setScrollRegion(top + 1, bottom + 1) +
+      (delta > 0 ? csiScrollUp(delta) : csiScrollDown(-delta)) +
+      RESET_SCROLL_REGION +
+      CURSOR_HOME
+  }]
+}
+
 function transitionHyperlink(diff: Diff, current: Hyperlink, target: Hyperlink): Hyperlink {
   if (current !== target) {
     diff.push({ type: 'hyperlink', uri: target ?? '' })
@@ -517,17 +538,38 @@ function fullResetSequence_CAUSES_FLICKER(
   frame: Frame,
   reason: FlickerReason,
   stylePool: StylePool,
-  debug?: { triggerY: number; prevLine: string; nextLine: string }
+  debug?: { triggerY: number; prevLine: string; nextLine: string },
+  altScreen = false,
+  initialRenderMode: 'clear-terminal' | 'append-to-existing-scrollback' = 'clear-terminal'
 ): Diff {
-  // After clearTerminal, cursor is at (0, 0)
+  const isResize = reason === 'resize'
+  const isInit = reason === 'init'
+  const isAppendInitial = isInit && initialRenderMode === 'append-to-existing-scrollback'
+  const t0 = performance.now()
+
+  // Static History / Dynamic Active Split:
+  // In inline mode, completed turns reside in the terminal emulator's native scrollback,
+  // which the terminal automatically and hardware-reflows on window resize.
+  // When appending to existing scrollback, only the active viewport slice is mounted.
+  const fullHistory = altScreen ? true : (isInit && !isAppendInitial)
   const screen = new VirtualScreen({ x: 0, y: 0 }, frame.viewport.width)
-  renderFrame(screen, frame, stylePool)
+  const originY = fullHistory ? 0 : inlineViewportOrigin(frame)
+  renderFrameSlice(screen, frame, originY, frame.screen.height, stylePool, originY, !fullHistory)
 
-  return [{ type: 'clearTerminal', reason, debug }, ...screen.diff]
-}
+  // Restore cursor to frame's target cursor position so typing does NOT overwrite the status bar!
+  if (!altScreen && frame.cursor) {
+    moveCursorTo(screen, frame.cursor.x, fullHistory ? frame.cursor.y : Math.max(0, Math.min(frame.viewport.height - 1, frame.cursor.y - originY)))
+  }
 
-function renderFrame(screen: VirtualScreen, frame: Frame, stylePool: StylePool): void {
-  renderFrameSlice(screen, frame, 0, frame.screen.height, stylePool)
+  // When appending to existing scrollback, do NOT wipe native scrollback!
+  const patchType = isAppendInitial
+    ? undefined
+    : (altScreen || (isInit && !altScreen)) ? 'clearTerminal' : 'clearScreen'
+  const diff: Diff = patchType ? [{ type: patchType, reason, debug }, ...screen.diff] : [...screen.diff]
+  if (isResize) {
+    logForDebugging(`[tui-perf] fullResetSequence: resize complete in ${(performance.now() - t0).toFixed(1)}ms: rows=${frame.screen.height}, cols=${frame.viewport.width}, patches=${diff.length}`)
+  }
+  return diff
 }
 
 /**
@@ -539,7 +581,9 @@ function renderFrameSlice(
   frame: Frame,
   startY: number,
   endY: number,
-  stylePool: StylePool
+  stylePool: StylePool,
+  originY = 0,
+  viewportOnly = false
 ): VirtualScreen {
   let currentStyleId = stylePool.none
   let currentHyperlink: Hyperlink = undefined
@@ -558,8 +602,9 @@ function renderFrameSlice(
     // when the cursor is at the viewport bottom, moveCursorTo's
     // cursor-down silently fails, creating a permanent off-by-one
     // between the virtual cursor and the real terminal cursor.
-    if (screen.cursor.y < y) {
-      const rowsToAdvance = y - screen.cursor.y
+    const targetY = y - originY
+    if (screen.cursor.y < targetY) {
+      const rowsToAdvance = targetY - screen.cursor.y
       screen.txn(prev => {
         const patches: Diff = new Array<Diff[number]>(1 + rowsToAdvance)
         patches[0] = CARRIAGE_RETURN
@@ -586,7 +631,7 @@ function renderFrameSlice(
         continue
       }
 
-      moveCursorTo(screen, x, y)
+      moveCursorTo(screen, x, targetY)
 
       // Handle hyperlink
       const targetHyperlink = cell.hyperlink
@@ -610,7 +655,11 @@ function renderFrameSlice(
     // CR+LF at end of row — \r resets to column 0, \n moves to next line.
     // Without \r, the terminal cursor stays at whatever column content ended
     // (since we skip trailing spaces, this can be mid-row).
-    screen.txn(prev => [[CARRIAGE_RETURN, NEWLINE], { dx: -prev.x, dy: 1 }])
+    // LF on the bottom viewport row scrolls preserved history. A bounded
+    // repaint leaves the final row in place; cursor restoration follows.
+    if (!viewportOnly || targetY + 1 < frame.viewport.height) {
+      screen.txn(prev => [[CARRIAGE_RETURN, NEWLINE], { dx: -prev.x, dy: 1 }])
+    }
   }
 
   // Reset any open style/hyperlink at end of slice

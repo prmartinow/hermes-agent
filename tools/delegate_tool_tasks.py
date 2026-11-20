@@ -160,3 +160,128 @@ def _coerce_task_images(
             return [], err
         task_images.append(cleaned)
     return task_images, None
+
+
+def _coerce_task_inherit_context(
+    task_list: list[dict[str, Any]],
+) -> tuple[list[bool], Optional[str]]:
+    """Per-task validated inherit_context booleans (default False). Validates type strictly (bool only).
+    A non-boolean value (including None when explicitly specified) fails the whole call before any child spawns."""
+    result: list[bool] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        if "inherit_context" in task:
+            val = task["inherit_context"]
+            if not isinstance(val, bool):
+                return [], f"Task {i} 'inherit_context' must be a boolean."
+            result.append(val)
+        else:
+            result.append(False)
+    return result, None
+
+
+def _coerce_task_inherit_max_tokens(
+    task_list: list[dict[str, Any]],
+    task_inherit_contexts: list[bool],
+) -> tuple[list[Optional[int]], Optional[str]]:
+    """Per-task validated inherit_max_tokens integers (default None).
+    Validates type strictly (positive integer only, rejects bool, float, string, None).
+    Only valid when inherit_context is True.
+    """
+    result: list[Optional[int]] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        if "inherit_max_tokens" in task:
+            inherit_ctx = task_inherit_contexts[i] if i < len(task_inherit_contexts) else False
+            if not inherit_ctx:
+                return [], f"Task {i} 'inherit_max_tokens' is only valid when 'inherit_context' is true."
+            val = task["inherit_max_tokens"]
+            if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+                return [], f"Task {i} 'inherit_max_tokens' must be a positive integer."
+            result.append(val)
+        else:
+            result.append(None)
+    return result, None
+
+
+_VALID_INHERIT_CONTEXT_MODES = frozenset({"full", "bounded"})
+
+
+def _coerce_task_inherit_context_mode(
+    task_list: list[dict[str, Any]],
+    task_inherit_contexts: list[bool],
+) -> tuple[list[str], Optional[str]]:
+    """Per-task validated inherit_context_mode enum (full | bounded, default full).
+    Strict validation: rejects non-string types, non-exact values (no case normalization or whitespace stripping).
+    Only valid when inherit_context is True.
+    """
+    result: list[str] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        inherit_ctx = task_inherit_contexts[i] if i < len(task_inherit_contexts) else False
+        if "inherit_context_mode" in task:
+            if not inherit_ctx:
+                return [], f"Task {i} 'inherit_context_mode' is only valid when 'inherit_context' is true."
+            val = task["inherit_context_mode"]
+            if not isinstance(val, str) or val not in _VALID_INHERIT_CONTEXT_MODES:
+                return [], f"Task {i} 'inherit_context_mode' must be 'full' or 'bounded'."
+            result.append(val)
+        else:
+            result.append("full")
+    return result, None
+
+
+def _coerce_task_inherit_compacted_history(
+    task_list: list[dict[str, Any]],
+    task_inherit_contexts: list[bool],
+) -> tuple[list[bool], Optional[str]]:
+    """Per-task validated inherit_compacted_history booleans (default False).
+    Validates type strictly (bool only).
+    Requires inherit_context: true when field supplied (including explicit false).
+    """
+    result: list[bool] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        inherit_ctx = task_inherit_contexts[i] if i < len(task_inherit_contexts) else False
+        if "inherit_compacted_history" in task:
+            if not inherit_ctx:
+                return [], f"Task {i} 'inherit_compacted_history' is only valid when 'inherit_context' is true."
+            val = task["inherit_compacted_history"]
+            if not isinstance(val, bool):
+                return [], f"Task {i} 'inherit_compacted_history' must be a boolean."
+            result.append(val)
+        else:
+            result.append(False)
+    return result, None
+
+
+def _coerce_task_continue_from(
+    task_list: list[dict[str, Any]],
+    task_inherit_contexts: list[bool],
+) -> tuple[list[Optional[str]], Optional[str]]:
+    """Per-task validated continue_from session IDs (default None).
+    Strict string validation: rejects non-string types, boolean, empty, whitespace, or whitespace-wrapped refs.
+    Never strips or repairs IDs.
+    Requires inherit_context: true when field supplied.
+    """
+    result: list[Optional[str]] = []
+    for i, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            continue
+        inherit_ctx = task_inherit_contexts[i] if i < len(task_inherit_contexts) else False
+        if "continue_from" in task:
+            if not inherit_ctx:
+                return [], f"Task {i} 'continue_from' is only valid when 'inherit_context' is true."
+            val = task["continue_from"]
+            if isinstance(val, bool) or not isinstance(val, str):
+                return [], f"Task {i} 'continue_from' must be a string."
+            if not val or val.strip() != val or not val.strip():
+                return [], f"Task {i} 'continue_from' must be a non-empty string without leading or trailing whitespace."
+            result.append(val)
+        else:
+            result.append(None)
+    return result, None

@@ -128,7 +128,8 @@ def _wire_route(model: Any, base_url: Any, scope: Any = None) -> _WireRoute:
     keep_fn_sig = profile is not None and bool(ask_profile(
         profile, "replays_function_thought_signature", False, model=model, base_url=url, scope=scope))
     # Same gate as tool-call extra_content, so the two signature carriers can never disagree.
-    return _WireRoute(model, url, _model_consumes_thought_signature(model), profile, keep_fn_sig, _message_keys(),
+    return _WireRoute(model, url, _model_consumes_thought_signature(model, url, getattr(scope, "provider", None)),
+                      profile, keep_fn_sig, _message_keys(),
                       scope)
 
 

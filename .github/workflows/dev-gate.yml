@@ -1,0 +1,74 @@
+name: Dev Gate CI
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanitization:
+    name: Sanitization & Path Leak Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Scan tracked content for private paths and addresses
+        shell: bash
+        run: |
+          set -euo pipefail
+          patterns=("/home/"'ops' "192.168."'1.16' "10.66."'66.')
+          failed=0
+          for pattern in "${patterns[@]}"; do
+            if git grep -l -F "$pattern" -- ':!.github/workflows/**'; then
+              echo "Private path or address detected in tracked content"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  linearity:
+    name: Dev Ancestry & Linearity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a linear development branch based on main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor refs/remotes/origin/main HEAD
+          if [ -n "$(git rev-list --merges refs/remotes/origin/main..HEAD)" ]; then
+            echo "dev must be linear on main"
+            exit 1
+          fi
+
+  tests:
+    name: State DB & Lineage Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Set up locked Python and isolated test dependencies
+        uses: ./.github/actions/setup-pm
+        with:
+          extras: '[]'
+          test-environment: 'true'
+      - name: Run state and lineage contracts offline
+        run: scripts/run_tests.sh tests/test_state_db_lineage.py tests/test_state_db_compacted_display.py -m 'not live and not allow_network' -v

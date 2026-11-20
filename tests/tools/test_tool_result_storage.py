@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from tools.budget_config import (
     DEFAULT_PREVIEW_SIZE_CHARS,
+    DEFAULT_BUDGET,
     BudgetConfig,
 )
 from tools.tool_result_storage import (
@@ -225,6 +226,12 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
+    @pytest.fixture(autouse=True)
+    def _disable_context_db(self, monkeypatch):
+        import tools.tool_result_storage as trs
+        monkeypatch.setattr(trs, "_archive_to_context_db", lambda *a, **kw: None)
+        yield
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(
@@ -322,6 +329,12 @@ class TestMaybePersistToolResult:
 # ── enforce_turn_budget ───────────────────────────────────────────────
 
 class TestEnforceTurnBudget:
+    @pytest.fixture(autouse=True)
+    def _disable_context_db(self, monkeypatch):
+        import tools.tool_result_storage as trs
+        monkeypatch.setattr(trs, "_archive_to_context_db", lambda *a, **kw: None)
+        yield
+
     def test_under_budget_no_changes(self):
         msgs = [
             {"role": "tool", "tool_call_id": "t1", "content": "small"},
@@ -396,6 +409,7 @@ class TestSpillover:
         # Reset the once-per-process prune flag so each test is independent.
         import tools.tool_result_storage as trs
         monkeypatch.setattr(trs, "_spillover_pruned_homes", set())
+        monkeypatch.setattr(trs, "_archive_to_context_db", lambda *a, **kw: None)
         yield
 
     def test_env_none_persists_to_spillover(self):
@@ -852,3 +866,177 @@ class TestMcpEnvelopeSpillover:
         assert "could not be saved" in result
         assert "chars elided" in result and "error: LAST_LINE" in result
         assert "spillover" not in result
+
+class TestRecoveryHint:
+    def test_preview_teaches_recovery_not_refetch(self):
+        msg = _build_persisted_message(
+            preview="preview text",
+            has_more=True,
+            original_size=60_000,
+            file_path="/tmp/hermes-results/r.txt",
+        )
+        assert "Recovery:" in msg
+        assert "execute_code" in msg
+        assert "re-request" in msg
+        # Structure preserved: tag, size, path, read_file guidance all intact.
+        assert msg.startswith(PERSISTED_OUTPUT_TAG)
+        assert msg.endswith(PERSISTED_OUTPUT_CLOSING_TAG)
+        assert "read_file" in msg
+
+
+# ── Context Offloading & Retrieval (Gap 2) ─────────────────────────────
+
+class TestTracesPathResolution:
+    def test_explicit_traces_path_wins(self, monkeypatch, tmp_path):
+        import tools.tool_result_storage as trs
+        traces = tmp_path / "external" / "traces"
+        monkeypatch.setenv("AGENT_MEMORY_TRACES_PATH", str(traces))
+        assert trs._resolve_traces_path() == str(traces)
+
+    def test_default_tracks_active_profile(self, monkeypatch, tmp_path):
+        import tools.tool_result_storage as trs
+        monkeypatch.delenv("AGENT_MEMORY_TRACES_PATH", raising=False)
+        for profile in ("a", "b", "a"):
+            home = tmp_path / profile
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            assert trs._resolve_traces_path() == str(home / "agent-memory" / "traces")
+
+    def test_cached_archiver_from_another_profile_is_not_used(self, monkeypatch, tmp_path):
+        from types import ModuleType
+        from tools import tool_result_storage as trs
+
+        monkeypatch.delenv("AGENT_MEMORY_TRACES_PATH", raising=False)
+        monkeypatch.setattr(sys, "path", list(sys.path))
+        traces_a = tmp_path / "profile-a" / "agent-memory" / "traces"
+        traces_b = tmp_path / "profile-b" / "agent-memory" / "traces"
+        traces_a.mkdir(parents=True)
+        traces_b.mkdir(parents=True)
+        archiver, brief = ModuleType("archiver"), ModuleType("symbolic_brief")
+        archiver.__file__ = str(traces_a / "archiver.py")
+        brief.__file__ = str(traces_a / "symbolic_brief" / "__init__.py")
+        archiver.archive_content = lambda **kwargs: None
+        brief.generate_symbolic_brief = lambda *args: "brief"
+        monkeypatch.setitem(sys.modules, "archiver", archiver)
+        monkeypatch.setitem(sys.modules, "symbolic_brief", brief)
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
+        assert trs._get_archiver_modules() == (archiver.archive_content, brief.generate_symbolic_brief)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
+        assert trs._get_archiver_modules() == (None, None)
+
+
+class TestContextOffloading:
+    @pytest.fixture(autouse=True)
+    def _fake_archiver(self, monkeypatch):
+        import uuid
+        from tools import context_retrieve_tool, tool_result_storage
+
+        rows = {}
+
+        def archive_content(*, raw_content, tool_name, **kwargs):
+            archive_id = str(uuid.uuid4())
+            rows[archive_id] = {"raw_content": raw_content, "tool_name": tool_name}
+            return {"archive_id": archive_id, "tool_name": tool_name}
+
+        def generate_brief(meta, content):
+            return f"⚡ [OFFLOADED VERBOSE TOOL OUTPUT: {meta['tool_name']}] [ARCHIVE_ID: {meta['archive_id']}] context_retrieve"
+
+        def retrieve_content(*, archive_id, **kwargs):
+            return rows.get(archive_id)
+
+        monkeypatch.setattr(tool_result_storage, "_get_archiver_modules", lambda: (archive_content, generate_brief))
+        monkeypatch.setattr(context_retrieve_tool, "_get_retrieve_content_fn", lambda: retrieve_content)
+
+    def test_offload_above_threshold_archives_and_returns_brief(self):
+        content = "Line 1: starting build\n" + "Line ...\n" * 800 + "Line 802: build finished"
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_term_1",
+            env=None,
+            threshold=5_120,
+        )
+        assert "[ARCHIVE_ID:" in result
+        assert "⚡ [OFFLOADED VERBOSE TOOL OUTPUT: terminal]" in result
+        assert "context_retrieve" in result
+
+    def test_default_threshold_triggers_at_5kb_for_terminal(self):
+        # ~6000 chars of terminal output should offload under DEFAULT_BUDGET (5120 char threshold)
+        content = "hello world\n" * 500
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_term_2",
+            env=None,
+            config=DEFAULT_BUDGET,
+        )
+        assert "[ARCHIVE_ID:" in result
+        assert "⚡ [OFFLOADED VERBOSE TOOL OUTPUT: terminal]" in result
+
+    def test_default_threshold_does_not_trigger_below_5kb(self):
+        content = "small output\n" * 100  # ~1300 chars
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_term_3",
+            env=None,
+            config=DEFAULT_BUDGET,
+        )
+        assert result == content
+
+    def test_read_file_unconstrained(self):
+        # read_file should never be offloaded even with large content
+        content = "a" * 50_000
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="read_file",
+            tool_use_id="tc_read_1",
+            env=None,
+            config=DEFAULT_BUDGET,
+        )
+        assert result == content
+
+    def test_context_retrieve_tool_full_and_sliced(self):
+        from tools.context_retrieve_tool import context_retrieve
+        sample_text = "\n".join([f"line_{i}" for i in range(1, 21)])
+        # Offload
+        result = maybe_persist_tool_result(
+            content=sample_text,
+            tool_name="terminal",
+            tool_use_id="tc_retrieve_test",
+            env=None,
+            threshold=10,
+        )
+        assert "[ARCHIVE_ID: " in result
+        import re
+        m = re.search(r"\[ARCHIVE_ID: ([a-f0-9\-]+)\]", result)
+        assert m is not None
+        archive_id = m.group(1)
+
+        # 1. Full retrieval
+        full = context_retrieve(archive_id=archive_id)
+        assert full == sample_text
+
+        # 2. Sliced retrieval (offset=5, limit=3)
+        sliced = context_retrieve(archive_id=archive_id, offset=5, limit=3)
+        assert "Lines 5 to 7 of 20 total lines" in sliced
+        assert "line_5\nline_6\nline_7" in sliced
+
+    def test_context_retrieve_not_found(self):
+        from tools.context_retrieve_tool import context_retrieve
+        res = context_retrieve(archive_id="non-existent-uuid-12345")
+        assert "not found" in res.lower() or "error" in res.lower()
+
+    def test_fallback_when_archiver_fails(self, monkeypatch):
+        import tools.tool_result_storage as trs
+        monkeypatch.setattr(trs, "_get_archiver_modules", lambda: (None, None))
+        content = "x" * 60_000
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="tc_fallback_1",
+            env=None,
+            threshold=30_000,
+        )
+        assert PERSISTED_OUTPUT_TAG in result
+        assert "Full output saved to:" in result

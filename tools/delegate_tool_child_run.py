@@ -3,6 +3,7 @@ timeout/failure handling, result-entry assembly and cleanup (``_ChildRun``)."""
 
 from __future__ import annotations
 
+import copy
 import logging
 import contextvars
 import json
@@ -116,6 +117,9 @@ def _fabricated_entry(idx: int, status: str, error: str, child: Any, duration: f
     route = _route_report(child)
     if route is not None:
         entry["route"] = route
+    child_sid = getattr(child, "session_id", None)
+    if isinstance(child_sid, str) and child_sid:
+        entry["child_session_id"] = child_sid
     return entry
 
 def _append_missed_steer(entry: dict[str, Any], late_steer: Optional[str]) -> None:
@@ -584,7 +588,7 @@ def _validate_child_output_schema(
             _retry_result = child.run_conversation(
                 user_message=append_output_contract(build_retry_message(_schema_errors), _output_schema),
                 task_id=child_task_id,
-                stream_callback=relay_child_text, conversation_history=_history,
+                stream_callback=relay_child_text, conversation_history=copy.deepcopy(_history),
             )
     except Exception as _retry_exc:
         logger.warning("Subagent %d schema-retry turn failed: %s", task_index, _retry_exc)
@@ -711,6 +715,12 @@ def _build_result_entry(
     _route = _route_report(child)
     if _route is not None:
         entry["route"] = _route
+    child_sid = getattr(child, "session_id", None)
+    if isinstance(child_sid, str) and child_sid:
+        entry["child_session_id"] = child_sid
+    _manifest = getattr(child, "_inherited_context_manifest", None)
+    if isinstance(_manifest, dict):
+        entry["inherited_context"] = _manifest
     if status == "failed":
         entry["error"] = result.get("error", "Subagent did not produce a response.")
         # Classified reason from the child loop (e.g. "rate_limit", "billing")
@@ -997,6 +1007,11 @@ class _ChildRun:
         # Worker thread handle so the timeout diagnostic can dump its stack.
         worker_thread_holder: dict[str, Optional[threading.Thread]] = {"t": None}
         # Resolved after seed_workspace so a multimodal goal's text part carries the worktree note too.
+        _snapshot = getattr(child, "_inherited_context_snapshot", None)
+        if _snapshot is not None and hasattr(_snapshot, "rendered_transcript") and isinstance(_snapshot.rendered_transcript, str):
+            effective_goal = f"{_snapshot.rendered_transcript}\n\n=== DELEGATED TASK ===\n{self.goal}"
+        else:
+            effective_goal = self.goal
         _images = list(getattr(child, "_delegate_images", None) or [])
         # action='continue': the child's saved transcript, so ``self.goal`` (the follow-up) is its next turn,
         # sent bare. Building the brief still registers its context prefix: the saved first turn starts with
@@ -1004,7 +1019,7 @@ class _ChildRun:
         _history = getattr(child, "_delegate_continue_history", None)
         resume = {"conversation_history": _history} if isinstance(_history, list) else {}
         from tools.delegate_tool_progress import child_task_message
-        _brief = child_task_message(self.goal, getattr(child, "_delegate_context", None))
+        _brief = child_task_message(effective_goal, getattr(child, "_delegate_context", None))
         task_text = self.goal if resume else _brief
         user_message: Any = _build_child_goal_message(task_text, _images, child) if _images else task_text
 
@@ -1123,6 +1138,9 @@ class _ChildRun:
             "_child_role": getattr(child, "_delegate_role", None),
             "diagnostic_path": diagnostic_path,
         }
+        child_sid = getattr(child, "session_id", None)
+        if isinstance(child_sid, str) and child_sid:
+            _error_entry["child_session_id"] = child_sid
         _error_entry = self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
         close_deferred = is_timeout and not future.done()
         if close_deferred:

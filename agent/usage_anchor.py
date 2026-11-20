@@ -64,7 +64,7 @@ def _priced_prefix_fingerprint(messages: list[dict[str, Any]], base_count: int) 
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()
 
 
-def capture_usage_anchor(prompt_tokens: Any, completion_tokens: Any, messages: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+def capture_usage_anchor(prompt_tokens: Any, completion_tokens: Any, messages: list[dict[str, Any]], *, model: Optional[str] = None, provider: Optional[str] = None) -> Optional[dict[str, Any]]:
     """Build a usage anchor from provider-reported usage, or None when usage is unusable."""
     try:
         pt = int(prompt_tokens or 0)
@@ -74,7 +74,7 @@ def capture_usage_anchor(prompt_tokens: Any, completion_tokens: Any, messages: l
     if pt <= 0 or not isinstance(messages, list) or not messages:
         return None  # some endpoints omit usage — caller keeps its anchor
     last = messages[-1]
-    return {
+    res: dict[str, Any] = {
         "prompt_tokens": pt,
         "completion_tokens": max(0, ct),
         "base_count": len(messages),
@@ -82,6 +82,11 @@ def capture_usage_anchor(prompt_tokens: Any, completion_tokens: Any, messages: l
         "base_last_fp": message_fingerprint(last),
         "base_prefix_fp": _priced_prefix_fingerprint(messages, len(messages)),
     }
+    if model:
+        res["model"] = str(model)
+    if provider:
+        res["provider"] = str(provider)
+    return res
 
 
 def _anchor_matches(messages: list[dict[str, Any]], anchor: dict[str, Any]) -> bool:
@@ -103,6 +108,21 @@ def _anchor_matches(messages: list[dict[str, Any]], anchor: dict[str, Any]) -> b
         and bool(prefix_fp)
         and _priced_prefix_fingerprint(messages, base_count) == prefix_fp
     )
+
+
+def _anchor_runtime_matches(agent: Any, anchor: dict[str, Any]) -> bool:
+    """True when anchor's model and provider match the agent's active runtime."""
+    agent_model = getattr(agent, "model", None)
+    anchor_model = anchor.get("model")
+    if anchor_model is not None or agent_model is not None:
+        if str(anchor_model or "").strip() != str(agent_model or "").strip():
+            return False
+    agent_provider = getattr(agent, "provider", None)
+    anchor_provider = anchor.get("provider")
+    if anchor_provider is not None or agent_provider is not None:
+        if str(anchor_provider or "").strip().lower() != str(agent_provider or "").strip().lower():
+            return False
+    return True
 
 
 def anchored_context_tokens(messages: list[dict[str, Any]], anchor: Optional[dict[str, Any]], *, charge_stale_thinking: bool = True) -> Optional[int]:
@@ -140,9 +160,13 @@ def _serialize(anchor: Any) -> Optional[dict[str, Any]]:
         or not prefix_fp
     ):
         return None
-    return {"prompt_tokens": pt, "completion_tokens": max(0, ct), "base_count": base_count,
-            "base_last_role": role if isinstance(role, str) else None, "base_last_fp": fp,
-            "base_prefix_fp": prefix_fp}
+    serialized = {"prompt_tokens": pt, "completion_tokens": max(0, ct), "base_count": base_count,
+                  "base_last_role": role if isinstance(role, str) else None, "base_last_fp": fp,
+                  "base_prefix_fp": prefix_fp}
+    for field in ("model", "provider"):
+        if anchor.get(field):
+            serialized[field] = str(anchor[field])
+    return serialized
 
 
 def persist_usage_anchor(agent: Any, anchor: Optional[dict[str, Any]]) -> None:
@@ -164,6 +188,11 @@ def persist_usage_anchor(agent: Any, anchor: Optional[dict[str, Any]]) -> None:
 
 def set_usage_anchor(agent: Any, anchor: Optional[dict[str, Any]], *, turn_base: bool = False) -> None:
     """Install ``anchor`` on the agent (``None`` clears) and mirror it to the session row."""
+    if isinstance(anchor, dict):
+        if not anchor.get("model") and getattr(agent, "model", None):
+            anchor["model"] = str(agent.model)
+        if not anchor.get("provider") and getattr(agent, "provider", None):
+            anchor["provider"] = str(agent.provider)
     agent._usage_anchor = anchor
     if turn_base or anchor is None:
         agent._turn_base_usage_anchor = anchor
@@ -189,7 +218,7 @@ def restore_usage_anchor(agent: Any, conversation_history: Optional[list[dict[st
         return
     if anchor is None:
         return
-    if _anchor_matches(conversation_history, anchor):
+    if _anchor_matches(conversation_history, anchor) and _anchor_runtime_matches(agent, anchor):
         agent._usage_anchor = anchor
     else:
         persist_usage_anchor(agent, None)
@@ -210,3 +239,12 @@ def persisted_anchor_tokens(session_db: Any, session_id: Any, messages: Any, *, 
         logger.debug("usage anchor load failed", exc_info=True)
         return None
     return anchored_context_tokens(messages, anchor) if anchor else None
+
+
+def clear_usage_anchor_on_route_change(agent, old_model, new_model, old_provider, new_provider, old_length):
+    """A new runtime must estimate tokens against its own model and context window."""
+    new_length = getattr(getattr(agent, "context_compressor", None), "context_length", None)
+    changed_model = (old_model or "").strip() != (new_model or "").strip()
+    changed_window = old_length is not None and new_length is not None and old_length != new_length
+    if changed_model or old_provider != new_provider or changed_window:
+        set_usage_anchor(agent, None)

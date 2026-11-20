@@ -209,6 +209,8 @@ from hermes_cli.cli_single_query import (
     _single_query_exit_code,
     _sync_cli_session_id_from_agent,
 )
+from agent.interrupt_compat import request_hard_interrupt
+from agent.pet import render as pet_render
 
 try:
     from prompt_toolkit.patch_stdout import patch_stdout
@@ -912,7 +914,6 @@ class HermesCLI(CLIBacktrackMixin, CLIInitMixin, CLITuiRuntimeMixin, CLIProcessN
                                  checkpoints, pass_session_id, ignore_rules)
         self._init_runtime_state(resume)
 
-
     def _claim_active_session(self, surface: str = "cli", *, stderr: bool = False) -> bool:
         """Claim a global active-session slot for this CLI process."""
         if self._active_session_lease is not None:
@@ -1138,6 +1139,7 @@ class HermesCLI(CLIBacktrackMixin, CLIInitMixin, CLITuiRuntimeMixin, CLIProcessN
         "agents": ("_handle_agents_command", False), "bg": ("_handle_background_command", True),
         "queue": ("_cmd_queue", True), "steer": ("_cmd_steer", True), "moa": ("_cmd_moa", True),
     }
+
 
     @classmethod
     def _slash_handler(cls, canonical: str) -> tuple[str, bool] | None:
@@ -1410,7 +1412,6 @@ class HermesCLI(CLIBacktrackMixin, CLIInitMixin, CLITuiRuntimeMixin, CLIProcessN
     # approvals.destructive_slash_confirm in config. (Native Windows now drives the modal normally — see
     # #33961.)
     _DESTRUCTIVE_SKIP_TOKENS = frozenset({"now", "--yes", "-y"})
-
 
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
@@ -1749,6 +1750,18 @@ def main(
         configure_windows_stdio()
 
     os.environ["HERMES_INTERACTIVE"] = "1"  # terminal_tool: interactive sudo prompts with timeout
+    if os.environ.get("HERMES_ACTIVE_TURN") == "1":  # health: allow HX002 -- child-process recursion guard, not user configuration
+        sys.stderr.write(
+            "Error: Recursive interactive Hermes CLI execution is blocked within an active turn.\n"
+            "Spawning nested CLI processes against the shared state.db causes SQLite lock starvation.\n"
+            "  • For subagent tasks, use delegate_task.\n"
+            "  • For cross-session communication, use the Dual Atomic Write workflow (SessionDB + LiveSessionStreamWriter / share_to_session).\n"
+        )
+        sys.exit(1)
+    # The banner names affected plugins; the raw per-name compat warnings would only duplicate it on stderr.
+    with suppress(Exception):
+        from hermes_cli.plugin_compat import quiet_for_interactive
+        quiet_for_interactive()
 
     if gateway:
         _run_legacy_gateway()

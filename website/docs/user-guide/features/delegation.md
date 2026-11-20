@@ -132,6 +132,89 @@ Delivery follows the same routing as user-attached images (`agent.image_input_mo
 
 Forwarding is best-effort: unreadable paths are skipped with a log line, and any failure in the image plumbing falls back to the plain text goal — it can never break a spawn. Images are for things the child must *see*; put text file paths in `context` as usual.
 
+### Opt-in Context Inheritance (`inherit_context`)
+
+By default, subagents are isolated and receive only the explicit `goal` and `context` passed in `delegate_task`. When a task requires deep awareness of earlier conversation history, parent decisions, or recently gathered tool evidence, each task can opt in with `inherit_context: true` (default `false`).
+
+:::warning Cross-Provider Transmission Warning
+When subagents are configured to use a different provider or model than the parent (via `delegation.provider` or `delegation.model`), enabling `inherit_context: true` transmits sanitized historical conversation context across provider boundaries. Only enable `inherit_context` when cross-provider data transmission is intended and authorized. Structural sanitization is not secret redaction: sensitive data in ordinary message text or completed tool output is still part of the transferred context.
+:::
+
+#### How It Works
+
+1. **Current-Turn Preservation**: Unlike simple message-tail pruning, context inheritance preserves the user's instructions and completed tool evidence from the in-flight turn, while cleanly stripping unresolved tool scaffolding (such as the in-flight `delegate_task` invocation itself) and orphan tool results.
+2. **Sanitized Historical Evidence**: System prompts, developer instructions, provider-specific reasoning sidecars (e.g. `codex_reasoning_items`, `thought`), and internal metadata are stripped. The context is rendered as an immutable, provenance-labeled historical transcript (`[HISTORICAL CONTEXT: USER PROMPT]`, `[HISTORICAL CONTEXT: COMPLETED TOOL CALL]`, etc.) and seeded into the subagent's initial user message alongside the assigned task.
+3. **Multimodal Block Extraction**: Multimodal messages extract text parts while explicitly tracking omitted images and unsupported blocks with visible counters.
+4. **Token Budgeting & Fail-Closed Safety**: The transcript token count is estimated using `estimate_tokens_rough`. The configured token ceiling (`delegation.inherit_max_tokens`, default 64,000) or per-task `inherit_max_tokens` override is clamped against the child model's verified context window with conservative headroom (reserving at least 2,048 tokens or 25% of the window for system prompts, tools, and child outputs). If context is empty, missing, or exceeds the effective budget, delegation **fails closed** immediately before any subagent is spawned or dispatched.
+5. **Per-Task Budget Overrides (`inherit_max_tokens`)**: Tasks with `inherit_context: true` can set an explicit `inherit_max_tokens` (positive integer) to allow large-context models (such as Gemini with a 1M+ token window) to receive more than the 64,000 token default ceiling without changing global configuration or affecting sibling tasks.
+6. **Initial Request Preflight & Honest Compression Preview**: Before child execution begins, Hermes checks the complete initial child request budget (inherited transcript + goal/context/schema + real system prompt + tool definitions + output reservation). It previews the child's effective compression trigger without mutating the compressor instance. If the full inherited snapshot would immediately trigger context compression on turn 1 or overflow the model's usable context window, delegation **fails closed** with an actionable report and cleans up any unrun children, ensuring full snapshot integrity without silent compaction.
+7. **Metadata Receipts**: Task receipts and dispatch payloads report snapshot metadata (snapshot ID digest, token counts, requested budget, effective budget, retained/omitted tallies) without echoing the full transcript back into parent results.
+8. **Snapshot-Scoped Historical Retrieval (`session_search`)**: Subagents inheriting context attach an immutable, detached `ContextSnapshot` carrying deterministic 1-based chronological message records. Subagents can query and navigate their inherited history on demand using `session_search` under the reserved namespace `session_id="snapshot"` (convenient alias for the caller's own attached snapshot) or `session_id="snapshot:<snapshot_id>"`:
+   - **Caller-Bound Authorization & Exact ID Equality**: Snapshot access is strictly bound to the calling subagent's attached snapshot. The convenient alias `session_id="snapshot"` safely routes directly to the caller's attached snapshot without needing to know the generated ID. Explicit IDs require exact string equality; forged IDs, missing snapshots, sibling-foreign references, or whitespace-wrapped refs fail closed with explicit errors before any database access. Profile queries (`profile=`) and sorting/filtering options (`sort=`, `after=`, `before=`, `exclude_session_ids=`) are disallowed.
+   - **Strict Type Validation**: Numeric arguments (`around_message_id`, `start_message_id`, `window`, `limit`, `content_offset`, `max_chars`) strictly require non-boolean integers with positivity contracts; floats and strings are rejected. Empty records allow `content_offset=0` but reject `content_offset > 0`.
+   - **Zero Database Overhead**: Snapshot routing executes entirely in-memory against frozen records before any SQLite session database acquisition or profile resolution. If `session_search` is deferred, use the normal tool-description and `tool_call` bridge; the owning-child binding is preserved through that path.
+   - **Safe Literal Search with Exact Original Offsets**: Literal (non-regex) search safely evaluates untrusted historical turns without ReDoS risks and treats metacharacters like `.*` literally. Search returns match-centered snippets with exact character offsets referring to original text (immune to Unicode case expansion shifts). Content characters are bounded in aggregate by `max_chars`.
+   - **Cursor Pagination & Unambiguous `next_call`**: Search pagination uses `query + around_message_id` as an inclusive search start cursor. Sequential browse/window continuation uses `start_message_id` plus `content_offset`, so finishing a partial record does not skip later records. Follow `next_call` as returned: it preserves the content budget, limit and role filter. Do not combine `start_message_id` with `query` or `around_message_id`. Exact `window=0` reads remain scoped to one record; their `has_more` describes only that record's remaining text.
+   - **Complete Paginated Recovery**: With `around_message_id`, `window=0`, and `content_offset` paired with bounded `max_chars` (default 8,000, max 32,000), long messages can be retrieved page-by-page and reassembled exactly without permanent cutoffs.
+   - **Multi-Record Window Scrolling**: Passing `around_message_id` with `window > 0` returns neighboring message turns with aggregate character budgeting and continuation positions (`has_more`, `next_around_message_id`, `next_content_offset`, `next_call`). When character budget boundaries hit zero, records are cleanly unconsumed without empty skipped placeholders.
+
+9. **Opt-in Bounded Context Inheritance (`inherit_context_mode: "bounded"`)**: By default, `inherit_context_mode` is `"full"`, which attempts to seed the complete sanitized conversation history into the child's initial prompt (failing closed if history exceeds the token ceiling). When conversation history is long or a tight initial seed budget is preferred:
+   - Setting `inherit_context_mode: "bounded"` renders a deterministic, prioritized initial seed within the `inherit_max_tokens` budget without discarding any underlying history.
+   - **Latest User Prompt Invariant**: The latest user-role record is always preserved in full. If the latest prompt alone plus required framing exceeds the effective budget, delegation fails closed explicitly with `BudgetExceededError`.
+   - **Deterministic Lexical Selection**: Whole candidate turns are selected using a transparent deterministic scoring policy based on task goal and context term matches, latest user prompt terms, adjacency to the latest user request, and turn recency, discounted by the square root of record size so large keyword-heavy dumps do not crowd out concise decisions. Selected records are emitted in strictly preserved chronological order.
+   - **Clear Partial Coverage Hint**: The initial seed transcript carries an explicit, compact guidance hint noting partial coverage and instructing the model how to retrieve unseeded historical records on-demand via `session_search(session_id="snapshot", ...)`.
+   - **Full Immutable Backing**: Underlying frozen snapshot records remain complete and queryable. Sibling tasks in a batch share the exact same backing records tuple while receiving distinct seeds tailored to their specific goals.
+   - **Reader Availability Gating**: Bounded mode requires `session_search` to be callable by the child (either directly or via the deferred `tool_call` bridge). Hermes verifies reader reachability before child inference begins and cleans up constructed children if the reader is unavailable. Full mode remains functional without `session_search`.
+   - **Honest Coverage Receipts**: Task manifests report `mode: "bounded"`, `source_records_count`, `source_digest`, `selected_record_ids`, `omitted_records_count`, `selection_policy: "deterministic_terms_density_and_recency"`, and `seed_estimated_tokens`.
+   - **Efficiency Is Workload-Dependent**: A smaller seed is not automatically cheaper overall: each retrieval round replays accumulated context. Start with a task-scoped budget (for example, 8,192 tokens), then compare total provider input, answer quality and retrieval rounds against a full-context baseline. The global default is unchanged.
+   - **Heuristic Limits**: Lexical term matching scores explicit ASCII word/identifier overlap. It does not perform semantic reasoning or embedding search; omission from the initial seed reflects budget prioritization rather than absolute irrelevance. The subagent should query `session_search(session_id="snapshot", ...)` when additional background is required.
+
+10. **Opt-in Compaction History Recovery (`inherit_compacted_history: true`)**: By default, context inheritance reads only the active conversation generation. When a long session has undergone in-place compaction and earlier details are needed by a subagent, tasks can opt in with `inherit_compacted_history: true` (requires `inherit_context: true`).
+    - **Detached Same-Session Recovery**: Queries locally archived messages (`active = 0 AND compacted = 1`) and active messages in a single atomic SQL statement against the parent's attached `_session_db`. Archived turns are stitched in id order before the active generation.
+    - **Active Generation Alignment & Summary Guard**: Recovery executes only if the live active generation contains a recognized plaintext compaction summary marker and aligns as a persisted prefix of the live conversation list. Unexplained archive rows without a visible summary marker in the active generation do not resurrect reset or cleared contexts. If the database active generation differs from live conversation turns or a concurrent race occurs, delegation fails closed with `ContextRecoveryError`.
+    - **Honest Coverage Receipts**: Task manifests explicitly report:
+      - `inherit_compacted_history`: whether recovery was requested.
+      - `compaction_recovery_coverage`: `"available_readable"` (archives recovered and stitched), `"active_only"` (uncompacted session or unexplained archives), or `"unavailable"` (no database attached to parent).
+      - `available_archived_messages_count`: number of archive messages fetched from the database.
+      - `retained_archived_records_count`: number of archive turns that survived sanitization as portable snapshot records.
+      - `observed_db_row_watermark`: highest message row id observed during the atomic query.
+    - **Rotated Lineage Limit**: Recovery queries only rows within the parent's exact session. Rotated ancestor lineages across session rotation boundaries are not traversed.
+    - **Opaque Checkpoint Limit**: Opaque native compaction checkpoints (such as encrypted or non-portable provider checkpoints) fail closed immediately; Hermes never attempts to blindly bypass or decrypt opaque state.
+    - **Legacy Tail Deduplication Limit**: Legacy compactions created with `tail_count=0` may retain duplicate representations of carried turns in both archive and active sets. To protect legitimate repeated turns, identical queries, and completed tool pairing, Hermes avoids heuristic timestamp or ID deduplication.
+    - **Derivative Summaries Retained**: Summaries are preserved and labeled as derivative context rather than dropped.
+    - **Privacy Boundary**: Opting in can send retained historical text no longer visible in the active generation to the configured child provider. Structural filtering does not redact secrets from ordinary text. Rewound and superseded rows (`active=0, compacted=0`) are excluded. Available readable coverage is not a guarantee of complete conversation recovery.
+
+```python
+delegate_task(tasks=[{
+    "goal": "Audit early design decisions and compare with current implementation",
+    "inherit_context": True,
+    "inherit_compacted_history": True,
+    "inherit_context_mode": "bounded",
+    "inherit_max_tokens": 8000,
+}])
+```
+
+11. **Opt-in Bounded Worker Follow-up Continuity (`continue_from: "<child_session_id>"`)**: A new child can use an owned terminal prior worker's saved evidence together with current parent context (`requires inherit_context: true`). This does not revive the old agent, process, tool resources, or in-memory snapshot.
+    - **Exact Ownership & Source State Gates**: Tasks must reference an exact child session ID string (`no leading or trailing whitespace, no self-reference`). The prior worker must be owned by the current parent session (`parent_session_id == parent.session_id` and `model_config._delegate_from == parent.session_id`), have a durable terminal marker (`_delegate_terminal`), and have completed orderly execution (not active in-process or holding an unexpired turn lease). Unrun/empty sources and active transcripts whose count, row boundary or canonical digest changed after terminal stamping fail closed immediately. A terminal outcome may represent success, failure, interruption or iteration exhaustion; it is not proof that the previous task succeeded.
+    - **Result Identity & Eligibility**: Use the exact `child_session_id` returned by the previous result (also formatted in async completion and task failure notices ahead of summaries alongside `continuation_available`). `continuation_available` is verified after teardown through the same atomic source gate used by follow-up; it is rechecked on each request. Older workers without a verifiable terminal marker are unsupported.
+    - **Strict Parent Ownership Across Legacy Rotation**: Lineage checks verify exact equality against the current parent session ID; rotated ancestor chains across session rotation boundaries are excluded.
+    - **Composition**: Previous worker messages are sanitized first using the standard portable renderer (system prompts omitted, provider sidecars stripped, completed tool calls paired, unresolved scaffolding and orphan results omitted). Each resulting portable record is converted into provenance-labeled assistant evidence text before fresh parent context. Original worker role and tool call details are included as quoted data (not native `tool_calls` scaffolding) to prevent cross-session repeated tool ID pairing.
+    - **Authority & Historical Framing**: Prior worker instructions never expand permissions; the latest parent task scope and corrections strictly control actions. Transcript headers explicitly warn that old snapshot references are historical and prior filesystem/tool observations may be stale.
+    - **Saved Evidence, Not Hidden State**: Continuation uses the persisted worker transcript and current parent context. It cannot restore omitted records from the old worker's discarded in-memory snapshot. `inherit_compacted_history` can separately opt into available readable archives; opaque checkpoints remain unsupported. Ordinary historical text may contain sensitive data, including previous tool observations.
+    - **Complete Backing Accessible via Session Search**: In bounded mode, the latest parent user prompt is mandatory in the initial seed transcript; all underlying prior-worker evidence records and parent turns remain accessible on-demand via `session_search(session_id="snapshot", ...)`.
+    - **Honest Coverage Receipts**: Task manifests report `prior_worker_session_id`, `prior_worker_status`, `prior_worker_exit_reason`, `prior_worker_available_records_count`, `prior_worker_retained_records_count`, and `prior_worker_coverage`.
+
+```python
+delegate_task(tasks=[{
+    "goal": "Verify the findings from prior worker run and finalize audit",
+    "inherit_context": True,
+    "continue_from": "20000101_000000_d00d0007",
+    "inherit_context_mode": "bounded",
+    "inherit_max_tokens": 8000,
+}])
+```
+
+
 ## Practical Examples
 
 ### Parallel Research

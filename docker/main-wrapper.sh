@@ -62,14 +62,17 @@ fi
 # to the hermes user's home before dropping privileges so libraries that
 # resolve paths via $HOME (e.g. discord lockfile under XDG_STATE_HOME)
 # don't try to write to /root.
-export HOME=/opt/data
+case "${HOME:-}" in
+    ""|/root) export HOME="${HERMES_HOME:-/opt/data}" ;;
+esac
+_hermes_state_dir="${HERMES_HOME:-/opt/data}"
 
 # Save the Docker -w (or default) working directory before init
 # scripts cd to /opt/data, so the container starts in the
 # directory the user requested.
 _hermes_orig_cwd="${HERMES_ORIG_CWD:-$PWD}"
 
-cd /opt/data
+cd "$_hermes_state_dir"
 
 # Restore the original working directory before handing off to
 # the user's command so `hermes chat` starts in the Docker -w

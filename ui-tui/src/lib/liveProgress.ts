@@ -10,7 +10,7 @@ export const isToolShelfMessage = (msg: Msg | undefined) =>
   Boolean(msg?.kind === 'trail' && !msg.text && !msg.thinking?.trim() && msg.tools?.length)
 
 export const canHoldToolShelf = (msg: Msg | undefined) =>
-  Boolean(msg?.kind === 'trail' && !msg.text && (msg.thinking?.trim() || msg.tools?.length))
+  Boolean(msg?.kind === 'trail' && !msg.text && !msg.thinking?.trim() && msg.tools?.length)
 
 export const mergeToolShelfInto = (target: Msg, source: Msg): Msg => ({
   ...target,
@@ -37,10 +37,17 @@ const isBarrierMessage = (msg: Msg | undefined) => {
     return true
   }
 
+  // Thinking segments terminate the shelf — tools executed after a thinking step
+  // must not merge backward into the thinking segment.
+  if (msg.thinking?.trim()) {
+    return true
+  }
+
   return false
 }
 
-const isToolCarryingTrail = (msg: Msg | undefined) => Boolean(msg?.kind === 'trail' && !msg.text && msg.tools?.length)
+const isToolCarryingTrail = (msg: Msg | undefined) =>
+  Boolean(msg?.kind === 'trail' && !msg.text && !msg.thinking?.trim() && msg.tools?.length)
 
 export const appendToolShelfMessage = (prev: readonly Msg[], msg: Msg): Msg[] => {
   if (!isToolShelfMessage(msg)) {
@@ -52,6 +59,10 @@ export const appendToolShelfMessage = (prev: readonly Msg[], msg: Msg): Msg[] =>
   for (let index = prev.length - 1; index >= 0; index--) {
     const candidate = prev[index]
 
+    if (isBarrierMessage(candidate)) {
+      break
+    }
+
     if (isToolCarryingTrail(candidate)) {
       const next = [...prev]
 
@@ -62,10 +73,6 @@ export const appendToolShelfMessage = (prev: readonly Msg[], msg: Msg): Msg[] =>
 
     if (fallbackHolder === null && canHoldToolShelf(candidate)) {
       fallbackHolder = index
-    }
-
-    if (isBarrierMessage(candidate)) {
-      break
     }
   }
 

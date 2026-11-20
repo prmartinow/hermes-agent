@@ -1,4 +1,5 @@
 /// <reference path="./ambient.d.ts" />
+
 export { default as useStderr } from './src/hooks/use-stderr.ts'
 export type { StderrHandle } from './src/hooks/use-stderr.ts'
 export { default as useStdout } from './src/hooks/use-stdout.ts'
@@ -33,11 +34,13 @@ export { useTerminalTitle } from './src/ink/hooks/use-terminal-title.ts'
 export type { TerminalTitlePair } from './src/ink/hooks/use-terminal-title.ts'
 export { useTerminalViewport } from './src/ink/hooks/use-terminal-viewport.ts'
 export { default as measureElement } from './src/ink/measure-element.ts'
-export { createRoot, forceRedraw, default as render, renderSync } from './src/ink/root.ts'
-export type { Instance, RenderOptions, Root } from './src/ink/root.ts'
+export { renderNodeToAnsi, renderToScreen, serializeScreenToAnsi } from './src/ink/render-to-screen.ts'
+export { acquireMainScreenStaticOutput, createRoot, forceRedraw, isMainScreenStaticOutputLeased, default as render, renderSync, requestRedraw, writeAfterRender } from './src/ink/root.ts'
+export type { Instance, MainScreenStaticOutputLease, RenderOptions, Root } from './src/ink/root.ts'
 export { stringWidth } from './src/ink/stringWidth.ts'
 export type { MouseTrackingMode } from './src/ink/termio/dec.ts'
 export { wrapAnsi } from './src/ink/wrapAnsi.ts'
+export { logForDebugging } from './src/utils/debug.ts'
 // 'ink-text-input' types deliberately not re-exported here; see
 // src/entry-exports.ts for the full rationale (#31227). Use the
 // '@hermes/ink/text-input' subpath when the upstream widget is needed.

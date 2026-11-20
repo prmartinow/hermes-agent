@@ -2912,6 +2912,7 @@ def test_history_to_messages_ships_full_tool_args():
     assert "args" not in argless[0]
 
 
+
 def test_tool_start_ships_full_args(monkeypatch):
     # The desktop rebuilds the expanded row's `$` transcript from args. When
     # only the 80-char `context` preview shipped, the expanded command was
@@ -4936,7 +4937,7 @@ def test_session_close_settles_active_turn_before_teardown(monkeypatch):
     assert response["result"] == {"closed": True, "messages": []}
 
 
-def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
+def test_ws_orphan_reap_preserves_isolated_turn_then_reaps_when_idle(monkeypatch):
     callbacks = []
     interrupted = []
     torn_down = []
@@ -4981,18 +4982,20 @@ def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
         server._schedule_ws_orphan_reap("isolated-sid")
         callbacks.pop(0)()
 
-        assert interrupted == [("isolated-sid", "client-gone-isolated-sid")]
-        assert session["_turn_cancel_requested"] is True
-        assert session["queued_prompt"] is None
+        # Under new contract, actively running isolated turns must never be interrupted
+        assert interrupted == []
+        assert not session.get("_turn_cancel_requested")
+        assert session["queued_prompt"] == {"text": "must not run"}
         assert session["history"] == [{"role": "assistant", "content": "partial"}]
         assert len(callbacks) == 1
 
         callbacks.pop(0)()
 
-        assert interrupted == [("isolated-sid", "client-gone-isolated-sid")]
+        assert interrupted == []
         assert len(callbacks) == 1
 
         session["running"] = False
+        session["queued_prompt"] = None
         callbacks.pop(0)()
 
         assert "isolated-sid" not in server._sessions
@@ -5085,7 +5088,7 @@ def test_session_resume_does_not_rebind_after_client_gone_interrupt_claim(monkey
 def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     callbacks = []
     interrupted = []
-    delegation_active = iter((True, False, False))
+    delegation_active = [True]
 
     class _Timer:
         def __init__(self, _delay, callback):
@@ -5115,7 +5118,7 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     monkeypatch.setattr(
         server,
         "_session_has_active_delegations",
-        lambda *_args, **_kwargs: next(delegation_active),
+        lambda *_args, **_kwargs: delegation_active[0],
     )
     monkeypatch.setattr(server, "_teardown_popped_session", lambda *_args, **_kwargs: True)
 
@@ -5126,18 +5129,27 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
         assert interrupted == []
         assert len(callbacks) == 1
 
+        session["running"] = False
+        session["_run_thread"] = None
         callbacks.pop(0)()
+        assert "delegating-turn" in server._sessions  # Child work still owns the session.
+        assert interrupted == []
 
-        assert interrupted == ["interrupted"]
+        delegation_active[0] = False
+        session["running"] = True
+        callbacks.pop(0)()
+        # A parent continuation stays protected after its child has finished.
+        assert interrupted == []
         assert len(callbacks) == 1
 
+        session["running"] = False
         callbacks.pop(0)()
         assert "delegating-turn" not in server._sessions
     finally:
         server._sessions.pop("delegating-turn", None)
 
 
-def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
+def test_ws_orphan_reap_preserves_in_process_turn(monkeypatch):
     callbacks = []
     interrupted = []
 
@@ -5171,14 +5183,20 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
         server._schedule_ws_orphan_reap("inline-sid")
         callbacks.pop(0)()
 
-        assert interrupted == ["interrupted"]
-        assert session["_turn_cancel_requested"] is True
+        # Actively running turns must never be automatically interrupted
+        assert interrupted == []
+        assert not session.get("_turn_cancel_requested")
         assert len(callbacks) == 1
+
+        session["running"] = False
+        session["_run_thread"] = None
+        callbacks.pop(0)()
+        assert "inline-sid" not in server._sessions
     finally:
         server._sessions.pop("inline-sid", None)
 
 
-def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):
+def test_ws_disconnect_running_sidecar_detaches_with_orphan_timer(monkeypatch):
     closed = []
     scheduled = []
     transport = object()
@@ -5197,10 +5215,23 @@ def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeyp
     )
 
     try:
+        # Running sidecar must not be dropped: detaches and schedules reap
         reaped, detached = server._close_sessions_for_transport(transport)
+        assert (reaped, detached) == (0, 1)
+        assert closed == []
+        assert scheduled == ["sidecar-sid"]
 
+        # When actually idle, close_on_disconnect tears down immediately
+        idle_transport = object()
+        server._sessions["idle-sidecar"] = _session(
+            transport=idle_transport,
+            running=False,
+            close_on_disconnect=True,
+        )
+        scheduled.clear()
+        reaped, detached = server._close_sessions_for_transport(idle_transport)
         assert (reaped, detached) == (1, 0)
-        assert closed == [("sidecar-sid", "ws_disconnect")]
+        assert ("idle-sidecar", "ws_disconnect") in closed
         assert scheduled == []
     finally:
         server._sessions.pop("sidecar-sid", None)
@@ -5432,62 +5463,28 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
 
 
 def test_close_transport_rebinds_session_to_remaining_viewer(monkeypatch):
-    """Closing a pop-out window's transport must leave the session with the
-    still-open window instead of stranding it on the drop sentinel (#83716).
-
-    The rebind #83716 added is gone; multi-client fan-out subsumes it. Both
-    windows are attached to the slot at once, so the pop-out is a fan-out peer
-    rather than a viewer waiting to be promoted, and closing it detaches that
-    peer while retaining the surviving ordered mailbox. This pins the same
-    guarantee through the mechanism that replaced the rebind: the session is
-    not parked, not reaped, not handed to the orphan reaper, and the surviving
-    window keeps receiving frames.
-    """
+    """Closing a pop-out window's transport must re-bind the session to a
+    still-open window instead of stranding it on the drop sentinel (#83716)."""
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
     class _LiveTransport:
-        def __init__(self):
-            self.frames = []
-            self.received = threading.Event()
-
-        def write(self, obj=None, *a, **k):
-            self.frames.append(obj)
-            self.received.set()
+        def write(self, *a, **k):
             return True
 
     main = _LiveTransport()
     popout = _LiveTransport()
-    session = _session(transport=None, running=False)
-    # Build the state the way production does: every window that resumes goes
-    # through _live_session_payload, which attaches it into the slot and then
-    # stamps it into the viewers registry.
-    server._attach_session_transport(session, main)
-    server._attach_session_transport(session, popout)
+    session = _session(transport=main, running=False)
+    assert server._attach_session_transport(session, popout)
     session["viewers"] = {main: 100.0, popout: 200.0}
     server._sessions["multi-sid"] = session
-    assert isinstance(session["transport"], server.FanoutTransport)
 
-    try:
-        reaped, detached = server._close_sessions_for_transport(popout)
+    reaped, detached = server._close_sessions_for_transport(popout)
 
-        assert reaped == 0 and detached == 0
-        assert server._session_transport_contains(session, main)
-        assert not server._session_transport_contains(session, popout)
-        assert "multi-sid" not in reap_calls
-        assert server._ws_session_is_orphaned(session) is False
-
-        # And it is still a working stream, not just a surviving reference.
-        server._emit("message.delta", "multi-sid", {"text": "still here"})
-        assert main.received.wait(timeout=5)
-        assert [(f.get("params") or {}).get("type") for f in main.frames] == [
-            "message.delta"
-        ]
-        assert popout.frames == []
-    finally:
-        # The fake slot must not outlive the test: _sessions is module state and
-        # later sweeps would walk it.
-        server._sessions.pop("multi-sid", None)
+    assert reaped == 0 and detached == 0
+    assert session["transport"] is main
+    assert "multi-sid" not in reap_calls
+    assert server._ws_session_is_orphaned(session) is False
 
 
 def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
@@ -5513,15 +5510,7 @@ def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
 
 
 def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
-    """A viewer whose socket is already dead must not hold the session open.
-
-    #83716's rebind refused to hand the session to a dead viewer; fan-out
-    membership keeps that filter through _transport_is_live_peer, which is what
-    decides whether anything survives the departing client. Both windows are
-    ATTACHED here, which is the state production builds — a viewer that was
-    never attached leaves the slot single-client and exercises the ordinary park
-    path instead of this one.
-    """
+    """A viewer whose socket is already dead must not win the re-bind."""
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
@@ -5530,25 +5519,17 @@ def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
             return True
 
     dead = _LiveTransport()
-    popout = _LiveTransport()
-    session = _session(transport=None, running=False)
-    server._attach_session_transport(session, dead)
-    server._attach_session_transport(session, popout)
-    session["viewers"] = {dead: 100.0, popout: 200.0}
-    assert isinstance(session["transport"], server.FanoutTransport)
-    # The socket goes away without a disconnect reaching the gateway; the latch
-    # _transport_is_dead reads is the only trace it leaves behind.
     dead._closed = True
+    owner = _LiveTransport()
+    session = _session(transport=owner, running=False)
+    session["viewers"] = {dead: 100.0, owner: 200.0}
     server._sessions["dead-viewer-sid"] = session
 
-    try:
-        reaped, detached = server._close_sessions_for_transport(popout)
+    _reaped, detached = server._close_sessions_for_transport(owner)
 
-        assert reaped == 0 and detached == 1
-        assert session["transport"] is server._detached_ws_transport
-        assert reap_calls == ["dead-viewer-sid"]
-    finally:
-        server._sessions.pop("dead-viewer-sid", None)
+    assert detached == 1
+    assert session["transport"] is server._detached_ws_transport
+    assert reap_calls == ["dead-viewer-sid"]
 
 
 def test_live_session_payload_registers_transport_as_viewer():
@@ -6008,13 +5989,15 @@ def test_ws_orphan_reap_defers_running_turn_with_fresh_activity(monkeypatch):
             assert delays[-1] == server._WS_ORPHAN_REAP_GRACE_S
             assert "fresh-sid" in server._sessions
 
-        # Activity goes stale (turn wedged) -> interrupt fires on next poll.
+        # Activity goes stale -> running turn is still NEVER interrupted.
         activity["seconds_since_activity"] = 301.0
         callbacks.pop(0)()
-        assert interrupted == ["interrupted"]
-        assert session["_client_gone_interrupt_requested"] is True
+        assert interrupted == []
+        assert not session.get("_client_gone_interrupt_requested")
+        assert delays[-1] == server._WS_ORPHAN_REAP_GRACE_S
+        assert "fresh-sid" in server._sessions
 
-        # Turn settles -> reap proceeds exactly as today.
+        # Turn settles -> reap proceeds when idle.
         session["running"] = False
         callbacks.pop(0)()
         assert "fresh-sid" not in server._sessions
@@ -6023,7 +6006,7 @@ def test_ws_orphan_reap_defers_running_turn_with_fresh_activity(monkeypatch):
         server._sessions.pop("fresh-sid", None)
 
 
-def test_ws_orphan_activity_gate_zero_restores_interrupt_at_grace(monkeypatch):
+def test_ws_orphan_disabled_activity_clock_preserves_running_turn(monkeypatch):
     """ws_orphan_activity_stale_s=0 opts out: fresh activity no longer defers
     the client-gone interrupt (pre-#98028 behaviour)."""
     callbacks = []
@@ -6060,8 +6043,15 @@ def test_ws_orphan_activity_gate_zero_restores_interrupt_at_grace(monkeypatch):
     try:
         server._schedule_ws_orphan_reap("optout-sid")
         callbacks.pop(0)()
-        assert interrupted == ["interrupted"]
-        assert session["_client_gone_interrupt_requested"] is True
+        # Running turns must never be interrupted even if activity stale threshold is 0
+        assert interrupted == []
+        assert not session.get("_client_gone_interrupt_requested")
+        assert len(callbacks) == 1
+
+        session["running"] = False
+        session["_run_thread"] = None
+        callbacks.pop(0)()
+        assert "optout-sid" not in server._sessions
     finally:
         server._sessions.pop("optout-sid", None)
 
@@ -6986,14 +6976,9 @@ def test_prompt_submit_row_id_not_found(monkeypatch):
         server._sessions.pop("missing-row-sid", None)
 
 
-def test_prompt_submit_resolves_row_id_absorbed_into_marker_merge(monkeypatch):
-    """#94486: after a mid-session model switch, the marker is persisted as
-    role=user (#48338) and the next real user row merges into it under
-    repair. The merged row must stay addressable (plain row's _row_id kept,
-    display classification dropped) so prompt.submit with
-    truncate_before_row_id resolves instead of failing closed with the
-    user's input silently dropped.
-    """
+def test_prompt_submit_resolves_row_id_after_preserved_model_switch_marker(monkeypatch):
+    """Typed model-switch markers stay separate during repair, and editing the
+    next user row must retain the marker and every earlier durable row."""
     import copy
 
     from session_rules.turns import repair_message_sequence
@@ -7010,12 +6995,10 @@ def test_prompt_submit_resolves_row_id_absorbed_into_marker_merge(monkeypatch):
         {"_row_id": 12135, "role": "user", "content": "the dropped prompt"},
     ]
     repaired = copy.deepcopy(verbatim)
-    assert repair_message_sequence(None, repaired) == 1
-    # The merged pair survives as ONE addressable user row carrying the
-    # plain row's durable id — this is the property the gateway relies on.
-    assert len(repaired) == 3
-    assert repaired[2]["_row_id"] == 12135
-    assert not repaired[2].get("display_kind")
+    assert repair_message_sequence(None, repaired) == 0
+    assert repaired == verbatim
+    assert repaired[2]["display_kind"] == "model_switch"
+    assert repaired[3]["_row_id"] == 12135
 
     replaced = []
 
@@ -7036,11 +7019,9 @@ def test_prompt_submit_resolves_row_id_absorbed_into_marker_merge(monkeypatch):
     def _fake_session_db(_session):
         yield _FakeDB()
 
-    # Live history as a RUNNING session holds it after a turn rewrite: the
-    # repaired, merged shape with row-id stamps still attached (the live
-    # dicts carry them), so the in-memory lookup resolves directly.
+    # The repaired live view keeps durable row stamps for direct lookup.
     live = copy.deepcopy(repaired)
-    assert live[2]["_row_id"] == 12135
+    assert live[3]["_row_id"] == 12135
     server._sessions["merged-marker-sid"] = _session(history=list(live))
     monkeypatch.setattr(server, "_session_db", _fake_session_db)
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
@@ -7062,17 +7043,11 @@ def test_prompt_submit_resolves_row_id_absorbed_into_marker_merge(monkeypatch):
             }
         )
         assert resp.get("error") is None, resp.get("error")
-        # The cut lands before the merged marker+prompt pair: everything the
-        # pair would have buried is kept, the pair itself is replaced by the
-        # freshly submitted turn. (Rows carry _row_id stamps because the
-        # durable fallback healed the live list's missing stamps first.)
+        # Editing the user prompt preserves the preceding model-switch marker.
         assert len(replaced) == 1
         assert replaced[0][0] == "session-key"
-        assert replaced[0][1] == _written([
-            {"role": "user", "content": "first"},
-            {"role": "assistant", "content": "reply 1"},
-        ])
-        assert [m.get("_row_id") for m in server._sessions["merged-marker-sid"]["history"]] == [12131, 12133]
+        assert replaced[0][1] == _written(verbatim[:3])
+        assert [m.get("_row_id") for m in server._sessions["merged-marker-sid"]["history"]] == [12131, 12133, 12134]
     finally:
         server._sessions.pop("merged-marker-sid", None)
 
@@ -7098,16 +7073,10 @@ def _mk_merge_fake_db(verbatim, repaired, replaced):
     return _FakeDB()
 
 
-def test_prompt_submit_resolves_row_id_swallowed_by_marker_merge(monkeypatch):
-    """#94486 (live-session shape): model-switch markers persist as role=user
-    (#48338), so the just-sent prompt forms a user;user run that
-    repair_message_sequence merges into the FIRST row — the target's _row_id
-    vanishes from the repaired view and truncate_before_row_id fails closed
-    (4018) even though the row is physically present. Identity resolution must
-    read the un-repaired durable transcript, the same discipline the rebind
-    path already applies ('repair can merge a physical user;user pair while
-    preserving only the first row id').
-    """
+def test_prompt_submit_resolves_row_id_after_preserved_markers_without_live_stamps(monkeypatch):
+    """A provider-format rewrite can lose live row stamps while typed markers
+    stay separate. Durable identity lookup must recover the user's row and
+    keep both model-switch markers when replacing that prompt."""
     import contextlib
     import copy
 
@@ -7131,9 +7100,9 @@ def test_prompt_submit_resolves_row_id_swallowed_by_marker_merge(monkeypatch):
         {"_row_id": 205, "role": "user", "content": "the interrupted prompt"},
     ]
     repaired = copy.deepcopy(verbatim)
-    assert repair_message_sequence(None, repaired) == 2  # 3-row run, two merges
-    # On main the merge buries the plain row's id inside the marker.
-    assert len(repaired) == 3
+    assert repair_message_sequence(None, repaired) == 0
+    assert repaired == verbatim
+    assert [message["display_kind"] for message in repaired[2:4]] == ["model_switch", "model_switch"]
 
     replaced = []
     fake_db = _mk_merge_fake_db(verbatim, repaired, replaced)
@@ -7881,7 +7850,7 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         process_registry._poll_observed.discard(event["session_id"])
 
 
-def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
+def test_run_prompt_submit_batches_completions_once_with_real_threading(
     monkeypatch, tmp_path
 ):
     import queue as _queue_mod
@@ -7897,10 +7866,10 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     release_nested = threading.Event()
     turns = []
 
-    def _recording_thread(*args, **kwargs):
-        thread = real_thread_class(*args, **kwargs)
-        threads.append(thread)
-        return thread
+    class _RecordingThread(real_thread_class):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            threads.append(self)
 
     class _BlockingNotificationAgent(_RecordingAgent):
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
@@ -7911,7 +7880,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
                     raise TimeoutError("notification turn was not released")
             return {"final_response": "", "messages": []}
 
-    monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    monkeypatch.setattr(server.threading, "Thread", _RecordingThread)
     session = _session(
         session_key="session-a",
         agent=_BlockingNotificationAgent(turns),
@@ -7928,9 +7897,6 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         }
         for index in range(1, 4)
     ]
-    # Consecutive completions share one turn (#104671); a watch_match is a turn
-    # barrier, so it is the in-flight turn behind which batch_2/batch_3 must survive.
-    events[0].update(type="watch_match", pattern="owned-1")
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     for event in events:
         isolated_queue.put(event)
@@ -7941,28 +7907,20 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
 
         assert nested_started.wait(timeout=5)
-        threads[0].join(timeout=5)
-        assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
-        queued: dict = {}
-        deadline = time.time() + 5.0
-        while time.time() < deadline and set(queued) != {
-            "proc_batch_2",
-            "proc_batch_3",
-        }:
-            try:
-                evt = isolated_queue.get(timeout=0.1)
-            except _queue_mod.Empty:
-                continue
-            queued[evt["session_id"]] = evt
-        assert set(queued) == {"proc_batch_2", "proc_batch_3"}
+        assert turns[0] == "session-a-turn"
+        assert len(turns) == 2
+        assert "3 background processes completed" in turns[1]
+        for event in events:
+            assert turns[1].count(event["session_id"]) == 1
+            assert event["output"] in turns[1]
+        assert isolated_queue.empty()
+        assert session["running"] is True
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        assert len(turns) == 2
+        assert session["running"] is False
     finally:
         release_nested.set()
         for thread in threads:
@@ -11429,6 +11387,11 @@ def test_slash_exec_r7_read_commands_use_metadata_mirror_flag_on(monkeypatch):
             })
             mark = "~" if estimated else ""
             assert f"Context usage: {mark}80 / 1,000 tokens ({mark}8.0%)" in response["result"]["output"]
+            usage = server.handle_request({
+                "id": "usage-provenance", "method": "slash.exec",
+                "params": {"command": "usage", "session_id": "sid"},
+            })
+            assert f"{mark}80 / 1,000 ({mark}8%)" in usage["result"]["output"]
     finally:
         server._sessions.pop("sid", None)
 
@@ -12967,6 +12930,14 @@ def test_session_info_includes_turn_started_at():
     assert server._session_info(agent, session)["turn_started_at"] is None
 
 
+
+
+
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # History-mutating commands must reject while session.running is True.
 # Without these guards, prompt.submit's post-run history write either
@@ -13013,10 +12984,11 @@ def test_session_undo_allowed_when_idle():
             {"id": "1", "method": "session.undo", "params": {"session_id": "sid"}}
         )
         assert resp.get("result"), f"got error: {resp.get('error')}"
-        assert resp["result"]["removed"] == 2
+        assert resp["result"] == {"removed": 2}
         assert server._sessions["sid"]["history"] == []
     finally:
         server._sessions.pop("sid", None)
+
 
 
 def test_session_compress_rejects_while_running(monkeypatch):
@@ -16109,7 +16081,6 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
     """session.branch must copy history into the parent's profile state.db."""
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     seen: dict = {"msgs": []}
 
     class LaunchDB(_HandleRepositories):
@@ -16632,7 +16603,6 @@ def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_pa
 
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (profile_home / ".env").write_text(
         "PROXMOX_TOKEN=mlperf-secret\n", encoding="utf-8"
     )
@@ -16722,7 +16692,6 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
     """A live branch must copy the complete visible transcript, not the compacted model tail."""
     profile_home = tmp_path / "profiles" / "mlperf"
     profile_home.mkdir(parents=True)
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     seen: dict = {"msgs": []}
 
     display_history = [
@@ -20564,6 +20533,8 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         assert captured.get("persist_user_message") == "hi"
     finally:
         server._sessions.pop("sid", None)
+
+
 
 
 def test_fallback_session_info_reports_session_cwd_not_launch_dir(monkeypatch):
