@@ -292,10 +292,6 @@ from hermes_cli.web_upload_limit import ChatFileUploadLimitMiddleware
 # and the receive limit runs before FastAPI can spool a multipart attachment.
 app.add_middleware(ChatFileUploadLimitMiddleware)
 
-from hermes_cli.hindsight_webhook import PATH as _HINDSIGHT_WEBHOOK_PATH, receive as _receive_hindsight_webhook
-
-app.add_api_route(_HINDSIGHT_WEBHOOK_PATH, _receive_hindsight_webhook, methods=["POST"])
-
 # Endpoints that do NOT require the session token; everything else under /api/
 # is gated below. Shared with the OAuth gate so the two allowlists cannot
 # drift (/api/status once 401'd under the OAuth gate, breaking the portal probe).
@@ -470,15 +466,6 @@ async def auth_middleware(request: Request, call_next):
     (``token_authenticated``) and when the OAuth gate is active — cookie auth is
     then authoritative and the loopback-only token path must not override it.
     """
-    from hermes_cli.hindsight_webhook import authenticate, ingress_profile_scope, is_hindsight_webhook
-
-    if is_hindsight_webhook(request):
-        with ingress_profile_scope():
-            try:
-                await authenticate(request)
-            except HTTPException as exc:
-                return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-            return await call_next(request)
     path = request.url.path
     if (
         not getattr(request.state, "token_authenticated", False)
