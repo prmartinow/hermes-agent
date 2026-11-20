@@ -1,23 +1,22 @@
 """Tests for tools/context_retrieve_tool.py."""
 
 import sqlite3
-import sys
 import uuid
-from types import ModuleType
-import pytest
 
 from tools.context_retrieve_tool import (
     CONTEXT_RETRIEVE_SCHEMA,
     check_context_retrieve_requirements,
     context_retrieve,
-    _retrieve_from_db_direct,
 )
 from tools.registry import registry
 
 
 class TestContextRetrieveTool:
     def test_schema_registered(self):
-        assert "context_retrieve" in registry.get_all_tool_names()
+        from toolsets import resolve_toolset
+
+        for toolset in ("file", "context"):
+            assert "context_retrieve" in resolve_toolset(toolset)
         entry = registry.get_entry("context_retrieve")
         assert entry is not None
         schema = entry.schema
@@ -29,6 +28,8 @@ class TestContextRetrieveTool:
 
     def test_check_requirements(self, tmp_path, monkeypatch):
         monkeypatch.setenv("AGENT_MEMORY_TRACES_PATH", str(tmp_path))
+        assert check_context_retrieve_requirements() is False
+        (tmp_path / "context.db").touch()
         assert check_context_retrieve_requirements() is True
 
     def test_missing_archive_id(self):
@@ -40,10 +41,9 @@ class TestContextRetrieveTool:
         result = context_retrieve(fake_id)
         assert f"Archive ID '{fake_id}' not found" in result
 
-    def test_retrieval_uses_the_active_profile_when_archiver_is_cached(self, tmp_path, monkeypatch):
+    def test_retrieval_uses_the_active_profile(self, tmp_path, monkeypatch):
         monkeypatch.delenv("AGENT_MEMORY_TRACES_PATH", raising=False)
         monkeypatch.delenv("AGENT_MEMORY_CONTEXT_DB_PATH", raising=False)
-        monkeypatch.setattr(sys, "path", list(sys.path))
         homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
         for home, content in zip(homes, ("first profile", "second profile")):
             traces = home / "agent-memory" / "traces"
@@ -52,10 +52,6 @@ class TestContextRetrieveTool:
                 conn.execute("CREATE TABLE content_archives (archive_id TEXT, tool_name TEXT, raw_content TEXT)")
                 conn.execute("INSERT INTO content_archives VALUES (?, ?, ?)", ("same-id", "terminal", content))
 
-        cached = ModuleType("archiver")
-        cached.__file__ = str(homes[0] / "agent-memory" / "traces" / "archiver.py")
-        cached.retrieve_content = lambda **kwargs: {"tool_name": "terminal", "raw_content": "first profile"}
-        monkeypatch.setitem(sys.modules, "archiver", cached)
         monkeypatch.setenv("HERMES_HOME", str(homes[0]))
         assert context_retrieve("same-id") == "first profile"
         monkeypatch.setenv("HERMES_HOME", str(homes[1]))
@@ -63,7 +59,7 @@ class TestContextRetrieveTool:
 
     def test_multiplexed_profile_does_not_inherit_launch_profile_paths(self, tmp_path, monkeypatch):
         from agent import secret_scope
-        from tools.context_retrieve_tool import _db_path, _traces_path
+        from tools.context_retrieve_tool import _db_path
 
         home = tmp_path / "profile-b"
         monkeypatch.setenv("HERMES_HOME", str(home))
@@ -73,8 +69,7 @@ class TestContextRetrieveTool:
         try:
             token = secret_scope.set_secret_scope({}, profile_home=str(home))
             try:
-                assert _traces_path() == str(home / "agent-memory" / "traces")
-                assert _db_path() == str(home / "agent-memory" / "traces" / "context.db")
+                assert _db_path() == home / "agent-memory" / "traces" / "context.db"
             finally:
                 secret_scope.reset_secret_scope(token)
             assert check_context_retrieve_requirements() is False
@@ -98,7 +93,7 @@ class TestContextRetrieveTool:
                 );
             """)
             lines = [f"output_line_{i}" for i in range(1, 11)]
-            raw_text = "\n".join(lines)
+            raw_text = "\r\n".join(lines) + "\r\n"
             test_id = "test-uuid-999"
             conn.execute(
                 "INSERT INTO content_archives VALUES (?, ?, ?, ?, ?, ?)",
@@ -106,10 +101,7 @@ class TestContextRetrieveTool:
             )
         conn.close()
 
-        import tools.context_retrieve_tool as crt
         monkeypatch.setenv("AGENT_MEMORY_CONTEXT_DB_PATH", str(test_db))
-        # Force fallback to direct db query to test against test_db
-        monkeypatch.setattr(crt, "_get_retrieve_content_fn", lambda: None)
 
         # 1. Full retrieval
         full = context_retrieve(test_id)

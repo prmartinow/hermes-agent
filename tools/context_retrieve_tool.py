@@ -1,105 +1,46 @@
-#!/usr/bin/env python3
-"""
-Context Retrieve Tool - Retrieve full or sliced tool output from Context Memory (context.db).
+"""Read historic tool outputs referenced by archive ID in Hermes conversations."""
 
-Allows the agent to query raw outputs that were offloaded to the SQLite FTS5 ContentStore
-using an archive_id reference token (e.g. from an offloaded [ARCHIVE_ID: <uuid>] brief).
-Supports full output retrieval or line-based pagination (offset, limit).
-"""
-
-import logging
-import os
 import sqlite3
-import sys
-from typing import Any, Dict, Optional
+from contextlib import closing
+from pathlib import Path
+from typing import Any
 
+from agent.secret_scope import UnscopedSecretError, get_secret
+from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error
 
-logger = logging.getLogger(__name__)
 
-def _traces_path() -> str:
-    from tools.tool_result_storage import _resolve_traces_path
-    return _resolve_traces_path()
-
-
-def _db_path() -> str:
-    from tools.tool_result_storage import _scoped_memory_setting
-    return _scoped_memory_setting("AGENT_MEMORY_CONTEXT_DB_PATH") or os.path.join(_traces_path(), "context.db")
-
-
-def _get_retrieve_content_fn():
-    """Import retrieve_content from archiver module if available."""
-    try:
-        traces = _traces_path()
-        if traces not in sys.path and os.path.isdir(traces):
-            sys.path.insert(0, traces)
-        import importlib
-        archiver_mod = importlib.import_module("archiver")
-        from tools.tool_result_storage import _module_in_traces
-        if not _module_in_traces(archiver_mod, traces):
-            logger.debug("Context archiver belongs to another profile; querying the current database")
-            return None
-        return getattr(archiver_mod, "retrieve_content", None)
-    except Exception as exc:
-        logger.debug("Could not import retrieve_content from archiver: %s", exc, exc_info=True)
-        return None
-
-
-def _retrieve_from_db_direct(archive_id: str) -> Optional[dict[str, Any]]:
-    """Direct query to context.db if archiver module import fails."""
-    from agent.secret_scope import UnscopedSecretError
-    try:
-        db_path = _db_path()
-    except UnscopedSecretError:
-        return None
-    if not os.path.exists(db_path):
-        return None
-    try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM content_archives WHERE archive_id = ?", (archive_id,))
-            row = cursor.fetchone()
-            if row:
-                return dict(row)
-            return None
-        finally:
-            conn.close()
-    except Exception as exc:
-        logger.error("Direct context.db query failed: %s", exc, exc_info=True)
-        return None
+def _db_path() -> Path:
+    database = get_secret("AGENT_MEMORY_CONTEXT_DB_PATH", "")
+    if database:
+        return Path(database).absolute()
+    traces = get_secret("AGENT_MEMORY_TRACES_PATH", "")
+    directory = Path(traces) if traces else get_hermes_home() / "agent-memory" / "traces"
+    return (directory / "context.db").absolute()
 
 
 def context_retrieve(
     archive_id: str,
-    offset: Optional[int] = 1,
-    limit: Optional[int] = None,
-    session_id: str = "system-retrieve",
-    tool_caller: str = "hermes-agent",
+    offset: int | None = 1,
+    limit: int | None = None,
 ) -> str:
     """Retrieve full raw output or sliced lines from context.db using archive_id."""
     if not archive_id or not isinstance(archive_id, str):
         return tool_error("archive_id is required and must be a valid string UUID.")
 
-    # 1. Try retrieve_content from archiver (includes audit logging)
-    fn = _get_retrieve_content_fn()
-    res = None
-    if fn is not None:
-        try:
-            res = fn(archive_id=archive_id, session_id=session_id, tool_caller=tool_caller)
-        except Exception as exc:
-            logger.warning("retrieve_content call failed: %s", exc, exc_info=True)
+    try:
+        with closing(sqlite3.connect(_db_path().as_uri() + "?mode=ro", uri=True)) as conn:
+            row = conn.execute(
+                "SELECT raw_content, tool_name FROM content_archives WHERE archive_id = ?",
+                (archive_id,),
+            ).fetchone()
+    except (UnscopedSecretError, sqlite3.OperationalError):
+        row = None
 
-    # 2. Direct sqlite fallback
-    if res is None:
-        res = _retrieve_from_db_direct(archive_id)
-
-    if not res:
+    if row is None:
         return tool_error(f"Archive ID '{archive_id}' not found in context database.")
 
-    raw_content = res.get("raw_content", "")
-    tool_name = res.get("tool_name", "tool")
+    raw_content, tool_name = row
 
     lines = raw_content.splitlines()
     total_lines = len(lines)
@@ -128,7 +69,7 @@ def context_retrieve(
 
     # If full content was requested without slicing
     if start_idx == 0 and end_idx == total_lines:
-        return sliced_text
+        return raw_content
 
     # Sliced content with header
     header = f"[Archive {archive_id} ({tool_name}) - Lines {start_line} to {end_idx} of {total_lines} total lines]\n"
@@ -136,10 +77,9 @@ def context_retrieve(
 
 
 def check_context_retrieve_requirements() -> bool:
-    """Check if context retrieval is available (context.db exists or archiver module found)."""
-    from agent.secret_scope import UnscopedSecretError
+    """Offer legacy retrieval only to profiles with an archive on disk."""
     try:
-        return os.path.exists(_db_path()) or os.path.isdir(_traces_path())
+        return _db_path().is_file()
     except UnscopedSecretError:
         return False
 
@@ -147,9 +87,8 @@ def check_context_retrieve_requirements() -> bool:
 CONTEXT_RETRIEVE_SCHEMA = {
     "name": "context_retrieve",
     "description": (
-        "Retrieve full raw tool output or sliced lines from the context database (context.db) "
-        "using an archive_id token (e.g. from an offloaded [ARCHIVE_ID: <uuid>] brief). "
-        "Use this instead of re-running commands when you need more details from an offloaded output."
+        "Read an archived tool result or a range of its lines "
+        "using an [ARCHIVE_ID: <uuid>] reference in an older conversation."
     ),
     "parameters": {
         "type": "object",
@@ -176,18 +115,12 @@ def _handle_context_retrieve(args: dict[str, Any], **kwargs) -> str:
     archive_id = args.get("archive_id", "")
     offset = args.get("offset", 1)
     limit = args.get("limit")
-    session_id = kwargs.get("session_id", "hermes-session")
-    return context_retrieve(
-        archive_id=archive_id,
-        offset=offset,
-        limit=limit,
-        session_id=session_id,
-    )
+    return context_retrieve(archive_id=archive_id, offset=offset, limit=limit)
 
 
 registry.register(
     name="context_retrieve",
-    toolset="context",
+    toolset="file",
     schema=CONTEXT_RETRIEVE_SCHEMA,
     handler=_handle_context_retrieve,
     check_fn=check_context_retrieve_requirements,
