@@ -3,13 +3,12 @@
  *  URL and ticket come from is the caller's `connect` (Ink: `gateway_bootstrap.py`; any other local
  *  client: `hermes gateway attach --json`). */
 import { EventEmitter } from 'node:events'
-import { type IntervalHistogram, monitorEventLoopDelay } from 'node:perf_hooks'
 
 import { CircularBuffer } from '../circular-buffer.js'
 import {
   canonicalEvent, canonicalRequest, canonicalResult, type ClientIdentity, type CreationContract, type LaunchSource
 } from '../gateway-canonical.js'
-import type { ClientLocalGatewayEventMap, GatewayEvent } from '../gateway-events.js'
+import type { GatewayEvent } from '../gateway-events.js'
 import { type GatewayText, gatewayText } from '../gateway-text.js'
 import type { AnyGatewayEvent } from '../gateway-types.js'
 import {
@@ -124,16 +123,6 @@ export const redactUrl = (raw: string): string => {
   }
 }
 
-export type GatewayExitSource = 'process' | 'websocket'
-
-export interface GatewayExitContext {
-  code: null | number
-  source: GatewayExitSource
-  reason?: string
-  clean?: boolean
-  initiator?: string
-}
-
 // Reconnects after the first launch are discovery-only, except that a bounded number per window
 // re-ensure an owner that is not ready (gateway_bootstrap.py --recover): crashed, idle-exited,
 // stopped with `hermes gateway stop` while this TUI is open, or an older Hermes's gateway. Main's
@@ -144,13 +133,6 @@ export const OWNER_RECOVERY_WINDOW_MS = 60_000
 
 
 export interface AttachHold { sid: string; frames: AnyGatewayEvent[] }
-interface ReplayResult {
-  events?: Array<{ type: string; session_id?: string; seq?: number; payload?: unknown }>
-  truncated?: boolean
-  epoch?: string
-  latest_seq?: number
-}
-
 export class GatewayClient extends EventEmitter {
   private ws: WebSocket | null = null
   private wsConnectPromise: Promise<void> | null = null
@@ -168,22 +150,10 @@ export class GatewayClient extends EventEmitter {
   // mount-order contract as events: an attached session mid-turn can send one
   // the instant the socket opens, before the Ink handler is registered.
   private bufferedRequests: ServerRequest[] = []
-  private pendingExit: { code: null | number; context: GatewayExitContext } | undefined
+  private pendingExit: number | null | undefined
   private ready = false
   private readyTimer: ReturnType<typeof setTimeout> | null = null
-  private consumerReady = false
   private subscribed = false
-  // Legacy listeners replay process-wide sequence cursors. Canonical owners instead use
-  // runtime.describe plus holdAttach/settleAttach and their session-specific snapshot fence.
-  private lastSeenSeq = new Map<string, number>()
-  private replayEpoch: string | null = null
-  private replayInFlight = false
-  private replayHold: Map<string, AnyGatewayEvent[]> | null = null
-  private eventBarrierOwner = new Map<string, string>()
-  private hadGatewayReady = false
-  private transportGeneration = 0
-  private loopDelayMonitor: IntervalHistogram | null = null
-  private closeInitiator: 'heartbeat_timeout' | 'client_kill' | null = null
   private drainGeneration = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectAttempts = 0
@@ -280,11 +250,7 @@ export class GatewayClient extends EventEmitter {
       }
     }
 
-    if (this.isCanonical) {
-      this.publish(ev)
-    } else {
-      this.handleGatewayEvent(ev)
-    }
+    this.publish(ev)
   }
 
   private adoptCanonicalAttach(ev: GatewayEvent<'gateway.ready'>) {
@@ -352,50 +318,6 @@ export class GatewayClient extends EventEmitter {
     }
   }
 
-  private initLoopDelayMonitor() {
-    this.cleanupLoopDelayMonitor()
-
-    try {
-      this.loopDelayMonitor = monitorEventLoopDelay({ resolution: 20 })
-      this.loopDelayMonitor.enable()
-    } catch {
-      this.loopDelayMonitor = null
-    }
-  }
-
-  private cleanupLoopDelayMonitor() {
-    if (this.loopDelayMonitor) {
-      try {
-        this.loopDelayMonitor.disable()
-      } catch {
-        // best effort
-      }
-
-      this.loopDelayMonitor = null
-    }
-  }
-
-  getLoopDelaySummary(): { meanMs: number; maxMs: number; p99Ms: number } | null {
-    if (!this.loopDelayMonitor) {
-      return null
-    }
-
-    try {
-      const mean = Number.isNaN(this.loopDelayMonitor.mean) ? 0 : this.loopDelayMonitor.mean
-      const meanMs = Number((mean / 1e6).toFixed(2))
-      const maxMs = Number((this.loopDelayMonitor.max / 1e6).toFixed(2))
-      const p99Ms = Number((this.loopDelayMonitor.percentile(99) / 1e6).toFixed(2))
-
-      return { meanMs, maxMs, p99Ms }
-    } catch {
-      return null
-    }
-  }
-
-  isAttached(): boolean {
-    return Boolean(this.attachUrl)
-  }
-
   private closeSidecarSocket() {
     try {
       this.sidecarWs?.close()
@@ -434,7 +356,6 @@ export class GatewayClient extends EventEmitter {
       return
     }
 
-    this.closeInitiator = 'heartbeat_timeout'
     this.lifecycle('[lifecycle] websocket silent drop detected (heartbeat ack timeout); forcing reconnect')
 
     try {
@@ -484,7 +405,6 @@ export class GatewayClient extends EventEmitter {
     // handlers (now identity-gated to ignore unrelated transports)
     // never settle the channel's pending RPCs, leaving callers hanging on promises
     // attached to a discarded child / socket.
-    this.cleanupLoopDelayMonitor()
     this.channel.detach(new Error(this.text('libText.gateway.restarting')))
     this.ready = false
     // `subscribed` is NOT reset here: the renderer drain()s once on mount, so a
@@ -493,15 +413,9 @@ export class GatewayClient extends EventEmitter {
     // Invalidate any pending deferred drain() flush from a prior transport so
     // its queued microtask becomes a no-op (it captured the old generation).
     this.drainGeneration += 1
-    this.invalidateTransportGeneration()
     this.bufferedEvents.clear()
     this.bufferedRequests = []
     this.pendingExit = undefined
-
-    if (this.consumerReady && !this.subscribed) {
-      this.scheduleDeferredDrain()
-    }
-
     this.clearReadyTimer()
   }
 
@@ -526,19 +440,11 @@ export class GatewayClient extends EventEmitter {
     }, this.options.startupTimeoutMs ?? 15_000)
   }
 
-  private handleTransportExit(
-    code: null | number,
-    reason?: string,
-    source: GatewayExitSource = 'websocket',
-    clean?: boolean,
-    initiator?: string
-  ) {
+  private handleTransportExit(code: null | number, reason?: string) {
     this.clearReadyTimer()
     this.ready = false
     this.closeSidecarSocket()
-    this.cleanupLoopDelayMonitor()
-    this.invalidateTransportGeneration()
-    this.lifecycle(`[lifecycle] transport exit code=${code ?? 'null'} reason=${reason ?? 'none'} source=${source}`)
+    this.lifecycle(`[lifecycle] transport exit code=${code ?? 'null'} reason=${reason ?? 'none'}`)
     this.channel.detach(
       new Error(reason || (code === null ? this.text('libText.gateway.exited') : this.text('libText.gateway.exitedWithCode', code)))
     )
@@ -552,12 +458,10 @@ export class GatewayClient extends EventEmitter {
     // until gateway.ready so backoff keeps growing across failed restarts.
     this.scheduleReconnect()
 
-    const context: GatewayExitContext = { code, source, reason, clean, initiator }
-
     if (this.subscribed) {
-      this.emit('exit', code, context)
+      this.emit('exit', code)
     } else {
-      this.pendingExit = { code, context }
+      this.pendingExit = code
     }
   }
 
@@ -651,314 +555,6 @@ export class GatewayClient extends EventEmitter {
     }
   }
 
-  private handleGatewayEvent(ev: AnyGatewayEvent) {
-    if (ev.type === 'gateway.ready') {
-      void this.handleGatewayReadyEvent(ev as GatewayEvent<'gateway.ready'>)
-
-      return
-    }
-
-    const sid = (ev as any).session_id as string | undefined
-
-    if (this.replayInFlight && sid && this.replayHold?.has(sid)) {
-      this.replayHold.get(sid)!.push(ev)
-
-      return
-    }
-
-    this.dispatchIfNewer(ev, true)
-  }
-
-  private dispatchIfNewer(ev: AnyGatewayEvent, mirrorSidecar = true) {
-    const sid = (ev as any).session_id as string | undefined
-    const seq = (ev as any).seq as number | undefined
-
-    if (sid && typeof seq === 'number' && Number.isFinite(seq)) {
-      const previous = this.lastSeenSeq.get(sid) ?? 0
-
-      if (seq <= previous) {
-        return
-      }
-
-      this.lastSeenSeq.set(sid, seq)
-    }
-
-    if (mirrorSidecar) {
-      const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
-      this.mirrorEventToSidecar(frame)
-    }
-
-    this.publish(ev)
-  }
-
-  private invalidateTransportGeneration(): void {
-    this.transportGeneration += 1
-    this.replayInFlight = false
-    this.replayHold = null
-    this.eventBarrierOwner.clear()
-  }
-
-  private publishGatewayReady(ev: GatewayEvent<'gateway.ready'>): void {
-    const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
-    this.mirrorEventToSidecar(frame)
-    this.publish(ev)
-  }
-
-  private publishReplayGap(gap: ClientLocalGatewayEventMap['gateway.replay_gap']): void {
-    const ev: AnyGatewayEvent = {
-      type: 'gateway.replay_gap',
-      payload: gap
-    } as AnyGatewayEvent
-
-    const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
-    this.mirrorEventToSidecar(frame)
-    this.publish(ev)
-  }
-
-  private flushReplayHold(pendingGaps?: Map<string, ClientLocalGatewayEventMap['gateway.replay_gap']>): void {
-    const hold = this.replayHold
-    this.replayHold = null
-
-    if (!hold) {return}
-
-    for (const [sid, parked] of hold.entries()) {
-      let expectedNext = (this.lastSeenSeq.get(sid) ?? 0) + 1
-
-      for (const event of parked) {
-        const seq = (event as any).seq as number | undefined
-
-        if (typeof seq === 'number' && Number.isFinite(seq)) {
-          if (seq > expectedNext) {
-            this.pushLog(`[replay-hold] session ${sid} continuity gap: expected ${expectedNext}, got ${seq}`)
-
-            const gap = {
-              reason: 'continuity-gap' as const,
-              session_id: sid,
-              last_seen: expectedNext - 1,
-              latest_seq: seq
-            }
-
-            if (pendingGaps) {
-              pendingGaps.set(sid, gap)
-            } else {
-              this.publishReplayGap(gap)
-            }
-          }
-
-          expectedNext = Math.max(expectedNext, seq + 1)
-        }
-
-        this.dispatchIfNewer(event, true)
-      }
-    }
-  }
-
-  private processReplayResult(
-    sid: string, lastSeen: number, result: PromiseSettledResult<ReplayResult>,
-    pendingGaps: Map<string, ClientLocalGatewayEventMap['gateway.replay_gap']>,
-    latestSeqBySid: Map<string, number>
-  ): void {
-    if (result.status !== 'fulfilled' || !result.value) {
-      this.pushLog(`[replay] session ${sid} events request failed`)
-      pendingGaps.set(sid, { reason: 'request-failed', session_id: sid, last_seen: lastSeen })
-
-      return
-    }
-
-    const value = result.value
-
-    if (typeof value.latest_seq === 'number') {latestSeqBySid.set(sid, value.latest_seq)}
-    if (value.truncated) {
-      this.pushLog(`[replay] session ${sid} events truncated (lastSeen=${lastSeen}, latest=${value.latest_seq})`)
-      pendingGaps.set(sid, { reason: 'truncated', session_id: sid, last_seen: lastSeen, latest_seq: value.latest_seq })
-    }
-
-    let expectedNext = lastSeen + 1
-
-    for (const event of Array.isArray(value.events) ? value.events : []) {
-      if (!event || !event.type) {continue}
-      const seq = event.seq
-
-      if (typeof seq === 'number' && Number.isFinite(seq)) {
-        if (seq > expectedNext) {
-          this.pushLog(`[replay] session ${sid} continuity gap: expected ${expectedNext}, got ${seq}`)
-          if (!pendingGaps.has(sid)) {
-            pendingGaps.set(sid, { reason: 'continuity-gap', session_id: sid, last_seen: expectedNext - 1, latest_seq: seq })
-          }
-        }
-
-        expectedNext = Math.max(expectedNext, seq + 1)
-      }
-
-      this.dispatchIfNewer(event as AnyGatewayEvent, true)
-    }
-  }
-
-  private finishReplay(
-    ev: GatewayEvent<'gateway.ready'>, generation: number,
-    pendingGaps: Map<string, ClientLocalGatewayEventMap['gateway.replay_gap']>,
-    latestSeqBySid: Map<string, number>
-  ): void {
-    if (generation !== this.transportGeneration) {return}
-    this.flushReplayHold(pendingGaps)
-    this.replayInFlight = false
-
-    for (const [sid, latest] of latestSeqBySid) {
-      const seen = this.lastSeenSeq.get(sid) ?? 0
-
-      if (seen < latest) {
-        this.pushLog(`[replay] session ${sid} latest_seq tail gap: seen=${seen}, latest=${latest}`)
-        if (!pendingGaps.has(sid)) {
-          pendingGaps.set(sid, { reason: 'continuity-gap', session_id: sid, last_seen: seen, latest_seq: latest })
-        }
-      }
-    }
-
-    // Reconcile all gaps before notifying consumers that the gateway is ready.
-    for (const gap of pendingGaps.values()) {this.publishReplayGap(gap)}
-    this.publishGatewayReady(ev)
-  }
-
-  private async handleGatewayReadyEvent(ev: GatewayEvent<'gateway.ready'>) {
-    const generation = ++this.transportGeneration
-    const epoch = (ev.payload as any)?.replay_epoch as string | undefined
-
-    if (ev.payload?.heartbeat === true && this.ws?.readyState === WS_OPEN) {
-      this.channel.startHeartbeat()
-    }
-
-    // First connection or no active sequence watermarks: expose immediately
-    if (!this.hadGatewayReady || this.lastSeenSeq.size === 0) {
-      this.hadGatewayReady = true
-
-      if (epoch) {this.replayEpoch = epoch}
-      this.publishGatewayReady(ev)
-
-      return
-    }
-
-    // Epoch reset (server restarted): invalidate old watermarks
-    if (epoch && this.replayEpoch && epoch !== this.replayEpoch) {
-      this.pushLog(`[replay] epoch changed from ${this.replayEpoch} to ${epoch} - clearing watermarks`)
-      this.lastSeenSeq.clear()
-      this.replayEpoch = epoch
-      this.publishReplayGap({ reason: 'epoch-reset', epoch })
-      this.publishGatewayReady(ev)
-
-      return
-    }
-
-    if (epoch && !this.replayEpoch) {
-      this.replayEpoch = epoch
-    }
-
-    // Establish replay hold for tracked sessions
-    this.replayInFlight = true
-    const hold = new Map<string, AnyGatewayEvent[]>()
-
-    for (const sid of this.lastSeenSeq.keys()) {
-      hold.set(sid, [])
-    }
-
-    this.replayHold = hold
-
-    const pendingGaps = new Map<string, ClientLocalGatewayEventMap['gateway.replay_gap']>()
-    const latestSeqBySid = new Map<string, number>()
-
-    try {
-      const entries = Array.from(this.lastSeenSeq.entries())
-
-      const results = await Promise.allSettled(
-        entries.map(([sid, lastSeen]) =>
-          this.channel.request<ReplayResult>('session.events.since', { session_id: sid, last_seen: lastSeen }, 10000)
-        )
-      )
-
-      if (generation !== this.transportGeneration) {
-        return
-      }
-
-      for (let i = 0; i < entries.length; i++) {
-        const [sid, lastSeen] = entries[i]!
-        this.processReplayResult(sid, lastSeen, results[i]!, pendingGaps, latestSeqBySid)
-      }
-    } catch {
-      // Replay failure degrades to snapshot reconciliation
-    } finally {
-      this.finishReplay(ev, generation, pendingGaps, latestSeqBySid)
-    }
-  }
-
-  getSeqWatermarks(): Record<string, number> {
-    return Object.fromEntries(this.lastSeenSeq)
-  }
-
-  retireSession(sid: string): void {
-    this.lastSeenSeq.delete(sid)
-  }
-
-  activateEventBarrier(sid: string, owner: string): void {
-    if (this.isCanonical) {return}
-
-    if (!this.replayHold) {
-      this.replayHold = new Map()
-    }
-
-    if (!this.replayHold.has(sid)) {
-      this.replayHold.set(sid, [])
-    }
-
-    this.eventBarrierOwner.set(sid, owner)
-    this.replayInFlight = true
-  }
-
-  hasEventBarrier(sid: string, owner: string): boolean {
-    return !this.isCanonical && this.eventBarrierOwner.get(sid) === owner && Boolean(this.replayHold?.has(sid))
-  }
-
-  releaseEventBarrier(sid: string, owner: string): AnyGatewayEvent[] {
-    if (this.isCanonical) {return []}
-
-    if (!this.replayHold) {return []}
-
-    if (this.eventBarrierOwner.get(sid) !== owner) {
-      return []
-    }
-
-    this.eventBarrierOwner.delete(sid)
-    const parked = this.replayHold.get(sid) ?? []
-    this.replayHold.delete(sid)
-
-    if (this.replayHold.size === 0) {
-      this.replayHold = null
-      this.replayInFlight = false
-    }
-
-    for (const ev of parked) {
-      this.dispatchIfNewer(ev, true)
-    }
-
-    return parked
-  }
-
-  cancelEventBarrier(sid: string, owner: string): void {
-    if (this.isCanonical) {return}
-
-    if (!this.replayHold) {return}
-
-    if (this.eventBarrierOwner.get(sid) !== owner) {
-      return
-    }
-
-    this.eventBarrierOwner.delete(sid)
-    this.replayHold.delete(sid)
-
-    if (this.replayHold.size === 0) {
-      this.replayHold = null
-      this.replayInFlight = false
-    }
-  }
-
   publishLocalEvent(ev: AnyGatewayEvent) {
     const frame = JSON.stringify({ jsonrpc: '2.0', method: 'event', params: ev })
 
@@ -981,7 +577,7 @@ export class GatewayClient extends EventEmitter {
       return
     }
 
-    if (frame.method === 'event' && this.isCanonical) {
+    if (frame.method === 'event') {
       this.mirrorEventToSidecar(text)
     }
   }
@@ -1054,7 +650,7 @@ export class GatewayClient extends EventEmitter {
 
       this.pushLog(line)
       this.publish({ type: 'gateway.stderr', payload: { line } })
-      this.handleTransportExit(1, this.text('libText.gateway.websocketUnavailable'), 'websocket', false, 'unavailable')
+      this.handleTransportExit(1, this.text('libText.gateway.websocketUnavailable'))
 
       return
     }
@@ -1064,7 +660,6 @@ export class GatewayClient extends EventEmitter {
       let settled = false
 
       this.ws = ws
-      this.closeInitiator = null
       // Bind the channel to the socket as soon as it exists (not on open):
       // RPCs issued while CONNECTING await wsConnectPromise and then must
       // reach *this* generation; a stale generation's late frames are
@@ -1142,21 +737,12 @@ export class GatewayClient extends EventEmitter {
           return
         }
 
-        const initiator = this.closeInitiator ?? 'remote_or_network'
-        this.closeInitiator = null
-        this.lifecycle(`[lifecycle] websocket close code=${ev.code} clean=${ev.wasClean} ready=${this.ready} initiator=${initiator}`)
-        const delaySummary = this.getLoopDelaySummary()
-
-        if (delaySummary) {
-          this.lifecycle(`[lifecycle] event-loop delay max=${delaySummary.maxMs}ms p99=${delaySummary.p99Ms}ms mean=${delaySummary.meanMs}ms`)
-        }
-
+        this.pushLog(`[lifecycle] websocket close code=${ev.code}`)
         this.ws = null
         this.wsConnectPromise = null
         this.handleTransportExit(
           ev.code,
-          ev.code ? this.text('libText.gateway.websocketClosedWithCode', ev.code) : this.text('libText.gateway.websocketClosed'),
-          'websocket', ev.wasClean, initiator
+          ev.code ? this.text('libText.gateway.websocketClosedWithCode', ev.code) : this.text('libText.gateway.websocketClosed')
         )
       })
       ws.addEventListener('error', () => {
@@ -1167,7 +753,7 @@ export class GatewayClient extends EventEmitter {
       })
     } catch (err) {
       this.pushLog(`[startup] failed to connect websocket gateway ${safeAttachUrl} (constructor error)`)
-      this.handleTransportExit(1, this.text('libText.gateway.websocketStartupFailed'), 'websocket', false, 'client_error')
+      this.handleTransportExit(1, this.text('libText.gateway.websocketStartupFailed'))
     }
   }
 
@@ -1193,7 +779,6 @@ export class GatewayClient extends EventEmitter {
     this.attachUrl = attachUrl
     this.sidecarUrl = sidecarUrl
     this.resetStartupState()
-    this.initLoopDelayMonitor()
 
     this.closeGatewaySocket()
     this.closeSidecarSocket()
@@ -1232,46 +817,7 @@ export class GatewayClient extends EventEmitter {
     return typeof WebSocket === 'undefined' ? this.options.fallbackWebSocket : WebSocket
   }
 
-  private scheduleDeferredDrain() {
-    const generation = this.drainGeneration
-
-    queueMicrotask(() => {
-      if (this.disposed) {
-        return
-      }
-
-      if (this.drainGeneration !== generation) {
-        return
-      }
-
-      this.subscribed = true
-
-      // Replay everything buffered up to now, then any events that arrived in
-      // the gap before this microtask ran — all in chronological order.
-      for (const ev of this.bufferedEvents.drain()) {
-        this.emit('event', ev)
-      }
-
-      for (const request of this.bufferedRequests.splice(0)) {
-        this.emit('request', request)
-      }
-
-      if (this.pendingExit !== undefined) {
-        const { code, context } = this.pendingExit
-
-        this.pendingExit = undefined
-        this.emit('exit', code, context)
-      }
-    })
-  }
-
   drain() {
-    this.consumerReady = true
-
-    if (this.subscribed) {
-      return
-    }
-
     // Defer the buffered-event replay to the next microtask, and DO NOT flip
     // `subscribed` until that microtask runs.
     //
@@ -1293,7 +839,32 @@ export class GatewayClient extends EventEmitter {
     // flush re-drains the buffer right after flipping `subscribed`, so any
     // in-window arrivals are delivered in FIFO order. A generation token makes
     // the queued microtask a no-op if the transport was reset/killed meanwhile.
-    this.scheduleDeferredDrain()
+    const generation = this.drainGeneration
+
+    queueMicrotask(() => {
+      if (this.drainGeneration !== generation) {
+        return
+      }
+
+      this.subscribed = true
+
+      // Replay everything buffered up to now, then any events that arrived in
+      // the gap before this microtask ran — all in chronological order.
+      for (const ev of this.bufferedEvents.drain()) {
+        this.emit('event', ev)
+      }
+
+      for (const request of this.bufferedRequests.splice(0)) {
+        this.emit('request', request)
+      }
+
+      if (this.pendingExit !== undefined) {
+        const code = this.pendingExit
+
+        this.pendingExit = undefined
+        this.emit('exit', code)
+      }
+    })
   }
 
   getLogTail(limit = 20): string {
@@ -1444,9 +1015,6 @@ export class GatewayClient extends EventEmitter {
 
   kill(reason = 'requested') {
     this.disposed = true
-    this.closeInitiator = 'client_kill'
-    this.cleanupLoopDelayMonitor()
-    this.invalidateTransportGeneration()
     this.localGeneration++
     this.clearReconnect()
     this.reconnectAttempts = 0

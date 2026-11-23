@@ -10,10 +10,9 @@ import asyncio
 import logging
 import threading
 import time
-import uuid
 from concurrent.futures import Executor
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 from fastapi import WebSocketDisconnect
 
@@ -49,35 +48,15 @@ _VIEWER_SEND_ERRORS = (WebSocketDisconnect, RuntimeError, OSError)
 TUI_FORCE_REDRAW = b"\x0c"
 
 
-def make_replay_request(generation: Optional[str] = None) -> tuple[str, bytes]:
-    """Format a private OSC 777 redraw request for Ink TUI that does not insert text."""
-    if not generation:
-        generation = str(uuid.uuid4())
-    return generation, f"\x1b]777;hermes-replay;request;{generation}\x07".encode("ascii")
-
-
 class RingBuffer:
     """Keeps only the most recent ``capacity`` bytes appended to it."""
 
     def __init__(self, capacity: int) -> None:
         self._cap = capacity
         self._buf = bytearray()
-        self._escape_tail = b""
         self.truncated = False
 
     def append(self, data: bytes) -> None:
-        # If the incoming stream clears the terminal scrollback (\x1b[3J),
-        # discard all buffered bytes prior to that clear. Keeping wiped
-        # scrollback causes reconnected viewers to replay duplicate transcripts.
-        # PTY read boundaries can split CSI 3 J at any byte. Inspect the
-        # retained suffix too, without duplicating it when no clear is found.
-        candidate = self._escape_tail + data
-        self._escape_tail = candidate[-3:]
-        clear_idx = candidate.rfind(b"\x1b[3J")
-        if clear_idx != -1:
-            self._buf.clear()
-            self.truncated = False
-            data = candidate[clear_idx:]
         self._buf.extend(data)
         overflow = len(self._buf) - self._cap
         if overflow > 0:
@@ -133,17 +112,12 @@ class PtySession:
         self._replay_limit = buffer_cap
         self.alive = True
         self.attached = False
-        self._retiring = False
-        self._busy_probed_logged = False
         # Admission can fail before the first attach (e.g. lost metadata).
         self.last_detached_at: Optional[float] = time.monotonic()
         self._read_timeout = read_timeout
         # Runs the blocking reads; None is the loop's default executor.
         self._drain_executor = drain_executor
         self._ws = None
-        self._viewers: set[Any] = set()
-        self._viewer_output_locks: dict[Any, asyncio.Lock] = {}
-        self._multi_viewer = False
         self._attach_generation = 0
         # Only final sink writes and viewer claims hold this lock. Profile
         # admission/backpressure waits happen outside it.
@@ -157,9 +131,6 @@ class PtySession:
         self._outputs = 0
         self._output_arrived = asyncio.Event()
 
-    def is_leader(self, ws: Any) -> bool:
-        return self._ws is ws
-
     async def start(self) -> None:
         self._drain_task = asyncio.create_task(self._drain())
 
@@ -172,48 +143,39 @@ class PtySession:
                 chunk = None
             if chunk is None:                       # EOF — the agent process exited
                 self.alive = False
-                viewers = list(self._viewers)
-                for viewer in viewers:
-                    self.detach(viewer)
-                await asyncio.gather(*(
-                    _close_ws(viewer, WS_CLOSE_PROCESS_EXITED, WS_CLOSE_PROCESS_EXITED_REASON)
-                    for viewer in viewers
-                ))
+                ws = self._ws
+                async with self._output_lock:
+                    if self._ws is ws:
+                        await _close_ws(ws, WS_CLOSE_PROCESS_EXITED, WS_CLOSE_PROCESS_EXITED_REASON)
                 return
             if not chunk:                            # idle tick
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0)
                 continue
             self.buffer.append(chunk)
             self._outputs += 1
             self._output_arrived.set()
-            await asyncio.gather(*(self._send_output(viewer, chunk) for viewer in list(self._viewers)))
-
-    async def _send_output(self, ws, chunk: bytes) -> None:
-        output_lock = self._viewer_output_locks.get(ws)
-        if output_lock is None:
-            return
-        try:
-            async with output_lock:
-                if ws in self._viewers:
-                    await asyncio.wait_for(ws.send_bytes(chunk), timeout=_VIEWER_SEND_TIMEOUT_SECONDS)
-        except Exception:
-            logger.exception("PTY viewer output failed; detaching viewer")
-            if self._viewer_output_locks.get(ws) is output_lock:
-                self.detach(ws)
-                await _close_ws(ws, WS_CLOSE_VIEWER_STALLED, WS_CLOSE_VIEWER_STALLED_REASON)
+            ws = self._ws
+            output_lock = self._output_lock
+            try:
+                if ws is not None:
+                    async with output_lock:
+                        if self._ws is ws:
+                            await asyncio.wait_for(ws.send_bytes(chunk), timeout=_VIEWER_SEND_TIMEOUT_SECONDS)
+            except Exception:
+                # The viewer is gone; nothing else observes this failure (the handler's finally
+                # only runs once ws.receive() sees the disconnect). detach() is a no-op when a
+                # replacement socket attached during the send, so the new viewer keeps its session.
+                if self._ws is ws:
+                    self.detach(ws)
+                    await _close_ws(ws, WS_CLOSE_VIEWER_STALLED, WS_CLOSE_VIEWER_STALLED_REASON)
 
     async def write(self, ws, data: bytes, *, fence=None, **bridge_options) -> bool:
-        """Serialize input and discard bytes from a detached or superseded socket.
+        """Serialize input and discard bytes from a superseded socket.
 
         ``fence`` is handed to the bridge (see ``PtyBridge.write``); what it raises propagates.
         ``bridge_options`` (``timeout``) go to the bridge's ``write`` unchanged.
         """
         async with self._write_lock:
-            if isinstance(data, str):
-                data = data.encode("utf-8")
-            if self._multi_viewer and ws in self._viewers and data and not data.startswith(b"\x1b"):
-                if data >= b" " or data in (b"\r", b"\n"):
-                    self._ws = ws
             if self._ws is not ws or not self.alive:
                 return True
             generation = self._attach_generation
@@ -246,7 +208,6 @@ class PtySession:
                 not delivered
                 and self._ws is ws
                 and self._attach_generation == generation
-                and not self.bridge.is_alive()
             ):
                 self.alive = False
             return delivered
@@ -282,7 +243,6 @@ class PtySession:
     async def attach(
         self, ws, *, force_redraw: bool = False,
         initial_text: Optional[str | Callable[[bool], str]] = None,
-        generation: Optional[str] = None, multi_viewer: bool = False,
     ) -> bool:
         """Attach a browser terminal and replay buffered PTY output.
 
@@ -291,10 +251,6 @@ class PtySession:
         ``initial_text`` is sent before the replay; given as a function, it is called with whether
         the replay leaves out older output (dropped from the buffer or past the replay limit).
         """
-        if self._retiring:
-            return False
-        replay_generation = generation
-        self._busy_probed_logged = False
         self._attach_generation += 1
         generation = self._attach_generation
         if self._input_task is not None:
@@ -307,20 +263,14 @@ class PtySession:
             if self._attach_generation != generation:
                 return False
         try:
-            if self._attach_generation != generation or self._retiring:
+            if self._attach_generation != generation:
                 return False
             old_ws = self._ws
             self._ws = ws
-            self._multi_viewer = multi_viewer
-            if not multi_viewer:
-                self._viewers.clear()
-                self._viewer_output_locks.clear()
-            self._viewers.add(ws)
             self.attached = True
             self.last_detached_at = None
             # Per-viewer lock: a stalled old send must not block its replacement.
             output_lock = self._output_lock = asyncio.Lock()
-            self._viewer_output_locks[ws] = output_lock
         finally:
             self._viewer_lock.release()
         try:
@@ -328,14 +278,14 @@ class PtySession:
                 held = self.buffer.snapshot()
                 snap = held[len(held) - min(len(held), self._replay_limit):]
                 trimmed = self.buffer.truncated or len(snap) < len(held)
-                if not multi_viewer and old_ws is not ws:
+                if old_ws is not ws:
                     await _close_ws(old_ws, WS_CLOSE_SUPERSEDED)
-                if ws not in self._viewers:
+                if self._ws is not ws:
                     return False
                 if initial_text is not None:
                     text = initial_text(trimmed) if callable(initial_text) else initial_text
                     await asyncio.wait_for(ws.send_text(text), timeout=_VIEWER_SEND_TIMEOUT_SECONDS)
-                if ws not in self._viewers:
+                if self._ws is not ws:
                     return False
                 # Metadata-bearing host clients treat exactly the next binary
                 # frame as replay. Send an empty snapshot too, so the first live
@@ -353,28 +303,25 @@ class PtySession:
         except BaseException:  # cancellation or a bug: never leave this socket attached
             self.detach(ws)
             raise
-        if ws not in self._viewers:
+        if self._ws is not ws:
             return False
         if not self.alive:
             self.detach(ws)
             await _close_ws(ws, WS_CLOSE_PROCESS_EXITED, WS_CLOSE_PROCESS_EXITED_REASON)
             return False
-        if replay_generation is not None:
-            _, payload = make_replay_request(replay_generation)
-            return await self.write(ws, payload)
         if force_redraw:
             return await self.write(ws, TUI_FORCE_REDRAW)
         return True
 
-    def detach(self, ws: Any) -> None:
-        self._viewers.discard(ws)
-        self._viewer_output_locks.pop(ws, None)
-        if self._ws is ws:
-            self._ws = next(iter(self._viewers), None)
-        if not self._viewers:
-            self.attached = False
-            self.last_detached_at = time.monotonic()
-            self._busy_probed_logged = False
+    def detach(self, ws) -> None:
+        # Only the currently-attached socket may mark the session detached: a superseded socket's
+        # handler also calls detach on its way out (after the new tab attached), and flipping
+        # ``attached`` then would make a session with a live viewer look idle and reapable.
+        if self._ws is not ws:
+            return
+        self._ws = None
+        self.attached = False
+        self.last_detached_at = time.monotonic()
 
     def hosts_pid(self, pid: Optional[int]) -> bool:
         """Whether ``pid`` runs inside this PTY: the leader itself or one of its descendants.
@@ -400,14 +347,13 @@ class PtySession:
             self._attach_generation += 1
             if self._input_task is not None:
                 self._input_task.cancel()
-            viewers = list(self._viewers)
-            for viewer in viewers:
-                self.detach(viewer)
-            self._close_task = asyncio.create_task(self._close(viewers))
+            ws = self._ws
+            self.detach(ws)
+            self._close_task = asyncio.create_task(self._close(ws))
         await asyncio.shield(self._close_task)
 
-    async def _close(self, viewers) -> None:
-        await asyncio.gather(*(_close_ws(ws, WS_CLOSE_PROCESS_EXITED) for ws in viewers))
+    async def _close(self, ws) -> None:
+        await _close_ws(ws, WS_CLOSE_PROCESS_EXITED)
         if self._drain_task is not None:
             self._drain_task.cancel()
             try:
@@ -419,6 +365,8 @@ class PtySession:
                 # child below must still be closed.
                 logger.warning("PTY output drain failed", exc_info=True)
         try:
+            # bridge.close() joins the child — blocking; keep it off the event loop.
+            # See #53227.
             await asyncio.to_thread(self.bridge.close)
         except Exception:  # health: allow BLE001 S110 -- teardown of an already-dead PTY must not mask the caller's error path
             pass
@@ -436,23 +384,10 @@ class PtySession:
 
 
 class RegistryFull(Exception):
-    """Admission refused because retained terminals cannot be safely reclaimed."""
+    """Every keep-alive slot holds a PTY that some tab is still attached to."""
 
     def __init__(self, message: str = "Too many chat terminals are open in other tabs; close one and try again.") -> None:
         super().__init__(message)
-
-
-class MemoryBudgetFull(RegistryFull):
-    """A terminal cannot be admitted under the process-tree memory budget."""
-
-    def __init__(
-        self,
-        message: str = "Terminal memory budget reached or unavailable; existing work is protected.",
-        *,
-        reason: str = "memory",
-    ) -> None:
-        super().__init__(message)
-        self.rejection_reason = reason
 
 
 async def run_reaper(registry: PtySessionRegistry, *, interval: float = 60.0) -> None:
@@ -469,11 +404,7 @@ class PtySessionRegistry:
     def __init__(
         self, *, ttl: float, max_sessions: int, buffer_cap: int, read_timeout: float,
         drain_executor: Optional[Executor] = None,
-        memory_budget_bytes: int | None = None,
-        memory_usage: Callable[[list[PtySession]], int | None] | None = None,
     ) -> None:
-        self._memory_budget_bytes = memory_budget_bytes
-        self._memory_usage = memory_usage
         self._ttl = ttl
         self._max = max_sessions
         self._buffer_cap = buffer_cap
@@ -487,47 +418,16 @@ class PtySessionRegistry:
         self._closed = False
         # Retain ownership of removed sessions until helper-process shutdown completes.
         self._background_closes: set[asyncio.Task] = set()
-        self._closing_sessions: dict[asyncio.Task, PtySession] = {}
-        self._standby_session: Optional[PtySession] = None
-        self._standby_spawn_fn: Optional[Callable[[], object]] = None
-        self._standby_task: Optional[asyncio.Task] = None
-
-    def configure_standby_spawn(self, spawn_fn: Callable[[], object]) -> None:
-        self._standby_spawn_fn = spawn_fn
-
-    def _replenish_standby(self) -> None:
-        if not self._closed and self._standby_spawn_fn is not None:
-            if self._standby_task is None or self._standby_task.done():
-                self._standby_task = asyncio.create_task(self.ensure_standby())
-
-    async def ensure_standby(self) -> None:
-        async with self._spawn_lock:
-            if self._closed or self._memory_budget_bytes is not None or self._standby_spawn_fn is None:
-                return
-            if self._standby_session is not None:
-                if not self._reapable(self._standby_session):
-                    return
-                self._close_in_background(self._standby_session)
-                self._standby_session = None
-            try:
-                bridge = await asyncio.to_thread(self._standby_spawn_fn)
-                session = PtySession("__standby__", bridge, buffer_cap=self._buffer_cap,
-                                     read_timeout=self._read_timeout, drain_executor=self._drain_executor)
-                await session.start()
-                self._standby_session = session
-            except Exception:
-                logger.debug("Standby PTY spawn failed; using on-demand startup", exc_info=True)
 
     async def attach_or_spawn(
         self, key: str, *, spawn: Callable[[], object], active_session_file: Optional[Path] = None,
-        allow_standby: bool = False,
     ) -> tuple[PtySession, bool]:
         # Reserve capacity and the key across blocking fork/exec. On cancellation
         # the registry, not the request's cancellation scope, owns that reservation
         # until the admission finishes and any unclaimed child has been closed.
         await self._spawn_lock.acquire()
         admission = asyncio.create_task(
-            self._attach_or_spawn(key, spawn=spawn, active_session_file=active_session_file, allow_standby=allow_standby))
+            self._attach_or_spawn(key, spawn=spawn, active_session_file=active_session_file))
         try:
             # wait() leaves admission running on caller cancellation without
             # shield() reporting its late exception (Python 3.14). The registry's
@@ -563,31 +463,20 @@ class PtySessionRegistry:
 
     async def _attach_or_spawn(
         self, key: str, *, spawn: Callable[[], object], active_session_file: Optional[Path] = None,
-        allow_standby: bool = False,
     ) -> tuple[PtySession, bool]:
         if self._closed:
             raise RegistryFull("Terminal service is shutting down.")
+        await self.reap_idle()
         existing = self._sessions.get(key)
-        # Reconnecting does not allocate another terminal, even under pressure.
-        if existing is not None and not self._dead(existing):
+        if existing is not None and existing.alive:
             return existing, False
-        now = time.monotonic()
-        await self._reap_locked(now)
+        if existing is not None:                       # dead remnant
+            # Close in the background: ending a dead leader's helpers can take the helper
+            # grace, and this reservation serializes every new chat.
+            self._sessions.pop(key, None)
+            self._close_in_background(existing)
         if len(self._sessions) >= self._max:
-            await self._reap_one_idle_or_raise(now)
-        admitted, reason, usage = await self._check_memory_budget(now)
-        if not admitted:
-            logger.warning("Terminal admission rejected: reason=%s, registry_count=%d, rss_bytes=%s, budget_bytes=%s",
-                           reason, len(self._sessions), usage, self._memory_budget_bytes)
-            raise MemoryBudgetFull(reason=reason or "memory")
-        if allow_standby and active_session_file is None and self._standby_session is not None:
-            session, self._standby_session = self._standby_session, None
-            if not self._reapable(session):
-                session.key = key
-                self._sessions[key] = session
-                self._replenish_standby()
-                return session, True
-            self._close_in_background(session)
+            self._reap_one_idle_or_raise()
         # PTY spawn does blocking fork/exec work — keep it off the event loop.
         # See #53227.
         bridge = await asyncio.to_thread(spawn)
@@ -661,144 +550,6 @@ class PtySessionRegistry:
         for session in sessions:
             await session.close()
 
-    @staticmethod
-    def _safe_pid(session: PtySession) -> Optional[int]:
-        bridge = getattr(session, "bridge", None)
-        pid = getattr(bridge, "pid", None) if bridge is not None else None
-        if pid is None:
-            pid = getattr(session, "pid", None)
-        return pid
-
-    @staticmethod
-    def _dead(session: PtySession) -> bool:
-        probe = getattr(session.bridge, "is_alive", None)
-        return not session.alive or (probe is not None and not probe())
-
-    async def _remove(
-        self,
-        session: PtySession,
-        *,
-        reason: Optional[str] = None,
-        now: Optional[float] = None,
-        rss: Optional[int] = None,
-        budget: Optional[int] = None,
-    ) -> None:
-        session._retiring = True
-        self._sessions.pop(session.key, None)
-        await session.close()
-        if reason is not None:
-            now_ts = time.monotonic() if now is None else now
-            idle_duration = max(0.0, now_ts - session.last_detached_at) if session.last_detached_at is not None else 0.0
-            pid = self._safe_pid(session)
-            budget_val = budget if budget is not None else self._memory_budget_bytes
-            logger.info(
-                "PTY session evicted: reason=%s, pid=%s, idle_seconds=%.1f, "
-                "registry_count=%d, rss_bytes=%s, budget_bytes=%s",
-                reason,
-                pid,
-                idle_duration,
-                len(self._sessions),
-                rss,
-                budget_val,
-            )
-
-    async def _retire(
-        self,
-        session: PtySession,
-        now: float,
-        *,
-        reason: str = "ttl",
-        rss: Optional[int] = None,
-        budget: Optional[int] = None,
-    ) -> bool:
-        if session.attached or session.last_detached_at is None:
-            return False
-        probe = getattr(session.bridge, "retire_if_idle", None)
-        if probe is None:
-            return False
-        # Reject a stale attach() caller while the gateway freezes admission.
-        session._retiring = True
-        async def settle_retirement() -> bool:
-            try:
-                approved = await asyncio.to_thread(probe)
-            except Exception:
-                logger.exception("PTY idle probe failed; retaining session")
-                approved = False
-            if approved is True:
-                await self._remove(session, reason=reason, now=now, rss=rss, budget=budget)
-                return True
-            # Busy/unknown must not be killed as soon as a long turn finishes.
-            idle_duration = max(0.0, now - session.last_detached_at)
-            session.last_detached_at = now
-            if not getattr(session, "_busy_probed_logged", False):
-                session._busy_probed_logged = True
-                pid = self._safe_pid(session)
-                logger.debug(
-                    "PTY session busy probe: pid=%s busy_or_unknown, retaining; idle_seconds=%.1f",
-                    pid,
-                    idle_duration,
-                )
-            return False
-
-        # Shield the entire prepare/commit/close transaction, not just the probe.
-        # Releasing the admission lock after commit but before close loses both
-        # the process and its memory accounting if the requesting socket vanishes.
-        operation = asyncio.create_task(settle_retirement())
-        try:
-            return await asyncio.shield(operation)
-        except asyncio.CancelledError:
-            await operation
-            raise
-        finally:
-            if session.alive:
-                session._retiring = False
-
-    def _idle_candidates(self) -> list[PtySession]:
-        return sorted((s for s in self._sessions.values()
-                       if not s.attached and s.last_detached_at is not None),
-                      key=lambda s: s.last_detached_at)
-
-    async def _usage(self) -> int | None:
-        if self._memory_usage is None:
-            return None
-        try:
-            return await asyncio.to_thread(self._memory_usage, [*self._sessions.values(), *self._closing_sessions.values()])
-        except Exception:
-            logger.exception("PTY memory accounting failed")
-            return None
-
-    async def _check_memory_budget(self, now: float) -> tuple[bool, Optional[str], Optional[int]]:
-        if self._memory_budget_bytes is None:
-            return True, None, None
-        usage = await self._usage()
-        if usage is None:
-            return False, "memory_unknown", None
-        for session in self._idle_candidates():
-            if usage < self._memory_budget_bytes:
-                return True, None, usage
-            if await self._retire(session, now, reason="memory", rss=usage, budget=self._memory_budget_bytes):
-                usage = await self._usage()
-                if usage is None:
-                    return False, "memory_unknown", None
-        if usage < self._memory_budget_bytes:
-            return True, None, usage
-        return False, "memory", usage
-
-    async def _reclaim_memory(self, now: float) -> bool:
-        admitted, _, _ = await self._check_memory_budget(now)
-        return admitted
-
-    async def _reap_locked(self, now: float) -> None:
-        if self._standby_session is not None and self._dead(self._standby_session):
-            await self._standby_session.close()
-            self._standby_session = None
-        for session in list(self._sessions.values()):
-            if self._dead(session):
-                await self._remove(session, reason="dead", now=now)
-            elif (not session.attached and session.last_detached_at is not None
-                  and now - session.last_detached_at > self._ttl):
-                await self._retire(session, now, reason="ttl")
-
     def detach(self, key: str, ws) -> None:
         s = self._sessions.get(key)
         if s is not None:
@@ -815,26 +566,30 @@ class PtySessionRegistry:
         return not s.alive or not s.bridge.is_alive() or self.expired(s, now)
 
     async def reap_idle(self, now: Optional[float] = None) -> None:
-        async with self._spawn_lock:
-            if self._closed:
-                return
-            now = time.monotonic() if now is None else now
-            await self._reap_locked(now)
-            await self._reclaim_memory(now)
+        now = time.monotonic() if now is None else now
+        doomed = [(key, s) for key, s in self._sessions.items() if self._reapable(s, now)]
+        for key, expected in doomed:
+            # Reaps overlap (attach_or_spawn and the background reaper) and close()
+            # awaits, so a concurrent reap can have popped this key already — skip
+            # it instead of raising KeyError into the websocket handler. A viewer can
+            # also re-attach during an earlier close, so re-check before closing.
+            if self._sessions.get(key) is not expected or not self._reapable(expected, now):
+                continue
+            session = self._sessions.pop(key, None)
+            if session is not None:
+                await session.close()
 
-    async def _reap_one_idle_or_raise(self, now: float) -> None:
-        for session in self._idle_candidates():
-            if await self._retire(session, now, reason="capacity"):
-                return
-        logger.warning("Terminal admission rejected: reason=capacity, registry_count=%d, max_sessions=%d",
-                       len(self._sessions), self._max)
-        raise RegistryFull("Terminal capacity reached; attached or working sessions are protected.")
+    def _reap_one_idle_or_raise(self) -> None:
+        idle = [s for s in self._sessions.values() if not s.attached and s.last_detached_at is not None]
+        if not idle:
+            raise RegistryFull()
+        oldest = min(idle, key=lambda s: s.last_detached_at or 0.0)
+        self._sessions.pop(oldest.key, None)
+        self._close_in_background(oldest)
 
     def _close_in_background(self, session: PtySession) -> asyncio.Task:
         task = asyncio.create_task(session.close())
         self._background_closes.add(task)
-        self._closing_sessions[task] = session
-        task.add_done_callback(lambda completed: self._closing_sessions.pop(completed, None))
         task.add_done_callback(self._background_closes.discard)
         return task
 
@@ -846,9 +601,6 @@ class PtySessionRegistry:
 
     async def close_all(self) -> None:
         self._closed = True
-        if self._standby_task is not None:
-            await asyncio.shield(self._standby_task)
-            self._standby_task = None
         # Wait for any admitted spawn before snapshotting shutdown ownership.
         async with self._spawn_lock:
             pass
@@ -856,7 +608,4 @@ class PtySessionRegistry:
             await asyncio.shield(asyncio.gather(*self._spawn_cleanup))
         # Helper-process grace must run concurrently inside the backend shutdown budget.
         sessions = [self._sessions.pop(key) for key in list(self._sessions)]
-        if self._standby_session is not None:
-            sessions.append(self._standby_session)
-            self._standby_session = None
         await asyncio.gather(*(s.close() for s in sessions), *self._background_closes, return_exceptions=True)

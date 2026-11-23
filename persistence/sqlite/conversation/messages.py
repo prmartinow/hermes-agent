@@ -16,7 +16,7 @@ from persistence.conversation.messages import (
     HeldCoverage, HeldMessage, MarkerPurgeReport, MessageRecord, MessageStorageState, NewMessage, PagedMessage, PromptPage,
     PrUrlHit, PrunedRowChange, PruneRewriteResult, Reaction, ReadCheck, ReplaceMode, ReplaceResult, ResumeConversations,
     RewindPlan, RowDisposition, RowOutcome, RowStamp, RowUids, SegmentPage, SessionTimeline, TimelineEntry, TranscriptRead, TranscriptRow,
-    TranscriptHydrationPage, TranscriptView,
+    TranscriptView,
     UnseenReaction, UserTurnRewind, Watermark,
 )
 from persistence.core.identity import JsonValue, MessageId, SessionId
@@ -556,15 +556,6 @@ class SQLiteMessageRepository:
         with _refusals(holder, session_id):
             return worker_continuation.capture_terminal_child_session(
                 holder, session_id, expected_parent_id, include_compacted=include_compacted)
-
-    def read_hydration_page(self, session_id: SessionId, *, limit: int, offset: int = 0,
-                            after_row_id: Optional[int] = None, high_watermark: Optional[int] = None) -> TranscriptHydrationPage:
-        holder = self._store.holder()
-        with _refusals(holder, session_id):
-            rows, high_watermark, last_row = hydration.read_hydration_page(
-                holder, session_id, limit=limit, offset=offset, after_row_id=after_row_id,
-                high_watermark=high_watermark)
-        return TranscriptHydrationPage(_conversation(rows), high_watermark, last_row)
 
     def read_resume_conversations(self, session_id: SessionId) -> ResumeConversations:
         holder = self._store.holder()

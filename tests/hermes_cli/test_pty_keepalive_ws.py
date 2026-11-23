@@ -1,6 +1,5 @@
 import asyncio
 import json
-from threading import Event
 
 import pytest
 
@@ -13,8 +12,6 @@ class FakeBridge:
         self.alive = True
         self.accept_input = True
         self.written = bytearray()
-        self.replay_requests = []
-        self.input_written = Event()
 
     def read(self, timeout):
         return b""        # idle forever
@@ -22,11 +19,7 @@ class FakeBridge:
     async def write(self, data):
         if not self.accept_input:
             return False
-        if data.startswith(b"\x1b]777;hermes-replay;request;") and data.endswith(b"\x07"):
-            self.replay_requests.append(data)
-        else:
-            self.written.extend(data)
-            self.input_written.set()
+        self.written.extend(data)
         return True
 
     def resize(self, cols, rows):
@@ -46,15 +39,11 @@ def pty_keepalive_harness(monkeypatch):
 
     spawned = Spawned()
     spawned.bridges = []
-    spawned.ready = Event()
-    # Fake bridges have no OS process identity; budget accounting has its own real tests.
-    monkeypatch.setattr(_web_server_chat.PTY_REGISTRY, "_memory_usage", lambda sessions: 0)
 
     def fake_spawn(argv, cwd=None, env=None):
         b = FakeBridge()
         spawned.append(argv)
         spawned.bridges.append(b)
-        spawned.ready.set()
         return b
 
     monkeypatch.setattr(_web_server_chat.PtyBridge, "spawn", staticmethod(fake_spawn))
@@ -78,34 +67,7 @@ def pty_keepalive_harness(monkeypatch):
         _web_server_chat.PTY_REGISTRY._sessions.clear()
 
 
-@pytest.mark.parametrize("kind", ["memory", "capacity"])
-def test_resource_refusal_preserves_resume_for_reload(pty_keepalive_harness, monkeypatch, kind):
-    from starlette.testclient import TestClient
-    from starlette.websockets import WebSocketDisconnect
-    from hermes_cli.pty_session import MemoryBudgetFull, RegistryFull
-
-    seen = []
-
-    async def refuse(key, **kwargs):
-        seen.append(key)
-        raise MemoryBudgetFull() if kind == "memory" else RegistryFull()
-
-    monkeypatch.setattr(_web_server_chat.PTY_REGISTRY, "attach_or_spawn", refuse)
-    with TestClient(web_server.app).websocket_connect("/api/pty?attach=same-tab&resume=kept-chat") as ws:
-        text = ws.receive_text()
-        assert "Start new session" not in text
-        assert "same chat" in text
-        if kind == "memory":
-            assert "memory" in text.lower() and "too many" not in text.lower()
-        with pytest.raises(WebSocketDisconnect) as error:
-            ws.receive_text()
-        assert error.value.code == 4429
-        assert error.value.reason == "terminal-" + kind
-    assert len(seen) == 1 and "kept-chat" in seen[0] and "same-tab" in seen[0]
-    assert not pty_keepalive_harness.bridges
-
-
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_attach_token_reuses_same_session(pty_keepalive_harness):
     """Two connects with the same ?attach= token hit one spawned bridge."""
     from starlette.testclient import TestClient
@@ -114,12 +76,9 @@ async def test_attach_token_reuses_same_session(pty_keepalive_harness):
     with client.websocket_connect("/api/pty?attach=TOK1") as ws1:
         ws1.send_bytes(b"hi")
     with client.websocket_connect("/api/pty?attach=TOK1") as ws2:
-        ctrl = ws2.receive_json()
-        assert ctrl["type"] == "replay-start"
         ws2.send_bytes(b"again")
     assert len(pty_keepalive_harness) == 1                # reattached, did not respawn
-    assert bytes(pty_keepalive_harness.bridges[0].written) == b"hiagain"
-    assert len(pty_keepalive_harness.bridges[0].replay_requests) == 1
+    assert bytes(pty_keepalive_harness.bridges[0].written) == b"hi\x0cagain"
 
 
 @pytest.mark.asyncio
@@ -131,7 +90,6 @@ async def test_stalled_input_closes_only_the_keepalive_socket(
 
     client = TestClient(web_server.app)
     with client.websocket_connect("/api/pty?attach=TOK1") as ws:
-        assert pty_keepalive_harness.ready.wait(5)
         bridge = pty_keepalive_harness.bridges[0]
         bridge.accept_input = False
         ws.send_bytes(b"input")
@@ -139,8 +97,7 @@ async def test_stalled_input_closes_only_the_keepalive_socket(
             ws.receive_bytes()
 
     assert exc_info.value.code == 1013
-    assert web_server.PTY_REGISTRY._sessions["TOK1"].alive is True
-    assert bridge.alive is True
+    assert web_server.PTY_REGISTRY._sessions["TOK1"].alive is False
 
 
 def test_chat_without_a_pty_bridge_says_what_to_install_as_on_main(pty_keepalive_harness, monkeypatch):
@@ -239,7 +196,7 @@ async def test_attach_token_reuses_same_resume(pty_keepalive_harness):
 
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_attach_token_reuses_canonical_resume(pty_keepalive_harness):
     from starlette.testclient import TestClient
 
@@ -247,46 +204,13 @@ async def test_attach_token_reuses_canonical_resume(pty_keepalive_harness):
     with client.websocket_connect("/api/pty?attach=TOK1&resume=parent") as ws1:
         ws1.send_bytes(b"hi")
     with client.websocket_connect("/api/pty?attach=TOK1&resume=child") as ws2:
-        ctrl = ws2.receive_json()
-        assert ctrl["type"] == "replay-start"
-        gen = ctrl["generation"]
         ws2.send_bytes(b"again")
     assert pty_keepalive_harness == [["x", "child"]]
-    expected_request = f"\x1b]777;hermes-replay;request;{gen}\x07".encode("ascii")
-    written = bytes(pty_keepalive_harness.bridges[0].written)
-    assert written == b"hiagain"
-    assert pty_keepalive_harness.bridges[0].replay_requests == [expected_request]
-    assert b"\x0c" not in written
-
-
-@pytest.mark.anyio
-async def test_compacted_session_tip_reuses_device_owner(pty_keepalive_harness, monkeypatch):
-    from starlette.testclient import TestClient
-
-    tip = ["child"]
-
-    async def argv(**kwargs):
-        return ["x", tip[0]], "/tmp", {"HERMES_TUI_RESUME": tip[0]}
-
-    monkeypatch.setattr(_web_server_chat, "_resolve_chat_argv_async", argv)
-    client = TestClient(web_server.app)
-    with client.websocket_connect("/api/pty?attach=DEVICE&channel=DEVICE&resume=parent") as ws:
-        ws.send_bytes(b"before")
-    registry = _web_server_chat.PTY_REGISTRY
-    key = "DEVICE\0\0child"
-    owner = registry._sessions[key]
-    owner.active_session_file.write_text(json.dumps({"session_id": "next-child"}))
-    tip[0] = "next-child"
-    with client.websocket_connect("/api/pty?attach=DEVICE&channel=DEVICE&resume=parent") as ws:
-        assert ws.receive_json()["type"] == "replay-start"
-        ws.send_bytes(b"after")
-    assert len(pty_keepalive_harness) == 1
-    assert registry._sessions[key] is owner
 
 
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_attach_token_reuses_default_chat_after_active_session_fallback(
     pty_keepalive_harness, tmp_path, monkeypatch
 ):
@@ -452,79 +376,3 @@ async def test_fresh_start_pops_stale_marker_and_reregisters_child_path(
     assert markers["CHANFRESH"] is stale_path
     await web_server.PTY_REGISTRY.close_all()
     assert markers == {}
-
-
-@pytest.mark.anyio
-async def test_attach_token_requests_a_private_replay_with_large_buffer(pty_keepalive_harness):
-    """A large retained history still needs a frame, requested outside terminal input."""
-    from starlette.testclient import TestClient
-
-    client = TestClient(web_server.app)
-    with client.websocket_connect("/api/pty?attach=TOK_BUF") as ws1:
-        ws1.send_bytes(b"init")
-
-    # Manually append >256 bytes to the session ring buffer to simulate replayed history
-    session = web_server.PTY_REGISTRY._sessions.get("TOK_BUF")
-    assert session is not None
-    session.buffer.append(b"X" * 300)
-
-    with client.websocket_connect("/api/pty?attach=TOK_BUF") as ws2:
-        ctrl = ws2.receive_json()
-        assert ctrl["type"] == "replay-start"
-        snap = ws2.receive_bytes()
-        assert snap == b"X" * 300
-        ws2.send_bytes(b"after")
-
-    # The OSC protocol is separate from input; no form-feed enters the composer.
-    assert bytes(pty_keepalive_harness.bridges[0].written) == b"initafter"
-    assert len(pty_keepalive_harness.bridges[0].replay_requests) == 1
-
-
-@pytest.mark.anyio
-async def test_forced_fresh_with_rotated_token_preserves_prior_work(pty_keepalive_harness):
-    from starlette.testclient import TestClient
-
-    client = TestClient(web_server.app)
-    with client.websocket_connect("/api/pty?attach=TOK1") as ws1:
-        assert pty_keepalive_harness.ready.wait(5)
-        bridge0 = pty_keepalive_harness.bridges[0]
-        ws1.send_bytes(b"hi")
-        assert bridge0.input_written.wait(5)
-    assert len(pty_keepalive_harness) == 1
-    assert bridge0.alive is True
-
-    # Wait for the async fork and input dispatch, not merely WebSocket accept.
-    # Closing immediately after accept can cancel a fork still in progress.
-    pty_keepalive_harness.ready.clear()
-    with client.websocket_connect("/api/pty?attach=TOK_NEW&fresh=1") as ws2:
-        assert pty_keepalive_harness.ready.wait(5)
-        ws2.send_bytes(b"fresh")
-        assert pty_keepalive_harness.bridges[1].input_written.wait(5)
-    assert len(pty_keepalive_harness) == 2
-    assert bridge0.alive is True
-
-
-@pytest.mark.anyio
-async def test_tab_isolation_preserves_per_device_identity(pty_keepalive_harness):
-    from starlette.testclient import TestClient
-
-    client = TestClient(web_server.app)
-    with client.websocket_connect("/api/pty?attach=DEVICE_A&resume=child") as ws1:
-        ws1.send_bytes(b"a")
-    with client.websocket_connect("/api/pty?attach=DEVICE_B&resume=child") as ws2:
-        ws2.send_bytes(b"b")
-    # Separate bridges spawned per device
-    assert len(pty_keepalive_harness) == 2
-
-
-@pytest.mark.anyio
-async def test_profile_isolation_preserves_independent_sessions(pty_keepalive_harness):
-    from starlette.testclient import TestClient
-
-    client = TestClient(web_server.app)
-    with client.websocket_connect("/api/pty?attach=TOK1&profile=prof_a&resume=child") as ws1:
-        ws1.send_bytes(b"a")
-    with client.websocket_connect("/api/pty?attach=TOK1&profile=prof_b&resume=child") as ws2:
-        ws2.send_bytes(b"b")
-    # Separate bridges spawned per profile
-    assert len(pty_keepalive_harness) == 2

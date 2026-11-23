@@ -171,7 +171,20 @@ const TranscriptPane = memo(function TranscriptPane({
   const bodyCols = Math.max(28, (useGutter && petBox ? composer.cols - petBox.width : composer.cols) - railCols)
   const petBandRows = petBox && !useGutter ? petBox.height : 0
 
+  // LiveTodoPanel rides as a child of the latest user-message row so it
+  // visually belongs to the prompt and follows it during scroll. -1 when
+  // empty → row.index === -1 is always false → no render.
+  const lastUserIdx = useMemo(() => {
+    const items = transcript.historyItems
 
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (items[i].role === 'user') {
+        return i
+      }
+    }
+
+    return -1
+  }, [transcript.historyItems])
 
   // Index of the first user-role message; every later user message gets a
   // small dash above it so multi-turn transcripts visually segment by
@@ -240,6 +253,7 @@ const TranscriptPane = memo(function TranscriptPane({
             />
           )}
 
+          {row.index === lastUserIdx && <LiveTodoPanel />}
         </Box>
       ))}
 
@@ -461,7 +475,6 @@ const ComposerPane = memo(function ComposerPane({
 
       <GoalBar cols={Math.max(1, composer.cols - 2)} />
       <LoopBar cols={Math.max(1, composer.cols - 2)} />
-      <LiveTodoPanel />
       <LiveAgentsPanel cols={Math.max(1, composer.cols - 2)} />
       <StatusRulePane at="top" composer={composer} nativeMode={nativeMode} status={status} />
       <AmbientDock placement="dock-top" />
@@ -513,7 +526,6 @@ const ComposerPane = memo(function ComposerPane({
                 {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
                 <TextInput
                   accentColor={ui.theme.color.accent}
-                  busy={ui.busy}
                   color={ui.theme.color.text}
                   columns={inputColumns}
                   cursorSnapshotRef={cursorSnapshotRef}
@@ -604,8 +616,7 @@ const StatusRulePane = memo(function StatusRulePane({
         lastTurnEndedAt={status.lastTurnEndedAt}
         liveSessionCount={ui.liveSessionCount}
         model={ui.info?.model ?? ''}
-
-        modelFast={ui.info?.fast || ui.info?.service_tier === 'priority'}
+        modelFast={ui.info?.fast}
         modelReasoningEffort={ui.info?.reasoning_effort}
         modelReasoningEffortWire={ui.info?.reasoning_effort_wire}
         notice={ui.notice}

@@ -22,7 +22,7 @@ it('only the newest attachment request may replace session authority', async () 
 
   function Harness() {
     lifecycle = useSessionLifecycle({ colsRef: { current: 80 }, composerActions: { setComposerTokens: vi.fn() },
-      gw: { request, retireSession: vi.fn() }, rpc: request, scrollRef: { current: null }, panel: vi.fn(), sys: vi.fn(),
+      gw: { request }, rpc: request, scrollRef: { current: null }, panel: vi.fn(), sys: vi.fn(),
       setHistoryItems: vi.fn(), setLastUserMsg: vi.fn(), setSessionStartedAt: vi.fn(), setStickyPrompt: vi.fn(),
       setVoiceProcessing: vi.fn(), setVoiceRecording: vi.fn() } as any)
 
@@ -41,10 +41,8 @@ it('only the newest attachment request may replace session authority', async () 
   try {
     for (const start of [() => lifecycle.resumeById('old'), () => void lifecycle.newLiveSession(), () => lifecycle.activateLiveSession('old')]) {
       start()
-      await flush()
       const old = pending.shift()!
       lifecycle.activateLiveSession('new')
-      await flush()
       pending.shift()!.resolve(result('new'))
       await flush()
       expect(getUiState().sid).toBe('new')
@@ -79,7 +77,7 @@ it('resumes a successor with a reset epoch while retaining original attempted ad
   function Harness() {
     queue = useQueue()
     lifecycle = useSessionLifecycle({ colsRef: { current: 80 }, composerActions: { setComposerTokens: vi.fn() },
-      gw: { request, retireSession: vi.fn() }, rpc: async () => ({}), scrollRef: { current: null }, panel: vi.fn(), sys: vi.fn(),
+      gw: { request }, rpc: async () => ({}), scrollRef: { current: null }, panel: vi.fn(), sys: vi.fn(),
       setHistoryItems: vi.fn(), setLastUserMsg: vi.fn(), setSessionStartedAt: vi.fn(), setStickyPrompt: vi.fn(),
       setVoiceProcessing: vi.fn(), setVoiceRecording: vi.fn() } as any)
 

@@ -182,39 +182,6 @@ def test_exclusion_of_soft_deleted_undo_messages(db: Persistence):
     assert "Turn 2 valid prompt" in display_contents
 
 
-def test_resume_viewport_conversations_with_compacted_messages(db: Persistence):
-    """The hydration page must include compacted rows and exclude rewound rows."""
-    session_id = "sess_viewport_compacted"
-    seed_session(db, session_id, "cli")
-
-    for i in range(1, 6):
-        db.messages.append(session_id, NewMessage(role="user", content=f"User msg {i}"))
-        db.messages.append(session_id, NewMessage(role="assistant", content=f"Assistant reply {i}"))
-
-    # Compact turns 1-3 away
-    compacted_set = [
-        {"role": "system", "content": "Summary of msgs 1-3"},
-        {"role": "user", "content": "User msg 4"},
-        {"role": "assistant", "content": "Assistant reply 4"},
-        {"role": "user", "content": "User msg 5"},
-        {"role": "assistant", "content": "Assistant reply 5"},
-    ]
-    compact(db, session_id, compacted_set)
-
-    # Add a soft-deleted undo turn
-    db.messages.append(session_id, NewMessage(role="user", content="Mistake to undo"))
-    db.messages.append(session_id, NewMessage(role="assistant", content="Mistake reply to undo"))
-    db.messages.rewind_user_turn(session_id, 2)
-
-    viewport = db.messages.read_hydration_page(session_id, limit=20)
-    # 10 original rows + 5 replacement rows; the rewind removes the appended turn.
-    assert len(viewport.messages) == 15
-    viewport_contents = [m.content for m in viewport.messages]
-    assert "User msg 1" in viewport_contents
-    assert "Mistake to undo" not in viewport_contents
-
-
-
 def test_get_messages_with_ancestors_and_compaction(db: Persistence):
     """get_messages with include_ancestors=True retrieves full lineage across parent & child sessions."""
     parent_id = "sess_lineage_parent"

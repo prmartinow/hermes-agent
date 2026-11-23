@@ -15,11 +15,6 @@ export type Frame = {
   readonly absoluteOverlayMoved?: boolean
 }
 
-/** The final cursor may occupy a trailing row beyond the painted content. */
-export function inlineViewportOrigin(frame: Frame, rows = frame.viewport.height): number {
-  return Math.max(0, Math.max(frame.screen.height, frame.cursor.y + 1) - rows)
-}
-
 export function emptyFrame(
   rows: number,
   columns: number,
@@ -34,7 +29,7 @@ export function emptyFrame(
   }
 }
 
-export type FlickerReason = 'resize' | 'offscreen' | 'clear' | 'init'
+export type FlickerReason = 'resize' | 'offscreen' | 'clear'
 
 export type FrameEvent = {
   durationMs: number
@@ -86,11 +81,6 @@ export type Patch =
       type: 'clearTerminal'
       reason: FlickerReason
       // Populated by log-update when a scrollback diff triggers the reset.
-      debug?: { triggerY: number; prevLine: string; nextLine: string }
-    }
-  | {
-      type: 'clearScreen'
-      reason: FlickerReason
       debug?: { triggerY: number; prevLine: string; nextLine: string }
     }
   | { type: 'cursorHide' }

@@ -74,28 +74,9 @@ const imageRows = (msg: Msg, inlineImages: boolean) =>
   inlineImages && msg.images?.length ? 1 + msg.images.length * INLINE_IMAGE_MAX_ROWS : 0
 
 // Rows whose height doesn't depend on wrapped text; null for the rest.
-const fixedKindHeight = (msg: Msg, leadGap: boolean, inlineImages: boolean, cols: number): null | number => {
+const fixedKindHeight = (msg: Msg, leadGap: boolean, inlineImages: boolean): null | number => {
   if (msg.kind === 'intro') {
-    if (!msg.info) {
-      return 5
-    }
-
-    // Match Banner.tsx responsive tiers:
-    // cols >= 68 (logoW + 2) => Full art (10) + tagline (1) + margin (1) = 12
-    // cols >= 58 (COMPACT_FROM) => Compact rule (3) + margin (1) = 4
-    // cols >= 34 (HIDE_BELOW) => Text name (1) + tagline (1) + margin (1) = 3
-    // cols < 34 => Hidden = 0
-    const bannerHeight = cols >= 68 ? 12 : cols >= 58 ? 4 : cols >= 34 ? 3 : 0
-
-    // Match SessionPanel.tsx layout:
-    // Header/model/version/profile rows + WidgetGrid toolset rows
-    const toolCategories =
-      typeof msg.info.tools === 'object' && msg.info.tools ? Object.keys(msg.info.tools).length : 0
-
-    const toolRows = Math.min(3, Math.max(1, toolCategories))
-    const panelHeight = 8 + toolRows
-
-    return bannerHeight + panelHeight
+    return msg.info?.version ? 9 : 5
   }
 
   if (msg.kind === 'panel') {
@@ -139,7 +120,7 @@ export const estimatedMsgHeight = (
     withSeparator?: boolean
   }
 ) => {
-  const fixed = fixedKindHeight(msg, leadGap, inlineImages, cols)
+  const fixed = fixedKindHeight(msg, leadGap, inlineImages)
 
   if (fixed !== null) {
     return fixed

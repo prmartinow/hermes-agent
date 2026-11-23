@@ -13,6 +13,7 @@ import { resetServerRequestsForTests } from '../app/serverRequestStore.js'
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
+import { ZERO } from '../domain/usage.js'
 import { estimateTokensRough } from '../lib/text.js'
 import type { Msg } from '../types.js'
 
@@ -42,7 +43,7 @@ const buildCtx = (appended: Msg[]) =>
       colsRef: ref(80),
       newSession: vi.fn(),
       resetSession: vi.fn(),
-      resumeById: vi.fn().mockResolvedValue(undefined),
+      resumeById: vi.fn(),
       setCatalog: vi.fn()
     },
     submission: {
@@ -512,20 +513,6 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.system.sys).not.toHaveBeenCalled()
   })
 
-  it('updates the turnStore when receiving a dedicated todo.updated gateway event', () => {
-    const appended: Msg[] = []
-
-    const todos = [
-      { content: 'Inspect repo', id: '1', status: 'completed' },
-      { content: 'Fix bug', id: '2', status: 'in_progress' }
-    ]
-
-    const onEvent = createGatewayEventHandler(buildCtx(appended))
-
-    onEvent({ payload: { revision: 2, todos }, type: 'todo.updated' } as any)
-    expect(getTurnState().todos).toEqual(todos)
-  })
-
   it('clears the visible todo list when the todo tool returns an empty list', () => {
     const appended: Msg[] = []
     const todos = [{ content: 'Boil water', id: 'boil', status: 'in_progress' }]
@@ -558,13 +545,12 @@ describe('createGatewayEventHandler', () => {
       type: 'message.complete'
     } as any)
 
-    expect(appended).toHaveLength(3)
+    expect(appended).toHaveLength(2)
     expect(appended[0]).toMatchObject({ kind: 'trail', role: 'system', text: '', thinking: 'mapped the page' })
-    expect(appended[1]).toMatchObject({ kind: 'trail', role: 'system', text: '' })
-    expect(appended[1]?.tools).toHaveLength(1)
-    expect(appended[1]?.tools?.[0]).toContain('home page')
-    expect(appended[1]?.toolTokens).toBeGreaterThan(0)
-    expect(appended[2]).toMatchObject({ role: 'assistant', text: 'final answer' })
+    expect(appended[0]?.tools).toHaveLength(1)
+    expect(appended[0]?.tools?.[0]).toContain('home page')
+    expect(appended[0]?.toolTokens).toBeGreaterThan(0)
+    expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
   it('groups sequential completed tools into one trail when the turn completes', () => {
@@ -611,26 +597,26 @@ describe('createGatewayEventHandler', () => {
       type: 'message.complete'
     } as any)
 
-    expect(appended).toHaveLength(3)
-    expect(appended[0]).toMatchObject({ kind: 'trail', role: 'system', text: '', thinking: 'mapped the page' })
-    expect(appended[1]?.tools).toHaveLength(1)
-    expect(appended[1]?.toolTokens).toBeGreaterThan(0)
-    expect(appended[2]).toMatchObject({ role: 'assistant', text: 'final answer' })
+    expect(appended).toHaveLength(2)
+    expect(appended[0]?.tools).toHaveLength(1)
+    expect(appended[0]?.toolTokens).toBeGreaterThan(0)
+    expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
-  it('routes thinking.delta to status ticker without polluting reasoning state', () => {
+  it('streams legacy thinking.delta into visible reasoning state', () => {
     vi.useFakeTimers()
     const appended: Msg[] = []
-    const statusText = '(｡•̀ᴗ-)✧ pondering...'
+    const streamed = 'short streamed reasoning'
     const onEvent = createGatewayEventHandler(buildCtx(appended))
 
     try {
       onEvent({ payload: {}, type: 'message.start' } as any)
-      onEvent({ payload: { text: statusText }, type: 'thinking.delta' } as any)
+      onEvent({ payload: { text: streamed }, type: 'thinking.delta' } as any)
       vi.runOnlyPendingTimers()
 
-      expect(getUiState().status).toBe(statusText)
-      expect(getTurnState().reasoning).toBe('')
+      expect(getTurnState().reasoning).toBe(streamed)
+      expect(getTurnState().reasoningActive).toBe(true)
+      expect(getTurnState().reasoningTokens).toBe(estimateTokensRough(streamed))
     } finally {
       vi.useRealTimers()
     }
@@ -1305,7 +1291,7 @@ describe('createGatewayEventHandler', () => {
 
     onEvent({ payload: {}, type: 'gateway.ready' } as any)
 
-    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('sess-crashed', undefined, 0, { mode: 'transport-recovery' }))
+    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('sess-crashed'))
     expect(newSession).not.toHaveBeenCalled()
     expect(ctx.session.recoverSidRef.current).toBe('sess-crashed')
     expect(getUiState().status).not.toBe('resuming…')
@@ -1313,32 +1299,6 @@ describe('createGatewayEventHandler', () => {
     resumed.resolve()
     await vi.waitFor(() => expect(ctx.session.recoverSidRef.current).toBeNull())
     expect(getUiState().sid).toBe('sess-recovered')
-  })
-
-  it('on gateway.ready, prefers recoverSessionKeyRef and does not clear ref before resumeById succeeds', async () => {
-    const appended: Msg[] = []
-    const newSession = vi.fn()
-    const resumeById = vi.fn()
-    const ctx = buildCtx(appended)
-
-    ctx.session.newSession = newSession
-    ctx.session.STARTUP_RESUME_ID = ''
-    const keyRef = ref<null | string>('durable-key-abc')
-    ;(ctx.session as any).recoverSessionKeyRef = keyRef
-
-    // Mock resumeById that does NOT clear the ref yet (simulating in-flight or failure)
-    ctx.session.resumeById = resumeById.mockImplementation(() => {
-      patchUiState({ status: 'resuming…' })
-      return new Promise<void>(() => {})
-    })
-
-    const onEvent = createGatewayEventHandler(ctx)
-    onEvent({ payload: {}, type: 'gateway.ready' } as any)
-
-    await vi.waitFor(() => expect(resumeById).toHaveBeenCalledWith('durable-key-abc', undefined, 0, { mode: 'transport-recovery' }))
-    // Ref is NOT destroyed prematurely by createGatewayEventHandler
-    expect(keyRef.current).toBe('durable-key-abc')
-    expect(getUiState().status).toBe('recovering session…')
   })
 
   it('on gateway.ready with auto_resume on and a recent session, resumes it', async () => {
@@ -2279,6 +2239,47 @@ describe('createGatewayEventHandler', () => {
     expect(record?.text).toContain('alpha')
     expect(record?.text).toContain('Two?')
     expect(getOverlayState().clarify).toBeNull()
+  })
+
+  describe('session.usage', () => {
+    it('merges a live usage tick into uiState (payload.usage shape, see tui_gateway _start_usage_ticker)', () => {
+      patchUiState({ sid: 'sess-1' })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { usage: { calls: 3, context_percent: 42, input: 1200, output: 80, total: 1280 } },
+        session_id: 'sess-1',
+        type: 'session.usage'
+      } as any)
+
+      expect(getUiState().usage).toMatchObject({ context_percent: 42, input: 1200, total: 1280 })
+    })
+
+    it('keeps existing usage fields when the tick only carries a subset', () => {
+      patchUiState({ sid: 'sess-1', usage: { calls: 2, input: 500, output: 40, total: 540 } })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { usage: { context_percent: 55 } },
+        session_id: 'sess-1',
+        type: 'session.usage'
+      } as any)
+
+      expect(getUiState().usage).toMatchObject({ context_percent: 55, input: 500, total: 540 })
+    })
+
+    it('drops a tick for a non-focused session', () => {
+      patchUiState({ sid: 'focused', usage: ZERO })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { usage: { input: 9999, total: 9999 } },
+        session_id: 'background',
+        type: 'session.usage'
+      } as any)
+
+      expect(getUiState().usage).toEqual(ZERO)
+    })
   })
 
   describe('message.interim', () => {

@@ -157,18 +157,6 @@ describe('/usage slash command', () => {
     expect(body.toLowerCase()).not.toContain('credits')
   })
 
-  it('shows the free-models upsell for a free account', async () => {
-    const { panel, run } = buildCtx({
-      'session.usage': baseUsage({ usage: { available: true, status: 'free', plan_name: null } })
-    })
-
-    await run('')
-
-    const body = balancePanel(panel)
-    expect(body).toContain('free models only')
-    expect(body).toContain('/subscription')
-  })
-
   it('renders model usage and reasoning tokens', async () => {
     const { panel, run } = buildCtx({
       'session.usage': baseUsage({
@@ -180,6 +168,7 @@ describe('/usage slash command', () => {
         total: 12000
       })
     })
+
     await run('')
 
     const usageCall = panel.mock.calls.find(c => c[0] === 'Usage')

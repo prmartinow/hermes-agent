@@ -48,14 +48,12 @@ export function parseOsc52ClipboardData(data: string): null | string {
   }
 }
 
-export async function readOsc52Clipboard(querier: null | OscQuerier, timeoutMs = 250): Promise<null | string> {
+export async function readOsc52Clipboard(querier: null | OscQuerier, timeoutMs = 500): Promise<null | string> {
   if (!querier) {
     return null
   }
 
-  const timeout = new Promise<void>(resolve => {
-    setTimeout(resolve, timeoutMs)
-  })
+  const timeout = new Promise<void>(resolve => setTimeout(resolve, timeoutMs))
 
   const query = querier.send<OscResponse>({
     request: buildOsc52ClipboardQuery(),
@@ -64,10 +62,9 @@ export async function readOsc52Clipboard(querier: null | OscQuerier, timeoutMs =
     }
   })
 
-  // Flush sentinel with bounded timeout so a terminal that ignores DA1 never wedges the TUI
-  void Promise.race([querier.flush(), timeout]).catch(() => {})
-
   const response = await Promise.race([query, timeout])
+
+  await querier.flush()
 
   return response ? parseOsc52ClipboardData(response.data) : null
 }

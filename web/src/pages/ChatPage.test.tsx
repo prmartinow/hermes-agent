@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, useEffect, useState, type ReactNode } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,38 +30,27 @@ class FakeWebglAddon {
 }
 
 class FakeTerminal {
-  static instances: FakeTerminal[] = [];
   options: Record<string, unknown>;
   rows = 24;
   cols = 80;
   parser = {
-    registerOscHandler: vi.fn(() => ({ dispose() {} })),
+    registerOscHandler: vi.fn(),
   };
   unicode = { activeVersion: "" };
-  scrollLines = vi.fn();
-  customWheelHandler?: (ev: WheelEvent) => boolean;
-  customKeyHandler?: (ev: KeyboardEvent) => boolean;
 
   constructor(options: Record<string, unknown>) {
     this.options = options;
-    FakeTerminal.instances.push(this);
   }
 
-  attachCustomKeyEventHandler(handler: (ev: KeyboardEvent) => boolean) {
-    this.customKeyHandler = handler;
+  attachCustomKeyEventHandler() {
     return true;
   }
 
-  attachCustomWheelEventHandler = vi.fn((handler: (ev: WheelEvent) => boolean) => {
-    this.customWheelHandler = handler;
+  attachCustomWheelEventHandler() {
     return true;
-  });
+  }
 
   clearSelection() {}
-  reset() {}
-  clear() {}
-
-  hasSelection() { return false; }
 
   clearTextureAtlas() {}
 
@@ -75,9 +64,7 @@ class FakeTerminal {
 
   loadAddon() {}
 
-  dataHandler?: (data: string) => void;
-  onData(handler: (data: string) => void) {
-    this.dataHandler = handler;
+  onData() {
     return { dispose() {} };
   }
 
@@ -89,10 +76,6 @@ class FakeTerminal {
     return { dispose() {} };
   }
 
-  onSelectionChange() {
-    return { dispose() {} };
-  }
-
   get buffer() {
     // Minimal active-buffer surface for the resume follow-scroll pin
     // (isViewportPinnedToBottom reads viewportY/baseY).
@@ -100,8 +83,6 @@ class FakeTerminal {
   }
 
   scrollToBottom() {}
-
-  scrollToLine() {}
 
   open() {}
 
@@ -114,15 +95,7 @@ class FakeTerminal {
 
 const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
 const apiMocks = vi.hoisted(() => ({
-  buildWsUrl: vi.fn(async (path: string, params?: Record<string, string>) => {
-    const qs = params ? new URLSearchParams(params).toString() : "channel=chat-1";
-    return `ws://localhost${path}?${qs}`;
-  }),
-  buildWsUrlSync: vi.fn(() => null),
-  getSessions: vi.fn(async () => ({ sessions: [] as import("@/lib/api").SessionInfo[], total: 0, limit: 20, offset: 0 })),
-  getSessionDetail: vi.fn(async (id: string) => ({ title: `Session ${id}` })),
-  getSessionLatestDescendant: vi.fn(async (id: string) => ({ session_id: id })),
-  getSessionMessages: vi.fn(async () => ({ messages: [] })),
+  buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
 }));
 const uploadChatImage = vi.hoisted(() =>
   vi.fn(async () => ({ path: "/tmp/pasted.png" })),
@@ -148,25 +121,8 @@ vi.mock("@/components/Backdrop", () => ({ Backdrop: () => null }));
 vi.mock("@/plugins", () => ({
   PluginSlot: () => null,
 }));
-const headerSlot = vi.hoisted(() => {
-  const listeners = new Set<(node: React.ReactNode) => void>();
-  return {
-    setEnd: (node: React.ReactNode) => {
-      for (const listener of listeners) listener(node);
-    },
-    subscribe: (listener: (node: React.ReactNode) => void) => {
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-  };
-});
 vi.mock("@/contexts/usePageHeader", () => ({
-  usePageHeader: () => ({
-    setEnd: (node: React.ReactNode) => headerSlot.setEnd(node),
-    setTitle: vi.fn(),
-  }),
+  usePageHeader: () => ({ setEnd: vi.fn(), setTitle: vi.fn() }),
 }));
 vi.mock("@/contexts/useProfileScope", () => ({
   useProfileScope: () => ({ profile: "" }),
@@ -257,7 +213,6 @@ async function render(ui: ReactNode) {
 }
 
 beforeEach(() => {
-  FakeTerminal.instances = [];
   FakeWebSocket.instances = [];
   webglInstances.length = 0;
   maybeReloadForLoopbackWsAuthFailure.mockClear();
@@ -430,61 +385,6 @@ describe("ChatPage", () => {
     }
   });
 
-  it("lets the native paste event deliver text when clipboard permission is denied", async () => {
-    const host = await renderChat();
-    const terminal = FakeTerminal.instances.at(-1)!;
-    const pasteSpy = vi.spyOn(FakeTerminal.prototype, "paste");
-    const clipboard = {
-      read: vi.fn(async () => { throw new Error("permission denied"); }),
-      readText: vi.fn(async () => { throw new Error("permission denied"); }),
-    };
-    Object.defineProperty(window.navigator, "clipboard", { configurable: true, value: clipboard });
-    try {
-      const key = new KeyboardEvent("keydown", { key: "v", ctrlKey: true, cancelable: true });
-      expect(terminal.customKeyHandler?.(key)).toBe(false);
-      expect(key.defaultPrevented).toBe(false);
-      await act(async () => { host.dispatchEvent(textPasteEvent("native paste")); });
-      expect(pasteSpy).toHaveBeenCalledOnce();
-      expect(pasteSpy).toHaveBeenCalledWith("native paste");
-      expect(clipboard.read).not.toHaveBeenCalled();
-      expect(clipboard.readText).not.toHaveBeenCalled();
-    } finally {
-      pasteSpy.mockRestore();
-    }
-  });
-
-  it("does not interrupt the agent on an empty modified copy shortcut", async () => {
-    await renderChat();
-    const terminal = FakeTerminal.instances.at(-1)!;
-    const socket = FakeWebSocket.instances[0];
-    socket.send.mockClear();
-    for (const modifiers of [{ ctrlKey: true, shiftKey: true }, { metaKey: true, shiftKey: true }]) {
-      const key = new KeyboardEvent("keydown", { key: "c", ...modifiers, cancelable: true });
-      expect(terminal.customKeyHandler?.(key)).toBe(false);
-    }
-    expect(socket.send).not.toHaveBeenCalled();
-
-    const interrupt = new KeyboardEvent("keydown", { key: "c", ctrlKey: true, cancelable: true });
-    terminal.customKeyHandler?.(interrupt);
-    expect(socket.send).toHaveBeenCalledWith("\x03");
-  });
-
-  it("does not send an interrupt for empty Cmd+C on macOS", async () => {
-    const previous = Object.getOwnPropertyDescriptor(navigator, "platform");
-    Object.defineProperty(navigator, "platform", { configurable: true, value: "MacIntel" });
-    try {
-      await renderChat();
-      const socket = FakeWebSocket.instances[0];
-      socket.send.mockClear();
-      const key = new KeyboardEvent("keydown", { key: "c", metaKey: true, cancelable: true });
-      expect(FakeTerminal.instances.at(-1)!.customKeyHandler?.(key)).toBe(false);
-      expect(socket.send).not.toHaveBeenCalled();
-    } finally {
-      if (previous) Object.defineProperty(navigator, "platform", previous);
-      else Reflect.deleteProperty(navigator, "platform");
-    }
-  });
-
   it("keeps the image-paste route working: image pastes upload instead of pasting text", async () => {
     const host = await renderChat();
     const pasteSpy = vi.spyOn(FakeTerminal.prototype, "paste");
@@ -560,34 +460,6 @@ describe("ChatPage", () => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
     await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
-  });
-
-  it("keeps Enter distinct from coalesced typing without altering bracketed paste", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
-    const socket=FakeWebSocket.instances.at(-1)!;
-    await act(async()=>{socket.onopen?.();});
-    const send=vi.spyOn(socket,"send");
-    const terminal=FakeTerminal.instances.at(-1)!;
-    await act(async()=>{
-      terminal.dataHandler?.("/model");terminal.dataHandler?.("\r");
-      terminal.dataHandler?.("\x1b[200~pasted\rtext\x1b[201~");
-    });
-    expect(send).toHaveBeenCalledWith("/model");
-    expect(send).toHaveBeenCalledWith("\x1b[13u");
-    expect(send).toHaveBeenCalledWith("\x1b[200~pasted\rtext\x1b[201~");
-  });
-
-  it("preserves legitimate ANSI erase and positioning bytes during resume", async () => {
-    const { default: ChatPage } = await import("./ChatPage");
-    await render(<MemoryRouter initialEntries={["/chat?resume=fixture"]}><ChatPage isActive /></MemoryRouter>);
-    await vi.waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
-    const terminal = FakeTerminal.instances.at(-1)!;
-    const write = vi.spyOn(terminal, "write");
-    const payload = "ABC\r\x1b[2KX" + "\r\n".repeat(60) + "z".repeat(8500);
-    await act(async () => { FakeWebSocket.instances.at(-1)!.onmessage?.({ data: payload }); });
-    expect(write.mock.calls.some(call => (call as unknown[])[0] === payload)).toBe(true);
   });
 
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
@@ -768,19 +640,11 @@ describe("ChatPage", () => {
 describe("ChatPage side panel collapse", () => {
   async function renderChat() {
     const { default: ChatPage } = await import("./ChatPage");
-    function TestWrapper() {
-      const [endNode, setEndNode] = useState<React.ReactNode>(null);
-      useEffect(() => {
-        return headerSlot.subscribe(setEndNode);
-      }, []);
-      return (
-        <MemoryRouter initialEntries={["/chat"]}>
-          <div>{endNode}</div>
-          <ChatPage isActive />
-        </MemoryRouter>
-      );
-    }
-    await render(<TestWrapper />);
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
   }
 
   it("collapses the desktop side panel and persists the choice", async () => {
@@ -946,26 +810,6 @@ describe("ChatPage PTY ticket connect deadline", () => {
     await advance(PTY_TICKET_TIMEOUT_MS);
     expect(apiMocks.buildWsUrl).toHaveBeenCalledTimes(1);
   });
-
-  it("attaches custom wheel event handler to decouple scrolling and suppress SGR emission", async () => {
-    await renderChat();
-    await advance(0);
-    const term = FakeTerminal.instances[0];
-    expect(term.attachCustomWheelEventHandler).toHaveBeenCalled();
-    expect(term.customWheelHandler).toBeDefined();
-
-    const ev = {
-      deltaY: 120,
-      preventDefault: vi.fn(),
-      stopPropagation: vi.fn(),
-    } as unknown as WheelEvent;
-
-    const handled = term.customWheelHandler!(ev);
-    expect(handled).toBe(false);
-    expect(ev.preventDefault).toHaveBeenCalled();
-    expect(ev.stopPropagation).toHaveBeenCalled();
-    expect(term.scrollLines).toHaveBeenCalledWith(3);
-  });
 });
 
 // xterm WebGL renderer gating (#18773 / #45520 / #58685): the addon must only
@@ -1099,21 +943,4 @@ describe("ChatPage WebGL renderer gating", () => {
 
     expect(webglInstances[0].disposed).toBe(true);
   });
-});
-
-
-it.each([
-  { reason: "Process exited", redial: false },
-  { reason: "", redial: true },
-])("preserves child-exit ownership on resumed chats (reason=$reason)", async ({ reason, redial }) => {
-  const { default: ChatPage } = await import("./ChatPage");
-  await render(<MemoryRouter initialEntries={["/chat?resume=fixture"]}><ChatPage isActive /></MemoryRouter>);
-  await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
-  await act(async () => FakeWebSocket.instances[0].onclose?.({ code: 4410, reason, wasClean: true }));
-  if (redial) {
-    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2), { timeout: 3000 });
-  } else {
-    const labels = Array.from(container.querySelectorAll("button")).map(button => button.textContent?.trim());
-    expect(labels).toContain("Start new session");
-  }
 });

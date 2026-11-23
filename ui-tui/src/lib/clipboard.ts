@@ -85,7 +85,6 @@ export async function readClipboardText(
       const result = await run(attempt.cmd, [...attempt.args], {
         encoding: 'utf8',
         maxBuffer: CLIPBOARD_MAX_BUFFER,
-        timeout: 400,
         windowsHide: true
       })
 
@@ -200,32 +199,4 @@ export async function writeClipboardText(
   }
 
   return false
-}
-
-export type RightClickDecision = { action: 'copy'; text: string } | { action: 'paste' }
-
-/**
- * Decide what right-click should do on the composer:
- *   - non-empty selection → copy that text to the clipboard
- *   - no selection (or empty/collapsed range) → fall through to paste
- *
- * Mirrors terminal-native behavior (xterm, iTerm, gnome-terminal) where
- * right-click pastes only when there is nothing selected to copy.
- *
- * Callers pass the already-normalized range from `selRange()` (start <= end,
- * or null when collapsed), so this helper does not need to re-normalize.
- */
-export function decideRightClickAction(
-  value: string,
-  range: { end: number; start: number } | null
-): RightClickDecision {
-  if (range && range.end > range.start) {
-    const text = value.slice(range.start, range.end)
-
-    if (text) {
-      return { action: 'copy', text }
-    }
-  }
-
-  return { action: 'paste' }
 }

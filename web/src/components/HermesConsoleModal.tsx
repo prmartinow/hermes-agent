@@ -354,8 +354,7 @@ export function HermesConsoleModal({ open, onClose }: HermesConsoleModalProps) {
     let resizeFrame = 0;
     const term = new XtermTerminal({
       allowProposedApi: true,
-      cursorStyle: "underline",
-      cursorBlink: false,
+      cursorBlink: true,
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 13,
       lineHeight: 1.25,

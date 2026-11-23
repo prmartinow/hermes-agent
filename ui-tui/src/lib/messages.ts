@@ -1,4 +1,3 @@
-import { INLINE_MODE } from '../config/env.js'
 import { MAX_HISTORY } from '../config/limits.js'
 import type { Msg, Role } from '../types.js'
 
@@ -12,10 +11,7 @@ export const appendTranscriptMessage = (prev: Msg[], msg: Msg): Msg[] =>
   appendToolShelfMessage(prev, msg.createdAt === undefined ? { ...msg, createdAt: Date.now() / 1000 } : msg)
 
 export const capTranscriptHistory = (items: Msg[]): Msg[] => {
-  // In inline mode, the full transcript history is preserved from Line 0
-  // (the authentic first user prompt) down to the prompt so native scrollback
-  // covers the complete conversation without truncating early turns.
-  if (INLINE_MODE || items.length <= MAX_HISTORY) {
+  if (items.length <= MAX_HISTORY) {
     return items
   }
 

@@ -32,11 +32,6 @@ export const STARTUP_IMAGE = (process.env.HERMES_TUI_IMAGE ?? '').trim()
 // `cwd` of session.create: the in-memory gateway's own cwd is the dashboard's launch dir.
 export const STARTUP_WORKSPACE_CWD = (process.env.HERMES_TUI_CWD ?? '').trim()
 
-// Set by the dashboard PTY launcher. This is intentionally narrower than
-// INLINE_MODE: users can opt into inline terminal rendering locally, but the
-// browser-embedded TUI has no healthy restart path after an idle exit.
-export const DASHBOARD_TUI_MODE = truthy(process.env.HERMES_TUI_DASHBOARD)
-
 // Mouse tracking mode resolution at startup. Per-mode selection (off|wheel|
 // buttons|all) lives in display.mouse_tracking in config.yaml — these env
 // vars only set the boot-time default before that config is applied.
@@ -47,38 +42,25 @@ export const DASHBOARD_TUI_MODE = truthy(process.env.HERMES_TUI_DASHBOARD)
 //   This is the "force a value" knob and intentionally beats the legacy
 //   kill-switch and the Termux default.
 // - HERMES_TUI_DISABLE_MOUSE=1 forces mouse off — the legacy kill switch.
-// - On Termux and Dashboard the default is mouse off so touch/browser selection
-//   isn't intercepted by terminal mouse protocols. Desktop CLI defaults to 'all'.
-const parseMouseTracking = (v?: string): MouseTrackingMode | null => {
-  const raw = (v ?? '').trim().toLowerCase()
-
-  if (!raw) {return null}
-
-  if (raw === 'buttons' || raw === 'all' || raw === 'wheel' || raw === 'off') {
-    return raw as MouseTrackingMode
-  }
-
-  if (truthy(raw)) {return 'buttons'}
-
-  if (falsy(raw)) {return 'off'}
-
-  return null
-}
-
-const mouseTrackingOverride = parseMouseTracking(process.env.HERMES_TUI_MOUSE_TRACKING)
+// - On Termux the default is mouse off so touch selection isn't intercepted
+//   by terminal mouse protocols. Desktop defaults to 'all' to preserve prior
+//   behavior.
+const mouseTrackingOverride = parseToggle(process.env.HERMES_TUI_MOUSE_TRACKING)
 const mouseTrackingDisabledLegacy = truthy(process.env.HERMES_TUI_DISABLE_MOUSE)
 export const NATIVE_MODE = truthy(process.env.HERMES_TUI_NATIVE)
 
-export const MOUSE_TRACKING: MouseTrackingMode =
-  NATIVE_MODE ? 'off' : mouseTrackingOverride != null
-    ? mouseTrackingOverride
-    : TERMUX_TUI_MODE
-      ? 'off'
-      : !mouseTrackingDisabledLegacy
-        ? 'buttons'
-        : 'off'
+const resolvedBootMouseEnabled = NATIVE_MODE
+  ? false
+  : (mouseTrackingOverride ?? (TERMUX_TUI_MODE ? false : !mouseTrackingDisabledLegacy))
+
+export const MOUSE_TRACKING: MouseTrackingMode = resolvedBootMouseEnabled ? 'all' : 'off'
 
 export const NO_CONFIRM_DESTRUCTIVE = truthy(process.env.HERMES_TUI_NO_CONFIRM)
+
+// Set by the dashboard PTY launcher. This is intentionally narrower than
+// INLINE_MODE: users can opt into inline terminal rendering locally, but the
+// browser-embedded TUI has no healthy restart path after an idle exit.
+export const DASHBOARD_TUI_MODE = truthy(process.env.HERMES_TUI_DASHBOARD)
 
 // HERMES_DEV_CREDITS — dev-only live-spend readout (Δ status segment + "(dev credits)"
 // banner). Throwaway dev scaffolding; the whole readout gates on this one flag.

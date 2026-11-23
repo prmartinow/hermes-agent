@@ -1038,45 +1038,6 @@ def _configure_auth_gate(
         )
 
 
-try:
-    from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol as _UvicornWebSocketProtocol
-except ImportError:
-    _UvicornWebSocketProtocol = None
-
-
-_ALLOWED_WS_FAIL_REASONS = frozenset({
-    "keepalive ping timeout",
-})
-
-
-if _UvicornWebSocketProtocol is not None:
-    class HermesWebSocketProtocol(_UvicornWebSocketProtocol):
-        """Narrow supported subclass of Uvicorn's WebSocketProtocol.
-
-        1. Disables keepalive ping/pong for internal loopback connections (Node <-> FastAPI),
-           preventing false disconnections when heavy terminal rendering delays Node's event loop.
-        2. Preserves configured keepalive pings for remote clients (e.g. LAN, tunnels).
-        3. Captures keepalive ping timeouts and protocol failure reasons at WARNING level
-           without enabling global websocket DEBUG logging or leaking credentials.
-        """
-        def connection_made(self, transport: Any) -> None:
-            super().connection_made(transport)
-            client_host = self.client[0] if self.client else ""
-            if client_host in {"127.0.0.1", "::1", "localhost"}:
-                self.ping_interval = None
-                self.ping_timeout = None
-
-        def fail_connection(self, code: int = 1006, reason: str = "") -> None:
-            safe_reason = reason if reason in _ALLOWED_WS_FAIL_REASONS else ""
-            if safe_reason:
-                _log.warning("ws protocol fail_connection code=%s reason=%s", code, safe_reason)
-            else:
-                _log.warning("ws protocol fail_connection code=%s", code)
-            super().fail_connection(code, reason)
-else:
-    HermesWebSocketProtocol = None  # Telemetry limitation: non-websockets_impl protocol in use
-
-
 def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
     """Build the uvicorn ``Config`` + ``Server`` for this bind (reads ``app.state.auth_required``).
 
@@ -1128,12 +1089,10 @@ def _build_uvicorn_server(host: str, port: int, *, ssh_isolated: bool = False):
         # Off by default so _ws_client_is_allowed sees the real peer, not
         # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
         # X-Forwarded-Proto for cookie Secure flags.
-        proxy_headers=bool(getattr(app.state, "auth_required", False)),
+        proxy_headers=bool(app.state.auth_required),
         # Loopback-only unless the operator trusts a bounded upstream proxy, so
         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
         forwarded_allow_ips=_dashboard_forwarded_allow_ips(_dash_cfg),
-        # An SSH-isolated backend needs pings even though its tunnel peer is loopback.
-        ws=HermesWebSocketProtocol if HermesWebSocketProtocol is not None and not ssh_isolated else "auto",
         ws_ping_interval=ping_interval,
         ws_ping_timeout=ping_timeout,
         # Per-frame zlib on the loop buys nothing for a local client (build_listener_server); a peer

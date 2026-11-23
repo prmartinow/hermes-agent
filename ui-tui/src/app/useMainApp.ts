@@ -1,6 +1,5 @@
 import {
   forceRedraw,
-  logForDebugging,
   type ScrollBoxHandle,
   setDimFallbackColor,
   useApp,
@@ -288,7 +287,9 @@ function copyMeasuredHeights(
   }
 }
 
-function useTerminalColumns(stdout: ReturnType<typeof useStdout>['stdout']): number {
+export function useMainApp(gw: GatewayClient) {
+  const { exit } = useApp()
+  const { stdout } = useStdout()
   const [cols, setCols] = useState(stdout?.columns ?? 80)
 
   useEffect(() => {
@@ -303,11 +304,7 @@ function useTerminalColumns(stdout: ReturnType<typeof useStdout>['stdout']): num
     // first event reflows immediately (the drag stays responsive), the rest
     // collapse to at most one reflow per RESIZE_COALESCE_MS, and the trailing
     // edge always applies the final width so the settled layout is exact.
-    const coalescer = createResizeCoalescer(() => {
-      logForDebugging(`[tui-perf] resize coalesced: cols=${stdout.columns ?? 80}`)
-      setCols(stdout.columns ?? 80)
-    }, RESIZE_COALESCE_MS)
-
+    const coalescer = createResizeCoalescer(() => setCols(stdout.columns ?? 80), RESIZE_COALESCE_MS)
     const sync = () => coalescer.schedule()
 
     stdout.on('resize', sync)
@@ -326,14 +323,7 @@ function useTerminalColumns(stdout: ReturnType<typeof useStdout>['stdout']): num
     }
   }, [stdout])
 
-  return cols
-}
-
-function useTranscriptHistory() {
-  const [historyItems, setHistoryItemsState] = useState<Msg[]>(() =>
-    STARTUP_RESUME_ID ? [] : [{ kind: 'intro', role: 'system', text: '' }]
-  )
-
+  const [historyItems, setHistoryItemsState] = useState<Msg[]>(() => [{ kind: 'intro', role: 'system', text: '' }])
   const [historyGeneration, setHistoryGeneration] = useState(0)
 
   const setHistoryItems = useCallback<StateSetter<Msg[]>>(value => {
@@ -343,16 +333,6 @@ function useTranscriptHistory() {
 
     setHistoryItemsState(previous => capTranscriptHistory(typeof value === 'function' ? value(previous) : value))
   }, [])
-
-  return { historyGeneration, historyItems, setHistoryItems }
-}
-
-export function useMainApp(gw: GatewayClient) {
-  const { exit } = useApp()
-  const { stdout } = useStdout()
-  const cols = useTerminalColumns(stdout)
-
-  const { historyGeneration, historyItems, setHistoryItems } = useTranscriptHistory()
 
   const [lastUserMsg, setLastUserMsg] = useState('')
   const [stickyPrompt, setStickyPrompt] = useState('')
@@ -690,7 +670,6 @@ export function useMainApp(gw: GatewayClient) {
     gw,
     onFreshSessionStarted: DASHBOARD_TUI_MODE ? setDashboardFreshSessionId : undefined,
     panel,
-    recoverSidRef,
     rpc,
     scrollRef,
     setHistoryItems,

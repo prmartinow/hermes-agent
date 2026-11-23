@@ -63,7 +63,6 @@ __all__ = [
     "SessionTimeline",
     "TimelineEntry",
     "ToolCallUids",
-    "TranscriptHydrationPage",
     "TranscriptRead",
     "TranscriptRow",
     "TranscriptView",
@@ -517,15 +516,6 @@ class CooldownSnapshot:
     def __post_init__(self) -> None:
         if not self.present and (self.until is not None or self.error is not None):
             raise ValueError("an absent CooldownSnapshot cannot carry stored fields")
-
-
-@dataclass(frozen=True, slots=True)
-class TranscriptHydrationPage:
-    """Physical hydration rows, bounded by the captured high-water mark."""
-
-    messages: tuple[ConversationMessage, ...]
-    high_watermark: int
-    last_row_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1100,11 +1090,6 @@ class MessageRepository(Protocol):
     def capture_terminal_child_session(self, session_id: SessionId, expected_parent_id: SessionId, *,
                                        include_compacted: bool = False) -> dict[str, Any]:
         """Read ownership, lease and transcripts together; never load another parent's messages."""
-        ...
-
-    def read_hydration_page(self, session_id: SessionId, *, limit: int, offset: int = 0,
-                            after_row_id: Optional[int] = None, high_watermark: Optional[int] = None) -> TranscriptHydrationPage:
-        """Page physical live and compacted rows of the verified lineage, excluding rewound rows."""
         ...
 
     def read_resume_conversations(self, session_id: SessionId) -> ResumeConversations:

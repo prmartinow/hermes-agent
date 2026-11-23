@@ -5,7 +5,6 @@ import {
   api,
   authedFetch,
   buildWsUrl,
-  buildWsUrlSync,
   fetchJSON,
   getManagementProfile,
   setManagementProfile,
@@ -109,20 +108,6 @@ describe("api.getModelOptions", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/model/options?profile=default&refresh=1&include_unconfigured=1",
-      expect.objectContaining({ credentials: "include" }),
-    );
-  });
-});
-
-describe("session transcript pagination", () => {
-  it("requests an explicit bounded page with its profile", async () => {
-    const fetchMock = jsonFetchMock({ session_id: "session", messages: [] });
-    vi.stubGlobal("fetch", fetchMock);
-
-    await api.getSessionMessages("session", { profile: "worker", limit: 500, offset: 500, order: "latest" });
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      "/api/sessions/session/messages?include_compacted=true&limit=500&offset=500&order=latest&profile=worker",
       expect.objectContaining({ credentials: "include" }),
     );
   });
@@ -414,19 +399,5 @@ describe("session token stays on the dashboard origin", () => {
       // redirects and off-origin <base href> resolution the URL check can't see.
       expect(init?.mode).toBe("same-origin");
     }
-  });
-});
-
-describe("synchronous WebSocket auth", () => {
-  it("requires ticket issuance when gated auth is active", () => {
-    window.__HERMES_AUTH_REQUIRED__ = true;
-    expect(buildWsUrlSync("/api/pty")).toBeNull();
-  });
-
-  it("preserves the selected profile for plugin sockets", () => {
-    setManagementProfile("worker");
-    const url = new URL(buildWsUrlSync("/api/plugins/demo/events")!);
-    expect(url.searchParams.get("profile")).toBe("worker");
-    expect(url.searchParams.get("token")).toBe("stale-token");
   });
 });

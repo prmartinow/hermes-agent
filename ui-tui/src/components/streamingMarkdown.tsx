@@ -100,21 +100,18 @@ export const advanceScan = (text: string, state: StreamScanState) => {
       break // partial trailing line — could still open a fence; keep in tail
     }
 
-    const line = text.slice(i, nl).trim()
-    const isBlankLine = nl === i
-    const isHeadingOrRule = !state.codeOpen && !state.mathOpener && (
-      /^#{1,6}\s+/.test(line) || /^(?:---|\*\*\*|___)\s*$/.test(line)
-    )
+    if (nl === i) {
+      // Second half of a "\n\n" outside any fence → prior text is a block.
+      if (i > 0 && !state.codeOpen && !state.mathOpener) {
+        const block = text.slice(state.settledLen, nl + 1)
 
-    if ((isBlankLine ? i > 0 : isHeadingOrRule) && !state.codeOpen && !state.mathOpener) {
-      const block = text.slice(state.settledLen, nl + 1)
-
-      if (/\S/.test(block)) {
-        state.blocks.push(block)
-        state.settledLen = nl + 1
+        if (/\S/.test(block)) {
+          state.blocks.push(block)
+          state.settledLen = nl + 1
+        }
       }
     } else {
-      applyLine(state, line)
+      applyLine(state, text.slice(i, nl).trim())
     }
 
     i = nl + 1

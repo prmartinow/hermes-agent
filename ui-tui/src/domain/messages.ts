@@ -3,10 +3,8 @@ import type { SessionInfo } from '@hermes/shared/gateway-types'
 import { storedClarifyRows } from '../app/clarifyTranscript.js'
 import { LONG_MSG } from '../config/limits.js'
 import { t } from '../i18n/runtime.js'
-import { isTodoDone } from '../lib/liveProgress.js'
-import { buildToolTrailLine, estimateTokensRough } from '../lib/text.js'
-import { parseTodos } from '../lib/todo.js'
-import type { Msg, TodoItem } from '../types.js'
+import { buildToolTrailLine } from '../lib/text.js'
+import type { Msg } from '../types.js'
 
 export const introMsg = (info: SessionInfo): Msg => ({ info, kind: 'intro', role: 'system', text: '' })
 
@@ -41,91 +39,6 @@ const pushToolRow = (out: Msg[], pending: string[], { content, context, name }: 
   return []
 }
 
-const pushTodoTrail = (out: Msg[], todos: TodoItem[]) => {
-  const done = isTodoDone(todos)
-  out.push({
-    kind: 'trail', role: 'system', text: '', todos,
-    ...(done ? { todoCollapsedByDefault: true } : { todoIncomplete: true })
-  })
-}
-
-const updatePendingTodos = (row: TranscriptRow, previous: TodoItem[] | null): TodoItem[] | null => {
-  if (row.name !== 'todo_list' && row.name !== 'todo') {return previous}
-
-  const parsed = parseTodos(row.todos ?? row.args?.todos)
-
-  return parsed?.length ? parsed : previous
-}
-
-const displayEvent = ({ display_kind, display_metadata: meta }: TranscriptRow): Msg | null => {
-  let label: string | undefined
-
-  switch (display_kind) {
-    case 'model_switch':
-      label = t('libText.messages.modelChanged')
-
-      break
-
-    case 'auto_continue':
-      label = t('libText.messages.resumedInterruptedTurn')
-
-      break
-
-    case 'personality_switch':
-      label = t('libText.messages.personalityChanged')
-
-      break
-  }
-
-  if (display_kind === 'async_delegation_complete' || display_kind === 'process_complete') {
-    const count = meta && typeof meta.task_count === 'number' ? meta.task_count : undefined
-    label = display_kind === 'process_complete'
-      ? t('libText.messages.backgroundProcessFinished')
-      : count === undefined
-        ? t('libText.messages.backgroundAgentWorkFinished')
-        : t(count === 1 ? 'libText.messages.backgroundAgentsFinishedOne' : 'libText.messages.backgroundAgentsFinishedOther', count)
-
-    if (typeof meta?.display_text === 'string') {label = meta.display_text}
-  }
-
-  return label === undefined ? null : { kind: 'event', role: 'system', text: label }
-}
-
-const pushPending = (out: Msg[], tools: string[], todos: TodoItem[] | null) => {
-  if (tools.length) {
-    out.push({ kind: 'trail', role: 'assistant', text: '', tools })
-  }
-
-  if (todos?.length) {
-    pushTodoTrail(out, todos)
-  }
-}
-
-const pushAssistantRow = (
-  out: Msg[], text: unknown, thinking: string | undefined, createdAt: number | undefined,
-  pending: string[], todos: TodoItem[] | null
-) => {
-  const assistantText = typeof text === 'string' ? text : ''
-
-  if (todos?.length) {
-    pushPending(out, pending, todos)
-    pending = []
-  }
-
-  const msg: Msg = {
-    role: 'assistant', text: assistantText,
-    ...(createdAt !== undefined && { createdAt }),
-    ...(pending.length && { tools: pending }),
-    ...(thinking && { thinking, thinkingTokens: estimateTokensRough(thinking) })
-  }
-
-  if (!assistantText.trim() && (thinking || pending.length)) {
-    msg.kind = 'trail'
-  }
-
-  out.push(msg)
-}
-
 export const toTranscriptMessages = (rows: unknown): Msg[] => {
   if (!Array.isArray(rows)) {
     return []
@@ -133,7 +46,6 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
   const out: Msg[] = []
   let pending: string[] = []
-  let pendingTodos: TodoItem[] | null = null
 
   for (const row of rows) {
     if (!row || typeof row !== 'object') {
@@ -142,26 +54,16 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
 
     const { content, context, display_kind, name, role, row_id, text, timestamp } = row as TranscriptRow
 
-    const rawReasoning =
-      (row as TranscriptRow).reasoning ??
-      (row as TranscriptRow).reasoning_content ??
-      (row as TranscriptRow).thinking
-
-    const thinking = typeof rawReasoning === 'string' && rawReasoning.trim() ? rawReasoning.trim() : undefined
-
     const createdAt =
       typeof timestamp === 'number' && Number.isFinite(timestamp) && timestamp > 0 ? timestamp : undefined
 
     if (role === 'tool') {
       pending = pushToolRow(out, pending, { content, context, name })
-      pendingTodos = updatePendingTodos(row as TranscriptRow, pendingTodos)
 
       continue
     }
 
-    const hasText = typeof text === 'string' && text.trim().length > 0
-
-    if (!hasText && !thinking && !pending.length && !pendingTodos) {
+    if (typeof text !== 'string' || !text.trim()) {
       continue
     }
 
@@ -171,32 +73,61 @@ export const toTranscriptMessages = (rows: unknown): Msg[] => {
       continue
     }
 
-    const event = displayEvent(row as TranscriptRow)
-
-    if (event) {
-      out.push(event)
+    if (display_kind === 'model_switch') {
+      out.push({ kind: 'event', role: 'system', text: t('libText.messages.modelChanged') })
       pending = []
-      pendingTodos = null
+
+      continue
+    }
+
+    if (display_kind === 'auto_continue') {
+      out.push({ kind: 'event', role: 'system', text: t('libText.messages.resumedInterruptedTurn') })
+      pending = []
+
+      continue
+    }
+
+    if (display_kind === 'personality_switch') {
+      out.push({ kind: 'event', role: 'system', text: t('libText.messages.personalityChanged') })
+      pending = []
+
+      continue
+    }
+
+    if (display_kind === 'async_delegation_complete' || display_kind === 'process_complete') {
+      const meta = (row as TranscriptRow).display_metadata
+      const count = meta && typeof meta.task_count === 'number' ? meta.task_count : undefined
+
+      const label =
+        display_kind === 'process_complete'
+          ? t('libText.messages.backgroundProcessFinished')
+          : count === undefined
+            ? t('libText.messages.backgroundAgentWorkFinished')
+            : t(
+                count === 1
+                  ? 'libText.messages.backgroundAgentsFinishedOne'
+                  : 'libText.messages.backgroundAgentsFinishedOther',
+                count
+              )
+
+      out.push({
+        kind: 'event',
+        role: 'system',
+        text: typeof meta?.display_text === 'string' ? meta.display_text : label
+      })
+      pending = []
 
       continue
     }
 
     if (role === 'assistant') {
-      pushAssistantRow(out, text, thinking, createdAt, pending, pendingTodos)
+      out.push({ role, text, ...(createdAt !== undefined && { createdAt }), ...(pending.length && { tools: pending }) })
       pending = []
-      pendingTodos = null
     } else if (role === 'user' || role === 'system') {
-      pushPending(out, pending, pendingTodos)
+      out.push({ role, text, ...(createdAt !== undefined && { createdAt }), ...storedRowId(role, row_id) })
       pending = []
-      pendingTodos = null
-
-      if (hasText) {
-        out.push({ role, text: text!, ...(createdAt !== undefined && { createdAt }), ...storedRowId(role, row_id) })
-      }
     }
   }
-
-  pushPending(out, pending, pendingTodos)
 
   return out
 }
@@ -212,17 +143,12 @@ export const fmtDuration = (ms: number) => {
 
 interface TranscriptRow {
   content?: string
-  args?: Record<string, unknown>
   context?: string
   display_kind?: string
   display_metadata?: { task_count?: number; [key: string]: unknown }
   name?: string
-  reasoning?: string
-  reasoning_content?: string
   role?: string
   row_id?: number
   text?: string
-  thinking?: string
   timestamp?: number
-  todos?: unknown[]
 }

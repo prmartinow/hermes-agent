@@ -670,8 +670,8 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
             return handleResolvedPaste({ bracketed: false, cursor, text: preferredText, value })
           }
 
-          // No text on the clipboard — quietly probe if there's an image on the system clipboard.
-          return pasteClipboardImage(value, cursor, true)
+          // No text on the clipboard — an image paste looks exactly like this.
+          return pasteClipboardImage(value, cursor, false)
         })
       }
 
@@ -697,7 +697,6 @@ export function useComposerState({ gw, submitRef, sys }: UseComposerStateOptions
         if (landed) {
           setInput(landed.value)
         }
-
       })
     },
     [setInput]

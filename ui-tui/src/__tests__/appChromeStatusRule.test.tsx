@@ -100,7 +100,7 @@ const baseProps = {
   statusColor: DEFAULT_THEME.color.ok,
   t: DEFAULT_THEME,
   turnStartedAt: null,
-  usage: { calls: 0, input: 0, output: 0, total: 50_000, context_max: 200_000, context_percent: 25, context_used: 50_000 },
+  usage: { context_max: 200_000, context_percent: 25, context_used: 50_000, total: 50_000 },
   voiceLabel: ''
 }
 
@@ -120,6 +120,26 @@ describe('StatusRule model label', () => {
 })
 
 describe('StatusRule session title', () => {
+  it('marks only estimated context occupancy at every visible width', () => {
+    for (const cols of [80, 120, 200]) {
+      for (const estimated of [true, false]) {
+        const text = textContent(
+          StatusRule({
+            ...baseProps,
+            cols,
+            statusBarFields: new Set(['context_detail']),
+            usage: { ...baseProps.usage, context_estimated: estimated }
+          })
+        )
+
+        const context = text.match(/(~?\d+(?:\.\d+)?k(?:\/\d+k| tok))/)?.[1]
+
+        expect(context, `context must render at ${cols} columns`).toBeTruthy()
+        expect(context?.startsWith('~')).toBe(estimated)
+      }
+    }
+  })
+
   it('pins the named session at the far-right edge instead of the cwd label', () => {
     const element = StatusRule({
       ...baseProps,
@@ -458,13 +478,5 @@ describe('StatusRule perf read-outs (cache hit / latency / tps)', () => {
     })
 
     expect(textContent(element)).not.toContain('weekly-digest')
-  })
-})
-describe('StatusRule model identity', () => {
-  it('renders the model without leaking stale account metadata', () => {
-    const props = { ...baseProps, model: 'bridge/test-model', modelAccount: 'private@example.invalid' }
-    const text = textContent(StatusRule(props))
-    expect(text).toContain('test model')
-    expect(text).not.toContain('private@example.invalid')
   })
 })

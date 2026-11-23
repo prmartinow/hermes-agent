@@ -3,7 +3,7 @@ import { execFile } from 'child_process'
 import { forceRedraw, onTerminalBackground, onTerminalForeground } from '@hermes/ink'
 import { stripAnsi } from '@hermes/shared/ansi'
 import { relativeLuminance } from '@hermes/shared/color'
-import type { ClientLocalGatewayEventMap, MessageDeltaPayload, SubagentStatus, Usage } from '@hermes/shared/gateway-events'
+import type { MessageDeltaPayload, SubagentStatus, Usage } from '@hermes/shared/gateway-events'
 import type {
   AnyGatewayEvent,
   ConfigFullResponse,
@@ -22,7 +22,6 @@ import { t } from '../i18n/runtime.js'
 import { billingDialogCopy, usageLimitDialog } from '../lib/billingDialog.js'
 import { type ImageAttachment, stageImagePath } from '../lib/imageAttachments.js'
 import { isTodoDone } from '../lib/liveProgress.js'
-import { appendTranscriptMessage } from '../lib/messages.js'
 import { openExternalUrl } from '../lib/openExternalUrl.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { topLevelSubagents } from '../lib/subagentTree.js'
@@ -42,7 +41,6 @@ import {
   openCanonicalClarify,
   settleSharedPrompt
 } from './gatewayCanonicalEvents.js'
-import { setActiveRecoveryTargetRef } from './gatewayRecovery.js'
 import { reportGatewayStartTimeout } from './gatewayStartTimeout.js'
 import type { GatewayEventHandlerContext, NoticeLevel } from './interfaces.js'
 import { applyControlSnapshot } from './loopStatus.js'
@@ -812,12 +810,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
   syncThemeToTerminalBackground()
 
   const { gw, rpc } = ctx.gateway
-  const sessionCtx = ctx.session
-  const { STARTUP_RESUME_ID, newSession, resumeById, setCatalog } = sessionCtx
-  const recoverSessionKeyRef = sessionCtx.recoverSessionKeyRef ?? sessionCtx.recoverSidRef
-
-  if (recoverSessionKeyRef) {setActiveRecoveryTargetRef(recoverSessionKeyRef)}
-  const pendingReplayGapRef = { current: null as null | ClientLocalGatewayEventMap['gateway.replay_gap'] }
+  const { STARTUP_RESUME_ID, newSession, recoverSidRef, resumeById, setCatalog } = ctx.session
   const { bellOnComplete, bellOnPrompt, stdout, sys } = ctx.system
 
   // display.bell_on_prompt — BEL whenever a blocking prompt modal opens
@@ -1016,70 +1009,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     }, ms)
   }
 
-  const handleStatusUpdate = (p: Extract<AnyGatewayEvent, { type: 'status.update' }>['payload']) => {
-    if (!p?.text) {
-      return
-    }
-
-    if (p.kind === 'goal') {
-      sys(p.text)
-
-      const brief = p.text.startsWith('✓')
-        ? t('gatewayMsg.goal.complete')
-        : p.text.startsWith('↻')
-          ? t('gatewayMsg.goal.continuing')
-          : p.text.startsWith('⏸')
-            ? t('gatewayMsg.goal.paused')
-            : 'ready'
-
-      setStatus(brief)
-      restoreStatusAfter(6000)
-
-      return
-    }
-
-    setStatus(p.text)
-
-    if (p.kind === 'compressing' || p.kind === 'compacting') {
-      sys(p.text)
-      turnController.clearStatusTimer()
-      patchUiState({ compacting: true })
-
-      return
-    }
-
-    if (p.kind === 'compacted') {
-      patchUiState({ compacting: false })
-    }
-
-    if (!p.kind || p.kind === 'status') {
-      return
-    }
-
-    if (turnController.lastStatusNote !== p.text) {
-      turnController.lastStatusNote = p.text
-      turnController.pushActivity(
-        p.text,
-        p.kind === 'error' ? 'error' : p.kind === 'warn' || p.kind === 'approval' ? 'warn' : 'info'
-      )
-    }
-
-    restoreStatusAfter(4000)
-  }
-
-  const handleThinkingDelta = (payload: Extract<AnyGatewayEvent, { type: 'thinking.delta' }>['payload']) => {
-    if (!getUiState().busy) {
-      return
-    }
-
-    const text = payload?.text
-
-    if (text !== undefined) {
-      const value = String(text)
-      scheduleThinkingStatus(value || statusFromBusy())
-    }
-  }
-
   const scheduleStartupPrompt = () => {
     if (startupPromptSubmitted || (!STARTUP_QUERY && !STARTUP_IMAGE)) {
       return
@@ -1159,27 +1088,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       void loadSlashCatalog(rpc, null, setCatalog)
     }
 
-    // Crash recovery: a respawn triggered by an unexpected gateway death
-    // resumes the session that was live, not a brand-new one. Keep the recovery
-    // target until resume succeeds, including across a second disconnect during
-    // setup or history loading. The ref is cleared on successful resume by
-    // resumeById so an ordinary later restart still forges/resumes per config,
-    // while preventing premature destruction if resume fails. Recovery never resends the prompt.
-    const recoverKey = recoverSessionKeyRef?.current
+    // Keep the recovery target until resume succeeds, including across a second
+    // disconnect during setup or history loading. Recovery never resends the prompt.
+    const recoverSid = recoverSidRef?.current
 
-    if (recoverKey) {
-      const pendingGap = pendingReplayGapRef.current
-      pendingReplayGapRef.current = null
-      const recoveryMode = pendingGap ? 'transport-gap-recovery' : 'transport-recovery'
-      void resumeById(recoverKey, undefined, 0, { mode: recoveryMode, gapReason: pendingGap?.reason }).then(() => {
-        if (getUiState().sid) {
-          if (recoverSessionKeyRef.current === recoverKey) {
-            recoverSessionKeyRef.current = null
-          }
-
-          if (sessionCtx.recoverSidRef && sessionCtx.recoverSidRef.current === recoverKey) {
-            sessionCtx.recoverSidRef.current = null
-          }
+    if (recoverSidRef && recoverSid) {
+      void resumeById(recoverSid).then(() => {
+        if (getUiState().sid && recoverSidRef.current === recoverSid) {
+          recoverSidRef.current = null
         }
       })
       // After resumeById: it synchronously sets status to 'resuming…' on entry,
@@ -1315,21 +1231,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         return
-      case 'session.rewound': {
-        const p = ev.payload
-
-        if (p?.notice) {
-          sys(p.notice)
-        }
-
-        const restoredSid = p?.session_id || sid
-
-        if (restoredSid) {
-          ctx.session.resumeById(restoredSid)
-        }
-
-        return
-      }
 
       case 'free_tier.challenge':
         showChallenge(ev.payload)
@@ -1365,24 +1266,20 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         applyUsageTick(ev.payload)
 
         return
-      case 'thinking.delta':
-        return handleThinkingDelta(ev.payload)
+      case 'thinking.delta': {
+        if (!getUiState().busy) {
+          return
+        }
 
-      case 'prompt.submitted': {
-        const p = ev.payload
-        const live = getUiState()
+        const text = ev.payload?.text
 
-        if (p?.session_id === live.sid && p.text) {
-          setHistoryItems(prev => {
-            const last = prev[prev.length - 1]
+        if (text !== undefined) {
+          const value = String(text)
+          scheduleThinkingStatus(value || statusFromBusy())
 
-            if (last && last.role === 'user' && last.text === p.text) {
-              return prev
-            }
-
-            return appendTranscriptMessage(prev, { role: 'user', text: p.text })
-          })
-          patchUiState({ busy: true, status: 'running…' })
+          if (value) {
+            turnController.recordReasoningDelta(value)
+          }
         }
 
         return
@@ -1398,8 +1295,60 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         turnController.startMessage()
 
         return
-      case 'status.update':
-        return handleStatusUpdate(ev.payload)
+      case 'status.update': {
+        const p = ev.payload
+
+        if (!p?.text) {
+          return
+        }
+
+        if (p.kind === 'goal') {
+          sys(p.text)
+
+          const brief = p.text.startsWith('✓')
+            ? t('gatewayMsg.goal.complete')
+            : p.text.startsWith('↻')
+              ? t('gatewayMsg.goal.continuing')
+              : p.text.startsWith('⏸')
+                ? t('gatewayMsg.goal.paused')
+                : 'ready'
+
+          setStatus(brief)
+          restoreStatusAfter(6000)
+
+          return
+        }
+
+        setStatus(p.text)
+
+        if (p.kind === 'compressing' || p.kind === 'compacting') {
+          sys(p.text)
+          turnController.clearStatusTimer()
+          patchUiState({ compacting: true })
+
+          return
+        }
+
+        if (p.kind === 'compacted') {
+          patchUiState({ compacting: false })
+        }
+
+        if (!p.kind || p.kind === 'status') {
+          return
+        }
+
+        if (turnController.lastStatusNote !== p.text) {
+          turnController.lastStatusNote = p.text
+          turnController.pushActivity(
+            p.text,
+            p.kind === 'error' ? 'error' : p.kind === 'warn' || p.kind === 'approval' ? 'warn' : 'info'
+          )
+        }
+
+        restoreStatusAfter(4000)
+
+        return
+      }
 
       case 'notification.show': {
         // Credits/usage notice from the gateway. Payload is snake_case on the
@@ -1443,14 +1392,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         const { attempt, delay_ms: delayMs } = ev.payload ?? {}
 
         setStatus(backendReconnecting(attempt, delayMs))
-
-        return
-      }
-
-      case 'gateway.replay_gap': {
-        const gap = ev.payload
-        sys(`[gateway] sequence replay gap (${gap?.reason ?? 'unknown'}) - scheduled for reconciliation`)
-        pendingReplayGapRef.current = gap ?? { reason: 'continuity-gap' }
 
         return
       }
@@ -1663,14 +1604,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         return turnController.pushImageSegment(ev.payload.image_path, ev.payload.tool_id)
-      }
-
-      case 'todo.updated': {
-        if (ev.payload && 'todos' in ev.payload) {
-          turnController.recordTodos(ev.payload.todos)
-        }
-
-        return
       }
 
       case 'request.cancel': {
@@ -1890,16 +1823,6 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         if (typeof text === 'string' && text.trim()) {
           turnController.recordInterimMessage(text)
-        }
-
-        return
-      }
-
-      case 'turn.steer': {
-        const text = ev.payload?.text ?? ev.payload?.user_message
-
-        if (typeof text === 'string' && text.trim()) {
-          turnController.recordSteer(text.trim())
         }
 
         return

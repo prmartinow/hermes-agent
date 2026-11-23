@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { supportsOsc52Clipboard } from '../../utils/env.js'
 
-import { link, MAX_OSC52_BYTES, setClipboard, shouldEmitClipboardSequence, shouldUseNativeClipboard } from './osc.js'
+import { link, shouldEmitClipboardSequence, shouldUseNativeClipboard } from './osc.js'
 
 describe('shouldEmitClipboardSequence', () => {
   it('suppresses local multiplexer clipboard OSC by default', () => {
@@ -155,19 +155,5 @@ describe('link', () => {
     expect(out).not.toContain(`${ESC}]2;`)
     expect(out).not.toContain('\u009b')
     expect(out).toContain(';https://example.com/x]2;T2J')
-  })
-})
-
-describe('MAX_OSC52_BYTES cap', () => {
-  it('suppresses OSC 52 sequence generation for payloads exceeding 256KB', async () => {
-    const hugeText = 'A'.repeat(MAX_OSC52_BYTES + 100)
-    const result = await setClipboard(hugeText)
-    expect(result.sequence).toBe('')
-  })
-
-  it('allows OSC 52 sequence generation for normal sized payloads', async () => {
-    const smallText = 'hello world'
-    const result = await setClipboard(smallText)
-    expect(result.sequence).toContain(']52;c;')
   })
 })

@@ -368,20 +368,6 @@ export function statusBarSegments(cols: number): StatusBarSegments {
   }
 }
 
-function contextUsageLabel(usage: Usage, compact: boolean, mark: string, visible: boolean): string {
-  if (!visible) {
-    return ''
-  }
-
-  if (usage.context_max) {
-    const used = compactNumber(usage.context_used ?? 0)
-
-    return compact ? `${mark}${used} tok` : `${mark}${used}/${compactNumber(usage.context_max)}`
-  }
-
-  return (usage.total ?? 0) > 0 ? `${compactNumber(usage.total)} tok` : ''
-}
-
 function SpawnHud({ t }: { t: Theme }) {
   // Tight HUD that only appears when the session is actually fanning out.
   // Colour escalates to warn/error as depth or concurrency approaches the cap.
@@ -517,9 +503,7 @@ const shortModelLabel = (model: string) =>
     .trim()
 
 const modelLabel = (model: string, effort?: string, fast?: boolean, effortWire?: string) =>
-  [shortModelLabel(model), effortLabel(effort, effortWire), fast ? tr('status.fast') : '']
-    .filter(Boolean)
-    .join(' ')
+  [shortModelLabel(model), effortLabel(effort, effortWire), fast ? tr('status.fast') : ''].filter(Boolean).join(' ')
 
 export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
   const [active, setActive] = useState(false)
@@ -557,7 +541,6 @@ export function StatusRule({
   statusBarFields = null,
   statusColor,
   model,
-
   modelFast,
   modelReasoningEffort,
   modelReasoningEffortWire,
@@ -587,7 +570,16 @@ export function StatusRule({
 
   // On narrow terminals the context read-out collapses to a bare token count
   // (`12k tok`) and the visual fill bar is dropped entirely.
-  const ctxLabel = contextUsageLabel(usage, segs.compactCtx, contextMark, ok('context_detail') || ok('context_pct'))
+  const ctxLabel =
+    ok('context_detail') || ok('context_pct')
+      ? usage.context_max
+        ? segs.compactCtx
+          ? `${contextMark}${compactNumber(usage.context_used ?? 0)} tok`
+          : `${contextMark}${compactNumber(usage.context_used ?? 0)}/${compactNumber(usage.context_max ?? 0)}`
+        : (usage.total ?? 0) > 0
+          ? `${compactNumber(usage.total)} tok`
+          : ''
+      : ''
 
   const bar = !segs.compactCtx && usage.context_max && ok('context_pct') ? ctxBar(pct) : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast, modelReasoningEffortWire)
@@ -917,7 +909,7 @@ export function FloatBox({ children, color }: { children: ReactNode; color: stri
 
 export function StickyPromptTracker({ messages, offsets, scrollRef, onChange }: StickyPromptTrackerProps) {
   const { atBottom, bottom, top } = useViewportSnapshot(scrollRef)
-  const text = atBottom ? '' : stickyPromptFromViewport(messages, offsets, top, bottom, atBottom)
+  const text = stickyPromptFromViewport(messages, offsets, top, bottom, atBottom)
 
   useEffect(() => onChange(text), [onChange, text])
 
@@ -952,8 +944,6 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
   return (
     <Box
       flexDirection="column"
-      flexGrow={0}
-      flexShrink={0}
       onMouseDown={(e: { localRow?: number }) => {
         const row = Math.max(0, Math.min(vp - 1, e.localRow ?? 0))
         const off = row >= thumbTop && row < thumbTop + thumb ? row - thumbTop : Math.floor(thumb / 2)
@@ -971,7 +961,6 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
         grabRef.current = null
         setGrab(null)
       }}
-      overflow="hidden"
       width={1}
     >
       {/* Nothing to scroll → draw nothing (the width={1} Box still reserves
@@ -980,21 +969,14 @@ export function TranscriptScrollbar({ scrollRef, t }: TranscriptScrollbarProps) 
       {!scrollable ? null : (
         <>
           {thumbTop > 0 ? (
-            <Text
-              color={trackColor}
-              wrap="truncate"
-            >{`${'│\n'.repeat(Math.max(0, thumbTop - 1))}${thumbTop > 0 ? '│' : ''}`}</Text>
+            <Text color={trackColor}>{`${'│\n'.repeat(Math.max(0, thumbTop - 1))}${thumbTop > 0 ? '│' : ''}`}</Text>
           ) : null}
           {thumb > 0 ? (
-            <Text
-              color={thumbColor}
-              wrap="truncate"
-            >{`${'┃\n'.repeat(Math.max(0, thumb - 1))}${thumb > 0 ? '┃' : ''}`}</Text>
+            <Text color={thumbColor}>{`${'┃\n'.repeat(Math.max(0, thumb - 1))}${thumb > 0 ? '┃' : ''}`}</Text>
           ) : null}
           {vp - thumbTop - thumb > 0 ? (
             <Text
               color={trackColor}
-              wrap="truncate"
             >{`${'│\n'.repeat(Math.max(0, vp - thumbTop - thumb - 1))}${vp - thumbTop - thumb > 0 ? '│' : ''}`}</Text>
           ) : null}
         </>
@@ -1016,7 +998,6 @@ interface StatusRuleProps {
   cols: number
   cwdLabel: string
   model: string
-
   modelFast?: boolean
   modelReasoningEffort?: string
   modelReasoningEffortWire?: string

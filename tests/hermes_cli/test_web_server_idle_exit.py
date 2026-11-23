@@ -76,7 +76,6 @@ def test_watchdog_sets_should_exit_and_only_arms_for_ssh_isolated_backends(monke
     try:
         isolated, _ = ws_mod._build_uvicorn_server("127.0.0.1", 0, ssh_isolated=True)
         assert isolated.ws_ping_interval and isolated.ws_ping_timeout > isolated.ws_ping_interval
-        assert isolated.ws == "auto"  # A loopback tunnel peer still needs upstream's keepalive.
         assert isolated.ws_per_message_deflate is True  # the tunnelled client is remote
         assert isinstance(ws_mod.app.state.ssh_isolated_clients, IdleClientTracker)
     finally:

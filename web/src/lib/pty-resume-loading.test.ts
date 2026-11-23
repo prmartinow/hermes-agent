@@ -1,14 +1,43 @@
 import { describe, expect, it } from "vitest";
 
-import { ReplayBoundaryGate } from "./pty-replay-boundary";
-
+import { PtyResumeSanitizer } from "./pty-resume-sanitizer";
 import {
-  PTY_RESUME_LOADING_MAX_MS,
+  shouldFinishResumeHydrationOnChunk,
   shouldShowResumeLoadingOverlay,
 } from "./pty-resume-loading";
 
-it("uses the replay timeout only as a positive warning deadline", () => {
-  expect(PTY_RESUME_LOADING_MAX_MS).toBeGreaterThan(0);
+describe("resume hydration gate over the real sanitizer", () => {
+  // Regression: the gate must key off the payload actually written to xterm,
+  // not the raw frame. The sanitizer collapses an erase-only / all-newline /
+  // partial-CSI resume frame to "", so a nonempty raw first frame would
+  // otherwise clear the wait notice while the terminal is still blank.
+  const ESC = String.fromCharCode(27);
+  const CRLF = String.fromCharCode(13, 10);
+  const VISIBLE = `Hello world${CRLF}`;
+
+  const controlOnlyFirstFrames: Array<[string, string]> = [
+    ["erase-only", `${ESC}[2K`],
+    ["all-newline", `${CRLF}${CRLF}`],
+    ["partial-CSI", `${ESC}[`],
+  ];
+
+  it.each(controlOnlyFirstFrames)(
+    "keeps hydrating on a %s first frame, then finishes on visible replay",
+    (_label, firstFrame) => {
+      const sanitizer = new PtyResumeSanitizer();
+
+      // Raw first frame is nonempty, but nothing is written to xterm...
+      expect(firstFrame.length).toBeGreaterThan(0);
+      const firstRendered = sanitizer.next(firstFrame);
+      expect(firstRendered).toBe("");
+      expect(shouldFinishResumeHydrationOnChunk(firstRendered)).toBe(false);
+
+      // ...so the notice only clears once real replay output arrives.
+      const secondRendered = sanitizer.next(VISIBLE);
+      expect(secondRendered.length).toBeGreaterThan(0);
+      expect(shouldFinishResumeHydrationOnChunk(secondRendered)).toBe(true);
+    },
+  );
 });
 
 describe("shouldShowResumeLoadingOverlay", () => {
@@ -60,21 +89,4 @@ describe("shouldShowResumeLoadingOverlay", () => {
       ).toBe(false);
     }
   });
-});
-
-
-describe("resume hydration waits for the explicit replay boundary", () => {
-  it.each(["\x1b[2K", "\r\n\r\n", "\x1b[", "Hello world\r\n"])(
-    "does not finish on terminal data %j", (chunk) => {
-      const gate = new ReplayBoundaryGate();
-      const generation = "12345678-1234-1234-1234-123456789abc";
-      gate.pin(generation);
-      expect(gate.receive(chunk)).toBeNull();
-      expect(gate.complete(generation)).toBe(false);
-      gate.receive(`hermes-replay;begin;${generation}`);
-      expect(gate.complete(generation)).toBe(false);
-      gate.receive(`hermes-replay;end;${generation}`);
-      expect(gate.complete(generation)).toBe(true);
-    },
-  );
 });

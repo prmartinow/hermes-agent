@@ -6,8 +6,7 @@ import {
   RefreshCw,
   Terminal,
 } from "lucide-react";
-import { api } from "@/lib/api";
-import type { OAuthProvider } from "@/lib/oauth-types";
+import { api, type OAuthProvider } from "@/lib/api";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { CopyButton } from "@nous-research/ui/ui/components/command-block";
 import { Spinner } from "@nous-research/ui/ui/components/spinner";
@@ -27,15 +26,6 @@ import { errorMessage } from "@/lib/api-error";
 interface Props {
   onError?: (msg: string) => void;
   onSuccess?: (msg: string) => void;
-}
-
-interface DisconnectTarget {
-  id: string;
-  name: string;
-}
-
-interface LoginTarget {
-  provider: OAuthProvider;
 }
 
 function formatExpiresAt(
@@ -64,63 +54,33 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
   const [providers, setProviders] = useState<OAuthProvider[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
-  const [loginFor, setLoginFor] = useState<LoginTarget | null>(null);
+  const [loginFor, setLoginFor] = useState<OAuthProvider | null>(null);
   const [disconnectTarget, setDisconnectTarget] =
-    useState<DisconnectTarget | null>(null);
+    useState<OAuthProvider | null>(null);
   const { t } = useI18n();
 
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
 
-  const isMountedRef = useRef(true);
-
-  const refresh = useCallback((showSpinner = true) => {
-    if (showSpinner) setLoading(true);
+  const refresh = useCallback(() => {
+    setLoading(true);
     api
       .getOAuthProviders()
-      .then((resp) => {
-        if (isMountedRef.current) setProviders(resp.providers);
-      })
-      .catch((e) => {
-        if (isMountedRef.current && showSpinner) onErrorRef.current?.(`Failed to load providers: ${errorMessage(e)}`);
-      })
-      .finally(() => {
-        if (isMountedRef.current && showSpinner) setLoading(false);
-      });
+      .then((resp) => setProviders(resp.providers))
+      .catch((e) => onErrorRef.current?.(`Failed to load providers: ${errorMessage(e)}`))
+      .finally(() => setLoading(false));
   }, []);
 
   useEffect(() => {
-    isMountedRef.current = true;
-    refresh(true);
-
-    // Continuous active polling (every 15s) regardless of window focus
-    const interval = setInterval(() => {
-      refresh(false);
-    }, 15000);
-
-    // Instant refresh when user focuses or returns to the tab
-    const handleFocus = () => {
-      if (document.visibilityState === "visible") {
-        refresh(false);
-      }
-    };
-    window.addEventListener("focus", handleFocus);
-    document.addEventListener("visibilitychange", handleFocus);
-
-    return () => {
-      isMountedRef.current = false;
-      clearInterval(interval);
-      window.removeEventListener("focus", handleFocus);
-      document.removeEventListener("visibilitychange", handleFocus);
-    };
+    refresh();
   }, [refresh]);
 
-  const handleDisconnect = async (target: DisconnectTarget) => {
-    setBusyId(target.id);
+  const handleDisconnect = async (provider: OAuthProvider) => {
+    setBusyId(provider.id);
     setDisconnectTarget(null);
     try {
-      await api.disconnectOAuthProvider(target.id);
-      onSuccess?.(`${target.name} disconnected`);
+      await api.disconnectOAuthProvider(provider.id);
+      onSuccess?.(`${provider.name} ${t.oauth.disconnect.toLowerCase()}ed`);
       refresh();
     } catch (e) {
       onError?.(`${t.oauth.disconnect} failed: ${errorMessage(e)}`);
@@ -147,7 +107,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
             ghost
             size="icon"
             className="text-muted-foreground hover:text-foreground"
-            onClick={() => refresh(true)}
+            onClick={refresh}
             disabled={loading}
             aria-label={t.common.refresh}
           >
@@ -178,8 +138,6 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
               t.oauth.expiresIn,
             );
             const isBusy = busyId === p.id;
-
-            // Standard rendering for other providers
             return (
               <div
                 key={p.id}
@@ -194,7 +152,10 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                   <div className="flex flex-col min-w-0 gap-0.5">
                     <div className="flex items-center gap-2 flex-wrap">
                       <span className="font-medium text-sm">{p.name}</span>
-                      <Badge tone="outline" className="text-xs tracking-wide">
+                      <Badge
+                        tone="outline"
+                        className="text-xs tracking-wide"
+                      >
                         {t.oauth.flowLabels[p.flow]}
                       </Badge>
                       {p.status.logged_in && (
@@ -271,7 +232,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                     <Button
                       size="sm"
                       className="uppercase"
-                      onClick={() => setLoginFor({ provider: p })}
+                      onClick={() => setLoginFor(p)}
                     >
                       {t.oauth.login}
                     </Button>
@@ -281,12 +242,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
                       size="sm"
                       outlined
                       className="uppercase"
-                      onClick={() =>
-                        setDisconnectTarget({
-                          id: p.id,
-                          name: p.name,
-                        })
-                      }
+                      onClick={() => setDisconnectTarget(p)}
                       disabled={isBusy}
                       prefix={isBusy ? <Spinner /> : undefined}
                     >
@@ -307,7 +263,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
       </CardContent>
       {loginFor && (
         <OAuthLoginModal
-          provider={loginFor.provider}
+          provider={loginFor}
           onClose={() => {
             setLoginFor(null);
             refresh();
@@ -323,7 +279,7 @@ export function OAuthProvidersCard({ onError, onSuccess }: Props) {
           if (disconnectTarget) void handleDisconnect(disconnectTarget);
         }}
         title={`${t.oauth.disconnect} ${disconnectTarget?.name ?? ""}?`}
-        description={`This will remove stored OAuth credentials for ${disconnectTarget?.name ?? "this account/provider"}. You will need to re-authenticate to use it again.`}
+        description={`This will remove the stored OAuth tokens for ${disconnectTarget?.name ?? "this provider"}. You will need to re-authenticate to use it again.`}
         destructive
         confirmLabel={t.oauth.disconnect}
       />

@@ -10,11 +10,13 @@ export type PtyKeyboardShortcut =
 
 export function resolvePtyKeyboardShortcut(
   ev: Pick<KeyboardEvent, "altKey" | "ctrlKey" | "key" | "metaKey" | "shiftKey">,
-  _isMac: boolean,
+  isMac: boolean,
   hasTerminalSelection: boolean,
 ): PtyKeyboardShortcut {
   const key = ev.key.toLowerCase();
-  const copyPressed = (ev.metaKey || ev.ctrlKey) && !ev.altKey;
+  const copyPressed = isMac
+    ? ev.metaKey && !ev.ctrlKey
+    : ev.ctrlKey && !ev.altKey && !ev.metaKey;
 
   if (copyPressed && key === "c" && hasTerminalSelection) {
     return "copy";
@@ -59,7 +61,3 @@ export function sendPtyShortcutSequence(
 
   return true;
 }
-
-// A browser keydown is unambiguously a key, unlike an unbracketed text paste.
-// CSI-u keeps Enter distinct when the PTY coalesces adjacent keyboard writes.
-export const PTY_EXPLICIT_ENTER = "\x1b[13u";

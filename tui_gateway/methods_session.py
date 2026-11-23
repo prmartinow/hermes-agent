@@ -6,7 +6,7 @@ server.py the same way (tests monkeypatching ``server.X`` still intercept)."""
 
 import contextlib
 
-from ..method_ctx import HandlerRegistry, bind_module
+from .method_ctx import HandlerRegistry, bind_module
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -609,7 +609,7 @@ def _find_live_unpersisted(needle: str, home) -> str:
 
 def _resume_live_unpersisted(ctx: _Resume, live_sid: str, live: dict) -> dict:
     """Reattach a LIVE lazy session with no state.db row yet (every fresh Bot Chat; a 404 here killed messaging
-    for never-spoken bots). Rebind the transport and cancel the armed orphan-reap Timer (a WS drop may have
+    for never-spoken bots). Attach the transport and cancel the armed orphan-reap Timer (a WS drop may have
     sentinel-parked the record) or it fires against this client."""
     if ctx.owns_db:
         _release_db(ctx.db)
@@ -765,7 +765,8 @@ def _resume_guard(ctx: _Resume) -> dict | None:
 
 def _resume_reuse_live(ctx: _Resume, sid: str, session: dict) -> dict:
     """Reattach an already-live session under the resume lock (held across the client-gone check,
-    transport rebind and reap cancel so grace expiry is atomic)."""
+    transport attach and reap cancel so grace expiry is atomic). _live_session_payload ATTACHES this
+    caller alongside the client(s) already streaming instead of taking the slot from them."""
     with _session_resume_lock:
         return _resume_reuse_live_locked(ctx, sid, session)
 
@@ -1350,8 +1351,7 @@ def _(rid, params: dict) -> dict:
 @_session_method("session.usage")
 def _(rid, params: dict, session: dict) -> dict:
     usage: dict = _session_usage_snapshot(session)
-    agent = session.get("agent")
-    if agent is None and not usage:
+    if session.get("agent") is None and not usage:
         usage = {"calls": 0, "input": 0, "output": 0, "total": 0}
     usage.update(_usage_nous_fields(session))
     return _ok(rid, usage)
@@ -1366,6 +1366,8 @@ def _(rid, params: dict, session: dict) -> dict:
             "context_percent": usage.get("context_percent", 0) or 0,
             "context_used": usage.get("context_used", 0) or 0,
             "estimated_total": usage.get("context_used", 0) or usage.get("total", 0) or 0,
+            "context_estimated": usage.get("context_estimated", False),
+            "context_source": usage.get("context_source", "provider_usage"),
             "model": _metadata_mirror(session).get("model", "")})
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1879,6 +1881,27 @@ def _(rid, params: dict, session: dict) -> dict:
     return _ok(rid, {"output": "\n".join(lines)})
 
 
+@_session_method("session.history")
+def _(rid, params: dict, session: dict) -> dict:
+    history = list(session.get("history", []))
+    # Address the session the live agent writes to, not session_key: a compression rotation moves the
+    # tip mid-session, and include_ancestors walks parent pointers, so a stale parent materializes
+    # root..parent and NEVER the continuation — a reconnect in that window renders a transcript missing
+    # every turn since the rotation (#123545).
+    row_session = _submit_row_target_key(session)
+    if row_session:
+        from persistence.conversation.messages import ConversationRequest
+        with _session_db(session) as db, _persistence_for(db) as persistence:
+            if persistence is not None:
+                # include_row_ids: the durable row id is how clients address a persisted turn (reactions,
+                # truncation targets); _history_to_messages forwards it.
+                with contextlib.suppress(Exception):
+                    # The projection in _history_to_messages only forwards row_id when the row carries a
+                    # stamp, so an unstamped read here silently strips the one durable address clients can
+                    # use. See #87059.
+                    history = [m.as_openai_message() for m in persistence.messages.read_conversation(
+                        row_session, ConversationRequest(include_lineage=True, include_row_ids=True))]
+    return _ok(rid, {"count": len(history), "messages": _history_to_messages(history, profile_home=session.get("profile_home"))})
 
 
 @_session_method("session.undo", live=True)
@@ -2186,10 +2209,9 @@ def _(rid, params: dict) -> dict:
 def register(server) -> None:
     """Publish this module's helpers onto ``server`` (rebound to its globals) and install handlers."""
     bind_module(globals(), server, skip=("_",))
-    from . import history
-    history.register(server)
-    from .. import methods_session_branch
+    from . import methods_session_branch
     methods_session_branch.register(server)
-    from .. import methods_session_interrupt, methods_session_seed
+    from . import methods_session_seed
     methods_session_seed.register(server)
+    from . import methods_session_interrupt
     methods_session_interrupt.register(server)

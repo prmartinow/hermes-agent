@@ -1,32 +1,9 @@
-"""Bounded reads for older TUI clients using physical transcript row cursors."""
+"""Read the archived and current messages for a compaction recovery in one snapshot."""
 
 from typing import Any, Optional
 
 from .core import _CONVERSATION_ROW_COLUMNS
-from .messages import _resume_lineage_ids, _rows_to_conversation
-
-
-def read_hydration_page(holder, session_id: str, *, limit: int, offset: int,
-                        after_row_id: int | None, high_watermark: int | None):
-    if limit < 0 or offset < 0:
-        raise ValueError("hydration page bounds must be nonnegative")
-    session_ids = _resume_lineage_ids(holder, session_id)
-    placeholders = ",".join("?" for _ in session_ids)
-    visible = f"session_id IN ({placeholders}) AND (active = 1 OR compacted = 1)"
-    after = after_row_id or 0
-    if high_watermark is None and after_row_id is not None:
-        row = holder._read_one(f"SELECT MAX(id) FROM messages WHERE {visible}", tuple(session_ids))
-        high_watermark = int(row[0] or 0)
-    upper = " AND id <= ?" if high_watermark is not None else ""
-    bounds = (high_watermark,) if high_watermark is not None else ()
-    rows = holder._read_all(
-        f"SELECT session_id, compacted, {_CONVERSATION_ROW_COLUMNS} FROM messages "
-        f"WHERE {visible} AND id > ?{upper} ORDER BY id LIMIT ? OFFSET ?",
-        (*session_ids, after, *bounds, limit, offset),
-    )
-    messages = _rows_to_conversation(holder, rows, session_id=session_id, include_ancestors=True,
-                                     repair_alternation=False, include_row_ids=True)
-    return messages, high_watermark or 0, int(rows[-1]["id"]) if rows else after
+from .messages import _rows_to_conversation
 
 
 def get_compaction_recovery_messages(holder, session_id: str) -> dict[str, Any]:

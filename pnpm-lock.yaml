@@ -637,9 +637,6 @@ importers:
       vitest:
         specifier: 4.1.12
         version: 4.1.12(@types/node@22.20.5)(jsdom@29.1.1(@noble/hashes@2.4.0))(vite@8.3.4(@types/node@22.20.5)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15)(yaml@2.9.1))
-      ws:
-        specifier: 8.22.0
-        version: 8.22.0
 
   ui-tui/packages/hermes-ink:
     dependencies:

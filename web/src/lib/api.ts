@@ -8,7 +8,6 @@ import { createDashboardSessionMutations } from "./session-mutations";
 const mutateSessionHttp = createDashboardSessionMutations(fetchJSON);
 
 import type { AuxiliaryModelsResponse, ModelAssignmentResponse } from "./api-aux";
-import type { OAuthPollResponse, OAuthProvidersResponse, OAuthStartResponse, OAuthSubmitResponse } from "./oauth-types";
 import type { ProfileCreateResponse } from "./api-profiles";
 import type {
   AgentPluginUpdateResponse,
@@ -358,29 +357,6 @@ export async function buildWsUrl(
   return buildHermesWebSocketUrl({ authParam: await buildWsAuthParam(), basePath: BASE, params, path });
 }
 
-/**
- * Synchronous variant of ``buildWsUrl`` for loopback / insecure mode where
- * the session token is already in memory. Returns null when gated auth is active
- * and a ticket must be fetched via REST.
- */
-export function buildWsUrlSync(
-  path: string,
-  params?: Record<string, string>,
-): string | null {
-  if (window.__HERMES_AUTH_REQUIRED__) {
-    return null;
-  }
-  const profile = getManagementProfile();
-  if (profile && path.startsWith("/api/plugins/") && !params?.profile) params = { ...params, profile };
-  const token = window.__HERMES_SESSION_TOKEN__ ?? "";
-  return buildHermesWebSocketUrl({
-    authParam: ["token", token],
-    basePath: BASE,
-    params,
-    path,
-  });
-}
-
 /** Build a ``?profile=<name>`` query suffix, or "" when unset.
  *
  * Used by the skills/toolsets endpoints so the dashboard can manage a
@@ -435,7 +411,6 @@ function appendSessionFilters(url: string, options: SessionQueryOptions): string
 
 export const api = {
   buildWsUrl,
-  buildWsUrlSync,
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
@@ -478,25 +453,13 @@ export const api = {
       ),
     );
   },
-  getSessionMessages: (
-    id: string,
-    profileOrOptions?: string | { profile?: string; limit?: number; offset?: number; order?: "latest" | "oldest" },
-    profile = getManagementProfile()
-  ) => {
-    let endpoint = `/api/sessions/${encodeURIComponent(id)}/messages?include_compacted=true`;
-    let effectiveProfile = profile;
-    if (typeof profileOrOptions === "string") {
-      effectiveProfile = profileOrOptions;
-    } else if (profileOrOptions && typeof profileOrOptions === "object") {
-      if (profileOrOptions.profile !== undefined) effectiveProfile = profileOrOptions.profile;
-      if (profileOrOptions.limit !== undefined) endpoint += `&limit=${profileOrOptions.limit}`;
-      if (profileOrOptions.offset !== undefined) endpoint += `&offset=${profileOrOptions.offset}`;
-      if (profileOrOptions.order) endpoint += `&order=${profileOrOptions.order}`;
-    }
-    return fetchJSON<SessionMessagesResponse>(
-      appendProfileParam(endpoint, effectiveProfile),
-    );
-  },
+  getSessionMessages: (id: string, profile = getManagementProfile()) =>
+    fetchJSON<SessionMessagesResponse>(
+      appendProfileParam(
+        `/api/sessions/${encodeURIComponent(id)}/messages?limit=500&order=latest`,
+        profile,
+      ),
+    ),
   getSessionDetail: (id: string, profile = getManagementProfile()) =>
     fetchJSON<SessionInfo>(
       appendProfileParam(`/api/sessions/${encodeURIComponent(id)}`, profile),
@@ -2070,7 +2033,6 @@ export interface ChatWorkspacesResponse {
   scan_enabled: boolean;
 }
 
-
 export interface SessionInfo {
   id: string;
   source: string | null;
@@ -2081,7 +2043,6 @@ export interface SessionInfo {
   last_active: number;
   is_active: boolean;
   message_count: number;
-  total_message_count?: number;
   tool_call_count: number;
   input_tokens: number;
   output_tokens: number;
@@ -2150,7 +2111,6 @@ export interface TelegramOnboardingApplyResponse {
 }
 
 export interface SessionMessage {
-  id?: number;
   role: "user" | "assistant" | "system" | "tool";
   content: string | null;
   tool_calls?: Array<{
@@ -2501,9 +2461,7 @@ export interface MoaConfigResponse {
     aggregator_temperature: number;
     reference_timeout: number | null;
     degraded_reference_policy: "loud" | "silent";
-    max_tokens: number;
-    /** Optional advisor output cap — round-tripped, not edited here. */
-    reference_max_tokens?: number | null;
+
     /** Fan-out cadence (user_turn default | per_iteration | every_n:N) — round-tripped. */
     fanout?: string;
     enabled: boolean;
@@ -2514,7 +2472,7 @@ export interface MoaConfigResponse {
   aggregator_temperature: number;
   reference_timeout: number | null;
   degraded_reference_policy: "loud" | "silent";
-  max_tokens: number;
+
   enabled: boolean;
 }
 
@@ -2527,6 +2485,64 @@ export interface ModelAssignmentRequest {
   base_url?: string;
   /** For auxiliary: task slot name, "" for all, "__reset__" to reset all. */
   task?: string;
+}
+
+// ── OAuth provider types ────────────────────────────────────────────────
+
+export interface OAuthProviderStatus {
+  logged_in: boolean;
+  source?: string | null;
+  source_label?: string | null;
+  token_preview?: string | null;
+  expires_at?: string | null;
+  has_refresh_token?: boolean;
+  last_refresh?: string | null;
+  error?: string;
+}
+
+export interface OAuthProvider {
+  id: string;
+  name: string;
+  /** "pkce" (browser redirect + paste code), "device_code" (show code + URL),
+   *  or "external" (delegated to a separate CLI like Claude Code or Qwen). */
+  flow: "pkce" | "device_code" | "external";
+  cli_command: string;
+  docs_url: string;
+  status: OAuthProviderStatus;
+}
+
+export interface OAuthProvidersResponse {
+  providers: OAuthProvider[];
+}
+
+/** Discriminated union — the shape of /start depends on the flow. */
+export type OAuthStartResponse =
+  | {
+      session_id: string;
+      flow: "pkce";
+      auth_url: string;
+      expires_in: number;
+    }
+  | {
+      session_id: string;
+      flow: "device_code";
+      user_code: string;
+      verification_url: string;
+      expires_in: number;
+      poll_interval: number;
+    };
+
+export interface OAuthSubmitResponse {
+  ok: boolean;
+  status: "approved" | "error";
+  message?: string;
+}
+
+export interface OAuthPollResponse {
+  session_id: string;
+  status: "pending" | "approved" | "denied" | "expired" | "error";
+  error_message?: string | null;
+  expires_at?: number | null;
 }
 
 // ── Dashboard theme types ──────────────────────────────────────────────

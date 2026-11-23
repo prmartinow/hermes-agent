@@ -21,7 +21,7 @@ const { FakeFitAddon, FakeTerminal, FakeWebglAddon } = vi.hoisted(() => {
     options: Record<string, unknown>;
     rows = 24;
     cols = 80;
-    parser = { registerOscHandler: vi.fn(() => ({ dispose() {} })) };
+    parser = { registerOscHandler: vi.fn() };
     unicode = { activeVersion: "" };
 
     constructor(options: Record<string, unknown>) {
@@ -34,8 +34,6 @@ const { FakeFitAddon, FakeTerminal, FakeWebglAddon } = vi.hoisted(() => {
     attachCustomWheelEventHandler() {
       return true;
     }
-    reset() {}
-    clear() {}
     clearSelection() {}
     clearTextureAtlas() {}
     dispose() {}
@@ -78,7 +76,6 @@ const { FakeFitAddon, FakeTerminal, FakeWebglAddon } = vi.hoisted(() => {
 });
 
 const apiMocks = vi.hoisted(() => ({
-  buildWsUrlSync: vi.fn(() => null),
   buildWsUrl: vi.fn(async () => "ws://localhost/api/pty?channel=chat-1"),
   getProfiles: vi.fn(() => new Promise(() => {})),
   getActiveProfile: vi.fn(() => new Promise(() => {})),

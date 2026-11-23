@@ -40,18 +40,7 @@ const REJECTION_BANNERS: Record<number, PtyBanner> = {
   }
 }
 
-export function ptyRejectionBanner(code: number, reason?: string): PtyBanner | null {
-  if (code === 4429) {
-    const cause = reason === 'terminal-memory'
-      ? 'The terminal memory budget is exhausted or could not be checked.'
-      : reason === 'terminal-capacity'
-        ? 'Terminal capacity is temporarily full.'
-        : 'Terminal resources are temporarily unavailable.'
-    return {
-      text: `${cause} Existing work is protected. Wait briefly, then reload this page to retry the same chat.`,
-      action: 'reload'
-    }
-  }
+export function ptyRejectionBanner(code: number): PtyBanner | null {
   return REJECTION_BANNERS[code] ?? null
 }
 

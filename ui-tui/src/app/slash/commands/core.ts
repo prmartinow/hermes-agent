@@ -909,7 +909,7 @@ export const coreCommands: SlashCommand[] = [
   {
     help: 'undo last exchange',
     name: 'undo',
-    run: (arg, ctx) => {
+    run: (_arg, ctx) => {
       if (!ctx.sid) {
         return ctx.transcript.sys(t('slashCmd.core.undo.nothing'))
       }
@@ -918,31 +918,13 @@ export const coreCommands: SlashCommand[] = [
         return canonicalRewind('undo', ctx)
       }
 
-      const count = arg ? parseInt(arg.trim(), 10) : 1
-      const turns = isNaN(count) || count < 1 ? 1 : count
-
-      let fallbackText = ''
-      const history = ctx.local.getHistoryItems()
-
-      for (let i = history.length - 1; i >= 0; i--) {
-        if (history[i]?.role === 'user') {
-          fallbackText = history[i]?.text || ''
-
-          break
-        }
-      }
-
-      ctx.gateway.rpc<SessionUndoResponse>('session.undo', { count: turns, session_id: ctx.sid }).then(
+      ctx.gateway.rpc<SessionUndoResponse>('session.undo', { session_id: ctx.sid }).then(
         ctx.guarded<SessionUndoResponse>(r => {
           if ((r.removed ?? 0) > 0) {
-            ctx.transcript.setHistoryItems((prev: Msg[]) => ctx.transcript.trimLastExchange(prev, r.turns_undone ?? turns))
+            ctx.transcript.setHistoryItems((prev: Msg[]) => ctx.transcript.trimLastExchange(prev))
             ctx.transcript.sys(
               t(r.removed === 1 ? 'slashCmd.core.undo.undidOne' : 'slashCmd.core.undo.undidOther', String(r.removed))
             )
-
-            const prefill = r.prefill ?? fallbackText
-
-            if (prefill) {ctx.composer.setInput(prefill)}
 
             if (r.undo_hint?.text) {
               ctx.transcript.sys(r.undo_hint.text)
