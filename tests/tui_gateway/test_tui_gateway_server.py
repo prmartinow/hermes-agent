@@ -4937,7 +4937,7 @@ def test_session_close_settles_active_turn_before_teardown(monkeypatch):
     assert response["result"] == {"closed": True, "messages": []}
 
 
-def test_ws_orphan_reap_preserves_isolated_turn_then_reaps_when_idle(monkeypatch):
+def test_ws_orphan_reap_interrupts_isolated_turn_then_reaps(monkeypatch):
     callbacks = []
     interrupted = []
     torn_down = []
@@ -4982,20 +4982,18 @@ def test_ws_orphan_reap_preserves_isolated_turn_then_reaps_when_idle(monkeypatch
         server._schedule_ws_orphan_reap("isolated-sid")
         callbacks.pop(0)()
 
-        # Under new contract, actively running isolated turns must never be interrupted
-        assert interrupted == []
-        assert not session.get("_turn_cancel_requested")
-        assert session["queued_prompt"] == {"text": "must not run"}
+        assert interrupted == [("isolated-sid", "client-gone-isolated-sid")]
+        assert session["_turn_cancel_requested"] is True
+        assert session["queued_prompt"] is None
         assert session["history"] == [{"role": "assistant", "content": "partial"}]
         assert len(callbacks) == 1
 
         callbacks.pop(0)()
 
-        assert interrupted == []
+        assert interrupted == [("isolated-sid", "client-gone-isolated-sid")]
         assert len(callbacks) == 1
 
         session["running"] = False
-        session["queued_prompt"] = None
         callbacks.pop(0)()
 
         assert "isolated-sid" not in server._sessions
@@ -5088,7 +5086,7 @@ def test_session_resume_does_not_rebind_after_client_gone_interrupt_claim(monkey
 def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     callbacks = []
     interrupted = []
-    delegation_active = [True]
+    delegation_active = iter((True, False, False))
 
     class _Timer:
         def __init__(self, _delay, callback):
@@ -5118,7 +5116,7 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
     monkeypatch.setattr(
         server,
         "_session_has_active_delegations",
-        lambda *_args, **_kwargs: delegation_active[0],
+        lambda *_args, **_kwargs: next(delegation_active),
     )
     monkeypatch.setattr(server, "_teardown_popped_session", lambda *_args, **_kwargs: True)
 
@@ -5129,27 +5127,18 @@ def test_ws_orphan_reap_defers_running_turn_for_active_delegation(monkeypatch):
         assert interrupted == []
         assert len(callbacks) == 1
 
-        session["running"] = False
-        session["_run_thread"] = None
         callbacks.pop(0)()
-        assert "delegating-turn" in server._sessions  # Child work still owns the session.
-        assert interrupted == []
 
-        delegation_active[0] = False
-        session["running"] = True
-        callbacks.pop(0)()
-        # A parent continuation stays protected after its child has finished.
-        assert interrupted == []
+        assert interrupted == ["interrupted"]
         assert len(callbacks) == 1
 
-        session["running"] = False
         callbacks.pop(0)()
         assert "delegating-turn" not in server._sessions
     finally:
         server._sessions.pop("delegating-turn", None)
 
 
-def test_ws_orphan_reap_preserves_in_process_turn(monkeypatch):
+def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
     callbacks = []
     interrupted = []
 
@@ -5183,20 +5172,14 @@ def test_ws_orphan_reap_preserves_in_process_turn(monkeypatch):
         server._schedule_ws_orphan_reap("inline-sid")
         callbacks.pop(0)()
 
-        # Actively running turns must never be automatically interrupted
-        assert interrupted == []
-        assert not session.get("_turn_cancel_requested")
+        assert interrupted == ["interrupted"]
+        assert session["_turn_cancel_requested"] is True
         assert len(callbacks) == 1
-
-        session["running"] = False
-        session["_run_thread"] = None
-        callbacks.pop(0)()
-        assert "inline-sid" not in server._sessions
     finally:
         server._sessions.pop("inline-sid", None)
 
 
-def test_ws_disconnect_running_sidecar_detaches_with_orphan_timer(monkeypatch):
+def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):
     closed = []
     scheduled = []
     transport = object()
@@ -5215,23 +5198,10 @@ def test_ws_disconnect_running_sidecar_detaches_with_orphan_timer(monkeypatch):
     )
 
     try:
-        # Running sidecar must not be dropped: detaches and schedules reap
         reaped, detached = server._close_sessions_for_transport(transport)
-        assert (reaped, detached) == (0, 1)
-        assert closed == []
-        assert scheduled == ["sidecar-sid"]
 
-        # When actually idle, close_on_disconnect tears down immediately
-        idle_transport = object()
-        server._sessions["idle-sidecar"] = _session(
-            transport=idle_transport,
-            running=False,
-            close_on_disconnect=True,
-        )
-        scheduled.clear()
-        reaped, detached = server._close_sessions_for_transport(idle_transport)
         assert (reaped, detached) == (1, 0)
-        assert ("idle-sidecar", "ws_disconnect") in closed
+        assert closed == [("sidecar-sid", "ws_disconnect")]
         assert scheduled == []
     finally:
         server._sessions.pop("sidecar-sid", None)
@@ -5463,28 +5433,62 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
 
 
 def test_close_transport_rebinds_session_to_remaining_viewer(monkeypatch):
-    """Closing a pop-out window's transport must re-bind the session to a
-    still-open window instead of stranding it on the drop sentinel (#83716)."""
+    """Closing a pop-out window's transport must leave the session with the
+    still-open window instead of stranding it on the drop sentinel (#83716).
+
+    The rebind #83716 added is gone; multi-client fan-out subsumes it. Both
+    windows are attached to the slot at once, so the pop-out is a fan-out peer
+    rather than a viewer waiting to be promoted, and closing it detaches that
+    peer while retaining the surviving ordered mailbox. This pins the same
+    guarantee through the mechanism that replaced the rebind: the session is
+    not parked, not reaped, not handed to the orphan reaper, and the surviving
+    window keeps receiving frames.
+    """
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
     class _LiveTransport:
-        def write(self, *a, **k):
+        def __init__(self):
+            self.frames = []
+            self.received = threading.Event()
+
+        def write(self, obj=None, *a, **k):
+            self.frames.append(obj)
+            self.received.set()
             return True
 
     main = _LiveTransport()
     popout = _LiveTransport()
-    session = _session(transport=main, running=False)
-    assert server._attach_session_transport(session, popout)
+    session = _session(transport=None, running=False)
+    # Build the state the way production does: every window that resumes goes
+    # through _live_session_payload, which attaches it into the slot and then
+    # stamps it into the viewers registry.
+    server._attach_session_transport(session, main)
+    server._attach_session_transport(session, popout)
     session["viewers"] = {main: 100.0, popout: 200.0}
     server._sessions["multi-sid"] = session
+    assert isinstance(session["transport"], server.FanoutTransport)
 
-    reaped, detached = server._close_sessions_for_transport(popout)
+    try:
+        reaped, detached = server._close_sessions_for_transport(popout)
 
-    assert reaped == 0 and detached == 0
-    assert session["transport"] is main
-    assert "multi-sid" not in reap_calls
-    assert server._ws_session_is_orphaned(session) is False
+        assert reaped == 0 and detached == 0
+        assert server._session_transport_contains(session, main)
+        assert not server._session_transport_contains(session, popout)
+        assert "multi-sid" not in reap_calls
+        assert server._ws_session_is_orphaned(session) is False
+
+        # And it is still a working stream, not just a surviving reference.
+        server._emit("message.delta", "multi-sid", {"text": "still here"})
+        assert main.received.wait(timeout=5)
+        assert [(f.get("params") or {}).get("type") for f in main.frames] == [
+            "message.delta"
+        ]
+        assert popout.frames == []
+    finally:
+        # The fake slot must not outlive the test: _sessions is module state and
+        # later sweeps would walk it.
+        server._sessions.pop("multi-sid", None)
 
 
 def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
@@ -5510,7 +5514,15 @@ def test_close_transport_detaches_when_no_viewers_remain(monkeypatch):
 
 
 def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
-    """A viewer whose socket is already dead must not win the re-bind."""
+    """A viewer whose socket is already dead must not hold the session open.
+
+    #83716's rebind refused to hand the session to a dead viewer; fan-out
+    membership keeps that filter through _transport_is_live_peer, which is what
+    decides whether anything survives the departing client. Both windows are
+    ATTACHED here, which is the state production builds — a viewer that was
+    never attached leaves the slot single-client and exercises the ordinary park
+    path instead of this one.
+    """
     reap_calls = []
     monkeypatch.setattr(server, "_schedule_ws_orphan_reap", lambda sid: reap_calls.append(sid))
 
@@ -5519,17 +5531,25 @@ def test_close_transport_skips_dead_remaining_viewers(monkeypatch):
             return True
 
     dead = _LiveTransport()
+    popout = _LiveTransport()
+    session = _session(transport=None, running=False)
+    server._attach_session_transport(session, dead)
+    server._attach_session_transport(session, popout)
+    session["viewers"] = {dead: 100.0, popout: 200.0}
+    assert isinstance(session["transport"], server.FanoutTransport)
+    # The socket goes away without a disconnect reaching the gateway; the latch
+    # _transport_is_dead reads is the only trace it leaves behind.
     dead._closed = True
-    owner = _LiveTransport()
-    session = _session(transport=owner, running=False)
-    session["viewers"] = {dead: 100.0, owner: 200.0}
     server._sessions["dead-viewer-sid"] = session
 
-    _reaped, detached = server._close_sessions_for_transport(owner)
+    try:
+        reaped, detached = server._close_sessions_for_transport(popout)
 
-    assert detached == 1
-    assert session["transport"] is server._detached_ws_transport
-    assert reap_calls == ["dead-viewer-sid"]
+        assert reaped == 0 and detached == 1
+        assert session["transport"] is server._detached_ws_transport
+        assert reap_calls == ["dead-viewer-sid"]
+    finally:
+        server._sessions.pop("dead-viewer-sid", None)
 
 
 def test_live_session_payload_registers_transport_as_viewer():
@@ -5989,15 +6009,13 @@ def test_ws_orphan_reap_defers_running_turn_with_fresh_activity(monkeypatch):
             assert delays[-1] == server._WS_ORPHAN_REAP_GRACE_S
             assert "fresh-sid" in server._sessions
 
-        # Activity goes stale -> running turn is still NEVER interrupted.
+        # Activity goes stale (turn wedged) -> interrupt fires on next poll.
         activity["seconds_since_activity"] = 301.0
         callbacks.pop(0)()
-        assert interrupted == []
-        assert not session.get("_client_gone_interrupt_requested")
-        assert delays[-1] == server._WS_ORPHAN_REAP_GRACE_S
-        assert "fresh-sid" in server._sessions
+        assert interrupted == ["interrupted"]
+        assert session["_client_gone_interrupt_requested"] is True
 
-        # Turn settles -> reap proceeds when idle.
+        # Turn settles -> reap proceeds exactly as today.
         session["running"] = False
         callbacks.pop(0)()
         assert "fresh-sid" not in server._sessions
@@ -6006,7 +6024,7 @@ def test_ws_orphan_reap_defers_running_turn_with_fresh_activity(monkeypatch):
         server._sessions.pop("fresh-sid", None)
 
 
-def test_ws_orphan_disabled_activity_clock_preserves_running_turn(monkeypatch):
+def test_ws_orphan_activity_gate_zero_restores_interrupt_at_grace(monkeypatch):
     """ws_orphan_activity_stale_s=0 opts out: fresh activity no longer defers
     the client-gone interrupt (pre-#98028 behaviour)."""
     callbacks = []
@@ -6043,15 +6061,8 @@ def test_ws_orphan_disabled_activity_clock_preserves_running_turn(monkeypatch):
     try:
         server._schedule_ws_orphan_reap("optout-sid")
         callbacks.pop(0)()
-        # Running turns must never be interrupted even if activity stale threshold is 0
-        assert interrupted == []
-        assert not session.get("_client_gone_interrupt_requested")
-        assert len(callbacks) == 1
-
-        session["running"] = False
-        session["_run_thread"] = None
-        callbacks.pop(0)()
-        assert "optout-sid" not in server._sessions
+        assert interrupted == ["interrupted"]
+        assert session["_client_gone_interrupt_requested"] is True
     finally:
         server._sessions.pop("optout-sid", None)
 
