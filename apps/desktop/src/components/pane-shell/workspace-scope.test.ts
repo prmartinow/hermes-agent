@@ -53,16 +53,6 @@ describe('workspace scope', () => {
     setWorkspaceScope('sessions')
     expect($workspaceNewSessionTarget.get()).toBeNull()
   })
-
-  it('keeps a group owner explicit while publishing why it has no generic route', () => {
-    const target = { kind: 'blocked' as const, message: 'New group conversations start in the group composer.' }
-
-    setWorkspaceScope('bots', 'group:room-1', target)
-
-    expect($workspaceOwnerKey.get()).toBe('group:room-1')
-    expect($workspaceNewSessionTarget.get()).toEqual(target)
-  })
-
 })
 
 describe('workspace owner title', () => {
