@@ -318,8 +318,7 @@ class AIAgent(
         """``model_config`` for the lazily created session row: the init config plus a live /yolo toggled
         before the first turn (``hermes --resume`` restores it)."""
         from tools.approval_yolo import with_session_yolo
-        model_config = with_session_yolo(self._session_init_model_config, self.session_id)
-        return model_config
+        return with_session_yolo(self._session_init_model_config, self.session_id)
 
     def _ensure_db_session(self) -> None:
         """Create the session DB row on first use; a transient failure leaves it to retry next turn."""
@@ -602,6 +601,7 @@ class AIAgent(
             return implicit
 
         from agent.chat_completion_helpers import _high_effort_silence_floor, cap_to_run_budget, estimate_request_context_tokens
+        from agent.gemini_long_decode import long_decode_stale_multiplier
         est_tokens = estimate_request_context_tokens(api_payload)
         explicit = self._stale_timeout_is_explicit()
         # The context tiers raise only an implicit base: an explicit value can shorten patience (#115024).
@@ -611,6 +611,8 @@ class AIAgent(
         # cap below, so the floor can never outlive the run budget.
         if self.api_mode == "codex_responses" and not explicit:
             timeout = max(timeout, _high_effort_silence_floor(self))
+        if not explicit:
+            timeout *= long_decode_stale_multiplier(api_payload)
         # Run-budget cap: an implicit stale timeout is capped at half the remaining budget (>= 60s) so one
         # hung call cannot eat the run. Never raises the timeout; explicit user config still wins.
         if not explicit:

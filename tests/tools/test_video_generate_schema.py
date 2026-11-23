@@ -178,7 +178,7 @@ class TestDynamicParamGating(unittest.TestCase):
         self.assertIn("text-to-video only", schema["description"])
 
     def test_i2v_only_model_overrides_backend_union(self):
-        # A dual-modality backend can contain an image-only model.
+        # gemini-omni-flash case: dual-modality backend, i2v-only model.
         schema = self._schema_with(
             {"modalities": ["text", "image"], "max_reference_images": 0,
              "supports_audio": False, "supports_negative_prompt": False,

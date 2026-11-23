@@ -744,7 +744,7 @@ class TestGetModelCapabilities:
     def test_modalities_non_dict_handled(self):
         """Non-dict modalities field should not crash."""
         registry = {
-            "openai": {"id": "openai", "models": {
+            "google": {"id": "google", "models": {
                 "weird-model": {
                     "id": "weird-model",
                     "modalities": "text",  # not a dict
@@ -753,7 +753,7 @@ class TestGetModelCapabilities:
             }},
         }
         with patch("agent.models_dev.fetch_models_dev", return_value=registry):
-            caps = get_model_capabilities("openai", "weird-model")
+            caps = get_model_capabilities("gemini", "weird-model")
         assert caps is not None
         assert caps.supports_vision is False
 

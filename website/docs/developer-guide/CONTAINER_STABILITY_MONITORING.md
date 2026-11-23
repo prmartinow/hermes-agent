@@ -34,19 +34,13 @@ print("✓ Credential protection PASS")
 '
 ```
 
-### Probe 2: Distributed Leader Lease & SQLite Concurrency
-Validates active-passive leader election and multi-process SQLite write absorption:
+### Probe 2. SQLite concurrency
+
+Check the session database’s journal mode and the probe connection’s busy timeout.
 
 ```bash
 python3 -c '
-import json, time, sqlite3
-from pathlib import Path
-
-lease_file = Path("/opt/data/runtime/quota_refresher.lease")
-assert lease_file.exists(), "Lease file missing"
-lease = json.loads(lease_file.read_text())
-assert lease.get("expires_at", 0) > time.time(), "Leader lease is expired"
-print(f"✓ Leader lease active: {lease.get("holder")}")
+import sqlite3
 
 conn = sqlite3.connect("/opt/data/state.db", timeout=15.0)
 timeout = conn.execute("PRAGMA busy_timeout").fetchone()[0]

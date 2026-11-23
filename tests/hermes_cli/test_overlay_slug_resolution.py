@@ -46,17 +46,17 @@ def test_overlay_provider_uses_hermes_slug():
 
 def test_mapped_provider_credential_pool_visibility(monkeypatch):
     """Mapped providers should appear when credentials live only in auth-store credential_pool."""
-    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {"kimi-for-coding": {"env": ["KIMI_API_KEY"]}})
-    monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {"kimi-coding": "kimi-for-coding"})
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {"google-ai-studio": {"env": ["GEMINI_API_KEY"]}})
+    monkeypatch.setattr("agent.models_dev.PROVIDER_TO_MODELS_DEV", {"gemini": "google-ai-studio"})
     monkeypatch.setattr(
         "hermes_cli.auth._load_auth_store",
-        lambda: {"providers": {}, "credential_pool": {"kimi-coding": {"token": "fake"}}},
+        lambda: {"providers": {}, "credential_pool": {"gemini": {"token": "fake"}}},
     )
-    monkeypatch.delenv("KIMI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
 
-    providers = list_authenticated_providers(current_provider="kimi-coding")
+    providers = list_authenticated_providers(current_provider="gemini")
 
-    kimi = next((p for p in providers if p["slug"] == "kimi-coding"), None)
-    assert kimi is not None, "kimi-coding should appear when auth-store credential_pool has creds"
-    assert kimi["is_current"] is True
-    assert kimi["total_models"] > 0
+    gemini = next((p for p in providers if p["slug"] == "gemini"), None)
+    assert gemini is not None, "gemini should appear when auth-store credential_pool has creds"
+    assert gemini["is_current"] is True
+    assert gemini["total_models"] > 0

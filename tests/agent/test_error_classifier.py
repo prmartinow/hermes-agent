@@ -1508,8 +1508,8 @@ class TestProviderCodeOnlyErrors:
     provider's structured reason instead of ``unknown`` (#70414)."""
 
     @pytest.mark.parametrize("provider, code, reason", [
-        ("vertex", "UNAVAILABLE", FailoverReason.overloaded),
-        ("google-vertex", "DEADLINE_EXCEEDED", FailoverReason.timeout),
+        ("gemini", "UNAVAILABLE", FailoverReason.overloaded),
+        ("google", "DEADLINE_EXCEEDED", FailoverReason.timeout),
         ("vertex", "INTERNAL", FailoverReason.server_error),
         ("anthropic", "API_ERROR", FailoverReason.server_error),
         ("openai-codex", "SERVER_ERROR", FailoverReason.server_error),
@@ -1525,12 +1525,12 @@ class TestProviderCodeOnlyErrors:
         e = MockAPIError("UNAVAILABLE", body={"error": {"code": "UNAVAILABLE"}})
         assert classify_api_error(e, provider="openai").reason == FailoverReason.unknown
 
-    def test_vertex_wire_body_numeric_code_falls_back_to_status(self):
-        """Vertex may carry the HTTP status in ``error.code`` and the
+    def test_gemini_wire_body_numeric_code_falls_back_to_status(self):
+        """Gemini's real body carries the HTTP status in ``error.code`` and the
         symbolic code in ``error.status``; the numeric code must not shadow it."""
         body = {"error": {"code": 503, "status": "UNAVAILABLE", "message": "Service unavailable."}}
         e = MockAPIError("Service unavailable.", body=body)
-        assert classify_api_error(e, provider="vertex").reason == FailoverReason.overloaded
+        assert classify_api_error(e, provider="gemini").reason == FailoverReason.overloaded
 
     def test_anthropic_rate_limit_error_code_rotates_credential(self):
         e = MockAPIError("rate limited", body={"error": {"code": "rate_limit_error"}})

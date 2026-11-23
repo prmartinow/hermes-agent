@@ -1290,6 +1290,10 @@ export const frOverrides = {
           model: 'Modèle TTS Mistral',
           voiceId: 'Voix Mistral'
         },
+        gemini: {
+          model: 'Modèle TTS Gemini',
+          voice: 'Voix Gemini'
+        },
         neutts: {
           model: 'Modèle NeuTTS',
           device: 'Appareil NeuTTS'

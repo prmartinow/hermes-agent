@@ -329,6 +329,7 @@ const BUILTIN_TTS_PROVIDERS = new Set([
   'minimax',
   'xai',
   'mistral',
+  'gemini',
   'neutts',
   'kittentts',
   'piper',

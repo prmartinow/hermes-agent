@@ -279,17 +279,9 @@ def _plugin_alias_owner(canonical: str) -> str:
     return owner.name
 
 
-def provider_removed(name: str) -> bool:
-    """Block the retired fork OAuth routes; Google AI Studio keeps its upstream API-key route."""
-    name = str(name or "").strip().lower().replace("_", "-")
-    return name == "solstice" or name.startswith("gemini-")
-
-
 def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderDef]:
     """Look up a built-in provider by id or alias: models.dev catalog merged with the Hermes overlay;
     Hermes-only overlay (nous, openai-codex, …); plugin provider profiles with a concrete endpoint."""
-    if provider_removed(name):
-        return None
     canonical = _plugin_alias_owner(normalize_provider(name))
     from hermes_cli.left_core_migration import provider_left_core
     if provider_left_core(canonical):  # its plugin is not loaded: models.dev must not stand in for it
@@ -508,8 +500,6 @@ def resolve_user_provider(name: str, user_config: dict[str, Any]) -> Optional[Pr
     the built-in's real transport/base_url/auth_type with an empty ``openai_chat``/``api_key``
     stub, routing e.g. AWS Bedrock through the generic custom-endpoint ``/models`` probe (#110402).
     """
-    if provider_removed(name):
-        return None
     if not isinstance(user_config, dict) or not user_config:
         return None
     # Callers lowercase the requested name; the config key keeps the user's case (``Axonhub``).
@@ -650,8 +640,6 @@ def resolve_provider_full(name: str, user_providers: Optional[dict[str, Any]] = 
     managed llamacpp -> models.dev directly. User-defined ``providers.<name>`` is tried FIRST on
     the raw (pre-alias) name: a configured ``providers.openai`` pointing at api.openai.com must not
     be hijacked by the legacy "openai" -> "openrouter" alias."""
-    if provider_removed(name):
-        return None
     canonical = normalize_provider(name)
     raw = name.strip().lower()
     if user_providers:

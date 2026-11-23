@@ -1543,7 +1543,7 @@ class GoalManager:
                 f"judge model returned unparseable output {n_parse} turns in a row", "continue", reason,
                 f"⏸ Goal paused — the judge model ({n_parse} turns) isn't returning the required JSON verdict. "
                 "Route the judge to a stricter model in "
-                + _JUDGE_CONFIG_HINT.format(provider="openrouter", model="anthropic/claude-haiku-4.5"),
+                + _JUDGE_CONFIG_HINT.format(provider="openrouter", model="google/gemini-3-flash-preview"),
             )
 
         if state.turns_used >= state.max_turns:

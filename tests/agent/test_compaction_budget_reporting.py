@@ -776,6 +776,24 @@ def test_cached_endpoint_limit_drives_report_and_live_trigger(monkeypatch):
     assert cc.get_budget_report()["actual_trigger"] == cc.threshold_tokens
 
 
+def test_output_reservation_follows_upstream_catalog_on_model_switch(monkeypatch):
+    from agent import models_dev
+
+    registry = {
+        "anthropic": {"models": {"claude-test": {"limit": {"output": 24_000}}}},
+        "openai": {"models": {"gpt-6-astra-900k": {"limit": {"output": 32_000}}}},
+    }
+    monkeypatch.setattr(models_dev, "_models_dev_cache", registry)
+    compressor = ContextCompressor(
+        model="claude-test", provider="anthropic", config_context_length=200_000, quiet_mode=True,
+    )
+    assert compressor.get_budget_report()["output_reservation"] == 24_000
+    compressor.update_model("gpt-6-astra-900k", 200_000, provider="openai-codex")
+    assert compressor.get_budget_report()["output_reservation"] == 32_000
+    compressor.update_model("unknown-test", 200_000, provider="anthropic")
+    assert compressor.get_budget_report()["output_reservation"] == 0
+
+
 def test_compute_threshold_tokens_astra_and_unknown_models_safe():
     """Model switch to gpt-6-astra or models with unspecified output reservation
     must compute threshold_tokens without TypeError or NoneType subtraction."""

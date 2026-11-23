@@ -94,3 +94,5 @@ class TestGeminiHttpErrorFreeTierGuidance:
         body = '{"error":{"code":429,"message":"Rate limited","status":"RESOURCE_EXHAUSTED"}}'
         err = gemini_http_error(self._FakeResp(429, body))
         assert "aistudio.google.com/apikey" not in str(err)
+
+

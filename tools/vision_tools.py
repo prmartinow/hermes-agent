@@ -514,12 +514,13 @@ def _resize_image_for_vision(image_path: Path, mime_type: Optional[str] = None,
 # tool-result envelope (the agent loop unwraps it into an OpenAI-style content list on the
 # `tool` role); no aux LLM, no information loss. Providers whose tool results accept image
 # content: Anthropic Messages (and aggregators proxying Claude — assume support), OpenAI
-# Chat/Responses.
+# Chat/Responses. Gemini is gated on model: only 3.x supports multimodal functionResponse.
 _TOOL_RESULT_MEDIA_PROVIDERS = frozenset({
     "openrouter", "nous", "vertex", "bedrock", "anthropic-vertex", "google-vertex",
     "anthropic", "claude", "anthropic-direct",
     "openai", "openai-chat", "openai-codex", "azure-openai",
 })
+_GEMINI_PROVIDERS = frozenset({"google", "gemini", "google-gemini", "google-vertex-gemini"})
 
 
 def _profile_rejects_tool_media(provider: str, model: str = "") -> bool:
@@ -546,6 +547,9 @@ def _supports_media_in_tool_results(provider: str, model: str) -> bool:
         return False
     if p in _TOOL_RESULT_MEDIA_PROVIDERS:
         return True
+    if p in _GEMINI_PROVIDERS:
+        m = model.strip().lower() if isinstance(model, str) else ""
+        return any(tag in m for tag in ("gemini-3", "gemini-pro-3", "gemini-flash-3"))
     try:
         from providers import get_provider_profile
         profile = get_provider_profile(p)
@@ -800,7 +804,7 @@ _VIDEO_ERROR_RULES = (
       "unrecognized request argument", "video input", "video_url"),
      "The model does not support video analysis or the request was "
      "rejected. Ensure you're using a video-capable model "
-     "for the configured provider. Error: {e}"),
+     "(e.g. google/gemini-2.5-flash). Error: {e}"),
     (_SIZE_ERROR_HINTS,
      "The video is too large for the API. Try compressing or trimming "
      "the video (max ~50 MB). Error: {e}"),
@@ -1158,7 +1162,7 @@ VIDEO_ANALYZE_SCHEMA = {
     "name": "video_analyze",
     "description": (
         "Analyze a video from a URL or local file path using a multimodal AI model. "
-        "Sends the video to a video-capable model for understanding. "
+        "Sends the video to a video-capable model (e.g. Gemini) for understanding. "
         "Use this for video files — for images, use vision_analyze instead. "
         "Supports mp4, webm, mov, avi, mkv, mpeg formats. "
         "Note: large videos (>20 MB) may be slow; max ~50 MB."

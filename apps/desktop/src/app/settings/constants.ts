@@ -83,6 +83,14 @@ export const PROVIDER_GROUPS: ProviderPrefix[] = [
     priority: 3
   },
   {
+    prefix: 'GOOGLE_',
+    name: 'Gemini',
+    description: 'Google AI Studio (Gemini 1.5 / 2.0 / 2.5)',
+    docsUrl: 'https://aistudio.google.com/app/apikey',
+    priority: 4
+  },
+  { prefix: 'GEMINI_', name: 'Gemini', priority: 4 },
+  {
     prefix: 'DEEPSEEK_',
     name: 'DeepSeek',
     description: 'Direct DeepSeek API (V3.x, R1)',
@@ -291,6 +299,40 @@ export const ENUM_OPTIONS: Record<string, string[]> = {
     'en-US-GuyNeural',
     'en-GB-SoniaNeural'
   ],
+  'tts.gemini.model': ['gemini-2.5-flash-preview-tts', 'gemini-2.5-pro-preview-tts'],
+  // Gemini TTS prebuilt voice set.
+  'tts.gemini.voice': [
+    'Zephyr',
+    'Puck',
+    'Charon',
+    'Kore',
+    'Fenrir',
+    'Leda',
+    'Orus',
+    'Aoede',
+    'Callirrhoe',
+    'Autonoe',
+    'Enceladus',
+    'Iapetus',
+    'Umbriel',
+    'Algieba',
+    'Despina',
+    'Erinome',
+    'Algenib',
+    'Rasalgethi',
+    'Laomedeia',
+    'Achernar',
+    'Alnilam',
+    'Schedar',
+    'Gacrux',
+    'Pulcherrima',
+    'Achird',
+    'Zubenelgenubi',
+    'Vindemiatrix',
+    'Sadachbia',
+    'Sadaltager',
+    'Sulafat'
+  ],
   'tts.xai.voice_id': ['eve'],
   'tts.minimax.model': ['speech-02-hd', 'speech-02-turbo'],
   'tts.mistral.model': ['voxtral-mini-tts-2603'],
@@ -312,6 +354,7 @@ export const ENUM_OPTIONS: Record<string, string[]> = {
     'xai',
     'minimax',
     'mistral',
+    'gemini',
     'neutts',
     'kittentts',
     'piper'
@@ -359,6 +402,8 @@ export const FREE_INPUT_KEYS = new Set([
   'stt.mistral.model',
   'stt.xai.model',
   'stt.deepinfra.model',
+  'tts.gemini.model',
+  'tts.gemini.voice',
   'tts.xai.voice_id',
   'tts.minimax.model',
   'tts.minimax.voice_id',
@@ -503,6 +548,10 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     mistral: {
       model: 'Mistral TTS Model',
       voiceId: 'Mistral Voice'
+    },
+    gemini: {
+      model: 'Gemini TTS Model',
+      voice: 'Gemini Voice'
     },
     neutts: {
       model: 'NeuTTS Model',
@@ -770,6 +819,8 @@ export const SECTIONS: DesktopConfigSection[] = [
       'tts.minimax.voice_id',
       'tts.mistral.model',
       'tts.mistral.voice_id',
+      'tts.gemini.model',
+      'tts.gemini.voice',
       'tts.neutts.model',
       'tts.neutts.device',
       'tts.kittentts.model',

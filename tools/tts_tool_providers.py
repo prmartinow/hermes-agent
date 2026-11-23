@@ -1,4 +1,4 @@
-"""Cloud TTS backends for ``tools.tts_tool``: Edge, ElevenLabs, xAI, MiniMax, Mistral.
+"""Cloud TTS backends for ``tools.tts_tool``: Edge, ElevenLabs, xAI, MiniMax, Mistral, Gemini.
 
 Each ``_generate_<provider>(text, output_path, tts_config) -> path`` writes one final-encoded
 file. Shared here: bounded upstream response reading (16 MiB cap so a hostile endpoint can't
@@ -49,7 +49,11 @@ DEFAULT_XAI_SPEED_MAX = 1.5
 DEFAULT_XAI_SPEED_DEFAULT = 1.0
 DEFAULT_XAI_OPTIMIZE_STREAMING_LATENCY_DEFAULT = 0
 DEFAULT_XAI_TEXT_NORMALIZATION_DEFAULT = False
-TTS_AUDIO_TAG_REWRITE_TASK = "tts_audio_tags"
+DEFAULT_GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+DEFAULT_GEMINI_TTS_VOICE = "Kore"
+DEFAULT_GEMINI_TTS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+DEFAULT_GEMINI_AUDIO_TAGS = False
+GEMINI_AUDIO_TAG_REWRITE_TASK = "tts_audio_tags"
 TTS_RESPONSE_BODY_LIMIT_BYTES = 16 * 1024 * 1024
 TTS_RESPONSE_BODY_CHUNK_BYTES = 64 * 1024
 
@@ -179,7 +183,7 @@ def _rewrite_with_auxiliary_model(
     try:
         from agent.auxiliary_client import call_llm
         response = call_llm(
-            task=TTS_AUDIO_TAG_REWRITE_TASK, temperature=0.7,
+            task=GEMINI_AUDIO_TAG_REWRITE_TASK, temperature=0.7,
             messages=[{"role": "system", "content": system_prompt},
                       {"role": "user", "content": user_prompt}])
         return _auxiliary_reply_text(response) or fallback
@@ -462,3 +466,152 @@ def _generate_mistral_tts(text: str, output_path: str, tts_config: dict[str, Any
         logger.error("Mistral TTS failed: %s", e, exc_info=True)
         raise RuntimeError(f"Mistral TTS failed: {type(e).__name__}") from e
     return _write_bytes(output_path, audio_bytes)
+
+
+# --- Google Gemini TTS ---
+def _read_gemini_persona_prompt(gemini_config: dict[str, Any]) -> str:
+    """Read ``tts.gemini.persona_prompt_file`` (relative -> under HERMES_HOME), failing soft."""
+    raw = gemini_config.get("persona_prompt_file")
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    path = Path(os.path.expandvars(raw.strip())).expanduser()
+    if not path.is_absolute():
+        try:
+            from hermes_constants import get_hermes_home
+            path = get_hermes_home() / path
+        except Exception:
+            path = Path.cwd() / path
+    try:
+        return path.read_text(encoding="utf-8-sig").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning("Gemini TTS persona prompt file unavailable at %s: %s", path, exc)
+        return ""
+
+
+def _gemini_audio_tags_enabled(gemini_config: dict[str, Any], model: str) -> bool:
+    """Audio tags are opt-in and only Gemini 3.1 TTS models are known to honor them."""
+    raw = gemini_config.get("audio_tags")
+    if isinstance(raw, dict):
+        raw = raw.get("enabled")
+    if not _config_bool(raw, default=DEFAULT_GEMINI_AUDIO_TAGS):
+        return False
+    normalized = (model or "").strip().lower().rsplit("/", 1)[-1]
+    if "gemini-3.1" in normalized and "tts" in normalized:
+        return True
+    logger.warning("Gemini TTS audio_tags enabled, but model %s is not known to support "
+                   "Gemini audio tags; skipping hidden tag rewrite", model)
+    return False
+
+
+def _rewrite_gemini_tts_audio_tags(text: str, persona_prompt: str = "") -> str:
+    """Use the configured auxiliary model to insert Gemini audio tags (falls back to *text*)."""
+    transcript = text.strip()
+    if not transcript:
+        return text
+    system_prompt = (
+        "You rewrite transcripts for Gemini 3.1 Flash TTS by inserting expressive "
+        "audio tags.\n\n"
+        "Audio tags are inline square-bracket modifiers such as [whispers], "
+        "[excitedly], [very slow], [sarcastically], [laughs], [sighs], or [gasp]. "
+        "There is no fixed allowlist. Use creative freeform tags generously but "
+        "naturally to control tone, pace, emotional vibe, emphasis, section-level "
+        "delivery, and non-verbal sounds. Use English audio tags even when the "
+        "spoken transcript is not English.\n\n"
+        + _TAG_REWRITE_RULES +
+        "- Use square brackets for every audio tag.\n"
+        "- Do not use SSML or XML tags.\n"
+        + _TAG_REWRITE_TAIL)
+    user_prompt = (f"PERSONA AND DIRECTOR CONTEXT:\n{persona_prompt.strip() or '(none)'}\n\n"
+                   f"TRANSCRIPT TO TAG:\n{transcript}")
+    return _rewrite_with_auxiliary_model(system_prompt, user_prompt, text, label="Gemini TTS",
+                                         fallback_label="untagged text", level=logging.WARNING)
+
+
+def _compose_gemini_tts_prompt(text: str, gemini_config: dict[str, Any], persona_prompt: Optional[str] = None) -> str:
+    """Gemini prompt = persona direction + transcript; a ``{transcript}`` / ``{{transcript}}``
+    placeholder is substituted in place, otherwise the transcript is appended under a heading."""
+    transcript = text.strip()
+    if persona_prompt is None:
+        persona_prompt = _read_gemini_persona_prompt(gemini_config)
+    if not persona_prompt:
+        return transcript
+    preamble = (
+        "Synthesize speech from the TRANSCRIPT only. Treat AUDIO PROFILE, "
+        "SCENE, DIRECTOR'S NOTES, and SAMPLE CONTEXT as performance direction; "
+        "do not speak those sections aloud.")
+    for pattern in (r"\{\{\s*transcript\s*\}\}", r"\{\s*transcript\s*\}"):
+        compiled = re.compile(pattern, flags=re.IGNORECASE)
+        if compiled.search(persona_prompt):
+            return f"{preamble}\n\n{compiled.sub(transcript, persona_prompt)}".strip()
+    return f"{preamble}\n\n{persona_prompt}\n\n#### TRANSCRIPT\n{transcript}".strip()
+
+
+def _gemini_error_detail(response: Any) -> str:
+    """Best-effort ``error.message`` from a non-200 Gemini reply, else the first 300 body chars."""
+    raw_body = _read_tts_response_bytes(response, label="Gemini TTS")
+    try:
+        message = _parse_json_body(response, raw_body).get("error", {}).get("message")
+    except Exception:
+        message = None
+    return message or raw_body.decode("utf-8", errors="replace")[:300]
+
+
+def _generate_gemini_tts(text: str, output_path: str, tts_config: dict[str, Any]) -> str:
+    """Generate audio via Gemini ``generateContent`` (``responseModalities=["AUDIO"]``). The reply is
+    base64 24kHz mono 16-bit PCM, wrapped as WAV and ffmpeg-converted to the requested container."""
+    origin = _origin()
+    api_key = origin._resolve_provider_key("GEMINI_API_KEY", "gemini") or origin._resolve_provider_key(
+        "GOOGLE_API_KEY", "gemini")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY not set. Get one at https://aistudio.google.com/app/apikey")
+    gemini_config = _section(tts_config, "gemini")
+    model = str(gemini_config.get("model", DEFAULT_GEMINI_TTS_MODEL)).strip() or DEFAULT_GEMINI_TTS_MODEL
+    voice = str(gemini_config.get("voice", DEFAULT_GEMINI_TTS_VOICE)).strip() or DEFAULT_GEMINI_TTS_VOICE
+    from hermes_cli.config import get_env_value
+    from agent.gemini_native_adapter import normalize_gemini_base_url
+    base_url = normalize_gemini_base_url(
+        gemini_config.get("base_url") or get_env_value("GEMINI_BASE_URL") or DEFAULT_GEMINI_TTS_BASE_URL,
+    )
+    persona_prompt = _read_gemini_persona_prompt(gemini_config)
+    tts_script = text
+    if _gemini_audio_tags_enabled(gemini_config, model):
+        tts_script = _rewrite_gemini_tts_audio_tags(text, persona_prompt=persona_prompt)
+    prompt_text = _compose_gemini_tts_prompt(
+        tts_script, gemini_config, persona_prompt=persona_prompt)
+    max_len = origin._resolve_max_text_length("gemini", tts_config)
+    if len(prompt_text) > max_len:
+        raise ValueError(
+            "Gemini TTS composed prompt exceeds the provider request limit "
+            f"({len(prompt_text)} > {max_len} chars). Reduce the persona/audio-tag "
+            "prompt or lower tts.gemini.max_text_length so long-form text is "
+            "split with enough prompt headroom.")
+    payload: dict[str, Any] = {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
+        },
+    }
+    # HTTP errors include request URLs, so credentials must stay in headers.
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    if urlparse(base_url).hostname == "generativelanguage.googleapis.com":
+        try:
+            from hermes_cli.version_info import get_version_info
+            headers["X-Goog-Api-Client"] = f"hermes-agent/{get_version_info().base_version}"
+        except Exception:
+            headers["X-Goog-Api-Client"] = "hermes-agent/0.0.0"
+    response = _post_json(f"{base_url}/models/{model}:generateContent", payload, headers)
+    if response.status_code != 200:
+        raise RuntimeError(f"Gemini TTS API error (HTTP {response.status_code}): {_gemini_error_detail(response)}")
+    try:
+        data = _read_tts_response_json(response, label="Gemini TTS")
+        parts = data["candidates"][0]["content"]["parts"]
+        audio_part = next((p for p in parts if "inlineData" in p or "inline_data" in p), None)
+        if audio_part is None:
+            raise RuntimeError("Gemini TTS response contained no audio data")
+        audio_b64 = (audio_part.get("inlineData") or audio_part.get("inline_data") or {}).get("data", "")
+    except (KeyError, IndexError, TypeError) as e:
+        raise RuntimeError(f"Gemini TTS response was malformed: {e}") from e
+    if not audio_b64:
+        raise RuntimeError("Gemini TTS returned empty audio data")
+    return _write_wav_bytes_as(_wrap_pcm_as_wav(base64.b64decode(audio_b64)), output_path)

@@ -8,9 +8,12 @@ removed mid-session can't hand the session another account's key.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 from typing import Any
 
 from agent.custom_entry_pool import SNAPSHOT_OWNER_KEY, runtime_entry_owner
+from agent.route_verdicts import ROUTE_VERDICT_FIELDS
 
 
 def _snapshot_primary_runtime(agent):
@@ -82,3 +85,40 @@ def _build_primary_runtime_snapshot(agent, api_mode) -> dict[str, Any]:
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
     return rt
+
+
+# Pool reload is part of the switch and must be reversible on rollback, hence the pool fields.
+_SWITCH_SNAPSHOT_FIELDS = (
+    "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
+    "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
+    "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
+    "_credential_pool", "_credential_pool_entry_id", *ROUTE_VERDICT_FIELDS,
+    "_usage_anchor", "_turn_base_usage_anchor",
+)
+_MISSING = object()
+
+
+def _snapshot_switch_state(agent) -> dict[str, Any]:
+    """Snapshot every field the swap+rebuild mutates so a failed rebuild rolls back atomically
+    (else a new model name + OLD client 400s next turn). The sentinel distinguishes unset from
+    None: tests build bare agents via ``__new__`` without all fields."""
+    snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
+    # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
+    snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    if isinstance(snapshot.get("_usage_anchor"), dict):
+        snapshot["_usage_anchor"] = copy.deepcopy(snapshot["_usage_anchor"])
+    if isinstance(snapshot.get("_turn_base_usage_anchor"), dict):
+        snapshot["_turn_base_usage_anchor"] = copy.deepcopy(snapshot["_turn_base_usage_anchor"])
+    return snapshot
+
+
+def _restore_switch_snapshot(agent, snapshot: dict[str, Any]) -> None:
+    for name, value in snapshot.items():
+        if value is _MISSING:
+            continue  # attribute did not exist before the swap; don't fabricate it
+        with contextlib.suppress(Exception):
+            setattr(agent, name, value)
+    if "_usage_anchor" in snapshot and snapshot["_usage_anchor"] is not _MISSING:
+        with contextlib.suppress(Exception):
+            from agent.usage_anchor import persist_usage_anchor
+            persist_usage_anchor(agent, snapshot["_usage_anchor"])

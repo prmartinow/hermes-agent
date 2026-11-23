@@ -1461,6 +1461,8 @@ def _openai_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]
     # Curated order, only models the account has access to; an account serving none of them (rare)
     # falls back to curated so the picker still offers sane defaults.
     discovered = [m for m in curated if m.lower() in live_lower]
+    # Astra is intentionally absent from offline/static catalogs: the official API's
+    # account-scoped /models response is the only source that may advertise it.
     discovered.extend(m for m in live if is_astra_model(m))
     return discovered or curated or live
 
@@ -1729,12 +1731,10 @@ def _static_catalog(normalized: str, fetcher: Any) -> list[str]:
 def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
     """Best known model catalog for a provider: per-provider live fetchers, then the generic profile
     fetch, then the static list (merged with models.dev for ``_MODELS_DEV_PREFERRED`` providers)."""
-    from hermes_cli.providers import provider_removed
-    if provider_removed(provider):
-        return []
     requested = str(provider or "").strip().lower()
     if requested == "ollama":
         return _ollama_local_catalog(force_refresh)
+
     normalized = normalize_provider(provider)
     # A configured `model.base_url` relay is TERMINAL for live catalog egress: the picker must
     # list what the configured endpoint serves and must never touch the vendor host (#121387).

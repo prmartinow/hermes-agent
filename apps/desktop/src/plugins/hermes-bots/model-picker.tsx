@@ -177,7 +177,7 @@ export function ModelPicker({ bot = null, value, onChange, placeholderModel }: M
                 model: event.target.value
               })
             }
-            placeholder="anthropic/claude-sonnet-4"
+            placeholder="antigravity/gemini-3.6-flash-high"
             value={value.model}
           />
         )}
@@ -209,7 +209,7 @@ export function ModelPicker({ bot = null, value, onChange, placeholderModel }: M
                   model: event.target.value
                 })
               }
-              placeholder="anthropic/claude-sonnet-4"
+              placeholder="antigravity/gemini-3.6-flash-high"
               value={value.model}
             />
           )}

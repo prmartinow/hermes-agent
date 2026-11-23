@@ -222,8 +222,8 @@ def test_cli_flow_classifies_landed_backed_out_failed_and_raised(marks, monkeypa
             pass  # returned without saving: backed out
         with setup_metrics.cli_provider_setup("nous"):
             setup_metrics.note_provider_setup_failure("no_models")
-        with setup_metrics.cli_provider_setup("deepseek"):
-            route["v"] = ("deepseek", "g", None)  # route changed without the save helper
+        with setup_metrics.cli_provider_setup("gemini"):
+            route["v"] = ("gemini", "g", None)  # route changed without the save helper
         with pytest.raises(KeyboardInterrupt):
             with setup_metrics.cli_provider_setup("xai"):
                 raise KeyboardInterrupt
@@ -235,7 +235,7 @@ def test_cli_flow_classifies_landed_backed_out_failed_and_raised(marks, monkeypa
     ends = [r for r in _setup_rows(marks.rows) if r[2] != "started"]
     assert ends == [
         ("cli_setup", "anthropic", "completed", "none"), ("cli_setup", "anthropic", "abandoned", "none"),
-        ("cli_setup", "nous", "failed", "no_models"), ("cli_setup", "deepseek", "completed", "none"),
+        ("cli_setup", "nous", "failed", "no_models"), ("cli_setup", "gemini", "completed", "none"),
         ("cli_setup", "xai", "abandoned", "none"), ("cli_setup", "xai", "failed", "network"),
     ]
     setup_metrics.note_provider_setup_saved()  # outside a flow: inert
@@ -260,7 +260,7 @@ def test_cli_setup_navigation_esc_cancels_and_back_resumes_one_flow(marks, monke
         attempt("anthropic")
         with pytest.raises(_SetupGoBack):
             attempt("nous", _SetupGoBack(1))  # Back, then another provider
-        attempt("deepseek")
+        attempt("gemini")
     with pytest.raises(_SetupGoBack):  # a wizard section replay keeps the flow open across the surface
         with setup_metrics.provider_setup_surface("cli_setup"):
             attempt("xai", _SetupGoBack(0))
@@ -270,7 +270,7 @@ def test_cli_setup_navigation_esc_cancels_and_back_resumes_one_flow(marks, monke
         ("cli_model", "xai", "started", "none"), ("cli_model", "xai", "abandoned", "none"),
         ("cli_model", "anthropic", "started", "none"), ("cli_model", "anthropic", "completed", "none"),
         ("cli_model", "nous", "started", "none"), ("cli_model", "nous", "abandoned", "none"),
-        ("cli_model", "deepseek", "started", "none"), ("cli_model", "deepseek", "completed", "none"),
+        ("cli_model", "gemini", "started", "none"), ("cli_model", "gemini", "completed", "none"),
         ("cli_setup", "xai", "started", "none"), ("cli_setup", "xai", "abandoned", "none"),
     ]
 
@@ -459,8 +459,8 @@ def test_pending_oauth_session_does_not_settle(marks, monkeypatch):
 def test_api_key_env_maps_to_provider_only():
     assert setup_metrics.provider_for_api_key_env("OPENROUTER_API_KEY") == "openrouter"
     assert setup_metrics.provider_for_api_key_env("GITHUB_TOKEN_FOR_TOOLS_XYZ") is None
-    # Ecosystem tokens and keys a tool panel also asks for (xAI TTS) are not a provider connection.
-    for shared in ("GITHUB_TOKEN", "GH_TOKEN", "HF_TOKEN", "XAI_API_KEY"):
+    # Ecosystem tokens and keys a tool panel also asks for (Gemini TTS) are not a provider connection.
+    for shared in ("GITHUB_TOKEN", "GH_TOKEN", "HF_TOKEN", "GEMINI_API_KEY"):
         assert setup_metrics.provider_for_api_key_env(shared) is None
 
 
@@ -476,12 +476,12 @@ def test_web_forms_count_only_a_new_provider_key_or_endpoint(marks, monkeypatch)
                        ("OPENROUTER_API_KEY", ""), ("OPENROUTER_API_KEY", "sk-or-b"),  # clear, then a new key
                        ("GITHUB_TOKEN", "ghp_" + "b" * 36)):
         config_env._save_env_credential(key, value)
-    config_env._save_env_credential("XAI_API_KEY", "xa-a")  # Keys page: could be the TTS tool's key
-    config_env._save_env_credential("XAI_API_KEY", "xa-b", provider_setup=True)  # a provider-connection form
+    config_env._save_env_credential("GEMINI_API_KEY", "gm-a")  # Keys page: could be the TTS tool's key
+    config_env._save_env_credential("GEMINI_API_KEY", "gm-b", provider_setup=True)  # a provider-connection form
     body = {"name": "Acme LLM", "base_url": "http://10.0.0.5:8080/v1", "model": "acme-70b"}
     endpoint = config_env.upsert_custom_endpoint(CustomEndpointUpdate(**body))["id"]
     config_env.upsert_custom_endpoint(CustomEndpointUpdate(id=endpoint, **{**body, "model": "acme-70b-v2"}))
-    assert done == ["openrouter", "openrouter", "xai", "custom"]
+    assert done == ["openrouter", "openrouter", "gemini", "custom"]
 
 
 # ---- feature disabled ----

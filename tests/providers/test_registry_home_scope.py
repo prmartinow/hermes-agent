@@ -46,7 +46,7 @@ def homes(tmp_path, monkeypatch):
     bare_home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(bare_home))
     monkeypatch.setenv("FAKE_AMBIENT_GH_TOKEN", TOKEN)
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek-key")
+    monkeypatch.setenv("GEMINI_API_KEY", "AIza" + "x" * 35)
     monkeypatch.setattr(providers, "_REGISTRY", dict(providers._REGISTRY))
     monkeypatch.setattr(providers, "_ALIASES", dict(providers._ALIASES))
     monkeypatch.setattr(providers, "_PROVIDER_LIST_CACHE", None)
@@ -101,8 +101,8 @@ def _assert_owner(view: dict) -> None:
     assert view["creds"] is True
     assert view["runtime_explicit"] == (SLUG, "https://ambient-fake.invalid/v1", True)
     # ambient credentials never auto-select, even where the plugin lives
-    assert view["auto"] == "deepseek"
-    assert view["runtime_auto"][0] == "deepseek"
+    assert view["auto"] == "gemini"
+    assert view["runtime_auto"][0] == "gemini"
 
 
 def _assert_absent(view: dict) -> None:
@@ -114,8 +114,8 @@ def _assert_absent(view: dict) -> None:
     assert isinstance(view["explicit"], AuthError)
     assert isinstance(view["creds"], AuthError)
     assert isinstance(view["runtime_explicit"], Exception)
-    assert view["auto"] == "deepseek"
-    assert view["runtime_auto"][0] == "deepseek" and view["runtime_auto"][2] is False
+    assert view["auto"] == "gemini"
+    assert view["runtime_auto"][0] == "gemini" and view["runtime_auto"][2] is False
 
 
 def test_mirrored_row_is_absent_in_a_home_without_the_plugin_a_b_a(homes):
@@ -133,7 +133,7 @@ def test_setup_detection_ignores_another_homes_mirrored_row(homes, monkeypatch):
     import providers
 
     plugin_home, bare_home = homes
-    monkeypatch.delenv("DEEPSEEK_API_KEY")
+    monkeypatch.delenv("GEMINI_API_KEY")
     _bound(plugin_home, lambda: providers.get_provider_profile(SLUG))
     assert _bound(plugin_home, lambda: _model_section_has_credentials({"model": {"provider": SLUG}})) is True
     assert _bound(bare_home, lambda: _model_section_has_credentials({"model": {"provider": SLUG}})) is False
@@ -149,6 +149,6 @@ def test_hidden_rows_survive_registry_reordering(homes):
     plugin_home, bare_home = homes
     _bound(plugin_home, lambda: providers.get_provider_profile(SLUG))
     assert _bound(plugin_home, lambda: SLUG in PROVIDER_REGISTRY) is True
-    row = dict.__getitem__(PROVIDER_REGISTRY, "deepseek")
+    row = dict.__getitem__(PROVIDER_REGISTRY, "gemini")
     _bound(bare_home, lambda: _insert_row(PROVIDER_REGISTRY, row, "lmstudio"))
     assert _bound(plugin_home, lambda: SLUG in PROVIDER_REGISTRY) is True

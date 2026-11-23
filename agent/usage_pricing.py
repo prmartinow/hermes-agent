@@ -443,7 +443,7 @@ _SNAPSHOT_PROVIDER_ALIASES = {
 }
 # AI Studio and Vertex host the same Gemini models (the Vertex "google/" vendor
 # prefix is stripped with the rest of the path).
-_GOOGLE_PROVIDER_NAMES = {"google", "gemini", "google-gemini", "google-ai-studio"}
+_GOOGLE_PROVIDER_NAMES = {"google", "gemini", "vertex", "google-gemini", "google-ai-studio", "google-vertex", "vertex-ai"}
 
 
 def resolve_billing_route(
@@ -474,7 +474,10 @@ def resolve_billing_route(
         return BillingRoute(provider="nous", model=model, base_url=base_url or _NOUS_DEFAULT_BASE_URL, billing_mode="official_models_api")
     snapshot_provider = _SNAPSHOT_PROVIDER_ALIASES.get(provider_name)
     if snapshot_provider is None:
-        if provider_name in _GOOGLE_PROVIDER_NAMES or host("generativelanguage.googleapis.com"):
+        if (
+            provider_name in _GOOGLE_PROVIDER_NAMES
+            or host("aiplatform.googleapis.com") or host("generativelanguage.googleapis.com")
+        ):
             snapshot_provider = "google"
         elif provider_name == "fireworks" or host("api.fireworks.ai"):
             snapshot_provider = "fireworks"

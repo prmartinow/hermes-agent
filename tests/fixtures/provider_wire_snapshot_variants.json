@@ -949,6 +949,201 @@
    ]
   }
  },
+ "aux:gemini": {
+  "aux_options": {},
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "high": {
+   "extra_body": {
+    "thinking_config": {
+     "includeThoughts": true,
+     "thinkingLevel": "high"
+    }
+   },
+   "max_tokens": 1024,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-flash",
+   "temperature": 0.3,
+   "timeout": 30.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  },
+  "model": "gemini-3-flash",
+  "off": {
+   "extra_body": {
+    "thinking_config": {
+     "includeThoughts": false,
+     "thinkingLevel": "low"
+    }
+   },
+   "max_tokens": 1024,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-flash",
+   "temperature": 0.3,
+   "timeout": 30.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  },
+  "provider": "gemini",
+  "unset": {
+   "max_tokens": 1024,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-flash",
+   "temperature": 0.3,
+   "timeout": 30.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  }
+ },
  "aux:kimi-coding": {
   "aux_options": {},
   "base_url": "https://api.kimi.com/coding/v1",
@@ -2504,6 +2699,33 @@
   "base_url": "http://127.0.0.1:8080/v1",
   "model": "my-local-model",
   "provider": "custom",
+  "removed": []
+ },
+ "stream:gemini-native": {
+  "added": {
+   "stream": true,
+   "timeout": "Timeout(connect=30.0, read=120.0, write=1800.0, pool=30.0)"
+  },
+  "agent_attrs": {},
+  "api_mode": "chat_completions",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "model": "gemini-3-pro",
+  "provider": "gemini",
+  "removed": []
+ },
+ "stream:gemini-openai": {
+  "added": {
+   "stream": true,
+   "stream_options": {
+    "include_usage": true
+   },
+   "timeout": "Timeout(connect=30.0, read=120.0, write=1800.0, pool=30.0)"
+  },
+  "agent_attrs": {},
+  "api_mode": "chat_completions",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+  "model": "gemini-3-pro",
+  "provider": "gemini",
   "removed": []
  },
  "stream:llamacpp": {
@@ -4218,6 +4440,457 @@
     }
    ],
    "model": "deepseek-v3.2",
+   "timeout": 1800.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  }
+ },
+ "variant:gemini-max-tokens": {
+  "agent_kwargs": {
+   "max_tokens": 1024
+  },
+  "api_mode": "chat_completions",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta",
+  "high": {
+   "extra_body": {
+    "thinking_config": {
+     "includeThoughts": true,
+     "thinkingLevel": "high"
+    }
+   },
+   "max_tokens": 65535,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-pro",
+   "timeout": 1800.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  },
+  "low": {
+   "extra_body": {
+    "thinking_config": {
+     "includeThoughts": true,
+     "thinkingLevel": "low"
+    }
+   },
+   "max_tokens": 65535,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-pro",
+   "timeout": 1800.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  },
+  "minimal": {
+   "extra_body": {
+    "thinking_config": {
+     "includeThoughts": true,
+     "thinkingLevel": "low"
+    }
+   },
+   "max_tokens": 65535,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-pro",
+   "timeout": 1800.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  },
+  "model": "gemini-3-pro",
+  "none": {
+   "extra_body": {
+    "thinking_config": {
+     "includeThoughts": false,
+     "thinkingLevel": "low"
+    }
+   },
+   "max_tokens": 1024,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-pro",
+   "timeout": 1800.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  },
+  "off": {
+   "extra_body": {
+    "thinking_config": {
+     "includeThoughts": false,
+     "thinkingLevel": "low"
+    }
+   },
+   "max_tokens": 1024,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-pro",
+   "timeout": 1800.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  },
+  "provider": "gemini",
+  "unset": {
+   "max_tokens": 1024,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-pro",
+   "timeout": 1800.0,
+   "tools": [
+    {
+     "function": {
+      "description": "Run a shell command.",
+      "name": "terminal",
+      "parameters": {
+       "properties": {
+        "command": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "command"
+       ],
+       "type": "object"
+      }
+     },
+     "type": "function"
+    }
+   ]
+  },
+  "xhigh": {
+   "extra_body": {
+    "thinking_config": {
+     "includeThoughts": true,
+     "thinkingLevel": "high"
+    }
+   },
+   "max_tokens": 65535,
+   "messages": [
+    {
+     "content": "You are a test agent.",
+     "role": "system"
+    },
+    {
+     "content": "list files",
+     "role": "user"
+    },
+    {
+     "content": "",
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "function": {
+        "arguments": "{\"command\": \"ls\"}",
+        "name": "terminal"
+       },
+       "id": "call_1",
+       "type": "function"
+      }
+     ]
+    },
+    {
+     "content": "a.txt\nb.txt",
+     "role": "tool",
+     "tool_call_id": "call_1"
+    },
+    {
+     "content": "thanks, now summarize",
+     "role": "user"
+    }
+   ],
+   "model": "gemini-3-pro",
    "timeout": 1800.0,
    "tools": [
     {

@@ -1,4 +1,4 @@
-"""Google Vertex AI provider profile via Google Cloud's OpenAI-compatible endpoint.
+"""Google Vertex AI provider profile: Gemini via Google Cloud's OpenAI-compatible endpoint.
 
 Auth is OAuth2 (service-account JSON or ADC), not a static key: ``agent/vertex_adapter.py``
 mints ``(token, base_url)`` and the token is passed as ``api_key``. ``auth_type="vertex"``
@@ -12,28 +12,24 @@ from providers.base import ProviderProfile
 
 
 class VertexProfile(ProviderProfile):
-    """Vertex AI provider profile."""
+    """Vertex AI — reuse Gemini's thinking_config translation for extra_body."""
 
     def build_extra_body(self, *, session_id: str | None = None, **context: Any) -> dict[str, Any]:
-        """Translate partner-model reasoning to the Vertex-compatible request body."""
-        model = str(context.get("model") or "").lower()
-        reasoning = context.get("reasoning_config")
-        if "claude" not in model or not isinstance(reasoning, dict):
-            return {}
-        effort = str(reasoning.get("effort", "medium") or "medium").strip().lower()
-        if reasoning.get("enabled") is False or effort == "none":
-            config = {"include_thoughts": False}
-        else:
-            budgets = {"minimal": 1024, "low": 1024, "medium": 4096, "high": 16384, "max": 24576, "ultra": 32768}
-            config = {"include_thoughts": True, "thinking_budget": budgets.get(effort, 4096)}
-        return {"extra_body": {"google": {"thinking_config": config}}}
+        """Emit ``extra_body.google.thinking_config`` like the ``gemini`` provider's OpenAI-compat subpath."""
+        from agent.reasoning_effort import gemini_top_thinking_level
+        from agent.transports.chat_completions import _build_gemini_thinking_config, _snake_case_gemini_thinking_config
+
+        raw = _build_gemini_thinking_config(context.get("model") or "", context.get("reasoning_config"))
+        raw = gemini_top_thinking_level(context.get("model"), context.get("reasoning_config"), raw) if raw else raw
+        thinking_config = _snake_case_gemini_thinking_config(raw) if raw else None
+        return {"extra_body": {"google": {"thinking_config": thinking_config}}} if thinking_config else {}
 
 
 vertex = VertexProfile(
     name="vertex", aliases=("google-vertex", "vertex-ai", "gcp-vertex", "vertexai"), api_mode="chat_completions",
     env_vars=(),  # OAuth2 via service account / ADC — not a static key env var
     base_url="https://aiplatform.googleapis.com",  # real base_url computed at runtime
-    auth_type="vertex", default_aux_model="claude-haiku-4-5",
+    auth_type="vertex", default_aux_model="google/gemini-3.6-flash",
     supports_model_listing=False,  # no /models route on the OpenAI-compat endpoint; setup ships a curated list
 )
 

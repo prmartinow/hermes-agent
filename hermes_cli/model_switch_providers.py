@@ -274,10 +274,8 @@ def _iter_builtin_candidates(models_dev_data: dict, excluded: set, seen: set):
     from agent.models_dev import models_dev_provider_map
     from hermes_cli.auth import PROVIDER_REGISTRY, is_runtime_provider_routable
     from hermes_cli.models import _AGGREGATOR_PROVIDERS
-    from hermes_cli.providers import ALIASES, provider_removed
+    from hermes_cli.providers import ALIASES
     for hermes_id, mdev_id in models_dev_provider_map().items():
-        if provider_removed(hermes_id):
-            continue
         alias_target = ALIASES.get(hermes_id)
         if alias_target and alias_target != hermes_id and alias_target in _AGGREGATOR_PROVIDERS:
             continue
@@ -998,10 +996,7 @@ def _lap_user_provider_rows(b: _PickerBuild, user_providers: dict) -> None:
     from hermes_cli.model_switch import _scoped_key_env
     from hermes_cli.config import coerce_provider_id, is_provider_enabled
     ep_groups: dict[tuple, dict] = {}
-    from hermes_cli.providers import provider_removed
     for ep_name, ep_cfg in user_providers.items():
-        if provider_removed(ep_name):
-            continue
         if not isinstance(ep_cfg, dict) or not is_provider_enabled(ep_cfg) or ep_name.lower() in b.seen_slugs:
             continue
         display_name = coerce_provider_id(ep_cfg.get("name")) or ep_name

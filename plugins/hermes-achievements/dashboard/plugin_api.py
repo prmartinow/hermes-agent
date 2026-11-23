@@ -119,6 +119,7 @@ ACHIEVEMENTS: list[dict[str, Any]] = [
     _ach("provider_polyglot", "Provider Polyglot", "Use models from multiple providers across Hermes history.", "Model Lore", "swap", metric="distinct_provider_count", tiers=[2, 3, 5, 8, 12]),
     _ach("model_sommelier", "Model Sommelier", "Taste enough model/provider conversations to develop preferences.", "Model Lore", "wine", metric="model_events", tiers=[250, 750, 2000, 6000, 15000]),
     _ach("claude_confidant", "Claude Confidant", "Bring Claude-flavored reasoning into the workflow repeatedly.", "Model Lore", "quote", metric="claude_events", tiers=[50, 150, 500, 1500, 4000]),
+    _ach("gemini_cartographer", "Gemini Cartographer", "Map enough Gemini-related workflows to know the terrain.", "Model Lore", "compass", metric="gemini_events", tiers=[50, 150, 500, 1500, 4000]),
     _ach("open_weights_pilgrim", "Open Weights Pilgrim", "Actually chat with local/open-weight models through Hermes session metadata.", "Model Lore", "terminal", metric="local_model_chat_sessions", tiers=[1, 3, 10, 30, 100]),
 
     # Workflow Intelligence
@@ -266,7 +267,7 @@ def _count_tool(tool_names: list[str], *needles: str) -> int:
     return sum(1 for name in lowered if any(needle in name for needle in needles))
 
 
-_PROVIDER_MARKERS = ["openai", "anthropic", "google", "mistral", "meta", "qwen", "deepseek", "xai", "nous", "ollama", "groq", "openrouter", "codex"]
+_PROVIDER_MARKERS = ["openai", "anthropic", "google", "gemini", "mistral", "meta", "qwen", "deepseek", "xai", "nous", "ollama", "groq", "openrouter", "codex"]
 _LOCAL_MARKERS = ["ollama", "llama.cpp", "localhost", "127.0.0.1", "local/", "local:", "gguf", "vllm-local"]
 
 
@@ -278,7 +279,7 @@ def model_provider(model_name: str) -> Optional[str]:
         return name.split("/", 1)[0]
     for provider in _PROVIDER_MARKERS:
         if provider in name:
-            return provider
+            return "google" if provider == "gemini" else provider
     return name.split(":", 1)[0].split("-", 1)[0]
 
 
@@ -369,10 +370,11 @@ def analyze_messages(session_id: str, title: str, messages: list[dict[str, Any]]
         "plugin_events": hits(r"plugin|dashboard-plugins|__HERMES_PLUGIN|manifest\.json"),
         "rollback_events": hits(r"rollback|checkpoint"),
         "docs_activity_events": hits(r"docs|documentation|docusaurus|README"),
-        "model_events": hits(r"model|provider|openrouter|codex|claude|anthropic|openai|mistral|qwen|deepseek|llama|ollama|vllm|gguf"),
+        "model_events": hits(r"model|provider|openrouter|codex|gemini|claude|anthropic|openai|mistral|qwen|deepseek|llama|ollama|vllm|gguf"),
         "openrouter_events": hits(r"openrouter"),
         "codex_events": hits(r"codex"),
         "claude_events": hits(r"claude|anthropic"),
+        "gemini_events": hits(r"gemini|google ai|google model"),
         "local_model_events": hits(r"ollama|llama\.cpp|gguf|vllm|local model|open[- ]weight|open weights"),
         "toolset_events": hits(r"toolset|enabled_toolsets|browser tool|terminal tool|file tool|web tool"),
         "config_events": hits(r"config\.ya?ml|\b[a-z0-9_-]+config\.(?:js|ts|json|ya?ml)|\.env(?:\b|\.)|manifest\.json|settings\.json|pyproject\.toml|package\.json"),
@@ -491,6 +493,7 @@ METRIC_LABELS = {
     "distinct_model_count": "distinct model names seen in session metadata",
     "distinct_provider_count": "distinct model providers inferred from session metadata",
     "claude_events": "Claude/Anthropic model mentions",
+    "gemini_events": "Gemini/Google model mentions",
     "local_model_events": "local/open-weight model mentions",
     "local_model_chat_sessions": "Hermes sessions whose model metadata is local/open-weight",
     "toolset_events": "toolset or tool-family mentions",
@@ -654,7 +657,7 @@ _SESSION_SUM_METRICS = {
     "tts_calls": "tts_calls"}
 # ``*_events`` counters summed under their own name.
 _SESSION_EVENT_KEYS = [
-    "traceback_events", "log_read_events", "port_conflict_events", "permission_denied_events", "install_error_events", "install_success_events", "restart_after_error_events", "env_var_error_events", "yaml_error_events", "docker_conflict_events", "frontend_activity_events", "css_activity_events", "git_events", "tiny_patch_after_errors_events", "skill_events", "skill_manage_events", "memory_events", "memory_write_events", "context_events", "gateway_events", "plugin_events", "rollback_events", "docs_activity_events", "model_events", "openrouter_events", "codex_events", "claude_events", "local_model_events", "toolset_events", "config_events", "git_history_events", "test_events", "screenshot_events", "release_events", "cache_events",
+    "traceback_events", "log_read_events", "port_conflict_events", "permission_denied_events", "install_error_events", "install_success_events", "restart_after_error_events", "env_var_error_events", "yaml_error_events", "docker_conflict_events", "frontend_activity_events", "css_activity_events", "git_events", "tiny_patch_after_errors_events", "skill_events", "skill_manage_events", "memory_events", "memory_write_events", "context_events", "gateway_events", "plugin_events", "rollback_events", "docs_activity_events", "model_events", "openrouter_events", "codex_events", "claude_events", "gemini_events", "local_model_events", "toolset_events", "config_events", "git_history_events", "test_events", "screenshot_events", "release_events", "cache_events",
 ]
 
 

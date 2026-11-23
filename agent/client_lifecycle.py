@@ -968,8 +968,6 @@ class ClientLifecycleMixin:
         self._credential_pool_entry_id = getattr(entry, "id", None)
         from hermes_cli.route_identity import normalize_route_base_url
         route_changed = normalize_route_base_url(self.base_url) != normalize_route_base_url(runtime_base)
-
-
         if self.api_mode == "anthropic_messages":
             with suppress(Exception):
                 self._anthropic_client.close()
@@ -984,8 +982,6 @@ class ClientLifecycleMixin:
         self.api_key, self.base_url = runtime_key, stripped_base
         # Inlined (not _sync_client_kwargs_credentials): tests call this unbound on a SimpleNamespace agent.
         self._client_kwargs["api_key"] = self.api_key
-        if "access_token" in self._client_kwargs:
-            self._client_kwargs["access_token"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
         self._reapply_route_client_config(route_changed=route_changed)
         self._replace_primary_openai_client(reason="credential_rotation")

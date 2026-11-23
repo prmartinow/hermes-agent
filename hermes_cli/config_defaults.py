@@ -578,9 +578,7 @@ DEFAULT_CONFIG = {
         # lower of the ratio threshold and this count. Clamped to the model's context length.
         # Off by default: no single count suits windows from 64K to 1M+, so the ratio decides.
         "threshold_tokens": None,
-        # Optional model families or patterns exempt from an explicitly configured absolute cap.
-        "threshold_tokens_exempt_models": [],
-        # "progress_notices": False,    # opt-in (#52995): when True, routine compression
+        "threshold_tokens_exempt_models": [],  # Model name patterns exempt from the absolute cap.
         "target_ratio": 0.20,         # fraction of threshold to preserve as recent tail
         # tail_mode: "lean" = clamped 2.5%-of-window tail (10K floor / 25K cap) plus chunked
         # digests, anchor index, verbatim user messages and session_search pointers in the summary
@@ -713,8 +711,8 @@ DEFAULT_CONFIG = {
         },
     },
     # Auxiliary model config — provider/model per side task. provider "auto" = auto-detect;
-    # empty model = provider's default aux model; the auto chain can fall back to
-    # OpenRouter when the configured provider is unavailable.
+    # empty model = provider's default aux model; all tasks fall back to
+    # openrouter:google/gemini-3-flash-preview when the configured provider is unavailable.
     # extra_body is forwarded verbatim as request body fields for that task, e.g. OpenRouter
     # routing prefs / Pareto Code floor:
     #   auxiliary:
@@ -733,8 +731,8 @@ DEFAULT_CONFIG = {
         # ":free" — a PAID lane is never used for background aux traffic even with
         # OPENROUTER_API_KEY set.
         "free_only": False,
-        # Override the auto-chain's OpenRouter fallback model (default nvidia/nemotron-3-ultra-550b-a55b:free).
-        # Pair a free model with free_only: true. A one-time
+        # Override the auto-chain's OpenRouter fallback model (default google/gemini-3.6-flash,
+        # PAID). Pair e.g. "nvidia/nemotron-3-ultra-550b-a55b:free" with free_only: true. A one-time
         # WARNING is logged whenever a non-":free" model is engaged.
         "openrouter_model": "",
         # Endpoints that reject NON-streaming chat (HTTP 400): aux calls are sent with stream=True
@@ -1057,11 +1055,11 @@ DEFAULT_CONFIG = {
     },
     # Text-to-speech. Each provider accepts an optional `max_text_length:` override for the
     # per-request input-character cap; omit to use the provider's documented limit (OpenAI 4096, xAI
-    # 15000, MiniMax 10000, ElevenLabs 5k-40k model-aware, Edge 5000, Mistral 4000,
+    # 15000, MiniMax 10000, ElevenLabs 5k-40k model-aware, Gemini 32000, Edge 5000, Mistral 4000,
     # NeuTTS/KittenTTS 2000).
     "tts": {
         # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" |
-        # "deepinfra" | "neutts" (local) | "kittentts" (local) | "piper" (local)
+        # "gemini" | "deepinfra" | "neutts" (local) | "kittentts" (local) | "piper" (local)
         "provider": "edge",
         # Seconds a local engine (Piper, KittenTTS) stays loaded after the last speech toggle
         # turns off, so a quick re-activation (wake word, voice-chat restart) skips the reload.
@@ -1091,6 +1089,15 @@ DEFAULT_CONFIG = {
             # Raw PCM rate for streaming playback. OpenAI emits 24 kHz; a compatible endpoint that
             # reports its rate (X-Audio-Sample-Rate header) overrides this automatically.
             "pcm_sample_rate": 24000,
+        },
+        "gemini": {
+            "model": "gemini-2.5-flash-preview-tts",
+            "voice": "Kore",
+            # Gemini 3.1: aux-model rewrite inserts [audio tags] into the TTS script only.
+            "audio_tags": False,
+            # Optional local text file with performance direction; may include a `{transcript}`
+            # placeholder, else the live transcript is appended.
+            "persona_prompt_file": "",
         },
         "xai": {
             "voice_id": "eve",  # or a custom voice ID (docs.x.ai custom voices)
@@ -1271,7 +1278,7 @@ DEFAULT_CONFIG = {
     "delegation": {
         "backend": "default",
         "backends": {},
-        "model": "",  # Empty = inherit parent.
+        "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
         # Fallback chain for delegated children (same entry format as the top-level list).
         # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
@@ -2631,13 +2638,14 @@ DEFAULT_CONFIG = {
         # up and nothing is used.
         "guest": True,
     },
-    # Google Vertex AI. Auth is OAuth2 from a service-account JSON or ADC, NOT an API key;
+    # Google Vertex AI (Gemini). Auth is OAuth2 from a service-account JSON or ADC, NOT an API key;
     # the credential path lives in .env (VERTEX_CREDENTIALS_PATH / GOOGLE_APPLICATION_CREDENTIALS).
     # Bridged to VERTEX_PROJECT_ID / VERTEX_REGION.
     "vertex": {
         # GCP project ID. Empty → project_id from the service-account JSON (or ADC).
         "project_id": "",
-        # Use a regional endpoint such as "us-central1" for region-pinned models.
+        # "global" is required for Gemini 3.x preview models (regional endpoints silently 404); use
+        # e.g. "us-central1" only if your models are region-pinned.
         "region": "global",
     },
     # Managed llama.cpp runtime (docs: user-guide/local-models): official binaries, one supervised

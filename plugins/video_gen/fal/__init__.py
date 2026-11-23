@@ -81,6 +81,10 @@ FAL_FAMILIES: dict[str, dict[str, Any]] = {
                                 "xai/grok-imagine-video/v1.5/text-to-video", "xai/grok-imagine-video/v1.5/image-to-video", duration_int=True,
                                 image_drop_keys=("aspect_ratio",), aspect_ratios=("16:9", "4:3", "3:2", "1:1", "2:3", "3:4", "9:16"),  # aspect is t2v-only
                                 resolutions=("480p", "720p", "1080p"), durations=(1, 15), audio_native=True),
+    # v1.1 (Aug 2026) added text-to-video and a 360p-4k resolution enum; v1.0 was image-only.
+    "gemini-omni-flash": _family("Gemini Omni Flash 1.1 (via FAL)", "~60-120s", "premium", "Google. Text & image to video with native audio, physics-grounded motion, up to 4K, 3-10s.",
+                                 "google/gemini-omni-flash/v1.1/text-to-video", "google/gemini-omni-flash/v1.1/image-to-video", duration_int=True,
+                                 aspect_ratios=("16:9", "9:16"), resolutions=("360p", "720p", "1080p", "4k"), durations=(3, 10), audio_native=True),
     # Kling 3.0 core tiers: t2v declares aspect_ratio, i2v derives it from `start_image_url`; string duration enum "3".."15";
     # generate_audio is a real toggle (default on, audio-on costs more); no resolution or seed keys in the v3 schemas.
     "kling-v3": _family("Kling 3.0 (Standard)", "~60-180s", "premium", "Kuaishou frontier core model. Cinematic motion, native audio, 3-15s.",
@@ -173,11 +177,9 @@ def _resolve_family(explicit: Optional[str]) -> tuple[str, dict[str, Any]]:
     cfg = cfg if isinstance(cfg, dict) else {}
     fal_cfg = cfg.get("fal") if isinstance(cfg.get("fal"), dict) else {}
     for c in (explicit, os.environ.get("FAL_VIDEO_MODEL"), fal_cfg.get("model"), cfg.get("model")):
-        if isinstance(c, str) and c.strip():
-            fid = _normalize_family_key(c)
-            if fid:
-                return fid, FAL_FAMILIES[fid]
-            raise ValueError(f"Unknown FAL video model: {c.strip()}")
+        fid = _normalize_family_key(c) if isinstance(c, str) else None
+        if fid:
+            return fid, FAL_FAMILIES[fid]
     return DEFAULT_MODEL, FAL_FAMILIES[DEFAULT_MODEL]
 
 
@@ -363,7 +365,8 @@ class FALVideoGenProvider(VideoGenProvider):
 
     def get_setup_schema(self) -> dict[str, Any]:
         return {"name": "FAL", "badge": "paid", "env_vars": [{"key": "FAL_KEY", "prompt": "FAL.ai API key", "url": "https://fal.ai/dashboard/keys"}],
-                "tag": "LTX 2.3/2.5, Pixverse, Seedance 2.0/2.5/Mini, Veo 3.1, MiniMax H3, FLUX 3, Kling 3.0/4K/O3, Wan 2.7/3.0, Happy Horse, Grok Imagine — text-to-video & image-to-video"}
+                "tag": "LTX 2.3/2.5, Pixverse, Seedance 2.0/2.5/Mini, Veo 3.1, MiniMax H3, FLUX 3, Kling 3.0/4K/O3, Wan 2.7/3.0, Happy Horse, Grok Imagine, "
+                       "Gemini Omni — text-to-video & image-to-video"}
 
     def capabilities(self) -> dict[str, Any]:
         # RESOLVED family's surface so the dynamic tool schema gates params on what the selected model honors; union fallback (never raises).
@@ -396,15 +399,12 @@ class FALVideoGenProvider(VideoGenProvider):
                 return _fal_error(_NO_BACKEND_MSG, "auth_required", prompt)
         except ValueError as exc:
             return _fal_error(str(exc), "auth_required", prompt)
-        prompt = (prompt or "").strip()
-        try:
-            family_id, family = _resolve_family(model)
-        except ValueError as exc:
-            return _fal_error(str(exc), "unknown_model", prompt, model=model or "")
         try:
             _load_fal_client()
         except ImportError:
             return _fal_error("fal_client Python package not installed (pip install fal-client)", "missing_dependency", prompt)
+        prompt = (prompt or "").strip()
+        family_id, family = _resolve_family(model)
         image_url_norm = (image_url or "").strip() or None
         modality_used = "image" if image_url_norm else "text"  # routes to the i2v vs t2v endpoint
         endpoint = family[f"{modality_used}_endpoint"]

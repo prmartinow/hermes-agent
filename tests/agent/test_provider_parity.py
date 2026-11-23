@@ -154,8 +154,10 @@ class TestBuildApiKwargsOpenRouter:
         assert "codex_reasoning_items" in messages[1]
         assert messages[1]["tool_calls"][0]["extra_content"] == {"thought_signature": "opaque"}
 
-    def test_strips_unrequested_vendor_extra_content_for_generic_route(self, monkeypatch):
-        """An unconfigured route must not forward provider-specific tool metadata."""
+    def test_keeps_extra_content_for_gemini_target(self, monkeypatch):
+        """Gemini-family targets must keep extra_content (thought_signature) —
+        Gemini 3 thinking models 400 without it replayed on the next turn.
+        """
         agent = _make_agent(monkeypatch, "openrouter", model="google/gemini-3-pro-preview")
         messages = [
             {"role": "user", "content": "hi"},
@@ -178,7 +180,7 @@ class TestBuildApiKwargsOpenRouter:
 
         kwargs = agent._build_api_kwargs(messages)
         tool_call = kwargs["messages"][1]["tool_calls"][0]
-        assert "extra_content" not in tool_call
+        assert tool_call["extra_content"] == {"google": {"thought_signature": "opaque"}}
         # call_id/response_item_id still stripped regardless of model
         assert "call_id" not in tool_call
         assert "response_item_id" not in tool_call
@@ -224,8 +226,8 @@ class TestBuildApiKwargsOpenRouter:
             "google": {"thought_signature": ""}
         }
 
-    def test_generic_image_request_strips_vendor_signature(self, monkeypatch):
-        """A generic route does not replay vendor-specific signatures."""
+    def test_gemini_image_request_keeps_nonempty_thought_signature(self, monkeypatch):
+        """A valid signature remains available for the required tool-call replay."""
         agent = _make_agent(monkeypatch, "openrouter", model="google/gemini-3.8-flash")
         messages = [
             {"role": "user", "content": "use a tool first"},
@@ -248,8 +250,24 @@ class TestBuildApiKwargsOpenRouter:
 
         kwargs = agent._build_api_kwargs(messages)
 
-        assert "extra_content" not in kwargs["messages"][1]["tool_calls"][0]
+        assert kwargs["messages"][1]["tool_calls"][0]["extra_content"] == {
+            "google": {"thought_signature": "signed-call"}
+        }
 
+    def test_gemini_native_passes_base_url_for_top_level_thinking_config(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "gemini",
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            model="gemini-3-flash-preview",
+        )
+        agent.reasoning_config = {"enabled": True, "effort": "high"}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["extra_body"]["thinking_config"] == {
+            "includeThoughts": True,
+            "thinkingLevel": "high",
+        }
+        assert "extra_body" not in kwargs["extra_body"]
 
 
 
@@ -763,7 +781,7 @@ class TestAuxiliaryClientProviderPriority:
         from agent.auxiliary_client import get_text_auxiliary_client
         with patch("agent.auxiliary_client._read_nous_auth", return_value=None), \
              patch("agent.auxiliary_client._resolve_custom_runtime",
-                   return_value=("http://localhost:1234/v1", "local-key", None)), \
+                   return_value=("http://localhost:1234/v1", "local-key", "openai-compatible")), \
              patch("agent.auxiliary_client.OpenAI") as mock:
             _client, _model = get_text_auxiliary_client()
         assert mock.call_args.kwargs["base_url"] == "http://localhost:1234/v1"

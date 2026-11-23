@@ -14,7 +14,7 @@ Full reference: https://hermes-agent.nousresearch.com/docs/user-guide/configurat
 | `display` | `skin`, `interface` (cli/tui), `language`, `show_reasoning`, `show_cost`, `pet` |
 | `approvals` | `mode` (smart/manual/off), `timeout`, `cron_mode` |
 | `stt` | `enabled`, `provider` (local/groq/openai/mistral/elevenlabs/deepinfra) |
-| `tts` | `provider` (edge/elevenlabs/openai/minimax/mistral/neutts/piper/kittentts/deepinfra/xai) |
+| `tts` | `provider` (edge/elevenlabs/openai/minimax/mistral/neutts/gemini/piper/kittentts/deepinfra/xai) |
 | `memory` | `memory_enabled`, `user_profile_enabled`, `provider`, `write_approval` |
 | `security` | `redact_secrets`, `website_blocklist` |
 | `browser` | `headed` (false), `engine` (auto/lightpanda), `executable_path` ("" = auto-detect Chromium), `user_data_dir` ("" = fresh ephemeral profile per session), `chromium_args` ([]), `command_timeout` (Chromium launch timeout floor), `cloud_provider`, `cdp_url`, `use_real_profile` |

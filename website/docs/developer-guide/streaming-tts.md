@@ -39,17 +39,20 @@ swaps your voice for a different provider just to get streaming.
 
 To override, set `tts.streaming.provider` in your `config.yaml`:
 
-- a provider name (`elevenlabs`, `openai`, `xai`) pins that streamer
-- `auto` walks the priority list `elevenlabs → openai → xai` and uses
+- a provider name (`elevenlabs`, `gemini`, `openai`, `xai`) pins that streamer
+- `auto` walks the priority list `elevenlabs → gemini → openai → xai` and uses
   the first one whose credentials resolve — an explicit opt-in to "best
   chunked voice available"
 
 ```yaml
 tts:
-  provider: openai
+  provider: gemini
   streaming:
-    provider: openai      # or "auto"
+    provider: gemini      # or "auto"
     min_len: 20           # shortest first sentence (chars) spoken on its own; CJK setups use ~6
+  gemini:
+    model: gemini-2.5-flash-preview-tts
+    voice: Kore
 ```
 
 ## Capability matrix
@@ -58,6 +61,7 @@ tts:
 |-------------|---------------------------------------|-------------|-------------|
 | elevenlabs  | chunked HTTP (`pcm_24000`)            | yes         | `ELEVENLABS_API_KEY` / `tts.elevenlabs` |
 | openai      | chunked HTTP (`with_streaming_response`, `pcm`) | yes | `tts.openai.api_key` → env → managed gateway |
+| gemini      | SSE (`streamGenerateContent?alt=sse`) | yes         | `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
 | xai         | WebSocket (`wss://api.x.ai/v1/tts`)   | yes         | `XAI_API_KEY` preferred, else xAI OAuth (the subscription bearer 403s on metered TTS) |
 | edge, piper, kitten, neutts, mistral, minimax, deepinfra, … | — | no (per-sentence sync fallback) | as usual |
 | plugin `TTSProvider` with `streams_pcm` | the plugin's `stream(format="pcm")` | yes, at its `stream_sample_rate` | the plugin's own |

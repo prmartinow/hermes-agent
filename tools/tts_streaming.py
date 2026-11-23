@@ -40,6 +40,8 @@ def _resolve_key(env_var: str, provider_id: str) -> str:
         return get_env_value(env_var) or ""
 
 
+def _gemini_key() -> str:
+    return _resolve_key("GEMINI_API_KEY", "gemini") or _resolve_key("GOOGLE_API_KEY", "gemini")
 
 
 # Interruption latch: a barge-in on a spoken reply marks it; the next turn's submit path takes it
@@ -166,7 +168,7 @@ def _try_instantiate(name: str, tts_config: dict) -> Optional[StreamingTTSProvid
 
 # Fallback priority for ``tts.streaming.provider: auto`` — best chunked latency/quality
 # first. Deliberately hard-coded (a UX decision); edge is absent (no chunked-PCM API).
-_PROVIDER_PRIORITY: list[str] = ["elevenlabs", "openai", "xai"]
+_PROVIDER_PRIORITY: list[str] = ["elevenlabs", "gemini", "openai", "xai"]
 
 
 class _PluginPCMStreamer(StreamingTTSProvider):
@@ -314,6 +316,62 @@ class OpenAIStreamer(StreamingTTSProvider):
             yield from _capped(response.iter_bytes(), "OpenAI streaming TTS")
 
 
+@register("gemini")
+class GeminiStreamer(StreamingTTSProvider):
+    """Gemini ``streamGenerateContent?alt=sse`` → SSE feed of base64 PCM chunks (24 kHz), bounded streamed body.
+
+    Salvaged from PR #47588 (@Cdddo) and rebased onto the post-campaign infrastructure: credentials via the
+    provider-secret resolver, requests (not httpx) with a bounded streamed body, and main's provider ABC.
+    """
+
+    @staticmethod
+    def available() -> bool:
+        return bool(_gemini_key())
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        import base64
+        import json as _json
+        import requests
+        from tools.tts_tool_providers import (
+            DEFAULT_GEMINI_TTS_BASE_URL, DEFAULT_GEMINI_TTS_MODEL, DEFAULT_GEMINI_TTS_VOICE)
+        from hermes_cli.config import get_env_value
+        api_key = _gemini_key()
+        model = str(self.section.get("model", DEFAULT_GEMINI_TTS_MODEL)).strip() or DEFAULT_GEMINI_TTS_MODEL
+        voice = str(self.section.get("voice", DEFAULT_GEMINI_TTS_VOICE)).strip() or DEFAULT_GEMINI_TTS_VOICE
+        from agent.gemini_native_adapter import normalize_gemini_base_url
+        base_url = normalize_gemini_base_url(
+            self.section.get("base_url") or get_env_value("GEMINI_BASE_URL") or DEFAULT_GEMINI_TTS_BASE_URL,
+        )
+        payload = {
+            "contents": [{"parts": [{"text": text}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}}}}
+        url = f"{base_url}/models/{model}:streamGenerateContent"
+
+        def _sse_chunks() -> Iterator[bytes]:
+            with requests.post(
+                url, params={"alt": "sse"}, headers={"x-goog-api-key": api_key},
+                json=payload, timeout=60, stream=True,
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data: "):
+                        continue
+                    try:
+                        parts = _json.loads(line[len("data: "):])["candidates"][0]["content"]["parts"]
+                    except (ValueError, KeyError, IndexError, TypeError):
+                        continue
+                    for part in parts:
+                        b64 = (part.get("inlineData") or part.get("inline_data") or {}).get("data", "")
+                        if not b64:
+                            continue
+                        try:
+                            yield base64.b64decode(b64)
+                        except (ValueError, TypeError) as exc:
+                            logger.warning("Gemini SSE: bad base64 audio: %s", exc)
+
+        yield from _capped(_sse_chunks(), "Gemini streaming TTS")
 
 
 # Bounded like SpeakerPipeline's _CHUNK_QUEUE_MAX: the pump waits for the consumer instead of

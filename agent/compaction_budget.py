@@ -5,7 +5,6 @@ one calculation between its live trigger and the reporting surfaces.
 """
 from __future__ import annotations
 
-import re
 from contextlib import suppress
 from typing import Any, Sequence
 
@@ -44,50 +43,14 @@ def _normalize_exempt_models(raw: Any) -> tuple[str, ...]:
     return ()
 
 
-def is_astra_model(model: str, provider: str = "") -> bool:
-    """Check if model is Astra canonical/900k or any provider-prefixed alias.
-
-    Matches canonical 'gpt-6-astra', '-900k' variants, provider-prefixed routes
-    ('openai-codex:gpt-6-astra', 'openrouter/openai/gpt-6-astra-900k'), and bare 'astra'.
-    """
-    if not model:
-        return False
-    raw = model.strip().lower()
-    parts = re.split(r'[/:]', raw)
-    base_slug = parts[-1]
-    return "astra" in base_slug or "astra" in raw
-
-
 def check_model_cap_exemption(
     model: str,
-    provider: str = "",
     exempt_configs: Sequence[str] | None = None,
 ) -> tuple[bool, str | None, str | None]:
-    """Check if a model is exempt from the absolute threshold_tokens cap.
-
-    Returns ``(is_exempt, exemption_reason, config_source)``.
-    Default is no exemption (preserves upstream behavior).
-    Supports Astra aliases and explicit configured model substrings.
-    """
-    if not exempt_configs or not model:
-        return False, None, None
-
-    normalized = _normalize_exempt_models(exempt_configs)
-    if not normalized:
-        return False, None, None
-
-    model_clean = model.strip().lower()
-    provider_clean = (provider or "").strip().lower()
-
-    for entry in normalized:
-        # Astra exemption
-        if entry in ("astra", "gpt-6-astra", "gpt-6-astra-900k", "openai/gpt-6-astra"):
-            if is_astra_model(model_clean, provider_clean):
-                return True, "model_family_exemption", "threshold_tokens_exempt_models"
-        # Exact/substring match fallback for explicit model entries in config
-        elif entry in model_clean:
-            return True, "model_family_exemption", "threshold_tokens_exempt_models"
-
+    """Match the configured case-insensitive model-name patterns."""
+    name = model.strip().lower()
+    if name and any(pattern in name for pattern in _normalize_exempt_models(exempt_configs)):
+        return True, "model_family_exemption", "threshold_tokens_exempt_models"
     return False, None, None
 
 
@@ -130,7 +93,7 @@ def _output_reservation(max_tokens: int | None, endpoint_limit: int, model: str,
     if model or provider:
         from agent.model_metadata_endpoint_cache import get_model_max_output_tokens
 
-        limit = get_model_max_output_tokens(model=model, provider=provider, config_max_tokens=max_tokens) or 0
+        limit = get_model_max_output_tokens(model, provider)
         if limit > 0:
             return limit, "model_metadata"
     return 0, "none"
@@ -289,7 +252,6 @@ class CompactionBudgetMixin:
         if requested_cap is not None and exempt_config:
             is_exempt, exemption_reason, config_source = check_model_cap_exemption(
                 model=model,
-                provider=provider,
                 exempt_configs=exempt_config,
             )
 
@@ -487,13 +449,10 @@ class CompactionBudgetMixin:
         return report["base_threshold_percent"], report["effective_model_ratio"], report["actual_trigger"]
 
 
-    def _effective_threshold_cap(self, context_length: int, model: str | None = None, provider: str | None = None) -> int | None:
+    def _effective_threshold_cap(self, context_length: int) -> int | None:
         """The configured ``threshold_tokens`` cap clamped to the window; None when no cap is configured or model is exempt."""
-        effective_model = self.model if model is None else model
-        effective_provider = self.provider if provider is None else provider
         is_exempt, _, _ = check_model_cap_exemption(
-            model=effective_model,
-            provider=effective_provider,
+            model=self.model,
             exempt_configs=getattr(self, "threshold_tokens_exempt_models", None),
         )
         if is_exempt:

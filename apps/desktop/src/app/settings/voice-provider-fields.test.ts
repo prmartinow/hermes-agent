@@ -16,6 +16,7 @@ describe('voiceProviderKeys', () => {
       'xai',
       'elevenlabs',
       'mistral',
+      'gemini',
       'kittentts',
       'piper',
       'deepinfra',
@@ -27,7 +28,6 @@ describe('voiceProviderKeys', () => {
 
   it('scopes to the exact provider segment (no prefix bleed)', () => {
     expect(voiceProviderKeys('tts', 'mini')).toEqual([])
-    expect(voiceProviderKeys('tts', 'gemini')).toEqual([])
     expect(voiceProviderKeys('stt', 'openai')).toEqual(['stt.openai.model', 'stt.openai.streaming_model'])
   })
 })

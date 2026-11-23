@@ -1,7 +1,7 @@
 """A provider plugin's alias names the same provider whether or not models.dev is reachable.
 
 Some bundled plugins claim an alias that models.dev also uses as a provider id (``meta`` for
-``meta-ai``, ``azure`` for ``azure-foundry``, ``google-vertex`` for
+``meta-ai``, ``azure`` for ``azure-foundry``, ``google`` for ``gemini``, ``google-vertex`` for
 ``vertex``). ``resolve_provider_full`` used to answer the bare models.dev id when the catalog
 loaded and the plugin id when it did not, so ``/model ... --provider meta`` persisted a
 different provider depending on the network, and disagreed with the credential resolver.
@@ -22,10 +22,11 @@ def _entry(key: str, api: str) -> dict:
 _CATALOG = {
     "meta": _entry("meta", "https://api.meta.ai/v1"),
     "azure": _entry("azure", "https://example.openai.azure.com/openai"),
+    "google": _entry("google", "https://generativelanguage.googleapis.com/v1beta"),
     "google-vertex": _entry("google-vertex", "https://aiplatform.googleapis.com/v1"),
 }
 
-_ALIASES = {"meta": "meta-ai", "azure": "azure-foundry", "google-vertex": "vertex"}
+_ALIASES = {"meta": "meta-ai", "azure": "azure-foundry", "google": "gemini", "google-vertex": "vertex"}
 
 
 @pytest.mark.parametrize("registry", [_CATALOG, {}], ids=["catalog", "offline"])

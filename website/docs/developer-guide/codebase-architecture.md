@@ -39,8 +39,8 @@ hermes-agent/
 │   └── hermes_logging.py         # Multi-sink logging (agent.log, errors.log, gateway.log)
 │
 ├── Agent Subsystems (agent/)
-│   ├── credential_pool.py        # Multi-account pool, DOCI rotation, rate limit tracking
-│   ├── gemini_cloudcode_adapter.py # Cloud Code PA client, SSE stream unwrapping, dynamic reasoning
+│   ├── credential_pool.py        # Provider credential selection and rate-limit cooldowns
+│   ├── gemini_native_adapter.py # Native Gemini API request and response handling
 │   ├── gemini_schema.py          # Google OpenAPI schema sanitization for tool declarations
 │   ├── transports/               # Chat completions, Codex responses, streaming transports
 │   ├── memory/ & context_engine/ # Dual memory architecture, KV cache preservation
@@ -54,7 +54,7 @@ hermes-agent/
 ├── CLI & Management (cli.py & hermes_cli/)
 │   ├── cli.py                    # Interactive prompt_toolkit REPL, streaming output, history
 │   ├── skin_engine.py            # Theming engine, KawaiiSpinner animated progress
-│   ├── auth.py & auth_commands.py# Unified OAuth pool, PKCE flow, 5-step quota primer & daemon
+│   ├── auth.py & auth_commands.py# Provider sign-in, credential lookup, and OAuth flows
 │   └── web_server.py             # FastAPI / Tornado backend for Web Dashboard (:9119)
 │
 ├── Messaging Gateway (gateway/)

@@ -24,7 +24,7 @@ Hermes Agent works with any OpenAI-compatible API. Supported providers include:
 - **[Nous Portal](../integrations/nous-portal.md)** — Nous Research's subscription gateway — 300+ models plus web/image/TTS/browser through one OAuth login (recommended for newcomers)
 - **OpenAI** — GPT-5.4, GPT-5-codex, GPT-4.1, GPT-4o, etc.
 - **Anthropic** — Claude models (direct API, OAuth via `hermes auth add anthropic`, OpenRouter, or any compatible proxy)
-- **Custom endpoints** — connect an OpenAI-compatible local or remote gateway using `hermes model`
+- **Google** — Gemini models (direct API via `gemini` provider, OpenRouter, or compatible proxy)
 - **z.ai / ZhipuAI** — GLM models
 - **Kimi / Moonshot AI** — Kimi models
 - **MiniMax** — global and China endpoints
@@ -339,7 +339,7 @@ hermes chat --model openrouter/meta-llama/llama-3.1-70b-instruct
 hermes chat
 
 # Use a model with a larger context window
-hermes chat --model openrouter/anthropic/claude-haiku-4.5
+hermes chat --model openrouter/google/gemini-3-flash-preview
 ```
 
 If this happens on the first long conversation, Hermes may have the wrong context length for your model. Check what it detected:
@@ -680,24 +680,24 @@ There is no hard limit. Each profile is a directory under `~/.hermes/profiles/` 
 
 ### Using different models for different tasks (multi-model workflows)
 
-**Scenario:** You use GPT-5.4 as your daily driver, but Claude or Grok writes better social media content. Manually switching models every time is tedious.
+**Scenario:** You use GPT-5.4 as your daily driver, but Gemini or Grok writes better social media content. Manually switching models every time is tedious.
 
 **Solution: Delegation config.** Hermes can route subagents to a different model automatically. Set this in `~/.hermes/config.yaml`:
 
 ```yaml
 delegation:
-  model: "anthropic/claude-haiku-4.5"   # subagents use this model
+  model: "google/gemini-3-flash-preview"   # subagents use this model
   provider: "openrouter"                    # provider for subagents
 ```
 
-Now when you tell Hermes "write me a Twitter thread about X" and it spawns a `delegate_task` subagent, that subagent runs on Claude instead of your main model. Your primary conversation stays on GPT-5.4.
+Now when you tell Hermes "write me a Twitter thread about X" and it spawns a `delegate_task` subagent, that subagent runs on Gemini instead of your main model. Your primary conversation stays on GPT-5.4.
 
 You can also be explicit in your prompt: *"Delegate a task to write social media posts about our product launch. Use your subagent for the actual writing."* The agent will use `delegate_task`, which automatically picks up the delegation config.
 
 For one-off model switches without delegation, use `/model` in the CLI:
 
 ```bash
-/model anthropic/claude-haiku-4.5    # switch for this session
+/model google/gemini-3-flash-preview    # switch for this session
 # ... write your content ...
 /model openai/gpt-5.4                   # switch back
 ```

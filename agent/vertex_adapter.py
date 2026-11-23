@@ -28,7 +28,7 @@ def _ensure_google_auth() -> bool:
     """Bind ``google.auth`` on first use, installing the [vertex] extra through PM if needed.
 
     The extra left [all] under the lazy-install policy (2026-05-12) so a plain ``hermes-agent``
-    install still reaches Vertex after selecting a supported model. This runs at the first
+    install still reaches Vertex after selecting a Gemini model. This runs at the first
     credential request, never at import: an import-time sync would rebuild the dependency
     environment of whatever process happens to import this module.
     """
@@ -191,7 +191,7 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> tuple[Opti
 
 
 def build_vertex_base_url(project_id: str, region: str = DEFAULT_REGION) -> str:
-    """OpenAI-compatible Vertex base URL; ``global`` uses the bare host."""
+    """OpenAI-compatible Vertex base URL; ``global`` uses the bare host (Gemini 3.x preview is global-only)."""
     host = "aiplatform.googleapis.com" if region == "global" else f"{region}-aiplatform.googleapis.com"
     return f"https://{host}/v1beta1/projects/{project_id}/locations/{region}/endpoints/openapi"
 
@@ -251,34 +251,3 @@ def has_explicit_vertex_config() -> bool:
         return True
     sa_path = _get_secret("VERTEX_CREDENTIALS_PATH")
     return bool(sa_path and os.path.isfile(sa_path) and os.access(sa_path, os.R_OK))
-
-
-def _vertex_claude_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
-    """Preserve partner-model thinking settings for Vertex routes."""
-    if "claude" not in (model or "").lower() or not isinstance(reasoning_config, dict):
-        return None
-    effort = str(reasoning_config.get("effort", "medium") or "medium").strip().lower()
-    if reasoning_config.get("enabled") is False or effort == "none":
-        return {"includeThoughts": False}
-    budgets = {"minimal": 1024, "low": 1024, "medium": 4096, "high": 16384, "max": 24576, "ultra": 32768}
-    return {"includeThoughts": True, "thinkingBudget": budgets.get(effort, 4096)}
-
-
-def vertex_output_tokens(model: str, reasoning_config: dict | None, requested: Any) -> Any:
-    """Keep Vertex thinking headroom without depending on a native provider adapter."""
-    config = _vertex_claude_thinking_config(model, reasoning_config)
-    if not config:
-        return requested
-    ceiling = 64000
-    try:
-        output = int(requested)
-    except (TypeError, ValueError):
-        output = ceiling
-    if output <= 0:
-        output = ceiling
-    if config.get("includeThoughts") is False:
-        return min(output, ceiling)
-    budget = config.get("thinkingBudget", 0)
-    if isinstance(budget, (int, float)) and budget > 0:
-        return max(output, int(budget) + 8192, ceiling)
-    return max(output, ceiling)

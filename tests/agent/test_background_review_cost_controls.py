@@ -62,6 +62,7 @@ def test_routing_to_different_model_marks_routed_and_resolves_credentials():
         "base_url": "https://openrouter.ai/api/v1", "api_mode": "chat_completions",
         "credential_pool": "routed-pool",
         "request_overrides": {"extra_body": {"store": False}},
+        "max_output_tokens": 2048,
     }
     with patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg), \
          patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value=fake_rp):
@@ -72,6 +73,7 @@ def test_routing_to_different_model_marks_routed_and_resolves_credentials():
     assert rt["api_key"] == "or-key"
     assert rt["credential_pool"] == "routed-pool"
     assert rt["request_overrides"] == {"extra_body": {"store": False}}
+    assert rt.get("max_tokens") is None
 
 
 def test_unrouted_runtime_keeps_parent_pool_and_overrides():

@@ -1,12 +1,12 @@
 ---
 sidebar_position: 15
 title: "Google Vertex AI"
-description: "Use partner models on Google Cloud Vertex AI with service-account or application-default credentials"
+description: "Use Hermes Agent with Gemini on Google Cloud Vertex AI — OAuth2 service account or ADC, GCP billing and quotas, no static API key"
 ---
 
 # Google Vertex AI
 
-Hermes connects to partner models through the Google Cloud Vertex AI OpenAI-compatible endpoint. Model availability depends on the project, region, and access configured in Google Cloud.
+Hermes Agent supports **Gemini models on Google Cloud Vertex AI** through Vertex's OpenAI-compatible endpoint. Unlike the [Google AI Studio provider](./google-gemini.md) (which uses a static API key against `generativelanguage.googleapis.com`), Vertex gives you **enterprise-grade rate limits and GCP billing/credits**, and is the right choice when you want Gemini usage to draw on your Google Cloud account rather than an AI Studio key.
 
 :::info Vertex authenticates with OAuth2, not an API key
 Vertex has **no static API key** for the standard endpoint. Every request needs a short-lived **OAuth2 access token** (≈1 hour TTL) minted from either a service-account JSON or Application Default Credentials (ADC). Hermes mints and **auto-refreshes** these tokens for you — you never paste a token by hand. This is why pasting a temporary token into a custom provider's `api_key` field does not work: it expires mid-session.
@@ -34,7 +34,7 @@ hermes model
 # → Choose "More providers..." → "Google Vertex AI"
 # → Enter your GCP project ID (or leave blank to use the one in your credentials)
 # → Choose a region (default: global)
-# → Select an available partner model
+# → Select a Gemini model
 
 # Start chatting
 hermes chat
@@ -59,12 +59,12 @@ GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 
 ```yaml
 model:
-  default: claude-sonnet-4-5
+  default: google/gemini-3-flash-preview
   provider: vertex
 
 vertex:
   project_id: my-gcp-project   # blank → use the project embedded in the credentials
-  region: global
+  region: global               # "global" is required for the Gemini 3.x previews
 ```
 
 :::tip Environment variables win over config.yaml
@@ -84,20 +84,39 @@ vertex:
 
 ## Available Models
 
-The bundled picker includes `claude-sonnet-4-5` and `claude-haiku-4-5` as partner-model examples. Check that your project and region have access to the model you select.
+Vertex requires the `google/` vendor prefix on model IDs. The `hermes model` picker offers:
+
+| Model | ID |
+|-------|----|
+| Gemini 3.8 Flash | `google/gemini-3.8-flash` |
+| Gemini 4 Neon | `google/gemini-4-neon` |
+| Gemini 4 Hydrogen | `google/gemini-4-hydrogen` |
+| Gemini 4 Carbon | `google/gemini-4-carbon` |
+| Gemini 4 Argon | `google/gemini-4-argon` |
+| Gemini 3.7 Flash | `google/gemini-3.7-flash` |
+| Gemini 3.1 Pro Preview | `google/gemini-3.1-pro-preview` |
+| Gemini 3 Pro Preview | `google/gemini-3-pro-preview` |
+| Gemini 3 Flash Preview | `google/gemini-3-flash-preview` |
+| Gemini 3.1 Flash Lite Preview | `google/gemini-3.1-flash-lite-preview` |
+| Gemini 2.5 Pro | `google/gemini-2.5-pro` |
+| Gemini 2.5 Flash | `google/gemini-2.5-flash` |
+
+:::note `global` region for Gemini 3.x
+The Gemini 3.x preview models and the Gemini 4 models are served through the `global` endpoint. Regional endpoints (`us-central1`, etc.) may 404 them. Leave `region: global` unless you have a specific reason to pin a region.
+:::
 
 ## Switching Models Mid-Session
 
 ```text
-/model claude-sonnet-4-5
-/model claude-haiku-4-5
+/model google/gemini-3-pro-preview
+/model google/gemini-3-flash-preview
 ```
 
 `/model` switches among already-configured providers and models; it does not collect new credentials. Configure Vertex with `hermes model` first.
 
 ## Reasoning / Thinking
 
-For supported partner models, the provider profile translates Hermes reasoning settings into the endpoint's request options.
+Vertex exposes Gemini's thinking budget through the OpenAI-compatible surface. Hermes maps its reasoning-effort setting onto `extra_body.google.thinking_config` automatically, so `reasoning_effort` works the same way it does on other Gemini surfaces. On Gemini 4 Hydrogen and Neon, the `xhigh`, `max` and `ultra` efforts send the `xhigh` thinking level; Gemini 4 Argon and Carbon stop at `high`. Long decode (output past 64K) is not available on this surface.
 
 ## Diagnostics
 
@@ -117,9 +136,9 @@ Hermes found neither a service-account JSON nor working ADC. Either set `VERTEX_
 
 Hermes lazy-installs it the first time you select the Vertex provider. If that fails, run `hermes setup` to repair the managed install.
 
-### 404 on a model
+### 404 on Gemini 3.x models
 
-Check that the model ID is available to the project and region in your configuration.
+You are probably on a regional endpoint. Set `region: global` in the `vertex:` section of `config.yaml` (or unset `VERTEX_REGION`).
 
 ### 403 / permission denied
 
@@ -127,6 +146,7 @@ The service account (or your ADC identity) needs the `roles/aiplatform.user` rol
 
 ## Related
 
+- [Google Gemini (AI Studio)](./google-gemini.md) — static-API-key Gemini without GCP
 - [AWS Bedrock](./aws-bedrock.md) — another native cloud-provider integration
 - [AI Providers](../integrations/providers.md)
 - [Configuration](../user-guide/configuration.md)

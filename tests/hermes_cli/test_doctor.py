@@ -605,6 +605,7 @@ def test_run_doctor_flags_missing_credentials_for_active_openrouter_provider(mon
         monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", dict)
         monkeypatch.setattr(_auth_mod, "get_codex_auth_status", dict)
         monkeypatch.setattr(_auth_mod, "get_minimax_oauth_auth_status", dict)
+        monkeypatch.setattr(_auth_mod, "get_gemini_oauth_auth_status", dict)
     except Exception:
         pass
 
@@ -1214,7 +1215,7 @@ class TestDoctorXaiOAuthStatus:
     """The ◆ Auth Providers section must show xAI OAuth login state.
 
     xAI OAuth is checked in a *separate* try/except block so that an import
-    failure (or runtime exception) cannot silence the Nous / Codex /
+    failure (or runtime exception) cannot silence the Nous / Codex / Gemini /
     MiniMax rows that were already printed above it.
     """
 
@@ -1260,7 +1261,7 @@ class TestDoctorXaiOAuthStatus:
 
 
     def test_import_failure_does_not_affect_other_providers(self, monkeypatch, tmp_path):
-        """Nous / Codex / MiniMax rows must survive an xAI import failure."""
+        """Nous / Codex / Gemini / MiniMax rows must survive an xAI import failure."""
         home = tmp_path / ".hermes"
         home.mkdir(parents=True, exist_ok=True)
         (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")

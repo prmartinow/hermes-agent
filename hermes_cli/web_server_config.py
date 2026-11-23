@@ -124,7 +124,7 @@ _SCHEMA_OVERRIDES: dict[str, dict[str, Any]] = {
     ),
     "tts.provider": _select(
         "Text-to-speech provider",
-        "edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "neutts", "kittentts", "piper",
+        "edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts", "piper",
     ),
     "stt.provider": _select(
         "Speech-to-text provider", "local", "groq", "openai", "mistral", "xai", "elevenlabs", "deepinfra"),

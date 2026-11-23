@@ -5,30 +5,22 @@ from __future__ import annotations
 import logging
 import time
 
-logger = logging.getLogger("agent.model_metadata")
+logger = logging.getLogger(__name__)
 
 
-def get_model_max_output_tokens(model: str = "", provider: str = "", config_max_tokens: int | None = None) -> int:
-    """Return the explicit, known native, or cached model output limit without network access."""
-    if config_max_tokens is not None and int(config_max_tokens) > 0:
-        return int(config_max_tokens)
-
+def get_model_max_output_tokens(model: str, provider: str) -> int:
+    """Resolve output limits from upstream capability metadata without network access."""
     from agent.model_metadata import strip_codex_context_variant_suffix
+    from agent.models_dev import get_model_capabilities
 
-    norm_provider = (provider or "").strip().lower()
-    bare_model = strip_codex_context_variant_suffix((model or "").strip().lower())
-    if "claude" in bare_model or "anthropic" in norm_provider:
-        if any(v in bare_model for v in ("opus-4-6", "sonnet-4-6", "3-7", "3.7", "4-")):
-            return 64000
-        return 8192
-    if "gpt-4o" in bare_model:
-        return 16384
+    # The selected model may have its own catalog entry. Only consult the wire model when the
+    # selected alias lacks a limit (e.g. an upstream Codex context-window variant).
+    selected = (model or "").strip()
     try:
-        from agent.models_dev import get_model_capabilities
-
-        caps = get_model_capabilities(provider, bare_model, allow_network=False)
-        if caps and caps.max_output_tokens:
-            return caps.max_output_tokens
+        for candidate in dict.fromkeys((selected, strip_codex_context_variant_suffix(selected))):
+            caps = get_model_capabilities(provider, candidate, allow_network=False)
+            if caps and caps.max_output_tokens:
+                return caps.max_output_tokens
     except Exception:
         logger.debug("Could not resolve cached output-token metadata", exc_info=True)
     return 0

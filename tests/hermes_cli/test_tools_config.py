@@ -584,7 +584,7 @@ class TestImagegenModelPicker:
 
         catalog = {
             "openai/gpt-5.4-image-2": {"strengths": "quality"},
-            "vendor/other-image": {"strengths": "fallback"},
+            "google/gemini-3-pro-image": {"strengths": "fallback"},
         }
         config = {"image_gen": {"model": "gpt-image-2-medium"}}
         with (
@@ -751,7 +751,7 @@ def test_exactly_one_image_row_is_active_for_a_managed_selection(monkeypatch):
         lambda config, **kwargs: SimpleNamespace(features={"image_gen": SimpleNamespace(managed_by_nous=True)}),
     )
     rows = TOOL_CATEGORIES["image_gen"]["providers"] + _plugin_image_gen_providers()
-    for model in ("fal-ai/flux-2/klein/9b", "krea-2-medium", "vendor/other-image"):
+    for model in ("fal-ai/flux-2/klein/9b", "krea-2-medium", "google/gemini-3-pro-image"):
         config = {"image_gen": {"provider": "nous", "model": model}}
         active = [r["name"] for r in rows if tools_config._is_provider_active(r, config)]
         assert active == [_managed_image_row()["name"]], (model, active)

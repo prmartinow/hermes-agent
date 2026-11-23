@@ -9,15 +9,15 @@ Deployment is a separate command with an explicit Compose target:
 scripts/container_release.sh deploy VERSION COMPOSE_FILE PROJECT SERVICE HEALTH_URL
 ```
 
-`promote` and `rollback` accept the same explicit target arguments. The parity checker requires
-`--container`, `--hermes-home`, `--memory-dir`, and `--oauth-dir`; HTTP probes run only for supplied
-`--url` arguments.
+`promote` and `rollback` accept the same explicit target arguments. Run the parity checker with
+`--container`, `--hermes-home`, and `--memory-dir`. Supply `--oauth-dir` for installations with
+a separate credentials mount. Supply `--url` for each HTTP endpoint to probe.
 
 ## Active Deployment (Single Container)
 
 | Container Name | Target Port | Active Image Tag | Compose Configuration | Role |
 | :--- | :---: | :--- | :--- | :--- |
-| **`hermes-agent-serving`** | `9119` | `hermes-agent:v0.25` (`v0.25`, `local`) | `docker-compose.local.yml` | Active production serving & leader lease holder |
+| **`hermes-agent-serving`** | `9119` | `hermes-agent:v0.25` (`v0.25`, `local`) | `docker-compose.local.yml` | Active production serving |
 
 ---
 
@@ -61,10 +61,5 @@ scripts/container_release.sh deploy VERSION COMPOSE_FILE PROJECT SERVICE HEALTH_
    - Never stop or restart the active serving container from inside an active agent session.
 2. **File Tool Safe Root Parity**:
    - `HERMES_WRITE_SAFE_ROOT` expands to `/opt/data:${HOST_HOME:-~}:${WORKSPACE_DIR:-/workspace}:/workspace` in compose files so `patch`/`write_file` match `terminal` host scope.
-3. **Distributed Leader Election**:
-   - Background polling daemons acquire an atomic file lease (`runtime/quota_refresher.lease`).
-   - Only the active leader container executes scheduled API polling and writes to `state.db`.
-4. **Immutable Packaging**:
+3. **Immutable Packaging**:
    - Static binaries and dependencies are baked directly into Dockerfile layers to prevent `overlay2` copy-on-write disk bloat.
-5. **Volume Mount Permissions**:
-   - All OAuth credential directories (`~/.gemini`) must be mounted with `:rw` permissions.

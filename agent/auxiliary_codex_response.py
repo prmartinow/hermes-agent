@@ -9,23 +9,6 @@ from types import SimpleNamespace
 from typing import Any, List, Optional, Tuple
 
 
-def is_codex_destination(destination: Any, client: Any = None) -> bool:
-    """Whether a fallback destination or client targets a Codex Responses route."""
-    from agent.auxiliary_client import AsyncCodexAuxiliaryClient, CodexAuxiliaryClient
-
-    if client is not None and isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient)):
-        return True
-    if destination is None:
-        return False
-    if getattr(destination, "api_mode", None) == "codex_responses":
-        return True
-    provider = str(getattr(destination, "provider", "") or "").strip().lower()
-    if provider in {"openai-codex", "codex", "openai_codex"}:
-        return True
-    from agent.codex_responses_adapter import classify_responses_route
-    return classify_responses_route(destination).is_codex_backend
-
-
 def _parse_codex_final_response(
     final: Any, *, issuer_kind: Optional[str] = None, issuer_model: Optional[str] = None,
 ) -> tuple[list[str], list[Any], Any, str]:

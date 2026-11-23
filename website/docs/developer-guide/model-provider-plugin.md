@@ -324,6 +324,7 @@ meaning says otherwise.
 | `replays_tool_call_signatures` | Tool calls keep Gemini `extra_content` signatures | `False` |
 | `reasoning_payload()` | Verbatim `reasoning` object for a model (catalog-clamped) | `None` |
 | `replay_message_carriers()` | Captured `message_carrier_*` values to put back on a replayed assistant message | `{}` |
+| `replays_function_thought_signature()` | Replayed tool calls keep `function.thought_signature` | `False` |
 | `picker_catalog` | `(force_refresh) -> list`: the provider's own model-picker catalog, tried before the generic fetch | `None` |
 | `static_models` | Curated ids answered as this provider's row of the static catalog (looked up per profile home, never copied into the shared table) | `()` |
 | `catalog_credential_files` | Credential files whose mtime joins every cached catalog's fingerprint | `()` |
@@ -464,6 +465,7 @@ Look at these bundled plugins for idioms:
 | Plugin | Why look |
 |---|---|
 | `plugins/model-providers/openrouter/` | Aggregator with provider preferences, public model catalog |
+| `plugins/model-providers/gemini/` | `thinking_config` translation (native + OpenAI-compat nested forms) |
 | `plugins/model-providers/kimi-coding/` | `OMIT_TEMPERATURE`, `extra_body.thinking`, top-level `reasoning_effort` |
 | `plugins/model-providers/qwen-oauth/` | Message normalization, `cache_control` injection, VL high-res |
 | `plugins/model-providers/nous/` | Attribution tags, "omit reasoning when disabled" |
@@ -484,7 +486,7 @@ register_provider(ProviderProfile(
     env_vars=("GMI_API_KEY",),
     base_url="https://gmi-staging.internal.example.com/v1",
     auth_type="api_key",
-    default_aux_model="anthropic/claude-haiku-4.5",
+    default_aux_model="google/gemini-3.1-flash-lite-preview",
 ))
 ```
 

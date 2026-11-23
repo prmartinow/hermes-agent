@@ -57,6 +57,7 @@ class TestPoolFallback:
             ("ELEVENLABS_API_KEY", "elevenlabs"),
             ("DEEPINFRA_API_KEY", "deepinfra"),
             ("MINIMAX_API_KEY", "minimax"),
+            ("GEMINI_API_KEY", "gemini"),
             ("XAI_API_KEY", "xai"),
             ("OPENAI_API_KEY", "openai-api"),
         ],

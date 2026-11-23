@@ -238,6 +238,7 @@ class AcmeProfile(ProviderProfile):
 | `replays_tool_call_signatures` | Tool calls keep Gemini `extra_content` signatures | `False` |
 | `reasoning_payload()` | Verbatim `reasoning` object for a model (catalog-clamped) | `None` |
 | `replay_message_carriers()` | Captured `message_carrier_*` values to put back on a replayed assistant message | `{}` |
+| `replays_function_thought_signature()` | Replayed tool calls keep `function.thought_signature` | `False` |
 | `picker_catalog` | `(force_refresh) -> list`: the provider's own model-picker catalog, tried before the generic fetch | `None` |
 | `static_models` | Curated ids registered as this provider's row of the static catalog | `()` |
 | `catalog_credential_files` | Credential files whose mtime joins every cached catalog's fingerprint | `()` |

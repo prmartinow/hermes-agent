@@ -6,17 +6,8 @@ prefixes."""
 
 from __future__ import annotations
 
-import logging
 import os
-import shlex
-from typing import TYPE_CHECKING, Optional
-
-from hermes_cli.auth_declared_providers import provider_env_base_url
-
-if TYPE_CHECKING:
-    from hermes_cli.auth import ProviderConfig
-
-logger = logging.getLogger(__name__)
+from typing import Optional
 
 
 def external_process_command(profile) -> str:
@@ -46,27 +37,6 @@ def resolve_external_process_command(command: str) -> Optional[str]:
     from agent.anthropic_adapter import find_claude_code_cli
 
     return find_claude_code_cli(command)
-
-
-def external_process_spec(
-    pconfig: ProviderConfig) -> tuple[str, list[str], str, Optional[str], tuple[str, ...]]:
-    """``(command, args, base_url, resolved_command, command_env_vars)`` for an ACP provider.
-
-    Launch details come from the provider's own profile (``process_command`` and its env overrides),
-    so out-of-tree providers describe their binary."""
-    base_url = provider_env_base_url(pconfig) or pconfig.inference_base_url
-    try:
-        from providers import get_provider_profile as _get_provider_profile
-        profile = _get_provider_profile(pconfig.id)
-    except Exception:
-        logger.debug("External process provider profile lookup failed", exc_info=True)
-        profile = None
-    command_env_vars = tuple(getattr(profile, "process_command_env_vars", ()) or ())
-    args_env_var = str(getattr(profile, "process_args_env_var", "") or "")
-    command = external_process_command(profile)
-    raw_args = os.getenv(args_env_var, "").strip() if args_env_var else ""
-    args = shlex.split(raw_args) if raw_args else list(getattr(profile, "process_args", ()) or [])
-    return command, args, base_url, resolve_external_process_command(command), command_env_vars
 
 
 def external_process_launch_env_names() -> frozenset[str]:

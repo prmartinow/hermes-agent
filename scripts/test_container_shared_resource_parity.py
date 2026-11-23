@@ -17,8 +17,10 @@ from pathlib import Path
 PROBE = r"""
 import json, os, sys
 from pathlib import Path
-home, memory, oauth = map(Path, sys.argv[1:])
-resources = {"state.db": home / "state.db", "skills": home / "skills", "memory": memory, "oauth": oauth}
+home, memory = map(Path, sys.argv[1:3])
+resources = {"state.db": home / "state.db", "skills": home / "skills", "memory": memory}
+if len(sys.argv) == 4:
+    resources["oauth"] = Path(sys.argv[3])
 result = {}
 for name, path in resources.items():
     try:
@@ -43,7 +45,10 @@ def read_probe(command: list[str]) -> dict:
 
 def compare_resources(container: dict, host: dict) -> bool:
     passed = True
-    for resource in ("state.db", "skills", "memory", "oauth"):
+    resources = ["state.db", "skills", "memory"]
+    if "oauth" in host or "oauth" in container:
+        resources.append("oauth")
+    for resource in resources:
         serving, local = container.get(resource), host.get(resource)
         shared = bool(serving and local and all(
             serving.get(key) == local.get(key) and serving.get(key) is not None
@@ -81,10 +86,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--container", required=True)
     parser.add_argument("--hermes-home", type=absolute_path, required=True)
     parser.add_argument("--memory-dir", type=absolute_path, required=True)
-    parser.add_argument("--oauth-dir", type=absolute_path, required=True)
+    parser.add_argument("--oauth-dir", type=absolute_path, help="Check an additional OAuth credential mount")
     parser.add_argument("--url", action="append", default=[])
     args = parser.parse_args(argv)
-    paths = [str(args.hermes_home), str(args.memory_dir), str(args.oauth_dir)]
+    paths = [str(args.hermes_home), str(args.memory_dir)]
+    if args.oauth_dir is not None:
+        paths.append(str(args.oauth_dir))
     try:
         # The normal service identity must be able to access the shared directories;
         # a default-root docker exec would give a false writable result.

@@ -125,10 +125,10 @@ class TestImageSizePresetFamily:
 
 
 class TestAspectRatioFamily:
-    """Kling uses an aspect_ratio enum, not image_size."""
+    """Nano-banana uses aspect_ratio enum, NOT image_size."""
 
-    def test_kling_landscape_uses_aspect_ratio(self, image_tool):
-        p = image_tool._build_fal_payload("fal-ai/kling-image/v3/text-to-image", "hello", "landscape")
+    def test_nano_banana_landscape_uses_aspect_ratio(self, image_tool):
+        p = image_tool._build_fal_payload("fal-ai/nano-banana-pro", "hello", "landscape")
         assert p["aspect_ratio"] == "16:9"
         assert "image_size" not in p
 
@@ -231,9 +231,9 @@ class TestModelResolution:
     def test_config_wins_over_env_var(self, image_tool, monkeypatch):
         monkeypatch.setenv("FAL_IMAGE_MODEL", "fal-ai/z-image/turbo")
         with patch("hermes_cli.config.load_config",
-                   return_value={"image_gen": {"model": "fal-ai/kling-image/v3/text-to-image"}}):
+                   return_value={"image_gen": {"model": "fal-ai/nano-banana-pro"}}):
             mid, _ = image_tool._resolve_fal_model()
-        assert mid == "fal-ai/kling-image/v3/text-to-image"
+        assert mid == "fal-ai/nano-banana-pro"
 
 
 # ---------------------------------------------------------------------------
@@ -322,10 +322,10 @@ class TestManagedGatewayErrorTranslation:
                             lambda gw: mock_managed_client)
 
         with pytest.raises(ValueError) as exc_info:
-            image_tool._submit_fal_request("fal-ai/kling-image/v3/text-to-image", {"prompt": "x"})
+            image_tool._submit_fal_request("fal-ai/nano-banana-pro", {"prompt": "x"})
 
         msg = str(exc_info.value)
-        assert "fal-ai/kling-image/v3/text-to-image" in msg
+        assert "fal-ai/nano-banana-pro" in msg
         assert "403" in msg
         # Original exception chained for debugging
         assert exc_info.value.__cause__ is bad_request
@@ -437,7 +437,7 @@ class TestKreaModelNormalization:
 
 
     def test_non_krea_models_are_not_krea(self, image_tool):
-        for mid in ("fal-ai/flux-2/klein/9b", "fal-ai/kling-image/v3/text-to-image", None, "", 123):
+        for mid in ("fal-ai/flux-2/klein/9b", "fal-ai/nano-banana-pro", None, "", 123):
             assert image_tool._normalize_krea_model(mid) is None
 
 

@@ -22,7 +22,7 @@ from agent.cache_bounds import publish_lru
 from agent.agent_init_session import agent_interface
 from agent.prompt_builder import steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
-from agent.route_verdicts import ROUTE_VERDICT_FIELDS, reset_route_verdicts, reset_route_verdicts_if_moved
+from agent.route_verdicts import reset_route_verdicts, reset_route_verdicts_if_moved
 from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
@@ -32,7 +32,7 @@ from agent.credential_pool import (
 from agent.error_classifier import FailoverReason
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
 from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
-from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
+from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot, _restore_switch_snapshot, _snapshot_switch_state
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 from session_rules.turns import _msg_has_payload, repair_message_sequence
 logger = logging.getLogger(__name__)
@@ -1499,6 +1499,27 @@ def _ensure_route_client_headers(client_kwargs: dict, provider: str) -> None:
     client_kwargs["default_headers"] = existing
 
 
+def _gemini_native_client(agent, client_kwargs: dict, httpx_verify, *, reason: str, shared: bool):
+    """Native Gemini client when the base_url is the Gemini API, else None."""
+    from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+    base_url = str(client_kwargs.get("base_url", "") or "")
+    if not is_native_gemini_base_url(base_url):
+        return None
+    safe_kwargs = {
+        k: v for k, v in client_kwargs.items()
+        if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+    }
+    if "http_client" not in safe_kwargs:
+        keepalive_http = agent._build_keepalive_http_client(base_url, verify=httpx_verify)
+        if keepalive_http is not None:
+            safe_kwargs["http_client"] = keepalive_http
+    client = GeminiNativeClient(**safe_kwargs)
+    _ra().logger.info(
+        "Gemini native client created (%s, shared=%s) %s", reason, shared, agent._client_log_context()
+    )
+    return client
+
+
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
     from agent.auxiliary_client import (
         _to_openai_base_url,
@@ -1558,9 +1579,9 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent.provider, reason, shared, agent._client_log_context(),
         )
         return provider_client
-    from agent.provider_route_hooks import GEMINI_NATIVE_PROVIDER_NAMES, gemini_native_client
-    if agent.provider in GEMINI_NATIVE_PROVIDER_NAMES:
-        client = gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
+    from agent.auxiliary_client import _GEMINI_NATIVE_PROVIDER_NAMES
+    if agent.provider in _GEMINI_NATIVE_PROVIDER_NAMES:
+        client = _gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
         if client is not None:
             return client
     # TCP keepalives so dead provider connections are detected (~60s) instead of hanging in
@@ -1641,43 +1662,6 @@ def _apply_switched_provider_request_overrides(agent, new_provider):
     if new_extra_body:
         overrides["extra_body"] = dict(new_extra_body)
     agent.request_overrides = overrides
-
-
-# Pool reload is part of the switch and must be reversible on rollback, hence the pool fields.
-_SWITCH_SNAPSHOT_FIELDS = (
-    "model", "provider", "requested_provider", "base_url", "api_mode", "api_key", "client",
-    "_anthropic_client", "_anthropic_api_key", "_anthropic_base_url", "_is_anthropic_oauth",
-    "_config_context_length", "_reasoning_echo_flag", "runtime_capabilities",
-    "_credential_pool", "_credential_pool_entry_id", *ROUTE_VERDICT_FIELDS,
-    "_usage_anchor", "_turn_base_usage_anchor",
-)
-_MISSING = object()
-
-
-def _snapshot_switch_state(agent) -> dict[str, Any]:
-    """Snapshot every field the swap+rebuild mutates so a failed rebuild rolls back atomically
-    (else a new model name + OLD client 400s next turn). The sentinel distinguishes unset from
-    None: tests build bare agents via ``__new__`` without all fields."""
-    snapshot = {name: getattr(agent, name, _MISSING) for name in _SWITCH_SNAPSHOT_FIELDS}
-    # Shallow-copy the dict so mutating the live one doesn't poison the rollback target.
-    snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
-    if isinstance(snapshot.get("_usage_anchor"), dict):
-        snapshot["_usage_anchor"] = copy.deepcopy(snapshot["_usage_anchor"])
-    if isinstance(snapshot.get("_turn_base_usage_anchor"), dict):
-        snapshot["_turn_base_usage_anchor"] = copy.deepcopy(snapshot["_turn_base_usage_anchor"])
-    return snapshot
-
-
-def _restore_switch_snapshot(agent, snapshot: dict[str, Any]) -> None:
-    for name, value in snapshot.items():
-        if value is _MISSING:
-            continue  # attribute did not exist before the swap; don't fabricate it
-        with contextlib.suppress(Exception):
-            setattr(agent, name, value)
-    if "_usage_anchor" in snapshot and snapshot["_usage_anchor"] is not _MISSING:
-        with contextlib.suppress(Exception):
-            from agent.usage_anchor import persist_usage_anchor
-            persist_usage_anchor(agent, snapshot["_usage_anchor"])
 
 
 def _resolve_switch_destination(agent, new_model, new_provider, base_url, api_mode, capabilities, old_norm, new_norm):
@@ -3193,9 +3177,6 @@ def extract_api_error_context(error: Exception) -> dict[str, Any]:
             context["reset_at"] = ratelimit_reset
         if "reset_at" not in context:
             _set_reset_from_vendor_headers(context, headers)
-
-    from agent.api_error_summary import fill_provider_retry_context
-    fill_provider_retry_context(error, context)
     if "message" not in context and str(error).strip():
         context["message"] = str(error).strip()[:500]
     if "reset_at" not in context and isinstance(context.get("message") or "", str):

@@ -59,10 +59,7 @@ class Run:
         """(last main request before the summary, first after it, every main request after it)."""
         calls = self.calls()
         idx = next((i for i, c in enumerate(calls) if c.reply.startswith("route:")), None)
-        assert idx is not None, (
-            f"no compaction summary request reached Google: {[c.reply for c in calls]}\n"
-            + "\n".join(turn.describe() for turn in self.turns)
-        )
+        assert idx is not None, f"no compaction summary request reached Google: {[c.reply for c in calls]}"
         before = [c for c in calls[:idx] if c.reply.startswith("script:")]
         after = [c for c in calls[idx + 1:] if c.reply.startswith("script:")]
         assert before and after, [c.reply for c in calls]

@@ -81,6 +81,44 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
             "enable_safety_checker", "enable_prompt_expansion",
         },
     ),
+    "fal-ai/nano-banana-pro": _model(
+        "Nano Banana Pro (Gemini 3 Pro Image)", "~8s", "Gemini 3 Pro, reasoning depth, text rendering", "$0.15/image (1K)",
+        style="aspect_ratio",
+        # "1K" is the cheapest tier; 4K doubles the per-image cost (Nous Subscription billing).
+        defaults={
+            "num_images": 1, "output_format": "png", "safety_tolerance": "5",
+            "resolution": "1K",
+        },
+        supports={
+            "prompt", "aspect_ratio", "num_images", "output_format", "safety_tolerance", "seed", "sync_mode",
+            "resolution", "enable_web_search", "limit_generations",
+        },
+        edit_endpoint="fal-ai/nano-banana-pro/edit",
+        edit_supports={
+            "prompt", "image_urls", "aspect_ratio", "num_images", "output_format", "safety_tolerance", "seed",
+            "sync_mode", "resolution", "enable_web_search", "limit_generations",
+        },
+        max_reference_images=2,
+    ),
+    "fal-ai/nano-banana-2": _model(
+        "Nano Banana 2 (Gemini 3.1 Flash Image)", "~3s", "Fast reasoning, multilingual text, infographics", "Lower-cost Flash tier",
+        style="aspect_ratio",
+        defaults={
+            "num_images": 1, "output_format": "png", "safety_tolerance": "4",
+            "resolution": "1K", "limit_generations": True,
+        },
+        supports={
+            "prompt", "aspect_ratio", "num_images", "output_format", "safety_tolerance", "seed", "sync_mode",
+            "system_prompt", "resolution", "enable_web_search", "limit_generations", "thinking_level",
+        },
+        edit_endpoint="fal-ai/nano-banana-2/edit",
+        edit_supports={
+            "prompt", "image_urls", "aspect_ratio", "num_images", "output_format", "safety_tolerance", "seed",
+            "sync_mode", "system_prompt", "resolution", "enable_web_search", "limit_generations",
+            "thinking_level",
+        },
+        max_reference_images=14,
+    ),
     "fal-ai/gpt-image-1.5": _model(
         "GPT Image 1.5", "~15s", "Prompt adherence", "$0.034/image",
         style="gpt_literal", sizes={
@@ -296,6 +334,21 @@ FAL_MODELS: dict[str, dict[str, Any]] = {
         style="aspect_ratio",
         defaults={"num_images": 1, "output_format": "png"},
         supports={"prompt", "aspect_ratio", "num_images", "output_format", "sync_mode"},
+    ),
+    "google/nano-banana-2-lite": _model(
+        "Nano Banana 2 Lite", "<2s", "Gemini image family, sub-2s, 14 aspect ratios incl. extreme", "~$0.04/image (1K fixed)",
+        style="aspect_ratio",
+        defaults={"num_images": 1, "output_format": "png", "safety_tolerance": "5"},
+        supports={
+            "prompt", "aspect_ratio", "num_images", "seed", "output_format", "safety_tolerance", "sync_mode",
+            "system_prompt", "limit_generations", "thinking_level",
+        },
+        edit_endpoint="google/nano-banana-2-lite/edit",
+        edit_supports={
+            "prompt", "image_urls", "aspect_ratio", "num_images", "seed", "output_format", "safety_tolerance",
+            "sync_mode", "system_prompt",
+        },
+        max_reference_images=4,
     ),
     "fal-ai/recraft/v4.1/text-to-image": _model(
         "Recraft V4.1", "~8s", "Design-first raster, brand systems, editorial", "$0.035/image",
