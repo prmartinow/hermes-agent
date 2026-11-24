@@ -70,3 +70,20 @@ from a PM-prepared checkout, rather than injecting benchmark packages into Herme
   cycle typically grows (intra-file coupling becomes inter-module edges). Neither is hidden by these tools.
 
 Results for PR #102117 are in the PR description; raw JSON for that run lives in the PR thread.
+
+## Behavior-to-source map
+
+`behavior_map.py` validates a maintained, read-only map of selected cross-module
+behaviors against this checkout. It is a navigation aid, not a complete call graph
+or runtime authority; each entry keeps directly observed facts separate from
+inferred links. Validation is offline and does not import application code.
+
+```bash
+python -m evals.codebase_navigability.behavior_map validate --root .
+python -m evals.codebase_navigability.behavior_map validate --root /path/to/checkout --map /path/to/map.json
+```
+
+The shipped four-flow map is `behavior_map.json`. Every source locator must
+resolve to a Python function, async function, or class definition inside the
+checkout; dotted names resolve nested class methods. Test references must be
+existing files inside the checkout. The validator only reads files.

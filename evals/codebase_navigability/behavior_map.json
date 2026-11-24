@@ -1,0 +1,123 @@
+{
+  "entries": [
+    {
+      "id": "turn-setup",
+      "behavior": "Initialize and execute a conversational turn through the AIAgent facade and conversation loop.",
+      "sources": [
+        {
+          "path": "run_agent.py",
+          "symbol": "AIAgent"
+        },
+        {
+          "path": "agent/turn_facade.py",
+          "symbol": "TurnFacadeMixin.run_conversation"
+        },
+        {
+          "path": "agent/conversation_loop.py",
+          "symbol": "_run_conversation_turn"
+        },
+        {
+          "path": "agent/conversation_loop.py",
+          "symbol": "run_conversation"
+        }
+      ],
+      "tests": [
+        "tests/agent/test_run_agent.py"
+      ],
+      "observed": [
+        "TurnFacadeMixin.run_conversation delegates to agent.conversation_loop.run_conversation. The inner turn resets per-turn compression flags and applies fast-mode state before inference."
+      ],
+      "inferred": []
+    },
+    {
+      "id": "compression-timeout",
+      "behavior": "Bound compression work with progress-aware timeout and fence durable commit admission at cancellation.",
+      "sources": [
+        {
+          "path": "agent/compression_facade.py",
+          "symbol": "_CommitFenceRegistration"
+        },
+        {
+          "path": "agent/compression_facade.py",
+          "symbol": "_run_under_progress_timeout"
+        },
+        {
+          "path": "agent/conversation_compression.py",
+          "symbol": "CompressionCommitFence"
+        },
+        {
+          "path": "agent/conversation_compression.py",
+          "symbol": "run_compress_context_with_progress_timeout"
+        },
+        {
+          "path": "agent/compression_facade.py",
+          "symbol": "CompressionFacadeMixin._compress_context"
+        }
+      ],
+      "tests": [
+        "tests/agent/test_compression_concurrent_fork.py",
+        "tests/agent/test_compression_timeout_terminal.py"
+      ],
+      "observed": [
+        "CompressionFacadeMixin._compress_context registers a fence for the active attempt. A hard stop can prevent a new commit from starting. If a commit was already admitted, cancellation waits for it to finish."
+      ],
+      "inferred": []
+    },
+    {
+      "id": "persistence-markers",
+      "behavior": "Read per-message persisted markers to skip duplicate flushes and stamp messages after database writes.",
+      "sources": [
+        {
+          "path": "agent/session_persistence.py",
+          "symbol": "_db_flush_collect"
+        },
+        {
+          "path": "agent/session_persistence.py",
+          "symbol": "_db_flush_write"
+        }
+      ],
+      "tests": [
+        "tests/agent/test_in_place_persist_marker.py"
+      ],
+      "observed": [
+        "_db_flush_collect skips durable messages. _db_flush_write appends the collected rows in one transaction and then stamps the live messages. If the write fails, the new messages remain eligible for retry."
+      ],
+      "inferred": []
+    },
+    {
+      "id": "tool-plugin-dispatch",
+      "behavior": "Dispatch a model function call through tool middleware, hook checks, registry lookup, execution, and result hooks.",
+      "sources": [
+        {
+          "path": "model_tools.py",
+          "symbol": "handle_function_call"
+        },
+        {
+          "path": "model_tools.py",
+          "symbol": "_pre_dispatch_guards"
+        },
+        {
+          "path": "model_tools.py",
+          "symbol": "_execute_tool"
+        },
+        {
+          "path": "tools/registry.py",
+          "symbol": "ToolRegistry.dispatch"
+        },
+        {
+          "path": "hermes_cli/plugins.py",
+          "symbol": "_dispatch_pre_tool_call_hooks"
+        }
+      ],
+      "tests": [
+        "tests/plugins/test_transform_tool_result_hook.py",
+        "tests/hermes_cli/test_plugins.py",
+        "tests/tools/test_registry.py"
+      ],
+      "observed": [
+        "handle_function_call checks pre-tool hooks before invoking the registry. A plugin can block the call or replace the arguments. Result hooks can transform the final result after tool execution."
+      ],
+      "inferred": []
+    }
+  ]
+}
